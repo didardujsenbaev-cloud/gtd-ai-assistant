@@ -1830,6 +1830,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Обработать через AI
         result = process_item(text, active_projects=_active_proj_names)
 
+        # ── Business Core routing (Фаза 5) ──────────────────
+        _bc_note = ""
+        try:
+            from business_core.inbox_bridge import route_inbox
+            _bc_note = route_inbox(text, result)
+        except Exception:
+            pass
+        # ────────────────────────────────────────────────────
+
         # Правило 2 минут или добавить в Next Actions
         if result["результат"] == "2min":
             reply = (
@@ -1901,6 +1910,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"*Время:* {result['время']} мин\n"
                 f"{deadline_line}\n"
                 f"_{result['пояснение']}_"
+                f"{_bc_note}"
             )
         elif result["результат"] == "Project":
             # Проверка дубликатов проектов
@@ -1950,6 +1960,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"{deadline_line}\n\n"
                 f"✅ Сохранено в список ожидания\n\n"
                 f"_{result['пояснение']}_"
+                f"{_bc_note}"
             )
         elif result["результат"] in ("Someday", "SomedayDate"):
             someday_sheet = get_sheet("someday")

@@ -613,6 +613,13 @@ async def newroadmap_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE)
             ]
             append_business_row("roadmap_stages", stage_row)
 
+        # Обновляем кеш inbox_bridge
+        try:
+            from business_core.inbox_bridge import invalidate_cache
+            invalidate_cache()
+        except Exception:
+            pass
+
         await update.message.reply_text(
             f"✅ *Дорожная карта создана!*\n\n"
             f"🆔 ID: `{rm_id}`\n"
@@ -766,6 +773,13 @@ async def newclient_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         ]
 
         append_business_row("people_registry", row_values)
+
+        # Обновляем кеш inbox_bridge
+        try:
+            from business_core.inbox_bridge import invalidate_cache
+            invalidate_cache()
+        except Exception:
+            pass
 
         await update.message.reply_text(
             f"✅ *Клиент добавлен!*\n\n"
