@@ -1,0 +1,45 @@
+# Виртуальное окружение
+venv/
+env/
+.venv/
+
+# Python кэш
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Секреты и ключи — НИКОГДА в git
+.env
+.env.*
+*.json
+*.secret
+*.key
+token.json
+credentials.json
+
+# Google сервисный аккаунт (на случай если расширение изменится)
+*-credentials.*
+*service-account*
+
+# Логи
+bot.log
+*.log
+
+# macOS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V7
+.Trashes
+
+# Редакторы
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Материалы (личные файлы, не код)
+materials/
+my_context.txt.rtf
