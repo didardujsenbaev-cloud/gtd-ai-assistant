@@ -4348,6 +4348,15 @@ def main():
     app.add_handler(CommandHandler("close", close_project))
     app.add_handler(CommandHandler("archive", show_archive))
     app.add_handler(CommandHandler("cleartest", cleartest_command))
+
+    # ── Business Core handlers (Фаза 4) ─────────────────────
+    try:
+        from business_core.telegram_handlers import register_business_handlers
+        register_business_handlers(app)
+    except Exception as _bc_err:
+        print(f"   ⚠️  Business Core handlers не загружены: {_bc_err}")
+    # ────────────────────────────────────────────────────────
+
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.Document.PDF, handle_document))
