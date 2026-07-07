@@ -1,17 +1,23 @@
 """
 Business Builder — конструктор нового бизнес-направления.
 
-Фаза 1: работает локально, без Google API.
-Создаёт структуру данных, которую потом можно будет записать в Google Sheets и Drive.
+Фаза 1: локальные данные (модели, стартовые проекты).
+Фаза Drive: provision_biz_drive() / save_drive_info_to_sheets() — безопасная обёртка
+            над integrations.google_drive_adapter. Не ломает основной GTD-поток:
+            любая ошибка Drive логируется и возвращается как {ok: False}.
 """
 
 from __future__ import annotations
 
+import logging
+import os
 from datetime import datetime
 from typing import Optional
 
 from business_core.models import BusinessArea
 from business_core.business_registry import create_business_record, validate_business_record
+
+log = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -280,6 +286,114 @@ def _build_summary(
     lines.append(f"   Добавить направление в Google Sheets: /biz_save {business.id}")
 
     return "\n".join(lines)
+
+
+# ─────────────────────────────────────────────────────────────
+# Google Drive интеграция (безопасная — не ломает GTD)
+# ─────────────────────────────────────────────────────────────
+
+def provision_biz_drive(biz_id: str, biz_name: str) -> dict:
+    """
+    Создать папку бизнеса в Google Drive.
+
+    Требует GDRIVE_BIZ_ROOT_FOLDER_ID и GOOGLE_CREDENTIALS_FILE.
+    Если переменные не заданы — возвращает {ok: False} без ошибки.
+    Если Drive API упал — возвращает {ok: False, error: str}.
+
+    Идемпотентно: если папка уже есть — возвращает её.
+
+    Args:
+        biz_id:   ID бизнеса (например "BIZ-001")
+        biz_name: Название бизнеса
+
+    Returns:
+        {
+            "ok":         bool,
+            "folder_id":  str | None,
+            "folder_url": str | None,
+            "error":      str | None,
+        }
+    """
+    gdrive_root = os.getenv("GDRIVE_BIZ_ROOT_FOLDER_ID", "").strip()
+    creds_file  = os.getenv("GOOGLE_CREDENTIALS_FILE", "").strip()
+
+    if not gdrive_root or not creds_file:
+        log.debug("provision_biz_drive: GDRIVE_BIZ_ROOT_FOLDER_ID или credentials не заданы — пропуск")
+        return {"ok": False, "folder_id": None, "folder_url": None,
+                "error": "GDRIVE_BIZ_ROOT_FOLDER_ID не задан в .env"}
+
+    try:
+        from integrations.google_drive_adapter import create_business_folder_structure
+
+        result = create_business_folder_structure(
+            biz_id=biz_id,
+            biz_name=biz_name,
+            dry_run=False,
+        )
+        log.info(f"provision_biz_drive: {biz_id} → {result['business_folder_url']}")
+        return {
+            "ok":         True,
+            "folder_id":  result["business_folder_id"],
+            "folder_url": result["business_folder_url"],
+            "error":      None,
+        }
+    except Exception as exc:
+        log.warning(f"provision_biz_drive error (biz_id={biz_id}): {exc}")
+        return {
+            "ok":         False,
+            "folder_id":  None,
+            "folder_url": None,
+            "error":      str(exc),
+        }
+
+
+def save_drive_info_to_sheets(
+    biz_id:     str,
+    folder_id:  str,
+    folder_url: str,
+) -> bool:
+    """
+    Сохранить Drive-ссылку и ID папки в BIZ_REGISTRY.
+
+    Находит строку по biz_id, определяет позицию колонок
+    "Google Drive" и "Drive Folder ID" по реальным заголовкам листа
+    (не хардкодит номера колонок — безопасно при разном порядке).
+
+    Args:
+        biz_id:     ID бизнеса (первая колонка)
+        folder_id:  Google Drive folder ID
+        folder_url: ссылка на папку
+
+    Returns:
+        True если успешно, False если ошибка или строка не найдена
+    """
+    try:
+        from business_core.sheets import (
+            find_row_by_id, update_business_cell, get_business_sheet,
+        )
+
+        row_result = find_row_by_id("biz_registry", biz_id)
+        if not row_result:
+            log.warning(f"save_drive_info_to_sheets: biz_id '{biz_id}' не найден в листе")
+            return False
+
+        row_num, _row_dict = row_result
+        actual_headers = get_business_sheet("biz_registry").row_values(1)
+
+        if "Google Drive" in actual_headers:
+            col = actual_headers.index("Google Drive") + 1
+            update_business_cell("biz_registry", row_num, col, folder_url)
+            log.debug(f"save_drive_info_to_sheets: 'Google Drive' col={col} ← {folder_url}")
+
+        if "Drive Folder ID" in actual_headers:
+            col = actual_headers.index("Drive Folder ID") + 1
+            update_business_cell("biz_registry", row_num, col, folder_id)
+            log.debug(f"save_drive_info_to_sheets: 'Drive Folder ID' col={col} ← {folder_id}")
+
+        return True
+    except Exception as exc:
+        log.warning(f"save_drive_info_to_sheets error: {exc}")
+        return False
 
 
 def get_business_creation_status(result: dict) -> str:

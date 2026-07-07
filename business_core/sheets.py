@@ -48,6 +48,7 @@ BUSINESS_HEADERS: dict[str, list[str]] = {
         "Ответственный", "Приоритет", "Дата старта", "Google Drive",
         "Google Sheet", "GTD Project ID", "SendPulse", "Binotel", "WABA",
         "Instagram", "Telegram", "CRM", "Комментарий", "Последнее обновление",
+        "Drive Folder ID",   # Drive ID для идемпотентного обновления (добавлено в конец)
     ],
     "service_catalog": [
         "ID", "Бизнес ID", "Название", "Slug", "Статус", "Город",

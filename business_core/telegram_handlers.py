@@ -1012,11 +1012,33 @@ async def newbiz_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         ]
         append_business_row("biz_registry", row)
 
+        # ── Drive интеграция (безопасная, не ломает GTD) ─────────
+        drive_note = ""
+        try:
+            from business_core.business_builder import (
+                provision_biz_drive, save_drive_info_to_sheets,
+            )
+            drive_res = provision_biz_drive(biz_id, nb.get("name", ""))
+            if drive_res["ok"]:
+                save_drive_info_to_sheets(
+                    biz_id,
+                    drive_res["folder_id"],
+                    drive_res["folder_url"],
+                )
+                drive_note = f"\n📁 [Drive папка]({drive_res['folder_url']})"
+            elif drive_res.get("error"):
+                short_err = str(drive_res["error"])[:80]
+                drive_note = f"\n⚠️ Бизнес создан, но папка Drive не создана: {short_err}"
+        except Exception as _drive_exc:
+            log.warning(f"newbiz Drive integration error: {_drive_exc}")
+        # ─────────────────────────────────────────────────────────
+
         await update.message.reply_text(
             f"✅ *Бизнес создан!*\n\n"
             f"🆔 `{biz_id}`\n"
             f"🏢 {nb['name']}\n"
-            f"📍 {nb['cities']}\n\n"
+            f"📍 {nb['cities']}"
+            f"{drive_note}\n\n"
             f"/bc — дашборд\n"
             f"/newroadmap — первая дорожная карта",
             parse_mode="Markdown",
