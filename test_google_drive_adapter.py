@@ -132,6 +132,14 @@ try:
         CLIENT_FOLDER_STRUCTURE,
         CASE_FOLDER_STRUCTURE,
         DRIVE_FOLDER_MIME,
+        # Новые (Фаза 5C)
+        find_business_root_folder,
+        ensure_biz_root_folder_id,
+        create_business_folder_structure,
+        setup_biz_client_folder,
+        _append_to_env,
+        _read_service_account_email,
+        _is_shared_drive,
     )
     test("import google_drive_adapter — все функции", True)
 except Exception as e:
@@ -472,13 +480,264 @@ for f in ["telegram_bot.py", "sheets.py", "inbox_processor.py",
 
 
 # ─────────────────────────────────────────────────────────────
+# Тест 13: Shared Drive helper
+# ─────────────────────────────────────────────────────────────
+
+section("13. _is_shared_drive() и _read_service_account_email()")
+
+original_shared = os.environ.get("GDRIVE_IS_SHARED_DRIVE", "")
+
+os.environ["GDRIVE_IS_SHARED_DRIVE"] = "true"
+test("_is_shared_drive() == True при GDRIVE_IS_SHARED_DRIVE=true", _is_shared_drive() is True)
+
+os.environ["GDRIVE_IS_SHARED_DRIVE"] = "false"
+test("_is_shared_drive() == False при GDRIVE_IS_SHARED_DRIVE=false", _is_shared_drive() is False)
+
+os.environ["GDRIVE_IS_SHARED_DRIVE"] = original_shared or "false"
+
+sa_email = _read_service_account_email()
+test("_read_service_account_email() возвращает строку", isinstance(sa_email, str))
+test("_read_service_account_email() не пустой или fallback",
+     len(sa_email) > 0)
+print(f"     service account: {sa_email}")
+
+
+# ─────────────────────────────────────────────────────────────
+# Тест 14: find_business_root_folder() — mock
+# ─────────────────────────────────────────────────────────────
+
+section("14. find_business_root_folder() — mock")
+
+from unittest.mock import MagicMock, patch
+
+
+class MockFilesWithRoot:
+    """Mock: возвращает папку BUSINESS_CORE_DRIVE."""
+    def list(self, q="", fields="", pageSize=10, **kwargs):
+        if "BUSINESS_CORE_DRIVE" in q:
+            mock = MagicMock()
+            mock.execute.return_value = {"files": [
+                {"id": "MOCK_ROOT_001", "name": "BUSINESS_CORE_DRIVE",
+                 "webViewLink": "https://drive.google.com/drive/folders/MOCK_ROOT_001"}
+            ]}
+            return mock
+        mock = MagicMock()
+        mock.execute.return_value = {"files": []}
+        return mock
+
+
+class MockServiceWithRoot:
+    def files(self):
+        return MockFilesWithRoot()
+
+
+class MockFilesNotFound:
+    def list(self, **kwargs):
+        mock = MagicMock()
+        mock.execute.return_value = {"files": []}
+        return mock
+
+
+class MockServiceNotFound:
+    def files(self):
+        return MockFilesNotFound()
+
+
+class MockFilesMultiple:
+    def list(self, **kwargs):
+        mock = MagicMock()
+        mock.execute.return_value = {"files": [
+            {"id": "ID_001", "name": "BUSINESS_CORE_DRIVE", "webViewLink": "..."},
+            {"id": "ID_002", "name": "BUSINESS_CORE_DRIVE", "webViewLink": "..."},
+        ]}
+        return mock
+
+
+class MockServiceMultiple:
+    def files(self):
+        return MockFilesMultiple()
+
+
+# Тест: папка найдена
+with patch("integrations.google_drive_adapter.get_drive_service",
+           return_value=MockServiceWithRoot()):
+    try:
+        info = find_business_root_folder("BUSINESS_CORE_DRIVE")
+        test("найдена одна папка → dict", isinstance(info, dict))
+        test("id заполнен", info.get("id") == "MOCK_ROOT_001")
+        test("name заполнен", info.get("name") == "BUSINESS_CORE_DRIVE")
+        test("webViewLink заполнен", "drive.google.com" in info.get("webViewLink", ""))
+    except Exception as e:
+        test("find_business_root_folder — нет исключения", False, str(e))
+
+# Тест: папка не найдена → RuntimeError
+with patch("integrations.google_drive_adapter.get_drive_service",
+           return_value=MockServiceNotFound()):
+    try:
+        find_business_root_folder("BUSINESS_CORE_DRIVE")
+        test("не найдена → RuntimeError", False, "исключение не брошено")
+    except RuntimeError as e:
+        test("не найдена → RuntimeError", True, str(e)[:60])
+    except Exception as e:
+        test("не найдена → RuntimeError (другое исключение)", False, str(e))
+
+# Тест: несколько папок → RuntimeError с ID
+with patch("integrations.google_drive_adapter.get_drive_service",
+           return_value=MockServiceMultiple()):
+    try:
+        find_business_root_folder("BUSINESS_CORE_DRIVE")
+        test("несколько папок → RuntimeError", False, "исключение не брошено")
+    except RuntimeError as e:
+        err_msg = str(e)
+        test("несколько папок → RuntimeError", True)
+        test("ошибка содержит ID_001", "ID_001" in err_msg)
+        test("ошибка содержит ID_002", "ID_002" in err_msg)
+
+
+# ─────────────────────────────────────────────────────────────
+# Тест 15: ensure_biz_root_folder_id() и _append_to_env()
+# ─────────────────────────────────────────────────────────────
+
+section("15. ensure_biz_root_folder_id() — mock")
+
+import tempfile
+
+# Тест: уже задан в env
+original_env_id = os.environ.get("GDRIVE_BIZ_ROOT_FOLDER_ID", "")
+os.environ["GDRIVE_BIZ_ROOT_FOLDER_ID"] = "ENV_FOLDER_ID_123"
+
+with patch("integrations.google_drive_adapter.get_drive_service"):  # не должен вызываться
+    result_id = ensure_biz_root_folder_id(ask_confirmation=False)
+test("env уже задан → возвращает его без Drive-запроса",
+     result_id == "ENV_FOLDER_ID_123", f"получено: {result_id}")
+
+# Тест: не задан → ищет в Drive
+del os.environ["GDRIVE_BIZ_ROOT_FOLDER_ID"]
+with patch("integrations.google_drive_adapter.get_drive_service",
+           return_value=MockServiceWithRoot()):
+    with patch("integrations.google_drive_adapter._append_to_env"):
+        found_id = ensure_biz_root_folder_id(ask_confirmation=False)
+test("не задан → находит через Drive API",
+     found_id == "MOCK_ROOT_001", f"получено: {found_id}")
+
+# Тест: _append_to_env добавляет строку (без изменения существующих)
+with tempfile.NamedTemporaryFile(mode="w", suffix=".env", delete=False) as tf:
+    tf.write("TELEGRAM_TOKEN=abc123\nGOOGLE_CREDENTIALS_FILE=creds.json\n")
+    tmp_path = tf.name
+
+# Напрямую передаём путь к временному файлу
+_append_to_env("GDRIVE_BIZ_ROOT_FOLDER_ID=NEW_TEST_ID", env_path=tmp_path)
+with open(tmp_path) as f:
+    content = f.read()
+test("_append_to_env добавил строку", "GDRIVE_BIZ_ROOT_FOLDER_ID=NEW_TEST_ID" in content)
+test("существующие переменные не изменились", "TELEGRAM_TOKEN=abc123" in content)
+
+# Повторный вызов не дублирует
+_append_to_env("GDRIVE_BIZ_ROOT_FOLDER_ID=NEW_TEST_ID", env_path=tmp_path)
+with open(tmp_path) as f:
+    content2 = f.read()
+count = content2.count("GDRIVE_BIZ_ROOT_FOLDER_ID")
+test("повторный _append_to_env не дублирует", count == 1, f"найдено {count} вхождений")
+
+import os as _os
+_os.unlink(tmp_path)
+
+# Восстанавливаем env
+if original_env_id:
+    os.environ["GDRIVE_BIZ_ROOT_FOLDER_ID"] = original_env_id
+elif "GDRIVE_BIZ_ROOT_FOLDER_ID" in os.environ:
+    del os.environ["GDRIVE_BIZ_ROOT_FOLDER_ID"]
+
+
+# ─────────────────────────────────────────────────────────────
+# Тест 16: create_business_folder_structure() — mock высокоуровневый
+# ─────────────────────────────────────────────────────────────
+
+section("16. create_business_folder_structure() — высокоуровневый mock")
+
+os.environ["GDRIVE_BIZ_ROOT_FOLDER_ID"] = "MOCK_BIZ_ROOT"
+
+with patch("integrations.google_drive_adapter.get_drive_service",
+           return_value=MockDriveService()):
+    biz_result = create_business_folder_structure(
+        biz_id="BIZ-TEST",
+        biz_name="Тестовый бизнес",
+        dry_run=False,
+    )
+
+test("возвращает dict", isinstance(biz_result, dict))
+test("business_folder_id не пустой", bool(biz_result.get("business_folder_id")))
+test("business_folder_url содержит drive.google.com",
+     "drive.google.com" in biz_result.get("business_folder_url", ""))
+test("folders содержит 12 папок",
+     len(biz_result.get("folders", {})) == 12,
+     f"найдено: {len(biz_result.get('folders', {}))}")
+test("01 Стратегия в folders", "01 Стратегия" in biz_result.get("folders", {}))
+test("06 Клиенты в folders",   "06 Клиенты"   in biz_result.get("folders", {}))
+test("12 Архив в folders",     "12 Архив"     in biz_result.get("folders", {}))
+print(f"     folder_url: {biz_result.get('business_folder_url')}")
+
+# Повтор — идемпотентность
+with patch("integrations.google_drive_adapter.get_drive_service",
+           return_value=MockDriveService()):
+    biz_result2 = create_business_folder_structure(
+        "BIZ-TEST", "Тестовый бизнес", dry_run=False
+    )
+test("dry_run=False, структура возвращается", bool(biz_result2.get("business_folder_id")))
+
+
+# ─────────────────────────────────────────────────────────────
+# Тест 17: setup_biz_client_folder() — mock высокоуровневый
+# ─────────────────────────────────────────────────────────────
+
+section("17. setup_biz_client_folder() — высокоуровневый mock")
+
+with patch("integrations.google_drive_adapter.get_drive_service",
+           return_value=MockDriveService()):
+    client_result = setup_biz_client_folder(
+        biz_id="BIZ-TEST",
+        biz_name="Тестовый бизнес",
+        client_name="Тестовый клиент",
+        roadmap_id="RM-TEST",
+        dry_run=False,
+    )
+
+test("возвращает dict", isinstance(client_result, dict))
+test("client_folder_id не пустой", bool(client_result.get("client_folder_id")))
+test("client_folder_url содержит drive.google.com",
+     "drive.google.com" in client_result.get("client_folder_url", ""))
+test("subfolders содержит 5 папок",
+     len(client_result.get("subfolders", {})) == 5,
+     f"найдено: {len(client_result.get('subfolders', {}))}")
+test("01 Документы от клиента",
+     "01 Документы от клиента" in client_result.get("subfolders", {}))
+test("05 Архив в subfolders",
+     "05 Архив" in client_result.get("subfolders", {}))
+
+# Без roadmap_id
+with patch("integrations.google_drive_adapter.get_drive_service",
+           return_value=MockDriveService()):
+    client_result2 = setup_biz_client_folder(
+        "BIZ-TEST", "Тестовый бизнес",
+        client_name="Другой клиент",
+        dry_run=False,
+    )
+test("без roadmap_id: папка создаётся", bool(client_result2.get("client_folder_id")))
+print(f"     client_url: {client_result.get('client_folder_url')}")
+
+# Очищаем env
+if "GDRIVE_BIZ_ROOT_FOLDER_ID" in os.environ:
+    del os.environ["GDRIVE_BIZ_ROOT_FOLDER_ID"]
+
+
+# ─────────────────────────────────────────────────────────────
 # LIVE-тест (только при --live)
 # ─────────────────────────────────────────────────────────────
 
 if LIVE_MODE:
     section("LIVE. Реальный Google Drive API")
     print("  ⚠️  Этот тест создаёт РЕАЛЬНЫЕ папки в Google Drive!")
-    print("  ⚠️  Убедись что BUSINESS_DRIVE_ENABLED=true в .env")
+    print("  ⚠️  Потребуется папка 'BUSINESS_CORE_DRIVE' с доступом для service account")
     print()
 
     try:
@@ -487,18 +746,50 @@ if LIVE_MODE:
         svc_live = get_drive_service()
         test("LIVE: авторизация успешна", True)
 
-        live_result = create_business_structure(
-            svc_live,
-            "TEST Business Core",
-            parent_folder_id=os.getenv("DRIVE_ROOT_FOLDER_ID") or None,
+        # 1. Найти корневую папку
+        root_info = find_business_root_folder("BUSINESS_CORE_DRIVE")
+        test("LIVE: BUSINESS_CORE_DRIVE найдена", bool(root_info.get("id")))
+        print(f"  🔗 Корень: {root_info.get('webViewLink', root_info['id'])}")
+
+        # 2. Создать тестовую структуру бизнеса
+        os.environ["GDRIVE_BIZ_ROOT_FOLDER_ID"] = root_info["id"]
+        biz_live = create_business_folder_structure(
+            biz_id="BIZ-TEST",
+            biz_name="Тестовый бизнес",
             dry_run=False,
         )
-        test("LIVE: root_id получен", bool(live_result["root_id"]))
-        test("LIVE: 12 подпапок создано", len(live_result["subfolders"]) == 12)
-        print(f"  🔗 URL: {live_result['root_url']}")
+        test("LIVE: BIZ-TEST_Тестовый бизнес — папка создана", bool(biz_live["business_folder_id"]))
+        test("LIVE: 12 подпапок", len(biz_live["folders"]) == 12)
+        print(f"  🔗 Бизнес: {biz_live['business_folder_url']}")
+
+        # 3. Создать клиентскую папку
+        client_live = setup_biz_client_folder(
+            biz_id="BIZ-TEST",
+            biz_name="Тестовый бизнес",
+            client_name="Тестовый клиент",
+            roadmap_id="RM-TEST",
+            dry_run=False,
+        )
+        test("LIVE: папка клиента создана", bool(client_live["client_folder_id"]))
+        test("LIVE: 5 подпапок клиента", len(client_live["subfolders"]) == 5)
+        print(f"  🔗 Клиент: {client_live['client_folder_url']}")
+
+        # 4. Повторный вызов — нет дублей
+        client_live2 = setup_biz_client_folder(
+            biz_id="BIZ-TEST", biz_name="Тестовый бизнес",
+            client_name="Тестовый клиент", roadmap_id="RM-TEST",
+            dry_run=False,
+        )
+        test("LIVE: нет дублей — тот же client_folder_id",
+             client_live2["client_folder_id"] == client_live["client_folder_id"])
+
+        print()
+        print("  ✅ Все LIVE-тесты прошли!")
+        print(f"  Структура создана в папке: {root_info.get('webViewLink', root_info['id'])}")
 
     except Exception as e:
         test("LIVE: Google Drive API", False, str(e))
+        traceback.print_exc()
 
 
 # ─────────────────────────────────────────────────────────────

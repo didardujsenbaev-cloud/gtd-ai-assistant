@@ -10,14 +10,18 @@ Google Drive Adapter — создание и управление структу
 Режим dry_run=True: все операции логируются, но не выполняются реально.
   Используется в тестах и при отладке.
 
+Поддержка Shared Drive: автоматически если GDRIVE_IS_SHARED_DRIVE=true.
+
 Требует:
   pip install google-api-python-client google-auth
 
 Переменные .env:
-  GOOGLE_CREDENTIALS_FILE = path/to/service_account.json
-  DRIVE_ROOT_FOLDER_ID    = ID корневой папки (опционально)
-                            Если не задан — папки создаются в корне Drive
-  BUSINESS_DRIVE_ENABLED  = true/false
+  GOOGLE_CREDENTIALS_FILE    = path/to/service_account.json
+  GDRIVE_BIZ_ROOT_FOLDER_ID  = ID корневой папки Business Core (BUSINESS_CORE_DRIVE)
+                               Если не задан — ensure_biz_root_folder_id() найдёт автоматически
+  GDRIVE_IS_SHARED_DRIVE     = true/false  (поддержка Team Drive)
+  BUSINESS_DRIVE_ENABLED     = true/false
+  DRIVE_ROOT_FOLDER_ID       = устаревший алиас (для обратной совместимости)
 """
 
 from __future__ import annotations
@@ -186,6 +190,11 @@ def check_configuration() -> dict:
 # Операции с папками
 # ─────────────────────────────────────────────────────────────
 
+def _is_shared_drive() -> bool:
+    """Проверить, используется ли Shared Drive (GDRIVE_IS_SHARED_DRIVE=true)."""
+    return os.getenv("GDRIVE_IS_SHARED_DRIVE", "false").lower() == "true"
+
+
 def find_folder(
     service,
     name: str,
@@ -211,11 +220,17 @@ def find_folder(
     if parent_id:
         query += f" and '{parent_id}' in parents"
 
-    result = service.files().list(
-        q=query,
-        fields="files(id, name)",
-        pageSize=10,
-    ).execute()
+    kwargs: dict = {
+        "q":      query,
+        "fields": "files(id, name)",
+        "pageSize": 10,
+    }
+    if _is_shared_drive():
+        kwargs["supportsAllDrives"]         = True
+        kwargs["includeItemsFromAllDrives"] = True
+        kwargs["corpora"]                   = "allDrives"
+
+    result = service.files().list(**kwargs).execute()
 
     files = result.get("files", [])
     if files:
@@ -261,10 +276,11 @@ def create_folder(
     if parent_id:
         metadata["parents"] = [parent_id]
 
-    folder = service.files().create(
-        body=metadata,
-        fields="id",
-    ).execute()
+    create_kwargs: dict = {"body": metadata, "fields": "id"}
+    if _is_shared_drive():
+        create_kwargs["supportsAllDrives"] = True
+
+    folder = service.files().create(**create_kwargs).execute()
 
     folder_id = folder["id"]
     log.info(f"Создана папка: '{name}' → {folder_id}")
@@ -586,6 +602,296 @@ def setup_client_workspace(
         f"setup_client_workspace: {client_name} → {client_result['client_root_url']}"
     )
     return result
+
+
+# ─────────────────────────────────────────────────────────────
+# Часть 1–2: Поиск корневой папки Business Core
+# ─────────────────────────────────────────────────────────────
+
+def find_business_root_folder(folder_name: str = "BUSINESS_CORE_DRIVE") -> dict:
+    """
+    Найти корневую папку Business Core в Google Drive по имени.
+
+    Ищет во всех доступных дисках (включая Shared Drive).
+    Папка должна быть расшарена для service account как Редактор.
+
+    Args:
+        folder_name: имя папки (default: "BUSINESS_CORE_DRIVE")
+
+    Returns:
+        {"id": str, "name": str, "webViewLink": str}
+
+    Raises:
+        RuntimeError: если папка не найдена, или найдено несколько
+    """
+    service = get_drive_service()
+    name_escaped = folder_name.replace("'", "\\'")
+    query = (
+        f"mimeType='{DRIVE_FOLDER_MIME}' "
+        f"and name='{name_escaped}' "
+        f"and trashed=false"
+    )
+
+    kwargs: dict = {
+        "q":      query,
+        "fields": "files(id, name, webViewLink)",
+        "pageSize": 20,
+    }
+    # Всегда ищем во всех дисках — папка может быть в Shared Drive
+    kwargs["supportsAllDrives"]         = True
+    kwargs["includeItemsFromAllDrives"] = True
+    kwargs["corpora"]                   = "allDrives"
+
+    result = service.files().list(**kwargs).execute()
+    files  = result.get("files", [])
+
+    if not files:
+        raise RuntimeError(
+            f"Папка '{folder_name}' не найдена в Google Drive.\n"
+            f"Создай папку с именем '{folder_name}' и дай доступ service account "
+            f"как Редактор:\n"
+            f"  {_read_service_account_email()}"
+        )
+
+    if len(files) > 1:
+        ids_list = "\n".join(f"  • {f['name']} → {f['id']}" for f in files)
+        raise RuntimeError(
+            f"Найдено {len(files)} папки с именем '{folder_name}':\n{ids_list}\n\n"
+            f"Укажи нужный ID вручную в .env:\n"
+            f"  GDRIVE_BIZ_ROOT_FOLDER_ID=<ID папки>"
+        )
+
+    folder = files[0]
+    log.info(f"find_business_root_folder: найдена '{folder_name}' → {folder['id']}")
+    return {
+        "id":          folder["id"],
+        "name":        folder["name"],
+        "webViewLink": folder.get("webViewLink", get_folder_url(folder["id"])),
+    }
+
+
+def _read_service_account_email() -> str:
+    """Прочитать email service account из credentials файла."""
+    try:
+        creds_file = os.getenv("GOOGLE_CREDENTIALS_FILE", "")
+        if creds_file and os.path.exists(creds_file):
+            with open(creds_file) as f:
+                return json.load(f).get("client_email", "<service_account>")
+    except Exception:
+        pass
+    return "<service_account>"
+
+
+def ensure_biz_root_folder_id(
+    folder_name: str = "BUSINESS_CORE_DRIVE",
+    ask_confirmation: bool = True,
+) -> str:
+    """
+    Получить ID корневой папки Business Core.
+
+    1. Если GDRIVE_BIZ_ROOT_FOLDER_ID задан в .env — возвращает его.
+    2. Иначе ищет папку folder_name в Drive.
+    3. Если нашёл — предлагает записать в .env и возвращает ID.
+
+    Args:
+        folder_name:       Имя папки для поиска (default: "BUSINESS_CORE_DRIVE")
+        ask_confirmation:  Показать предупреждение перед записью в .env (default: True)
+
+    Returns:
+        folder_id: str
+
+    Raises:
+        RuntimeError: если папка не найдена
+    """
+    # Шаг 1: уже есть в .env?
+    existing = os.getenv("GDRIVE_BIZ_ROOT_FOLDER_ID", "").strip()
+    if existing:
+        log.debug(f"ensure_biz_root_folder_id: из .env → {existing}")
+        return existing
+
+    # Шаг 2: ищем в Drive
+    log.info(f"GDRIVE_BIZ_ROOT_FOLDER_ID не задан, ищем '{folder_name}' в Drive...")
+    folder_info = find_business_root_folder(folder_name)
+    folder_id   = folder_info["id"]
+    folder_url  = folder_info.get("webViewLink", get_folder_url(folder_id))
+
+    # Шаг 3: предлагаем записать в .env
+    env_line = f"GDRIVE_BIZ_ROOT_FOLDER_ID={folder_id}"
+
+    if ask_confirmation:
+        print(f"\n✅ Найдена папка '{folder_name}':")
+        print(f"   ID:  {folder_id}")
+        print(f"   URL: {folder_url}")
+        print(f"\n📝 Будет добавлено в .env:")
+        print(f"   {env_line}")
+        print("\nПодтвердить запись? (yes/no): ", end="", flush=True)
+        answer = input().strip().lower()
+        if answer not in ("yes", "y", "да"):
+            print("Отменено. ID не записан в .env.")
+            return folder_id
+
+    # Записываем в .env (не меняем остальное)
+    _append_to_env(env_line)
+    # Обновляем текущий процесс
+    os.environ["GDRIVE_BIZ_ROOT_FOLDER_ID"] = folder_id
+    log.info(f"ensure_biz_root_folder_id: записано в .env → {folder_id}")
+    print(f"✅ Записано в .env: {env_line}")
+
+    return folder_id
+
+
+def _append_to_env(line: str, env_path: str = ".env") -> None:
+    """Добавить строку в .env файл (не перезаписывает существующие переменные)."""
+    if not os.path.exists(env_path):
+        log.warning(f".env файл не найден: {env_path}")
+        return
+
+    # Читаем текущее содержимое
+    with open(env_path, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    # Проверяем, нет ли уже такой переменной
+    var_name = line.split("=")[0].strip()
+    if var_name in content:
+        log.debug(f"_append_to_env: '{var_name}' уже есть в .env, не добавляем")
+        return
+
+    # Добавляем в конец
+    separator = "\n" if not content.endswith("\n") else ""
+    with open(env_path, "a", encoding="utf-8") as f:
+        f.write(f"{separator}{line}\n")
+
+    log.info(f"_append_to_env: добавлено '{line}'")
+
+
+# ─────────────────────────────────────────────────────────────
+# Часть 3: Высокоуровневые обёртки (не требуют service объекта)
+# ─────────────────────────────────────────────────────────────
+
+def create_business_folder_structure(
+    biz_id:   str,
+    biz_name: str,
+    dry_run:  bool = False,
+) -> dict:
+    """
+    Создать структуру папок бизнеса внутри BUSINESS_CORE_DRIVE.
+
+    Создаёт:
+    BUSINESS_CORE_DRIVE/
+    └── {biz_id}_{biz_name}/
+        ├── 01 Стратегия ... 12 Архив
+
+    Args:
+        biz_id:   ID бизнеса (например "BIZ-001")
+        biz_name: Название бизнеса (например "Узаконение")
+        dry_run:  True = только логировать
+
+    Returns:
+        {
+          "business_folder_id":  str,
+          "business_folder_url": str,
+          "folders":             {"01 Стратегия": {"id": str, "url": str}, ...},
+          "dry_run":             bool,
+        }
+    """
+    root_id   = ensure_biz_root_folder_id(ask_confirmation=False)
+    service   = get_drive_service()
+    biz_label = f"{biz_id}_{biz_name}"
+
+    result = create_business_structure(
+        service,
+        business_name=biz_label,
+        parent_folder_id=root_id,
+        dry_run=dry_run,
+    )
+
+    # Переформатируем в запрошенный формат
+    folders = {
+        info["name"]: {"id": info["id"], "url": info["url"]}
+        for info in result["subfolders"].values()
+    }
+
+    return {
+        "business_folder_id":  result["root_id"],
+        "business_folder_url": result["root_url"],
+        "folders":             folders,
+        "dry_run":             dry_run,
+    }
+
+
+def setup_biz_client_folder(
+    biz_id:      str,
+    biz_name:    str,
+    client_name: str,
+    roadmap_id:  Optional[str] = None,
+    dry_run:     bool = False,
+) -> dict:
+    """
+    Создать папку клиента внутри {biz_id}_{biz_name}/06 Клиенты/.
+
+    Структура:
+    BUSINESS_CORE_DRIVE/
+    └── {biz_id}_{biz_name}/
+        └── 06 Клиенты/
+            └── {client_name}_{roadmap_id}/   (roadmap_id опционально)
+                ├── 01 Документы от клиента
+                ├── 02 Документы наши
+                ├── 03 Переписка
+                ├── 04 Материалы
+                └── 05 Архив
+
+    Args:
+        biz_id:      ID бизнеса
+        biz_name:    Название бизнеса
+        client_name: ФИО клиента
+        roadmap_id:  ID карты (опционально, добавляется к имени папки)
+        dry_run:     True = только логировать
+
+    Returns:
+        {client_folder_id, client_folder_url, subfolders, dry_run}
+    """
+    root_id   = ensure_biz_root_folder_id(ask_confirmation=False)
+    service   = get_drive_service()
+    biz_label = f"{biz_id}_{biz_name}"
+
+    # Находим или создаём папку бизнеса
+    biz_folder_id, _ = get_or_create_folder(service, biz_label, root_id, dry_run=dry_run)
+
+    # Папка клиента: {client_name}_{roadmap_id} или просто {client_name}
+    folder_name = f"{client_name}_{roadmap_id}" if roadmap_id else client_name
+
+    # Находим "06 Клиенты"
+    clients_folder_id, _ = get_or_create_folder(
+        service, "06 Клиенты", biz_folder_id, dry_run=dry_run
+    )
+
+    # Создаём папку клиента
+    client_folder_id, _ = get_or_create_folder(
+        service, folder_name, clients_folder_id, dry_run=dry_run
+    )
+
+    # Структура внутри клиента (соответствует запросу)
+    client_subfolders_names = [
+        "01 Документы от клиента",
+        "02 Документы наши",
+        "03 Переписка",
+        "04 Материалы",
+        "05 Архив",
+    ]
+    subfolders = {}
+    for sub in client_subfolders_names:
+        fid, _ = get_or_create_folder(service, sub, client_folder_id, dry_run=dry_run)
+        subfolders[sub] = {"id": fid, "url": get_folder_url(fid)}
+
+    client_url = get_folder_url(client_folder_id)
+    log.info(f"setup_biz_client_folder: {client_name} → {client_url}")
+
+    return {
+        "client_folder_id":  client_folder_id,
+        "client_folder_url": client_url,
+        "subfolders":        subfolders,
+        "dry_run":           dry_run,
+    }
 
 
 # ─────────────────────────────────────────────────────────────
