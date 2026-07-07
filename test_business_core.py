@@ -555,11 +555,16 @@ for fname in os.listdir(bc_dir):
             for node in ast.walk(tree):
                 if isinstance(node, (ast.Import, ast.ImportFrom)):
                     if isinstance(node, ast.ImportFrom) and node.module:
-                        if forbidden in node.module:
+                        # Точное совпадение с модулем верхнего уровня:
+                        # "from sheets import ..."      → node.module == "sheets"         → запрещено
+                        # "from business_core.sheets import ..." → node.module == "business_core.sheets" → разрешено
+                        top_module = node.module.split(".")[0]
+                        if top_module == forbidden:
                             found = True
                     elif isinstance(node, ast.Import):
                         for alias in node.names:
-                            if forbidden in alias.name:
+                            top_module = alias.name.split(".")[0]
+                            if top_module == forbidden:
                                 found = True
         except SyntaxError:
             pass
