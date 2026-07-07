@@ -16,6 +16,13 @@ import sys
 import os
 import traceback
 
+# Загружаем .env до любых импортов адаптера
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 LIVE_MODE = "--live" in sys.argv
 
 PASSED = 0
@@ -74,7 +81,8 @@ class MockFiles:
     def _key(self, name, parent):
         return f"{name}|{parent or 'root'}"
 
-    def list(self, q="", fields="", pageSize=10, orderBy=None):
+    def list(self, q="", fields="", pageSize=10, orderBy=None, **kwargs):
+        # **kwargs поглощает supportsAllDrives, includeItemsFromAllDrives, corpora
         import re
         name_match = re.search(r"name='([^']+)'", q)
         parent_match = re.search(r"'([^']+)' in parents", q)
@@ -86,7 +94,8 @@ class MockFiles:
             return MockFileList([{"id": self._folders[key], "name": name}])
         return MockFileList([])
 
-    def create(self, body=None, fields="", media_body=None):
+    def create(self, body=None, fields="", media_body=None, **kwargs):
+        # **kwargs поглощает supportsAllDrives и прочие Drive API параметры
         name = body.get("name", "unnamed")
         parents = body.get("parents", [None])
         parent = parents[0] if parents else None
