@@ -6,6 +6,13 @@ Inbox Bridge — соединяет GTD Inbox-поток с Business Router.
 Не меняет GTD-результат, только добавляет бизнес-контекст в ответ.
 
 Кеш: данные из Google Sheets загружаются раз в 5 минут.
+
+Возвращаемый тип route_inbox():
+    (note: str, confirm_data: dict | None)
+
+    confidence >= 0.9  → (note_string, None)       — сноска сразу
+    0.5 <= conf < 0.9  → ("", confirm_dict)        — запросить подтверждение
+    confidence < 0.5   → ("", None)                — молчать
 """
 
 from __future__ import annotations
@@ -119,7 +126,7 @@ def _find_active_roadmap(client_name: str, business_id: str, roadmaps: list) -> 
 # Главная функция
 # ─────────────────────────────────────────────────────────────
 
-def route_inbox(original_text: str, gtd_result: dict) -> str:
+def route_inbox(original_text: str, gtd_result: dict) -> tuple[str, "dict | None"]:
     """
     Определить бизнес-контекст для входящего GTD-результата.
 
@@ -128,25 +135,27 @@ def route_inbox(original_text: str, gtd_result: dict) -> str:
         gtd_result:    результат process_item()
 
     Returns:
-        Строка с бизнес-контекстом для добавления к ответу боту.
-        Пустая строка если Business Core не активен или контекст не найден.
+        (note, confirm_data) — никогда не бросает исключений.
 
-    Никогда не бросает исключений.
+        confidence >= 0.9  → ("\n\n─────\n...", None)   — сноска сразу
+        0.5 <= conf < 0.9  → ("", dict)                 — нужно подтверждение
+        confidence < 0.5   → ("", None)                 — молчать
+        BC disabled        → ("", None)
     """
     try:
         # Проверяем что BC включён
         if os.getenv("BUSINESS_CORE_ENABLED", "false").lower() != "true":
-            return ""
+            return "", None
 
         # Роутим только Action / Project / Waiting — остальные не имеют смысла
         from business_core.business_router import route_business_context
         if gtd_result.get("результат") not in ("Action", "Project", "Waiting"):
-            return ""
+            return "", None
 
         # Загружаем данные из кеша
         businesses, people, roadmaps = _get_cached()
         if not businesses:
-            return ""
+            return "", None
 
         # Запускаем роутер (без AI для скорости)
         routing = route_business_context(
@@ -158,9 +167,15 @@ def route_inbox(original_text: str, gtd_result: dict) -> str:
             use_ai=False,
         )
 
+        confidence = routing["confidence"]
+
         # Нет ни бизнеса, ни клиента — молчим
         if not routing["business_name"] and not routing["client_name"]:
-            return ""
+            return "", None
+
+        # confidence < 0.5 — недостаточно уверенности, молчим
+        if confidence < 0.5:
+            return "", None
 
         # Ищем активную дорожную карту
         active_rm = _find_active_roadmap(
@@ -168,44 +183,56 @@ def route_inbox(original_text: str, gtd_result: dict) -> str:
             routing["business_id"],
             roadmaps,
         )
+        roadmap_id = active_rm.get("roadmap_id", "") if active_rm else ""
 
-        # Формируем компактную строку
-        parts = []
+        # confidence >= 0.9 — показываем сноску сразу
+        if confidence >= 0.9:
+            return _build_note(routing, active_rm), None
 
-        if routing["business_name"]:
-            conf_icon = "🏢" if routing["confidence"] >= 0.8 else "🏢❓"
-            parts.append(f"{conf_icon} {routing['business_name']}")
-
-        if routing["city"]:
-            parts.append(f"📍 {routing['city']}")
-
-        if routing["client_name"]:
-            client_str = routing["client_name"]
-            if not routing["client_id"]:
-                client_str += " _(не в базе)_"
-            parts.append(f"👤 {client_str}")
-
-        if routing["roadmap_stage_name"]:
-            parts.append(f"📋 Этап: {routing['roadmap_stage_name']}")
-
-        if active_rm:
-            rm_id = active_rm.get("roadmap_id", "")
-            parts.append(f"🗺 Карта: `{rm_id}`")
-
-        if not parts:
-            return ""
-
-        note = "\n".join(parts)
-
-        # Если нужно подтверждение — добавляем маркер
-        if routing["needs_confirmation"] and routing["confidence"] < 0.85:
-            note += "\n_Контекст определён автоматически_"
-
-        return "\n\n─────\n" + note
+        # 0.5 <= confidence < 0.9 — запрашиваем подтверждение
+        confirm_data = {
+            "business_name":    routing["business_name"],
+            "city":             routing["city"],
+            "client_name":      routing["client_name"],
+            "client_id":        routing["client_id"],
+            "roadmap_id":       roadmap_id,
+            "confidence":       confidence,
+            "routing_method":   routing["routing_method"],
+        }
+        return "", confirm_data
 
     except Exception as e:
         log.debug(f"route_inbox error (silent): {e}")
+        return "", None
+
+
+def _build_note(routing: dict, active_rm: "dict | None") -> str:
+    """Сформировать компактную сноску для уверенного бизнес-контекста."""
+    parts = []
+
+    if routing["business_name"]:
+        parts.append(f"🏢 {routing['business_name']}")
+
+    if routing["city"]:
+        parts.append(f"📍 {routing['city']}")
+
+    if routing["client_name"]:
+        client_str = routing["client_name"]
+        if not routing.get("client_id"):
+            client_str += " _(не в базе)_"
+        parts.append(f"👤 {client_str}")
+
+    if routing.get("roadmap_stage_name"):
+        parts.append(f"📋 Этап: {routing['roadmap_stage_name']}")
+
+    if active_rm:
+        rm_id = active_rm.get("roadmap_id", "")
+        parts.append(f"🗺 Карта: `{rm_id}`")
+
+    if not parts:
         return ""
+
+    return "\n\n─────\n" + "\n".join(parts)
 
 
 def invalidate_cache() -> None:

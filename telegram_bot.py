@@ -1830,11 +1830,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Обработать через AI
         result = process_item(text, active_projects=_active_proj_names)
 
-        # ── Business Core routing (Фаза 5) ──────────────────
+        # ── Business Core routing (Фаза 5 / 5B) ─────────────
         _bc_note = ""
+        _bc_confirm = None
         try:
             from business_core.inbox_bridge import route_inbox
-            _bc_note = route_inbox(text, result)
+            _bc_note, _bc_confirm = route_inbox(text, result)
         except Exception:
             pass
         # ────────────────────────────────────────────────────
@@ -2014,6 +2015,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 break
 
         await update.message.reply_text(reply, parse_mode="Markdown")
+
+        # ── Business Core: запрос подтверждения (Фаза 5B) ───
+        if _bc_confirm:
+            try:
+                from business_core.telegram_handlers import send_bc_confirmation
+                await send_bc_confirmation(update, _bc_confirm)
+            except Exception:
+                pass
+        # ────────────────────────────────────────────────────
 
     except Exception as e:
         await update.message.reply_text(f"❌ Ошибка: {e}")

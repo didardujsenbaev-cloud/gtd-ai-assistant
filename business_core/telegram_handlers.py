@@ -28,9 +28,10 @@ import os
 from datetime import datetime
 from typing import Optional
 
-from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     MessageHandler,
     ConversationHandler,
@@ -1104,6 +1105,83 @@ async def bc_drive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # ─────────────────────────────────────────────────────────────
+# Фаза 5B: подтверждение бизнес-контекста
+# ─────────────────────────────────────────────────────────────
+
+async def send_bc_confirmation(update: Update, confirm_data: dict) -> None:
+    """
+    Отправить отдельное сообщение с кнопками подтверждения бизнес-контекста.
+    Вызывается из telegram_bot.py когда 0.5 <= confidence < 0.9.
+
+    Никогда не бросает исключений — ошибки логируются тихо.
+    """
+    try:
+        lines = ["🤔 *Я правильно понял бизнес-контекст?*\n"]
+
+        if confirm_data.get("business_name"):
+            lines.append(f"🏢 {confirm_data['business_name']}")
+        if confirm_data.get("city"):
+            lines.append(f"📍 {confirm_data['city']}")
+        if confirm_data.get("client_name"):
+            client_str = confirm_data["client_name"]
+            if not confirm_data.get("client_id"):
+                client_str += " _(не в базе)_"
+            lines.append(f"👤 {client_str}")
+        if confirm_data.get("roadmap_id"):
+            lines.append(f"🗺 Карта: `{confirm_data['roadmap_id']}`")
+
+        conf_pct = int(confirm_data.get("confidence", 0) * 100)
+        lines.append(f"\n_Уверенность: {conf_pct}%_")
+
+        text = "\n".join(lines)
+
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ Да", callback_data="bc_ctx:yes"),
+                InlineKeyboardButton("✏️ Изменить", callback_data="bc_ctx:edit"),
+                InlineKeyboardButton("Только GTD", callback_data="bc_ctx:gtd"),
+            ]
+        ])
+
+        await update.message.reply_text(text, parse_mode="Markdown", reply_markup=keyboard)
+
+    except Exception as e:
+        log.debug(f"send_bc_confirmation error (silent): {e}")
+
+
+async def bc_ctx_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Обработчик всех трёх кнопок подтверждения бизнес-контекста.
+    callback_data: "bc_ctx:yes" | "bc_ctx:edit" | "bc_ctx:gtd"
+    """
+    query = update.callback_query
+    await query.answer()  # убирает индикатор загрузки
+
+    action = query.data.split(":")[1] if ":" in query.data else ""
+
+    if action == "yes":
+        await query.edit_message_text(
+            query.message.text + "\n\n✅ *Бизнес-контекст подтверждён*",
+            parse_mode="Markdown",
+        )
+
+    elif action == "gtd":
+        await query.edit_message_text(
+            "Ок, оставил только в GTD",
+            parse_mode="Markdown",
+        )
+
+    elif action == "edit":
+        await query.edit_message_text(
+            "Пока изменение вручную: уточни бизнес / клиента / карту одним сообщением",
+            parse_mode="Markdown",
+        )
+
+    else:
+        await query.answer("Неизвестное действие")
+
+
+# ─────────────────────────────────────────────────────────────
 # Регистрация всех handlers
 # ─────────────────────────────────────────────────────────────
 
@@ -1170,7 +1248,11 @@ def register_business_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("bcdrive",  bc_drive))
     app.add_handler(CommandHandler("initbc",   init_bc))
 
+    # Callback handler для кнопок подтверждения бизнес-контекста (Фаза 5B)
+    app.add_handler(CallbackQueryHandler(bc_ctx_callback, pattern=r"^bc_ctx:"))
+
     log.info(
         "Business Core handlers зарегистрированы: "
-        "/bc /bcstatus /roadmaps /clients /newroadmap /newclient /newbiz /initbc /bcdrive"
+        "/bc /bcstatus /roadmaps /clients /newroadmap /newclient /newbiz /initbc /bcdrive "
+        "+ bc_ctx callback (Фаза 5B)"
     )
