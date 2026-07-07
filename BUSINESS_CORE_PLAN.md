@@ -1,38 +1,67 @@
 # Business Core — Архитектура расширения GTD OS
 
-> Версия: 1.0 — Проектный документ (без кода)  
+> Версия: 2.0 — Обновлено с учётом реальной архитектуры GTD  
 > Дата: 07.07.2026  
-> Принцип: GTD — центр. Business Core — отдельный модуль рядом.
+> Источник: GTD_CURRENT_WORKFLOW.md (анализ реального кода)  
+> Принцип: GTD — методологический центр. Business Core — контекстный слой поверх GTD.
 
 ---
 
-## Общая архитектура
+## Разграничение ответственности
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                    ЛИЧНЫЙ GTD (существующий)             │
-│  telegram_bot.py  •  sheets.py  •  inbox_processor.py   │
-│  Inbox → Проекты → Next Actions → Горизонты → Архив     │
-└────────────────────┬────────────────────────────────────┘
-                     │ задачи и проекты ↕
-┌────────────────────▼────────────────────────────────────┐
-│                   BUSINESS CORE (новый модуль)           │
-│                                                          │
-│  Business Registry   Service Catalog   People Registry  │
-│  Channel Registry    Integration Reg.  Rel. Capital     │
-│  Business Branches   Business Builder                   │
-└─────────────────────────────────────────────────────────┘
-                     │ данные ↕
-┌────────────────────▼────────────────────────────────────┐
-│               GOOGLE SHEETS (отдельная таблица)          │
-│          BUSINESS_CORE_SPREADSHEET_ID                   │
-└─────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│              GTD MASTER SYSTEM (существующий, не меняем)      │
+│                                                               │
+│  Inbox  •  Projects  •  Next Actions  •  Waiting             │
+│  Someday  •  Reference  •  Horizons H1–H5  •  Archive        │
+│  Weekly Review  •  Calendar  •  Google Drive                  │
+│                                                               │
+│  telegram_bot.py (4392 строки) — НЕ ТРОГАТЬ                  │
+│  sheets.py • inbox_processor.py • project_planner.py          │
+│  calendar_sync.py — НЕ ТРОГАТЬ                               │
+└─────────────────────┬────────────────────────────────────────┘
+                      │ Projects/Actions ↕
+┌─────────────────────▼────────────────────────────────────────┐
+│                  BUSINESS CORE (строим)                       │
+│                                                               │
+│  РЕЕСТРЫ:                                                     │
+│  Business Registry  •  Service Catalog  •  People Registry   │
+│  Channel Registry  •  Integration Registry  •  Rel. Capital  │
+│                                                               │
+│  ЛОГИКА:                                                      │
+│  Business Router  ←  получает GTD-результат process_item()   │
+│  Roadmap Manager  ←  дорожные карты по клиенту/услуге        │
+│  Material Manager ←  файлы привязанные к этапу               │
+│  Business Builder ←  конструктор нового бизнеса              │
+└─────────────────────┬────────────────────────────────────────┘
+                      │ данные ↕
+┌─────────────────────▼────────────────────────────────────────┐
+│              BUSINESS_CORE Google Sheets                      │
+│         (отдельный BUSINESS_SPREADSHEET_ID)                  │
+│  BIZ_REGISTRY • SERVICE_CATALOG • PEOPLE_REGISTRY            │
+│  CHANNEL_REGISTRY • INTEGRATION_REGISTRY                     │
+│  ROADMAPS • MATERIALS • RELATIONSHIP_CAPITAL                 │
+└─────────────────────┬────────────────────────────────────────┘
+                      │ API ↕ (Фаза 6)
+┌─────────────────────▼────────────────────────────────────────┐
+│              ИНТЕГРАЦИИ (integrations/)                       │
+│  SendPulse • Binotel • WABA • Instagram                      │
+│  Google Drive • Google Calendar • Google Accounts            │
+└──────────────────────────────────────────────────────────────┘
 ```
 
 **Главный принцип потока данных:**
 ```
-Бизнес-событие → Business Core → GTD Inbox → AI → Projects/Actions
+Telegram → handle_message() → process_item() [GTD-классификация]
+→ Business Router [бизнес-контекст]
+→ GTD Master System [задачи/проекты]
+→ BUSINESS_CORE [реестры/дорожные карты]
+→ Google Drive / Calendar / Интеграции
 ```
+
+**Что GTD делает сам:** Inbox, классификация задач, создание Projects/Actions/Waiting, Горизонты, Review, Calendar sync.  
+**Что добавляет Business Core:** Бизнес, услуга, клиент, город, этап дорожной карты, материалы, каналы.
 
 ---
 
@@ -529,34 +558,697 @@ def create_business_area(
 
 ---
 
-## Структура папок `business_core/`
+---
+
+## Модуль 9: Business Router
+
+### Назначение
+
+Определяет **бизнес-контекст** входящего сообщения — после того как GTD уже классифицировал его через `process_item()`. Business Router не заменяет GTD-классификацию, а **дополняет** её бизнес-измерением.
+
+**Ключевой принцип:** GTD отвечает на "что делать?", Business Router отвечает на "в рамках какого бизнеса/клиента/этапа?"
+
+### Файл
+
+```
+business_core/business_router.py
+```
+
+### Входные данные
+
+```python
+{
+    "original_text": "По узаконению частного дома Иванова в Алматы надо проверить техпаспорт",
+    "gtd_result": "Action",           # результат process_item()
+    "action": "Проверить техпаспорт Иванова",
+    "context": "@Computer",
+    "deadline": "2026-07-10",
+    "area": "Legalization",            # уже есть из GTD
+    "project": "Узаконение дома Иванова",
+}
+```
+
+### Выходные данные
+
+```python
+{
+    "business_id": "BIZ-001",
+    "business_name": "Узаконение недвижимости",
+    "service_id": "SVC-003",
+    "service_name": "Узаконение частного дома",
+    "city": "Алматы",
+    "client_id": "PRS-042",
+    "client_name": "Иванов",
+    "process": "Производство",
+    "roadmap_id": "RM-017",
+    "roadmap_stage_id": "STAGE-07",
+    "roadmap_stage_name": "Техпаспорт",
+    "confidence": 0.86,
+    "needs_confirmation": True,      # если confidence < 0.9 → спросить
+    "routing_method": "keyword_match",  # keyword_match / ai / manual
+}
+```
+
+### Логика роутинга (3 уровня)
+
+**Уровень 1 — Ключевые слова (быстро, без AI):**
+```
+"узаконение", "легализация", "БТИ", "акт ввода" → BIZ-001
+"виза", "паспорт", "нотариус" → BIZ-002
+"коучинг", "сессия", "ментор" → BIZ-003
+```
+
+**Уровень 2 — Люди и клиенты:**
+```
+Имя в тексте → поиск в People Registry по имени
+→ если найден → привязать client_id
+→ если не найден → needs_confirmation = True
+```
+
+**Уровень 3 — AI (если confidence < 0.7):**
+```
+Краткий Claude-запрос с контекстом активных бизнесов и услуг
+→ определить business_id + service_id + city
+→ max_tokens: 256 (дешёвый запрос)
+```
+
+### Функции
+
+```python
+def route_business_context(
+    original_text: str,
+    gtd_result: dict,
+    businesses: list[dict],
+    services: list[dict],
+    people: list[dict],
+) -> dict
+    """Основная функция роутинга."""
+
+def _route_by_keywords(text: str, businesses: list) -> tuple[str, float]
+    """Быстрый матч по ключевым словам. Возвращает (biz_id, confidence)."""
+
+def _find_client_in_text(text: str, people: list) -> tuple[str, float]
+    """Найти имя клиента в тексте. Возвращает (person_id, confidence)."""
+
+def _find_city_in_text(text: str) -> str
+    """Определить город: Алматы / Астана / Шымкент / ""."""
+
+def _route_by_ai(text: str, businesses: list, services: list) -> dict
+    """AI-роутинг для неоднозначных случаев."""
+
+def _find_active_roadmap(client_id: str, service_id: str) -> str
+    """Найти активную дорожную карту клиента по услуге."""
+
+def format_routing_confirmation(routing: dict) -> str
+    """Текст для подтверждения пользователем (если needs_confirmation)."""
+```
+
+### Когда Business Router вызывается
+
+Business Router вызывается **только** если:
+1. `gtd_result["результат"]` в (`"Action"`, `"Project"`, `"Waiting"`)
+2. `gtd_result["область"]` ∈ бизнес-областям (`Business`, `Legalization`, `Visas`, `Coaching`, ...)
+3. Business Core активирован в `.env`: `BUSINESS_CORE_ENABLED=true`
+
+При `результат=Someday`, `H3/H4/H5`, `Reference`, `Trash` — Business Router **не вызывается**.
+
+### Связь с GTD
+
+Business Router **не создаёт** GTD-записи. Он только **обогащает** данные, которые потом GTD запишет в NEXT ACTIONS с дополнительными полями:
+```
+Проект: [gtd_project_id]        ← уже есть в GTD
+Заметки: [business_id, client_id, roadmap_stage_id]  ← добавляет Business Router
+```
+
+---
+
+## Модуль 10: Roadmap Manager
+
+### Назначение
+
+Создаёт и ведёт **дорожные карты** по конкретным сделкам/клиентам. Каждая дорожная карта = один кейс (клиент + услуга + город).
+
+**Связь с GTD:** Каждая дорожная карта → один GTD-проект (`gtd_project_id`). Этапы дорожной карты → GTD Next Actions того же проекта.
+
+### Файл
+
+```
+business_core/roadmap_manager.py
+```
+
+### Структура дорожной карты
+
+```python
+{
+    "roadmap_id": "RM-017",
+    "business_id": "BIZ-001",
+    "service_id": "SVC-003",
+    "city": "Алматы",
+    "client_id": "PRS-042",
+    "client_name": "Иванов А.А.",
+    "gtd_project_id": "PRJ-023",     # ссылка на GTD PROJECTS
+    "responsible": "Дидар",
+    "status": "in_progress",
+    "created_at": "2026-07-01",
+    "expected_completion": "2026-08-15",
+    "stages": [
+        {
+            "stage_id": "STAGE-01",
+            "order": 1,
+            "name": "Диагностика кейса",
+            "status": "done",
+            "completed_at": "2026-07-02",
+            "gtd_action_id": "ACT-045",
+            "notes": "Дом 1990 года, самострой",
+        },
+        {
+            "stage_id": "STAGE-07",
+            "order": 7,
+            "name": "Техпаспорт",
+            "status": "in_progress",
+            "due_date": "2026-07-10",
+            "gtd_action_id": "ACT-089",
+            "responsible": "Кайрат",
+            "documents_required": ["заявление", "копия удостоверения"],
+            "documents_received": ["заявление"],
+            "notes": "",
+        },
+        # ... до 10 этапов
+    ],
+    "documents": [],   # список Material IDs
+    "total_stages": 10,
+    "completed_stages": 6,
+    "progress_pct": 60,
+}
+```
+
+### Стандартные этапы по услугам
+
+**Узаконение частного дома (SVC-003):**
+```
+1. Диагностика кейса
+2. Сбор документов
+3. АПЗ (Архитектурно-планировочное задание)
+4. Проект
+5. Техобследование
+6. Топосъемка
+7. Техпаспорт
+8. Акт ввода
+9. Регистрация в ЕГРН
+10. Закрытие и архив
+```
+
+**Узаконение гаража (SVC-001):**
+```
+1. Диагностика
+2. Документы от клиента
+3. Технический паспорт
+4. Подача в ЦОН
+5. Получение акта ввода
+6. Регистрация
+7. Архив
+```
+
+### Статусы этапов
+
+| Статус | Описание |
+|--------|----------|
+| `not_started` | Этап ещё не начат |
+| `in_progress` | В работе |
+| `waiting` | Ждём от клиента или третьей стороны |
+| `blocked` | Заблокировано (проблема) |
+| `done` | Завершён |
+
+### Лист `ROADMAPS` в Google Sheets
+
+```
+Заголовки:
+Roadmap ID | Business ID | Service ID | City | Client ID | Client Name |
+GTD Project ID | Responsible | Status | Created | Expected | Progress % |
+Stage 1 Status | Stage 2 Status | ... | Stage 10 Status |
+Notes | Last Updated
+```
+
+### Лист `ROADMAP_STAGES` в Google Sheets
+
+```
+Stage ID | Roadmap ID | Order | Name | Status | Due Date | Completed At |
+GTD Action ID | Responsible | Docs Required | Docs Received | Notes
+```
+
+### Функции
+
+```python
+def create_roadmap(
+    business_id, service_id, city, client_id,
+    gtd_project_id, responsible="",
+) -> str   # → RM-ID
+
+def get_roadmap(roadmap_id: str) -> dict
+def get_active_roadmaps(business_id=None, client_id=None) -> list[dict]
+
+def advance_stage(roadmap_id: str, stage_id: str, notes="") -> dict
+    """Перевести этап в in_progress → done, создать GTD Action для следующего."""
+
+def block_stage(roadmap_id, stage_id, reason: str) -> None
+    """Заблокировать этап. Создать Waiting в GTD с reason."""
+
+def get_roadmap_summary(roadmap_id: str) -> str
+    """Текст для Telegram: прогресс по клиенту."""
+
+def create_roadmap_from_gtd_project(project_id: str, service_id: str) -> str
+    """Создать дорожную карту из существующего GTD-проекта."""
+
+def get_overdue_stages(days=0) -> list[dict]
+    """Этапы с просроченным дедлайном."""
+
+def calculate_progress(roadmap_id: str) -> int
+    """Процент выполнения: done_stages / total_stages * 100."""
+```
+
+### Автоматические GTD-действия из Roadmap
+
+При `advance_stage()`:
+```
+1. Текущий этап → статус "done", дата выполнения
+2. Следующий этап → статус "in_progress"
+3. В GTD: создать Next Action с именем следующего этапа
+   → project = gtd_project_id
+   → context = @Computer или @Government (по шаблону этапа)
+   → deadline = due_date этапа
+```
+
+---
+
+## Модуль 11: Material Manager
+
+### Назначение
+
+Привязывает файлы, фото, PDF, ссылки и заметки к **конкретному бизнес-контексту**: бизнес + клиент + услуга + этап дорожной карты.
+
+**Важно:** GTD уже умеет принимать документы через `handle_document()`, `handle_photo()`, `upload_pdf_to_drive()` и хранит в листе `REFERENCE`. Material Manager **не дублирует** эту логику — он добавляет к существующей ссылке в REFERENCE дополнительную бизнес-привязку.
+
+### Файл
+
+```
+business_core/material_manager.py
+```
+
+### Структура материала
+
+```python
+{
+    "material_id": "MAT-001",
+
+    # Откуда пришёл
+    "source": "Telegram",           # Telegram/PDF/Photo/WhatsApp/Email/Drive
+    "received_at": "2026-07-07",
+    "received_by": "Дидар",
+
+    # Ссылки на GTD
+    "gtd_reference_row": 42,        # строка в GTD REFERENCE sheet
+    "gtd_project_id": "PRJ-023",    # если материал привязан к проекту
+
+    # Ссылки на Business Core
+    "business_id": "BIZ-001",
+    "service_id": "SVC-003",
+    "city": "Алматы",
+    "client_id": "PRS-042",
+    "roadmap_id": "RM-017",
+    "stage_id": "STAGE-07",         # к какому этапу относится
+
+    # Файл
+    "file_type": "PDF",             # PDF/Photo/Text/Link/Voice
+    "drive_url": "https://drive.google.com/...",
+    "filename": "tehpasport_ivanov.pdf",
+    "file_size_kb": 342,
+
+    # Статус
+    "status": "received",           # received/checked/approved/archived
+    "checked_by": "",
+    "approved_at": "",
+    "notes": "Техпаспорт от 2019 года",
+}
+```
+
+### Статусы материала
+
+| Статус | Описание |
+|--------|----------|
+| `received` | Получен, ещё не проверен |
+| `checked` | Проверен, всё ок |
+| `approved` | Утверждён, принят в работу |
+| `rejected` | Не принят, нужна замена |
+| `archived` | В архиве завершённого проекта |
+
+### Лист `MATERIALS` в Google Sheets
+
+```
+Material ID | Source | Received At | GTD Reference Row | GTD Project ID |
+Business ID | Service ID | City | Client ID | Roadmap ID | Stage ID |
+File Type | Drive URL | Filename | File Size KB |
+Status | Checked By | Approved At | Notes
+```
+
+### Функции
+
+```python
+def register_material(
+    gtd_reference_row: int,
+    drive_url: str,
+    source: str,
+    routing: dict,             # результат Business Router
+    file_type: str = "PDF",
+    filename: str = "",
+    notes: str = "",
+) -> str   # → MAT-ID
+
+def get_materials_by_stage(roadmap_id, stage_id) -> list[dict]
+def get_materials_by_client(client_id) -> list[dict]
+def get_materials_by_roadmap(roadmap_id) -> list[dict]
+def update_material_status(mat_id, status, checked_by="") -> None
+def get_missing_documents(roadmap_id, stage_id) -> list[str]
+    """Вернуть список документов из шаблона услуги которых ещё нет."""
+
+def format_materials_summary(roadmap_id: str) -> str
+    """Текст для Telegram: документы по кейсу."""
+
+def archive_roadmap_materials(roadmap_id: str) -> int
+    """При закрытии проекта — перевести все материалы в archived."""
+```
+
+### Интеграция с существующим GTD
+
+При получении PDF/фото в Telegram (уже работает):
+```python
+# telegram_bot.py — handle_document() / handle_photo()
+drive_url = upload_pdf_to_drive(bytes, filename)     # уже есть
+_save_extracted_to_inbox(update, extracted, "PDF")   # уже есть
+# → попадает в GTD REFERENCE sheet
+
+# НОВОЕ (Фаза 2D):
+if BUSINESS_CORE_ENABLED:
+    routing = route_business_context(...)             # Business Router
+    if routing["confidence"] > 0.7:
+        register_material(
+            gtd_reference_row=ref_row_num,
+            drive_url=drive_url,
+            source="Telegram",
+            routing=routing,
+            file_type="PDF",
+        )
+```
+
+---
+
+## Модуль 12: Integration Architecture
+
+### Структура папки `integrations/`
+
+```
+integrations/
+├── __init__.py
+├── base_adapter.py              ← базовый класс адаптера
+├── integration_router.py        ← роутер: определяет куда направить данные
+├── sendpulse_adapter.py         ← SendPulse (рассылки, CRM, чат-боты)
+├── binotel_adapter.py           ← Binotel (телефония, запись звонков)
+├── waba_adapter.py              ← WhatsApp Business API
+├── instagram_adapter.py         ← Instagram DM и комментарии
+├── google_drive_adapter.py      ← Google Drive (структура папок бизнеса)
+├── google_calendar_adapter.py   ← Google Calendar (дедлайны и события)
+└── google_accounts_adapter.py   ← разные Google-аккаунты для разных бизнесов
+```
+
+---
+
+### 12.1 SendPulse Adapter
+
+**Что принимает SendPulse от нас:**
+- Новые контакты → добавить в адресную книгу (имя, телефон, email, теги)
+- Триггерные события → запустить автоматизацию (новый клиент, смена этапа)
+- Сегменты → обновить теги (бизнес, город, услуга, статус)
+
+**Что отдаёт SendPulse нам:**
+- Новые заявки с форм → `webhook → GTD Inbox`
+- Статусы рассылок → статистика открытий
+- Ответы клиентов на письма → `→ GTD INBOX → process_item()`
+- Чат-бот события → действие клиента в воронке
+
+**Ключи `.env`:**
+```
+SENDPULSE_CLIENT_ID=...
+SENDPULSE_CLIENT_SECRET=...
+SENDPULSE_ADDRESS_BOOK_ID_BIZ001=...   # отдельная книга на каждый бизнес
+SENDPULSE_ADDRESS_BOOK_ID_BIZ002=...
+```
+
+**Привязка к бизнесу:**
+- У каждого бизнеса своя адресная книга (`SENDPULSE_ADDRESS_BOOK_ID_BIZxxx`)
+- Теги = `biz_id` + `city` + `service_id` (например: `BIZ-001 Алматы SVC-003`)
+- При создании нового клиента → автоматически добавить в нужную книгу
+
+**Риски:**
+- Дубли контактов: один человек может быть в нескольких книгах → дедупликация по телефону через People Registry
+- Rate limiting API SendPulse: 10 запросов/секунду
+
+---
+
+### 12.2 Binotel Adapter
+
+**Что принимает Binotel от нас:**
+- Список сотрудников → для маршрутизации звонков
+- Теги звонка → добавить после разговора
+
+**Что отдаёт Binotel нам:**
+- CDR (Call Detail Record) через webhook: номер звонящего, длительность, запись
+- Пропущенные звонки → `webhook → GTD Inbox` → Action "Перезвонить [номер]"
+- Входящий звонок → поиск номера в People Registry → показать карточку
+
+**Ключи `.env`:**
+```
+BINOTEL_API_KEY_BIZ001=...    # ключ для каждого бизнеса/города
+BINOTEL_API_KEY_BIZ002=...
+BINOTEL_WEBHOOK_SECRET=...    # для верификации вебхуков
+```
+
+**Привязка к бизнесу и городу:**
+- Каждый виртуальный номер Binotel → строка в `CHANNEL_REGISTRY` (CH-ID + BIZ-ID + город)
+- При входящем звонке: номер → поиск в CHANNEL_REGISTRY → определить бизнес и город
+- CDR запись → Material Manager (ссылка на запись звонка)
+
+**Риски:**
+- Определение звонящего: если номер не в People Registry → создать нового PRS
+- Записи звонков хранятся на серверах Binotel (не в Drive) → ссылка, не файл
+
+---
+
+### 12.3 WABA Adapter
+
+**Что принимает WABA от нас:**
+- Шаблонные сообщения (HSM): уведомления о статусе этапа, напоминания
+- Ответы на входящие
+
+**Что отдаёт WABA нам:**
+- Входящие сообщения от клиентов → `webhook → GTD Inbox → process_item()`
+- Статусы доставки → логирование
+- Медиа (фото, документы) → Material Manager
+
+**Ключи `.env`:**
+```
+WABA_ACCESS_TOKEN=...
+WABA_PHONE_NUMBER_ID_BIZ001=...   # отдельный номер на каждый бизнес
+WABA_PHONE_NUMBER_ID_BIZ002=...
+WABA_VERIFY_TOKEN=...
+```
+
+**Привязка к бизнесу:**
+- Каждый WABA-номер → строка в CHANNEL_REGISTRY с `channel_type=WABA`
+- Входящее сообщение: определить по номеру → BIZ-ID → маршрутизировать
+
+**Дедупликация клиентов:**
+- При входящем: поиск по номеру в People Registry
+- Если не найден → создать новый PRS с `person_type=клиент`, `source=WABA`
+- Если найден → обновить `last_contact_date` и `last_contact_channel`
+
+**Риски:**
+- Шаблоны WABA требуют одобрения Meta (2–5 дней)
+- Лимит: 1000 уникальных разговоров/день на бесплатном тарифе
+- Провайдер (SendPulse как WABA-провайдер): API идёт через SendPulse
+
+---
+
+### 12.4 Instagram Adapter
+
+**Что принимает Instagram от нас:**
+- (нет прямой отправки без Instagram API)
+
+**Что отдаёт Instagram нам:**
+- DM входящие → `webhook → GTD Inbox`
+- Комментарии под постами → GTD Inbox (фильтровать спам)
+- Лиды из Stories/Reels → GTD Inbox
+
+**Ключи `.env`:**
+```
+INSTAGRAM_ACCESS_TOKEN_BIZ001=...
+INSTAGRAM_PAGE_ID_BIZ001=...
+```
+
+**Риски:**
+- Instagram Graph API требует прав `instagram_manage_messages`
+- Токены истекают → нужен refresh механизм
+- Комментарии часто спам → нужна фильтрация перед отправкой в Inbox
+
+**Статус:** Низкий приоритет. Реализовать только после стабилизации WABA + Binotel.
+
+---
+
+### 12.5 Google Drive Adapter
+
+**Задача:** Создавать и поддерживать структуру папок в Google Drive по шаблону бизнеса.
+
+**Структура папок для бизнеса:**
+```
+GTD_DOCUMENTS/                    ← уже существует (GDRIVE_FOLDER_ID)
+│
+├── BIZ-001_Узаконение/
+│   ├── 01 Стратегия/
+│   ├── 02 Услуги/
+│   ├── 06 Клиенты/
+│   │   ├── Иванов_RM-017/       ← папка под каждый кейс
+│   │   │   ├── Документы/
+│   │   │   ├── Переписка/
+│   │   │   └── Архив/
+│   │   └── Петров_RM-018/
+│   └── ...
+└── BIZ-002_Визы/
+    └── ...
+```
+
+**Ключи `.env`:**
+```
+GDRIVE_FOLDER_ID=...              # уже есть — корневая папка
+GOOGLE_CREDENTIALS_FILE=...       # уже есть — тот же service account
+```
+
+**Важно:** Google Drive API уже подключён через `sheets.py → _get_creds()`. Новый адаптер использует те же credentials.
+
+**Риски:**
+- Создание папок при первом запуске `create_business_area()` — нужен `GDRIVE_ENABLED=true`
+- Если папка бизнеса удалена → `business_registry.google_drive_folder` станет битой ссылкой
+
+---
+
+### 12.6 Google Accounts Adapter
+
+**Задача:** Управление разными Google-аккаунтами для разных бизнесов.
+
+**Проблема:** Сейчас один service account управляет всем. При масштабировании на несколько бизнесов каждый может иметь свой Google Workspace.
+
+**Архитектура:**
+```python
+# .env
+GOOGLE_CREDENTIALS_FILE=gtd-ai-assistant-38676c1d863d.json  # основной (GTD)
+GOOGLE_CREDENTIALS_BIZ001=biz001-credentials.json           # бизнес 1
+GOOGLE_CREDENTIALS_BIZ002=biz002-credentials.json           # бизнес 2
+```
+
+```python
+# google_accounts_adapter.py
+def get_credentials(biz_id: str = None):
+    """Вернуть credentials для конкретного бизнеса или основные GTD."""
+    if biz_id and os.getenv(f"GOOGLE_CREDENTIALS_{biz_id.replace('-','')}"):
+        return Credentials.from_service_account_file(...)
+    return _get_creds()  # fallback на основной GTD account
+```
+
+**Риски безопасности:**
+- Несколько JSON-ключей в файловой системе → все должны быть в `.gitignore` (уже есть `*.json`)
+- Лучшее решение: Secret Manager (Google Secret Manager или HashiCorp Vault) — на Фазе 6
+
+---
+
+### 12.7 Integration Router
+
+**Задача:** Единая точка входа для всех входящих webhook-событий.
+
+```python
+# integrations/integration_router.py
+
+async def route_webhook(source: str, payload: dict) -> dict:
+    """
+    Принять webhook от любого сервиса и направить в GTD Inbox.
+    
+    Поддерживаемые источники:
+    - binotel_missed_call  → Action "Перезвонить [номер]"
+    - waba_incoming         → Inbox → process_item()
+    - sendpulse_lead        → Inbox → process_item()
+    - instagram_dm          → Inbox → process_item()
+    """
+```
+
+### Порядок реализации интеграций
+
+**Делать первыми (высокий ROI, низкий риск):**
+1. `google_drive_adapter.py` — структура папок, без внешних API
+2. `binotel_adapter.py` — пропущенные звонки → GTD (прямой практический эффект)
+3. `waba_adapter.py` — входящие WhatsApp → GTD Inbox
+
+**Делать после стабилизации Business Core:**
+4. `sendpulse_adapter.py` — рассылки и CRM-контакты
+5. `google_calendar_adapter.py` — отдельный Calendar для каждого бизнеса
+6. `google_accounts_adapter.py` — мультиаккаунт
+
+**Не трогать до Фазы 6:**
+7. `instagram_adapter.py` — сложный API, нестабильный, низкий приоритет
+
+---
+
+## Обновлённая структура папок `business_core/`
 
 ```
 gtd-ai-assistant/
 │
-├── business_core/                    ← новая папка
+├── business_core/                    ← уже создан (Фаза 1 ✅)
 │   ├── __init__.py                   ← пустой, делает папку пакетом
 │   ├── sheets.py                     ← схема листов Business Core
 │   ├── registry.py                   ← Business Registry
-│   ├── services.py                   ← Service Catalog
-│   ├── people.py                     ← People Registry
-│   ├── channels.py                   ← Channel Registry
-│   ├── integrations.py               ← Integration Registry
-│   ├── relationships.py              ← Relationship Capital
-│   ├── branches.py                   ← Business Branches
-│   ├── builder.py                    ← Business Builder
-│   ├── bot_handlers.py               ← Telegram handlers для Business Core
-│   └── utils.py                      ← вспомогательные функции
+│   ├── service_catalog.py            ✅ создан
+│   ├── people_registry.py            ✅ создан
+│   ├── channel_registry.py           ✅ создан
+│   ├── integration_registry.py       ✅ создан
+│   ├── relationship_capital.py       ✅ создан
+│   ├── business_builder.py           ✅ создан
+│   ├── README.md                     ✅ создан
+│   │
+│   ├── sheets.py                     ← Фаза 2A
+│   ├── business_router.py            ← Фаза 2B
+│   ├── roadmap_manager.py            ← Фаза 2C
+│   ├── material_manager.py           ← Фаза 2D
+│   ├── bot_handlers.py               ← Фаза 4
+│   └── utils.py                      ← по мере необходимости
 │
-├── telegram_bot.py                   ← НЕ МЕНЯТЬ (существующий)
-├── sheets.py                         ← НЕ МЕНЯТЬ (существующий)
-├── inbox_processor.py                ← НЕ МЕНЯТЬ (существующий)
-├── calendar_sync.py                  ← НЕ МЕНЯТЬ (существующий)
-├── project_planner.py                ← НЕ МЕНЯТЬ (существующий)
+├── integrations/                     ← Фаза 6
+│   ├── __init__.py
+│   ├── base_adapter.py
+│   ├── integration_router.py
+│   ├── sendpulse_adapter.py
+│   ├── binotel_adapter.py
+│   ├── waba_adapter.py
+│   ├── instagram_adapter.py
+│   ├── google_drive_adapter.py
+│   ├── google_calendar_adapter.py
+│   └── google_accounts_adapter.py
 │
-├── PROJECT_ARCHITECTURE.md           ← уже создан
+├── telegram_bot.py                   ← НЕ МЕНЯТЬ
+├── sheets.py                         ← НЕ МЕНЯТЬ
+├── inbox_processor.py                ← НЕ МЕНЯТЬ
+├── calendar_sync.py                  ← НЕ МЕНЯТЬ
+├── project_planner.py                ← НЕ МЕНЯТЬ
+│
+├── PROJECT_ARCHITECTURE.md           ← создан
+├── GTD_CURRENT_WORKFLOW.md           ← создан
 ├── BUSINESS_CORE_PLAN.md             ← этот документ
-└── .env                              ← добавить BUSINESS_SPREADSHEET_ID
+└── .env                              ← добавить новые переменные
 ```
 
 ---
@@ -847,109 +1539,340 @@ def _create_gtd_project(biz_id, name):
 
 ---
 
-## Пошаговый план внедрения
+## Обновлённые переменные `.env`
 
-### Фаза 0: Подготовка (1 день)
-```
-□ Создать новый Google Sheets для Business Core
-□ Записать BUSINESS_SPREADSHEET_ID в .env
-□ Создать папку business_core/ в проекте
-□ Создать __init__.py (пустой)
-□ python3 -m py_compile telegram_bot.py  ← убедиться что всё работает
+```bash
+# ── СУЩЕСТВУЮЩИЕ (не менять) ──────────────────────────────
+TELEGRAM_BOT_TOKEN=...
+TELEGRAM_CHAT_ID=...
+ANTHROPIC_API_KEY=...
+OPENAI_API_KEY=...           # для Whisper (локально, не нужен если нет)
+GOOGLE_CREDENTIALS_FILE=gtd-ai-assistant-38676c1d863d.json
+SPREADSHEET_ID=...           # GTD Master таблица
+BIZ_SPREADSHEET_ID=...       # Бизнес-объекты (узаконение)
+CALENDAR_ID=...              # GTD-календарь
+READ_CALENDAR_IDS=...        # Доп. календари
+GDRIVE_FOLDER_ID=...         # GTD документы в Drive
+GDRIVE_IS_SHARED_DRIVE=false
+
+# ── ДОБАВИТЬ (Фаза 2A) ────────────────────────────────────
+BUSINESS_SPREADSHEET_ID=...  # Business Core таблица (новая)
+BUSINESS_CORE_ENABLED=false  # Включить после тестирования
+
+# ── ДОБАВИТЬ (Фаза 3) ─────────────────────────────────────
+GDRIVE_BIZ_ROOT_FOLDER_ID=...  # Корень папок бизнесов
+
+# ── ДОБАВИТЬ (Фаза 6) ─────────────────────────────────────
+BINOTEL_API_KEY_BIZ001=...
+BINOTEL_WEBHOOK_SECRET=...
+SENDPULSE_CLIENT_ID=...
+SENDPULSE_CLIENT_SECRET=...
+WABA_ACCESS_TOKEN=...
+WABA_PHONE_NUMBER_ID_BIZ001=...
+WABA_VERIFY_TOKEN=...
 ```
 
-### Фаза 1: Sheets и Registry (2–3 дня)
+---
+
+## Файлы которые нельзя менять
+
+| Файл | Причина | Допустимое изменение |
+|------|---------|---------------------|
+| `telegram_bot.py` | 4392 строки GTD-логики | **Только 2 строки в `main()`:** `register_business_handlers(app)` |
+| `sheets.py` | Структура GTD таблицы (11 листов) | Нельзя трогать |
+| `inbox_processor.py` | SYSTEM_PROMPT Claude — 63 строки правил | Менять только с тестом |
+| `project_planner.py` | 16 колонок PROJECTS + NEXT ACTIONS в строгом порядке | Нельзя трогать |
+| `calendar_sync.py` | MD5 ключи событий, синхронизация | Нельзя трогать |
+| `.env` | Ключи и ID | Только добавлять новые, не менять существующие |
+| `gtd-ai-assistant-38676c1d863d.json` | Service account credentials | Нельзя трогать |
+
+---
+
+## Пошаговый план внедрения (обновлён)
+
+### ✅ Фаза 0: Подготовка — ВЫПОЛНЕНО
 ```
-□ Написать business_core/sheets.py
-□ Написать init_business_core_sheets()
-□ Запустить: python3 -c "from business_core.sheets import init_business_core_sheets; init_business_core_sheets()"
-□ Убедиться что листы создались в Google Sheets
-□ Написать business_core/registry.py
-□ Заполнить BIZ_REGISTRY вручную (5 бизнесов)
-□ Протестировать get_all_businesses()
+✅ git init + .gitignore (venv, *.json, .env не в git)
+✅ Первый коммит: 30 файлов, 10 763 строки
+✅ test_business_core.py: 181/181 тестов
 ```
 
-### Фаза 2: People Registry (2–3 дня)
+### ✅ Фаза 1: Локальные модели — ВЫПОЛНЕНО
 ```
-□ Написать business_core/people.py
-□ Добавить первых 20 ключевых людей вручную
-□ Протестировать find_person(), get_people_to_touch_today()
-□ Написать business_core/bot_handlers.py (только /people команды)
-□ Добавить 2 строки в telegram_bot.py main()
+✅ business_core/__init__.py
+✅ business_core/models.py            — 6 dataclass-моделей
+✅ business_core/business_registry.py — реестр, валидация, 5 дефолтных бизнесов
+✅ business_core/service_catalog.py   — услуги, этапы, чек-листы
+✅ business_core/people_registry.py   — люди, касания, дни рождения
+✅ business_core/channel_registry.py  — каналы коммуникации
+✅ business_core/integration_registry.py — интеграции
+✅ business_core/relationship_capital.py — социальный капитал
+✅ business_core/business_builder.py  — 12 папок + 7 проектов + next actions
+✅ business_core/README.md
+```
+
+---
+
+### Фаза 2A: BUSINESS_CORE Google Sheets (2–3 дня)
+
+**Цель:** Подключить Business Core к реальной Google Sheets таблице.  
+**Изолирован от GTD:** только новый `BUSINESS_SPREADSHEET_ID`.
+
+```
+□ Создать новый Google Sheets (отдельный от GTD Master)
+□ Добавить BUSINESS_SPREADSHEET_ID в .env
+□ Создать business_core/sheets.py:
+  - get_biz_core_spreadsheet()
+  - get_biz_core_sheet(name)
+  - init_all_sheets()    ← создать все 8 листов с заголовками
+  - append_biz_row()
+  - update_biz_cell()
+□ Запустить: python3 -c "from business_core.sheets import init_all_sheets; init_all_sheets()"
+□ Убедиться в Google Sheets: 8 листов созданы с заголовками
+□ Написать заполнение: BIZ_REGISTRY → 5 дефолтных бизнесов
+□ Тест: прочитать BIZ_REGISTRY обратно в Python
+□ python3 -m py_compile telegram_bot.py  ← GTD бот не сломан
+□ Коммит: "feat: business_core sheets layer"
+```
+
+**Новые листы в BUSINESS_SPREADSHEET_ID:**
+```
+BIZ_REGISTRY • SERVICE_CATALOG • PEOPLE_REGISTRY
+CHANNEL_REGISTRY • INTEGRATION_REGISTRY
+ROADMAPS • ROADMAP_STAGES • MATERIALS • RELATIONSHIP_CAPITAL
+```
+
+---
+
+### Фаза 2B: Business Router — без Telegram (2–3 дня)
+
+**Цель:** Роутер умеет определять бизнес-контекст по тексту GTD-результата.  
+**Не затрагивает Telegram:** только Python-логика и тесты.
+
+```
+□ Написать business_core/business_router.py
+□ Реализовать _route_by_keywords() — матч по ключевым словам
+□ Реализовать _find_client_in_text() — поиск имени в тексте
+□ Реализовать _find_city_in_text()
+□ Реализовать route_business_context() — главная функция
+□ Написать тесты в test_business_router.py:
+  - "По узаконению дома Иванова" → business=BIZ-001, client=Иванов
+  - "Виза для Алматы" → business=BIZ-002, city=Алматы
+  - "коучинг сессия" → business=BIZ-003
+  - Неоднозначный текст → needs_confirmation=True
+□ python3 test_business_router.py
+□ Коммит: "feat: business router keyword matching"
+```
+
+---
+
+### Фаза 2C: Roadmap Manager — без Telegram (2–3 дня)
+
+**Цель:** Дорожные карты по кейсам.  
+**Данные:** хранятся в BUSINESS_SPREADSHEET_ID (листы ROADMAPS + ROADMAP_STAGES).
+
+```
+□ Написать business_core/roadmap_manager.py
+□ Шаблоны этапов для SVC-001 (гараж) и SVC-003 (дом)
+□ create_roadmap() → записать в ROADMAPS
+□ advance_stage() → обновить статус + создать GTD Next Action
+□ get_roadmap_summary() → текст для Telegram
+□ get_overdue_stages()
+□ Написать тесты: create → advance → check progress
+□ Тест advance_stage(): должен создавать GTD Action через project_planner.py
+□ python3 test_roadmap_manager.py
+□ Коммит: "feat: roadmap manager"
+```
+
+---
+
+### Фаза 2D: Material Manager — без Telegram (1–2 дня)
+
+**Цель:** Привязка файлов к этапам дорожной карты.  
+**Опирается на:** GTD REFERENCE sheet (уже работает), Google Drive (уже работает).
+
+```
+□ Написать business_core/material_manager.py
+□ register_material() → записать в MATERIALS sheet
+□ get_materials_by_stage()
+□ get_missing_documents()
+□ update_material_status()
+□ Тест: зарегистрировать материал → найти по этапу → получить список недостающих
+□ python3 test_material_manager.py
+□ Коммит: "feat: material manager"
+```
+
+---
+
+### Фаза 3: Google Drive структура бизнеса (1–2 дня)
+
+**Цель:** Автоматически создавать папки при `create_business_area()`.  
+**Требует:** `GDRIVE_BIZ_ROOT_FOLDER_ID` в .env, `GDRIVE_ENABLED=true`.
+
+```
+□ Написать integrations/google_drive_adapter.py
+□ create_business_folders(biz_id, biz_name) → 12 стандартных папок
+□ create_client_folder(biz_id, client_id, client_name)
+□ Обновить business_builder.py: вызывать create_business_folders() если GDRIVE_ENABLED
+□ Тест: создать структуру для BIZ-TEST, проверить в Drive, удалить
+□ Обновить BIZ_REGISTRY: записать drive_folder_url
+□ Коммит: "feat: google drive folder structure"
+```
+
+---
+
+### Фаза 4: Telegram /business (2–3 дня)
+
+**Цель:** Первые команды Business Core в Telegram-боте.  
+**Изменение в telegram_bot.py:** **только 2 строки** в `main()`.
+
+```
+□ Написать business_core/bot_handlers.py
+□ register_business_handlers(app) — главная функция
+□ Реализовать команды:
+  /biz_list   — список всех бизнесов
+  /people     — справочник людей с фильтрами
+  /person X   — карточка человека
+  /touch X    — зафиксировать касание
+  /roadmap X  — статус дорожной карты
+  /client X   — кейс клиента (RM + материалы)
+□ Добавить в telegram_bot.py main():
+  from business_core.bot_handlers import register_business_handlers
+  register_business_handlers(app)
 □ python3 -m py_compile telegram_bot.py
-□ Перезапустить бота и протестировать /people
-```
-
-### Фаза 3: Service Catalog (2–3 дня)
-```
-□ Написать business_core/services.py
-□ Заполнить SERVICE_CATALOG для топ-3 услуг
-□ Добавить /services команды в bot_handlers.py
-□ Протестировать service_to_gtd_project()
-```
-
-### Фаза 4: Channels & Integrations (1–2 дня)
-```
-□ Написать business_core/channels.py
-□ Написать business_core/integrations.py
-□ Заполнить данные по текущим каналам и интеграциям
-□ Добавить команды /channels, /integrations
-```
-
-### Фаза 5: Relationship Capital (1–2 дня)
-```
-□ Написать business_core/relationships.py
-□ Добавить поля теплоты и касаний к существующим записям
-□ Подключить к утреннему дайджесту (get_daily_relationship_digest)
-□ Добавить /warm, /birthdays команды
-```
-
-### Фаза 6: Business Builder (2–3 дня)
-```
-□ Написать business_core/builder.py
-□ Реализовать create_business_area()
-□ Добавить /newbiz команду
-□ Полное тестирование: /newbiz → проект в GTD → Next Actions
-```
-
-### Фаза 7: Автоматизации (по готовности)
-```
-□ Ежедневный relationship digest в morning_digest
-□ Напоминания о broken integrations
-□ Автосоздание GTD-задач при смене статусов
-□ n8n/Make webhooks (Binotel → GTD, SendPulse → GTD)
+□ Перезапустить бота, протестировать /biz_list
+□ Коммит: "feat: business core telegram handlers"
 ```
 
 ---
 
-## Итоговая схема всей системы
+### Фаза 5: Подключение к Inbox-потоку (осторожно, 2–3 дня)
+
+**Цель:** Business Router вызывается после `process_item()`.  
+**Это единственный этап с риском — тщательно тестировать.**
 
 ```
-                    ВЛАДЕЛЕЦ
-                       │
-                  Telegram Bot
-                  ┌────┴────┐
-                  │         │
-             GTD Core   Business Core
-                  │         │
-         ┌────────┼─────────┼────────┐
-         │        │         │        │
-      INBOX   PROJECTS   PEOPLE   SERVICES
-      TASKS   HORIZONS   CHANNELS REGISTRY
-      WAITING ARCHIVE    CAPITAL  BRANCHES
-         │        │         │        │
-         └────────┴─────────┴────────┘
-                       │
-              Google Sheets (2 таблицы)
-              GTD Master + Business Core
-                       │
-              ┌─────────────────┐
-              │  Внешние сервисы │
-              │ Binotel SendPulse│
-              │ WABA   Calendar  │
-              └─────────────────┘
+□ Добавить в .env: BUSINESS_CORE_ENABLED=false  (сначала выключен)
+□ В telegram_bot.py handle_message() добавить (после GTD-записи):
+  if os.getenv("BUSINESS_CORE_ENABLED") == "true":
+      routing = route_business_context(text, result, ...)
+      if routing["confidence"] > 0.9:
+          # автоматически обогатить запись
+      elif routing["needs_confirmation"]:
+          # спросить пользователя
+
+□ Протестировать с BUSINESS_CORE_ENABLED=false — GTD работает как раньше
+□ Включить BUSINESS_CORE_ENABLED=true
+□ Тест с реальными сообщениями:
+  "Позвонить Иванову по техпаспорту" → routing=BIZ-001, client=Иванов
+□ Проверить: GTD Next Actions создаются корректно
+□ Проверить: бизнес-контекст записывается в Notes/заметки
+□ Коммит: "feat: business router in inbox flow"
 ```
 
 ---
 
-*Документ готов к реализации. Начинать с Фазы 0.*
+### Фаза 6: SendPulse / Binotel / WABA / Instagram (по очереди)
+
+**Порядок внедрения интеграций:**
+
+```
+6.1 Binotel (пропущенные звонки → GTD):
+    □ integrations/binotel_adapter.py
+    □ Webhook: пропущенный звонок → GTD Inbox "Перезвонить [номер]"
+    □ CDR: запись звонка → Material Manager
+    □ Тест: эмулировать webhook, проверить появление в Inbox
+
+6.2 WABA (WhatsApp входящие → GTD):
+    □ integrations/waba_adapter.py
+    □ Webhook: входящее → GTD Inbox → process_item()
+    □ Медиа из WhatsApp → Material Manager
+    □ Дедупликация клиентов по номеру телефона
+
+6.3 SendPulse (лиды и рассылки):
+    □ integrations/sendpulse_adapter.py
+    □ Новая заявка → GTD Inbox
+    □ Синхронизация People Registry → адресная книга
+
+6.4 Google Accounts (мультиаккаунт):
+    □ integrations/google_accounts_adapter.py
+    □ Разные credentials для разных бизнесов
+
+6.5 Instagram (низкий приоритет, после стабилизации):
+    □ integrations/instagram_adapter.py
+    □ Только если Instagram является основным каналом
+```
+
+---
+
+## Итоговая схема системы (v2.0)
+
+```
+╔═══════════════════════════════════════════════════════════╗
+║                  ПОЛЬЗОВАТЕЛЬ (Telegram)                   ║
+╚═══════════════════════════╦═══════════════════════════════╝
+                            │
+                            ▼
+╔═══════════════════════════════════════════════════════════╗
+║         telegram_bot.py — handle_message()                ║
+║  Whisper (голос) • Claude Vision (фото/PDF)               ║
+║  → INBOX sheet (GTD)                                      ║
+╚═══════════════════════════╦═══════════════════════════════╝
+                            │
+                            ▼
+╔═══════════════════════════════════════════════════════════╗
+║       inbox_processor.py — process_item()                 ║
+║  Claude claude-sonnet-4-5 (GTD-классификация)             ║
+║  → Action / Project / Waiting / Someday / H3/H4/H5        ║
+╚═══════════════════════════╦═══════════════════════════════╝
+                            │
+                  ┌─────────▼─────────┐
+                  │                   │
+                  ▼                   ▼
+╔═════════════════════╗   ╔══════════════════════════════╗
+║  GTD MASTER SYSTEM  ║   ║  BUSINESS ROUTER (Фаза 5)    ║
+║  (существующий)     ║   ║  business_core/              ║
+║                     ║   ║  business_router.py          ║
+║  NEXT ACTIONS       ║   ║                              ║
+║  PROJECTS           ║   ║  → business_id               ║
+║  WAITING            ║   ║  → service_id                ║
+║  SOMEDAY            ║   ║  → client_id                 ║
+║  HORIZONS           ║   ║  → roadmap_id                ║
+║  ARCHIVE            ║   ║  → stage_id                  ║
+║  REFERENCE          ║   ║  → confidence                ║
+╚═════════════════════╝   ╚══════════════════════════════╝
+          │                            │
+          │            ┌───────────────┘
+          │            ▼
+          │   ╔═════════════════════════════════════╗
+          │   ║      BUSINESS CORE Sheets           ║
+          │   ║  (BUSINESS_SPREADSHEET_ID)          ║
+          │   ║                                     ║
+          │   ║  BIZ_REGISTRY  SERVICE_CATALOG      ║
+          │   ║  PEOPLE_REGISTRY  CHANNEL_REGISTRY  ║
+          │   ║  ROADMAPS  ROADMAP_STAGES            ║
+          │   ║  MATERIALS                           ║
+          │   ╚══════════╦══════════════════════════╝
+          │              │
+          │    ┌──────────┼──────────┐
+          │    ▼          ▼          ▼
+          │  Roadmap   Material  Rel.Capital
+          │  Manager   Manager   (Фаза 2C,D)
+          │    │          │
+          └────┘          ▼
+                     Google Drive
+                     (Фаза 3)
+                          │
+                          ▼
+                     ┌──────────┐
+                     │ Calendar │  ← уже работает
+                     └──────────┘
+                          │
+                          ▼ (Фаза 6)
+              SendPulse / Binotel / WABA / Instagram
+```
+
+---
+
+*Версия 2.0 — обновлено на основе GTD_CURRENT_WORKFLOW.md*  
+*Следующий шаг: Фаза 2A — создать BUSINESS_SPREADSHEET_ID и business_core/sheets.py*
