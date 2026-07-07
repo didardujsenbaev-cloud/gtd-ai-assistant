@@ -15,6 +15,8 @@ Business Core — Telegram handlers.
   /newroadmap       — создать новую дорожную карту (диалог)
   /clients          — поиск клиента по имени
   /newclient        — добавить клиента в People Registry
+  /newbiz           — добавить новый бизнес (диалог)
+  /initbc           — заполнить таблицу начальными данными (бизнесы + услуги)
   /bcdrive          — создать Drive-структуру для бизнеса
   /bcstatus         — проверить конфигурацию Business Core
 """
@@ -44,6 +46,7 @@ log = logging.getLogger(__name__)
 
 NR_BUSINESS, NR_CLIENT, NR_SERVICE, NR_CITY, NR_DAYS, NR_CONFIRM = range(6)
 NC_NAME, NC_PHONE, NC_TYPE, NC_BIZ, NC_CONFIRM = range(10, 15)
+NB_NAME, NB_CITIES, NB_PRIORITY, NB_CONFIRM = range(20, 24)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -125,10 +128,10 @@ async def bc_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             from business_core.sheets import check_configuration
             cfg = check_configuration()
             if cfg["ok"]:
-                sa = cfg.get("info", {}).get("service_account", "?")
+                sa = cfg.get("service_account", "?")
                 lines.append(f"✅ Google Sheets: OK")
                 lines.append(f"   SA: `{sa}`")
-                url = cfg.get("info", {}).get("spreadsheet_url", "")
+                url = cfg.get("url", "")
                 if url:
                     lines.append(f"   [Открыть таблицу]({url})")
             else:
@@ -209,9 +212,12 @@ async def bc_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         except Exception:
             pass
 
-        url = get_spreadsheet_url()
-        if url:
-            lines.append(f"\n[📊 Открыть Business Core таблицу]({url})")
+        try:
+            url = get_spreadsheet_url()
+            if url:
+                lines.append(f"\n[📊 Открыть Business Core таблицу]({url})")
+        except Exception:
+            pass
 
     except Exception as e:
         lines.append(f"\n❌ Ошибка загрузки данных: {e}")
@@ -788,6 +794,236 @@ async def newclient_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 # ─────────────────────────────────────────────────────────────
+# /initbc — заполнить таблицу начальными данными
+# ─────────────────────────────────────────────────────────────
+
+async def init_bc(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Заполнить BUSINESS_CORE таблицу начальными данными:
+    бизнесы из business_registry.list_default_businesses()
+    и услуги из service_catalog.
+    Пропускает уже существующие записи (проверяет по Slug).
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg())
+        return
+
+    await update.message.reply_text("⏳ Инициализирую Business Core...", parse_mode="Markdown")
+
+    try:
+        from business_core.sheets import (
+            read_business_sheet, append_business_row, generate_next_id
+        )
+        from business_core.business_registry import list_default_businesses
+        from datetime import datetime
+
+        now = datetime.now().strftime("%Y-%m-%d")
+        added_biz = 0
+        skipped_biz = 0
+
+        # Загружаем существующие записи
+        existing_rows = read_business_sheet("biz_registry")
+        existing_slugs = {r.get("Slug", "").lower() for r in existing_rows}
+
+        # priority: "high"→1, "medium"→2, "low"→3
+        _prio_map = {"high": "1", "medium": "2", "low": "3"}
+
+        businesses = list_default_businesses()
+        for biz in businesses:
+            slug = biz.slug.lower()
+            if slug in existing_slugs:
+                skipped_biz += 1
+                continue
+
+            biz_id = generate_next_id("biz_registry", "BIZ")
+            row = [
+                biz_id,
+                biz.name,
+                biz.slug,
+                biz.status,
+                biz.description or "",
+                ", ".join(biz.cities),
+                biz.owner or "Дидар",
+                _prio_map.get(str(biz.priority), "2"),
+                now,
+                "", "", "", "", "", "", "", "", "", "",  # Drive, Sheet, GTD, интеграции, комментарий
+                now,  # Последнее обновление
+            ]
+            append_business_row("biz_registry", row)
+            existing_slugs.add(slug)
+            added_biz += 1
+
+        # Дефолтные услуги
+        default_services = [
+            ("Узаконение гаража",                 "BIZ-001", "Алматы", "150000", "250000", "30"),
+            ("Узаконение частного дома",           "BIZ-001", "Алматы", "200000", "400000", "60"),
+            ("Узаконение коммерческой недвижимости","BIZ-001", "Алматы", "300000", "600000", "90"),
+            ("Туристическая виза",                 "BIZ-002", "Алматы", "15000",  "30000",  "14"),
+            ("Рабочая виза",                       "BIZ-002", "Алматы", "30000",  "60000",  "30"),
+            ("Стратегическая сессия",              "BIZ-003", "Онлайн", "50000",  "150000", "7"),
+        ]
+
+        existing_svc = read_business_sheet("service_catalog")
+        existing_svc_names = {r.get("Название", "").lower() for r in existing_svc}
+        added_svc = 0
+
+        for (name, biz_id, city, price_min, price_max, days) in default_services:
+            if name.lower() in existing_svc_names:
+                continue
+            svc_id = generate_next_id("service_catalog", "SVC")
+            row = [
+                svc_id, biz_id, name,
+                name.lower().replace(" ", "-"),
+                "active", city, price_min, price_max, days,
+                "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "",
+            ]
+            append_business_row("service_catalog", row)
+            existing_svc_names.add(name.lower())
+            added_svc += 1
+
+        lines = [
+            "✅ *Business Core инициализирован!*",
+            "",
+            f"🏢 Бизнесов добавлено: {added_biz} (пропущено: {skipped_biz})",
+            f"🛠 Услуг добавлено: {added_svc}",
+            "",
+            "Теперь попробуй:",
+            "/bc — дашборд",
+            "/newroadmap — создать дорожную карту",
+            "/newclient — добавить клиента",
+        ]
+        await _reply(update, "\n".join(lines))
+
+    except Exception as e:
+        log.error(f"init_bc error: {e}")
+        await _reply(update, f"❌ Ошибка инициализации: {e}")
+
+
+# ─────────────────────────────────────────────────────────────
+# /newbiz — добавление бизнеса (диалог)
+# ─────────────────────────────────────────────────────────────
+
+async def newbiz_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg())
+        return ConversationHandler.END
+
+    context.user_data["nb"] = {}
+    await update.message.reply_text(
+        "🏢 *Новый бизнес*\n\nВведи название направления:",
+        parse_mode="Markdown",
+    )
+    return NB_NAME
+
+
+async def newbiz_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data["nb"]["name"] = update.message.text.strip()
+    keyboard = [["Алматы, Астана", "Алматы, Шымкент"],
+                ["Алматы", "Астана"], ["Онлайн"], ["❌ Отмена"]]
+    await update.message.reply_text(
+        "📍 Города (выбери или напиши через запятую):",
+        reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True),
+    )
+    return NB_CITIES
+
+
+async def newbiz_cities(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text.strip()
+    if text == "❌ Отмена":
+        await update.message.reply_text("Отменено.", reply_markup=ReplyKeyboardRemove())
+        return ConversationHandler.END
+    context.user_data["nb"]["cities"] = text
+    keyboard = [["1 — Высокий", "2 — Средний", "3 — Низкий"], ["❌ Отмена"]]
+    await update.message.reply_text(
+        "⭐ Приоритет:",
+        reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True),
+    )
+    return NB_PRIORITY
+
+
+async def newbiz_priority(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text.strip()
+    if text == "❌ Отмена":
+        await update.message.reply_text("Отменено.", reply_markup=ReplyKeyboardRemove())
+        return ConversationHandler.END
+
+    priority = "1" if "1" in text else "3" if "3" in text else "2"
+    context.user_data["nb"]["priority"] = priority
+    nb = context.user_data["nb"]
+
+    await update.message.reply_text(
+        f"📋 *Проверь:*\n\n"
+        f"🏢 Название: {nb['name']}\n"
+        f"📍 Города: {nb['cities']}\n"
+        f"⭐ Приоритет: {priority}",
+        parse_mode="Markdown",
+        reply_markup=ReplyKeyboardMarkup(
+            [["✅ Создать"], ["❌ Отмена"]],
+            resize_keyboard=True, one_time_keyboard=True,
+        ),
+    )
+    return NB_CONFIRM
+
+
+async def newbiz_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text.strip()
+    if "Отмена" in text:
+        await update.message.reply_text("Отменено.", reply_markup=ReplyKeyboardRemove())
+        context.user_data.pop("nb", None)
+        return ConversationHandler.END
+
+    nb = context.user_data.get("nb", {})
+
+    try:
+        from business_core.sheets import append_business_row, generate_next_id
+        from business_core.business_registry import _slugify
+        from datetime import datetime
+
+        biz_id = generate_next_id("biz_registry", "BIZ")
+        slug = _slugify(nb.get("name", ""))
+        now = datetime.now().strftime("%Y-%m-%d")
+
+        row = [
+            biz_id,
+            nb.get("name", ""),
+            slug,
+            "active",
+            "",                      # описание
+            nb.get("cities", ""),
+            "Дидар",                 # ответственный
+            nb.get("priority", "2"),
+            now,
+            "", "", "", "", "", "", "", "", "", "", now,
+        ]
+        append_business_row("biz_registry", row)
+
+        await update.message.reply_text(
+            f"✅ *Бизнес создан!*\n\n"
+            f"🆔 `{biz_id}`\n"
+            f"🏢 {nb['name']}\n"
+            f"📍 {nb['cities']}\n\n"
+            f"/bc — дашборд\n"
+            f"/newroadmap — первая дорожная карта",
+            parse_mode="Markdown",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+    except Exception as e:
+        log.error(f"newbiz_confirm error: {e}")
+        await update.message.reply_text(
+            f"❌ Ошибка: {e}", reply_markup=ReplyKeyboardRemove()
+        )
+
+    context.user_data.pop("nb", None)
+    return ConversationHandler.END
+
+
+async def newbiz_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data.pop("nb", None)
+    await update.message.reply_text("Отменено.", reply_markup=ReplyKeyboardRemove())
+    return ConversationHandler.END
+
+
+# ─────────────────────────────────────────────────────────────
 # /bcdrive — создать Drive-структуру для бизнеса
 # ─────────────────────────────────────────────────────────────
 
@@ -894,18 +1130,33 @@ def register_business_handlers(app: Application) -> None:
         allow_reentry=True,
     )
 
+    # ConversationHandler — создание бизнеса
+    newbiz_handler = ConversationHandler(
+        entry_points=[CommandHandler("newbiz", newbiz_start)],
+        states={
+            NB_NAME:     [MessageHandler(filters.TEXT & ~filters.COMMAND, newbiz_name)],
+            NB_CITIES:   [MessageHandler(filters.TEXT & ~filters.COMMAND, newbiz_cities)],
+            NB_PRIORITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, newbiz_priority)],
+            NB_CONFIRM:  [MessageHandler(filters.TEXT & ~filters.COMMAND, newbiz_confirm)],
+        },
+        fallbacks=[CommandHandler("cancel", newbiz_cancel)],
+        allow_reentry=True,
+    )
+
     # Регистрируем ConversationHandlers первыми
     app.add_handler(newroadmap_handler)
     app.add_handler(newclient_handler)
+    app.add_handler(newbiz_handler)
 
     # Простые команды
-    app.add_handler(CommandHandler("bc",         bc_dashboard))
-    app.add_handler(CommandHandler("bcstatus",   bc_status))
-    app.add_handler(CommandHandler("roadmaps",   show_roadmaps))
-    app.add_handler(CommandHandler("clients",    show_clients))
-    app.add_handler(CommandHandler("bcdrive",    bc_drive))
+    app.add_handler(CommandHandler("bc",       bc_dashboard))
+    app.add_handler(CommandHandler("bcstatus", bc_status))
+    app.add_handler(CommandHandler("roadmaps", show_roadmaps))
+    app.add_handler(CommandHandler("clients",  show_clients))
+    app.add_handler(CommandHandler("bcdrive",  bc_drive))
+    app.add_handler(CommandHandler("initbc",   init_bc))
 
     log.info(
         "Business Core handlers зарегистрированы: "
-        "/bc /bcstatus /roadmaps /clients /newroadmap /newclient /bcdrive"
+        "/bc /bcstatus /roadmaps /clients /newroadmap /newclient /newbiz /initbc /bcdrive"
     )
