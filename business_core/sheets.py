@@ -66,6 +66,20 @@ BUSINESS_HEADERS: dict[str, list[str]] = {
         "Документы от клиента", "Документы наши",
         "Чек-лист производства", "Чек-лист закрытия",
         "Риски", "Шаблоны", "Инструкция", "Комментарий",
+        # Phase 8A: Service Catalog Upgrade (добавлены в конец)
+        "Service Name",          # англ. название (может совпадать с Название)
+        "Service Category",      # категория: узаконение / виза / коучинг / ...
+        "Object Type",           # тип объекта: частный дом / нежилое / новострой
+        "Client Type",           # тип клиента: физ. лицо / юр. лицо
+        "What Included",         # что включено в услугу
+        "What Not Included",     # что не включено
+        "Currency",              # KZT / USD / EUR
+        "Required Documents",    # необходимые документы
+        "Default Roadmap Template ID",  # ключ из ROADMAP_TEMPLATES
+        "Contractors Needed",    # нужны ли подрядчики
+        "Materials IDs",         # материалы (MATERIAL-ID через запятую)
+        "Created At",            # дата создания
+        "Last Updated",          # дата обновления
     ],
     "people_registry": [
         "ID", "ФИО", "Имя", "Телефон", "Телефон 2", "WhatsApp",

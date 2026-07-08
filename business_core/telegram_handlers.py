@@ -1364,16 +1364,24 @@ def _parse_kv_args(text: str) -> dict:
       biz_id=BIZ-001 client_id=PRS-001 city=Алматы address="ул. Абая 10"
 
     Поддерживает значения в кавычках (одинарных или двойных).
-    Ключи — до '=', значения — всё после '=' до следующего ключа.
+    Токены без '=' записываются как _pos0, _pos1, ... (позиционные аргументы).
     """
     import re
     result: dict[str, str] = {}
-    # Паттерн: ключ=значение (значение может быть в "..." или '...' или без)
-    pattern = r'(\w+)=(?:"([^"]*?)"|\'([^\']*?)\'|(\S+))'
-    for m in re.finditer(pattern, text):
-        key = m.group(1)
-        val = m.group(2) or m.group(3) or m.group(4) or ""
-        result[key] = val.strip()
+    # Паттерн: ключ=значение или "quoted value" или одиночное слово
+    token_pattern = r'(\w+)=(?:"([^"]*?)"|\'([^\']*?)\'|(\S+))|"([^"]*?)"|\'([^\']*?)\'|(\S+)'
+    pos_idx = 0
+    for m in re.finditer(token_pattern, text):
+        if m.group(1):
+            # key=value
+            key = m.group(1)
+            val = m.group(2) or m.group(3) or m.group(4) or ""
+            result[key] = val.strip()
+        else:
+            # позиционный: "quoted" или слово
+            val = m.group(5) or m.group(6) or m.group(7) or ""
+            result[f"_pos{pos_idx}"] = val.strip()
+            pos_idx += 1
     return result
 
 
@@ -1828,6 +1836,298 @@ async def stages_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await _reply(update, f"❌ Ошибка: {e}")
 
 
+# ─────────────────────────────────────────────────────────────
+# /newservice — создать услугу (Phase 8A)
+# ─────────────────────────────────────────────────────────────
+
+async def newservice_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Создать новую услугу в SERVICE_CATALOG.
+
+    Форматы:
+      /newservice biz_id=BIZ-001 name="Узаконение реконструкции" category="узаконение" ...
+      /newservice BIZ-001 "Узаконение реконструкции частного дома"
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg())
+        return
+
+    raw  = " ".join(context.args or [])
+    args = _parse_kv_args(raw)
+
+    biz_id       = args.get("biz_id")       or args.get("_pos0", "")
+    service_name = (args.get("name") or args.get("service_name")
+                    or args.get("_pos1", ""))
+
+    if not biz_id or not service_name:
+        await _reply(update,
+            "❌ Укажи biz\\_id и name.\n\n"
+            "Пример:\n"
+            "`/newservice biz_id=BIZ-001 name=\"Узаконение реконструкции\" "
+            "city=Алматы price_from=1500000 duration=\"3-4 месяца\"`"
+        )
+        return
+
+    try:
+        from business_core.service_manager import create_service_record
+
+        result = create_service_record(
+            biz_id=biz_id,
+            service_name=service_name,
+            service_category=args.get("category",          ""),
+            city=            args.get("city",              ""),
+            object_type=     args.get("object_type",       ""),
+            client_type=     args.get("client_type",       ""),
+            description=     args.get("description",       ""),
+            what_included=   args.get("what_included",     ""),
+            what_not_included=args.get("what_not_included",""),
+            price_from=      args.get("price_from",        ""),
+            price_to=        args.get("price_to",          ""),
+            currency=        args.get("currency",          "KZT"),
+            estimated_duration=args.get("duration",        ""),
+            required_documents=args.get("documents",       ""),
+            default_roadmap_template_id=args.get("template", ""),
+            risks=           args.get("risks",             ""),
+            contractors_needed=args.get("contractors",     ""),
+            materials_ids=   args.get("materials",         ""),
+            status=          args.get("status",            "active"),
+            notes=           args.get("notes",             ""),
+        )
+
+        if not result["ok"]:
+            await _reply(update, f"❌ Не удалось создать услугу: {result['error']}")
+            return
+
+        svc_id = result["service_id"]
+        price_str = ""
+        pf = args.get("price_from", "")
+        if pf:
+            try:
+                price_str = f"\nЦена от: {int(pf):,} {args.get('currency', 'KZT')}".replace(",", " ")
+            except ValueError:
+                price_str = f"\nЦена от: {pf} {args.get('currency', 'KZT')}"
+
+        lines = [
+            "✅ *Услуга создана*\n",
+            f"Service ID: `{svc_id}`",
+            f"Бизнес: `{biz_id}`",
+            f"Название: {service_name}",
+        ]
+        if args.get("category"):
+            lines.append(f"Категория: {args['category']}")
+        if args.get("city"):
+            lines.append(f"Город: {args['city']}")
+        if args.get("object_type"):
+            lines.append(f"Тип объекта: {args['object_type']}")
+        if price_str:
+            lines.append(price_str.strip())
+        if args.get("duration"):
+            lines.append(f"Срок: {args['duration']}")
+        lines.append(f"Статус: `active`")
+        lines.append(f"\nПодробнее: `/service {svc_id}`")
+
+        await _reply(update, "\n".join(lines))
+
+    except Exception as e:
+        log.error(f"newservice_cmd error: {e}")
+        await _reply(update, f"❌ Ошибка: {e}")
+
+
+# ─────────────────────────────────────────────────────────────
+# /services — список услуг (Phase 8A)
+# ─────────────────────────────────────────────────────────────
+
+async def services_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Показать список услуг с фильтрами.
+
+    Форматы:
+      /services
+      /services biz_id=BIZ-001
+      /services object_type="частный дом"
+      /services city=Алматы
+      /services status=active
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg())
+        return
+
+    raw  = " ".join(context.args or [])
+    args = _parse_kv_args(raw)
+
+    filter_biz_id      = args.get("biz_id",      "")
+    filter_object_type = args.get("object_type",  "")
+    filter_city        = args.get("city",         "")
+    filter_status      = args.get("status",       "")
+
+    try:
+        from business_core.service_manager import _load_services, normalize_service_status
+
+        rows, _ = _load_services()
+
+        if filter_biz_id:
+            rows = [r for r in rows if r.get("biz_id") == filter_biz_id]
+        if filter_object_type:
+            rows = [r for r in rows
+                    if r.get("object_type", "").lower() == filter_object_type.lower()]
+        if filter_city:
+            rows = [r for r in rows
+                    if r.get("city", "").lower() == filter_city.lower()]
+        if filter_status:
+            rows = [r for r in rows
+                    if normalize_service_status(r.get("status", "")) == filter_status.lower()]
+
+        if not rows:
+            await _reply(update,
+                "📋 *Каталог услуг*\n\nПусто. Создай первую: /newservice"
+            )
+            return
+
+        rows = rows[:20]
+
+        filter_info = " | ".join(filter(None, [
+            f"biz: {filter_biz_id}" if filter_biz_id else "",
+            f"obj: {filter_object_type}" if filter_object_type else "",
+            f"city: {filter_city}" if filter_city else "",
+            f"status: {filter_status}" if filter_status else "",
+        ]))
+
+        lines = [f"📋 *Каталог услуг* ({len(rows)} шт.)"
+                 + (f" | {filter_info}" if filter_info else "") + "\n"]
+
+        for r in rows:
+            svc_id = r.get("service_id", "?")
+            name   = r.get("service_name", r.get("notes", "?"))
+            biz    = r.get("biz_id", "")
+            city   = r.get("city", "")
+            otype  = r.get("object_type", "")
+            pf     = r.get("price_from", "")
+            dur    = r.get("duration", "")
+            status = r.get("status", "active")
+
+            status_icon = {"active": "✅", "inactive": "⏸", "draft": "📝"}.get(status, "✅")
+
+            line = f"{status_icon} *{svc_id}* — {name}"
+            meta = []
+            if biz:
+                meta.append(f"`{biz}`")
+            if city:
+                meta.append(city)
+            if otype:
+                meta.append(otype)
+            if pf:
+                meta.append(f"от {pf}")
+            if dur:
+                meta.append(dur)
+            if meta:
+                line += "\n  " + " | ".join(meta)
+            lines.append(line)
+            lines.append("")
+
+    except Exception as e:
+        log.error(f"services_cmd error: {e}")
+        await _reply(update, f"❌ Ошибка: {e}")
+        return
+
+    await _reply(update, "\n".join(lines))
+
+
+# ─────────────────────────────────────────────────────────────
+# /service — карточка услуги (Phase 8A)
+# ─────────────────────────────────────────────────────────────
+
+async def service_detail_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Показать подробную карточку услуги.
+
+    Форматы:
+      /service SVC-001
+      /service service_id=SVC-001
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg())
+        return
+
+    raw  = " ".join(context.args or [])
+    args = _parse_kv_args(raw)
+
+    service_id = args.get("service_id") or args.get("_pos0", "")
+
+    if not service_id:
+        await _reply(update,
+            "❌ Укажи service\\_id.\n\nПример: `/service SVC-001`"
+        )
+        return
+
+    try:
+        from business_core.service_manager import find_service_by_id
+
+        svc = find_service_by_id(service_id)
+        if not svc:
+            await _reply(update,
+                f"❌ Услуга `{service_id}` не найдена. Список: /services"
+            )
+            return
+
+        def _f(key: str, label: str) -> str:
+            val = svc.get(key, "").strip()
+            return f"{label}: {val}" if val else ""
+
+        status_icon = {
+            "active": "✅", "inactive": "⏸", "draft": "📝",
+        }.get(svc.get("status", "active"), "✅")
+
+        lines = [
+            f"📋 *Услуга {service_id}* {status_icon}\n",
+            f"Бизнес: `{svc.get('biz_id', '—')}`",
+            f"Название: *{svc.get('service_name', svc.get('notes', '—'))}*",
+        ]
+        for key, label in [
+            ("service_category",   "Категория"),
+            ("city",               "Город"),
+            ("object_type",        "Тип объекта"),
+            ("client_type",        "Тип клиента"),
+            ("description",        "Описание"),
+            ("what_included",      "Включено"),
+            ("what_not_included",  "Не включено"),
+        ]:
+            v = _f(key, label)
+            if v:
+                lines.append(v)
+
+        # Цена
+        pf = svc.get("price_from", "").strip()
+        pt = svc.get("price_to",   "").strip()
+        cur= svc.get("currency",   "KZT").strip() or "KZT"
+        if pf or pt:
+            price = f"Цена: от {pf}" if pf else "Цена:"
+            if pt:
+                price += f" до {pt}"
+            price += f" {cur}"
+            lines.append(price)
+
+        for key, label in [
+            ("duration",                      "Срок"),
+            ("required_documents",            "Документы"),
+            ("default_roadmap_template_id",   "Шаблон roadmap"),
+            ("risks",                         "Риски"),
+            ("contractors_needed",            "Подрядчики"),
+            ("notes",                         "Заметки"),
+        ]:
+            v = _f(key, label)
+            if v:
+                lines.append(v)
+
+        if svc.get("created_at"):
+            lines.append(f"\nСоздана: {svc['created_at']}")
+
+        await _reply(update, "\n".join(lines))
+
+    except Exception as e:
+        log.error(f"service_detail_cmd error: {e}")
+        await _reply(update, f"❌ Ошибка: {e}")
+
+
 def register_business_handlers(app: Application) -> None:
     """
     Зарегистрировать все Business Core handlers в приложении.
@@ -1896,6 +2196,10 @@ def register_business_handlers(app: Application) -> None:
     # Phase 7B
     app.add_handler(CommandHandler("startroadmap", startroadmap_cmd))
     app.add_handler(CommandHandler("stages",       stages_cmd))
+    # Phase 8A
+    app.add_handler(CommandHandler("newservice",   newservice_cmd))
+    app.add_handler(CommandHandler("services",     services_cmd))
+    app.add_handler(CommandHandler("service",      service_detail_cmd))
 
     # Callback handler для кнопок подтверждения бизнес-контекста (Фаза 5B)
     app.add_handler(CallbackQueryHandler(bc_ctx_callback, pattern=r"^bc_ctx:"))
@@ -1904,5 +2208,6 @@ def register_business_handlers(app: Application) -> None:
         "Business Core handlers зарегистрированы: "
         "/bc /bcstatus /roadmaps /clients /newroadmap /newclient /newbiz /initbc /bcdrive "
         "/newobject /objects /startroadmap /stages "
+        "/newservice /services /service "
         "+ bc_ctx callback (Фаза 5B)"
     )
