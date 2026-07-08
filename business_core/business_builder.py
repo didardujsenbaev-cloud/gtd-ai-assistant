@@ -400,6 +400,90 @@ def save_drive_info_to_sheets(
 # Google Drive интеграция для клиентов
 # ─────────────────────────────────────────────────────────────
 
+def _normalize_name(name: str) -> str:
+    """Нормализовать имя: trim + lower + убрать двойные пробелы."""
+    import re
+    return re.sub(r"\s+", " ", name.strip()).lower()
+
+
+def find_existing_client(full_name: str, biz_name: str = "") -> Optional[dict]:
+    """
+    Найти существующего клиента в PEOPLE_REGISTRY.
+
+    Поиск по нормализованному full_name (обязательно) +
+    biz_name (если задан, проверяем что имя бизнеса совпадает или входит).
+
+    Args:
+        full_name: ФИО клиента
+        biz_name:  название бизнеса (опционально — дополнительный фильтр)
+
+    Returns:
+        {
+            "row_num":        int,    # номер строки в листе (1-based)
+            "prs_id":         str,    # PRS-XXX
+            "full_name":      str,    # ФИО из таблицы
+            "drive_url":      str,    # ссылка на Drive-папку (или "")
+            "drive_folder_id":str,    # Drive folder ID (или "")
+        }
+        или None если не найдено
+    """
+    if not full_name or not full_name.strip():
+        return None
+
+    try:
+        from business_core.sheets import get_business_sheet
+        sheet = get_business_sheet("people_registry")
+        all_values = sheet.get_all_values()
+        if len(all_values) < 2:
+            return None
+
+        headers = all_values[0]
+
+        def _col(header):
+            return headers.index(header) if header in headers else None
+
+        id_col       = 0
+        name_col     = _col("ФИО") or 1
+        biz_col      = _col("Бизнесы") or 13
+        drive_col    = _col("Google Drive")
+        drive_id_col = _col("Drive Folder ID")
+
+        norm_name = _normalize_name(full_name)
+        norm_biz  = _normalize_name(biz_name) if biz_name else ""
+
+        for i, row in enumerate(all_values[1:], start=2):
+            if not row or not row[0]:
+                continue
+
+            row_name = _normalize_name(row[name_col] if name_col < len(row) else "")
+            if row_name != norm_name:
+                continue
+
+            # Имя совпало — проверяем бизнес (если задан)
+            if norm_biz:
+                row_biz = _normalize_name(row[biz_col] if biz_col < len(row) else "")
+                if row_biz and norm_biz not in row_biz and row_biz not in norm_biz:
+                    continue  # другой бизнес — не наш клиент
+
+            def _safe_get(col):
+                if col is None:
+                    return ""
+                return row[col].strip() if col < len(row) else ""
+
+            return {
+                "row_num":         i,
+                "prs_id":          row[id_col],
+                "full_name":       row[name_col] if name_col < len(row) else full_name,
+                "drive_url":       _safe_get(drive_col),
+                "drive_folder_id": _safe_get(drive_id_col),
+            }
+
+    except Exception as exc:
+        log.warning(f"find_existing_client error: {exc}")
+
+    return None
+
+
 def _get_biz_id_by_name(biz_name: str) -> str:
     """
     Найти BIZ-ID по названию бизнеса из BIZ_REGISTRY.

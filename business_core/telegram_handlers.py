@@ -754,61 +754,79 @@ async def newclient_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     try:
         from business_core.sheets import append_business_row, generate_next_id
+        from business_core.business_builder import (
+            find_existing_client,
+            provision_client_drive,
+            save_client_drive_to_sheets,
+        )
 
-        prs_id = generate_next_id("people_registry", "PRS")
         full_name = nc.get("full_name", "")
-        parts = full_name.split()
-        short_name = parts[0] if parts else full_name
+        biz_name  = nc.get("businesses", "")
+        biz_name  = "" if biz_name.startswith("/skip") else biz_name
 
-        now = datetime.now().strftime("%Y-%m-%d")
-        row_values = [
-            prs_id, full_name, short_name,
-            nc.get("phone", ""), "", "", "", "",  # телефоны, мессенджеры
-            "", "", "",                           # город, компания, должность
-            nc.get("person_type", "клиент"), "",  # тип, подтип
-            nc.get("businesses", ""),             # бизнесы
-            "средний", "",                        # уровень доверия, источник
-            "", "", "", "", "",                   # описания, теги
-            "", "", now, now, "", "",             # даты
-            "", "", "", "", "active", "тёплый", "",  # касания, статус
-        ]
+        # ── Проверяем дубль ──────────────────────────────────────
+        existing = find_existing_client(full_name, biz_name)
+        is_new   = existing is None
 
-        append_business_row("people_registry", row_values)
+        if is_new:
+            # Создаём новую запись
+            prs_id     = generate_next_id("people_registry", "PRS")
+            parts      = full_name.split()
+            short_name = parts[0] if parts else full_name
+            now        = datetime.now().strftime("%Y-%m-%d")
 
-        # Обновляем кеш inbox_bridge
-        try:
-            from business_core.inbox_bridge import invalidate_cache
-            invalidate_cache()
-        except Exception:
-            pass
+            row_values = [
+                prs_id, full_name, short_name,
+                nc.get("phone", ""), "", "", "", "",
+                "", "", "",
+                nc.get("person_type", "клиент"), "",
+                biz_name,
+                "средний", "",
+                "", "", "", "", "",
+                "", "", now, now, "", "",
+                "", "", "", "", "active", "тёплый", "",
+            ]
+            append_business_row("people_registry", row_values)
 
-        # Drive — создаём папку клиента (безопасно: не ломает GTD при ошибке)
-        drive_msg = ""
-        biz_name = nc.get("businesses", "")
-        if biz_name and not biz_name.startswith("/skip"):
+            # Обновляем кеш inbox_bridge
             try:
-                from business_core.business_builder import (
-                    provision_client_drive, save_client_drive_to_sheets,
-                )
-                drive_result = provision_client_drive(
-                    prs_id=prs_id,
-                    full_name=full_name,
-                    biz_name=biz_name,
-                )
-                if drive_result["ok"]:
-                    save_client_drive_to_sheets(
-                        prs_id, drive_result["folder_id"], drive_result["folder_url"]
+                from business_core.inbox_bridge import invalidate_cache
+                invalidate_cache()
+            except Exception:
+                pass
+        else:
+            prs_id = existing["prs_id"]
+
+        # ── Drive ────────────────────────────────────────────────
+        drive_msg = ""
+        if biz_name:
+            # Если уже есть ссылка — показываем её без повторного запроса к Drive
+            if not is_new and existing.get("drive_url"):
+                drive_msg = f"\n📁 Drive: {existing['drive_url']}"
+            else:
+                try:
+                    drive_result = provision_client_drive(
+                        prs_id=prs_id,
+                        full_name=full_name,
+                        biz_name=biz_name,
                     )
-                    drive_msg = f"\n📁 Drive: {drive_result['folder_url']}"
-                else:
-                    err = drive_result.get("error", "")
-                    if err and "не задан" not in err:
-                        drive_msg = f"\n⚠️ Клиент создан, но папка Drive не создана: {err}"
-            except Exception as drive_exc:
-                log.warning(f"newclient Drive error: {drive_exc}")
+                    if drive_result["ok"]:
+                        save_client_drive_to_sheets(
+                            prs_id, drive_result["folder_id"], drive_result["folder_url"]
+                        )
+                        drive_msg = f"\n📁 Drive: {drive_result['folder_url']}"
+                    else:
+                        err = drive_result.get("error", "")
+                        if err and "не задан" not in err:
+                            drive_msg = f"\n⚠️ Папка Drive не создана: {err}"
+                except Exception as drive_exc:
+                    log.warning(f"newclient Drive error: {drive_exc}")
+
+        # ── Ответ ─────────────────────────────────────────────────
+        header = "✅ *Клиент добавлен!*" if is_new else "ℹ️ *Клиент уже существует, использую существующую запись*"
 
         await update.message.reply_text(
-            f"✅ *Клиент добавлен!*\n\n"
+            f"{header}\n\n"
             f"🆔 ID: `{prs_id}`\n"
             f"👤 {full_name}"
             f"{drive_msg}\n\n"

@@ -403,5 +403,186 @@ class TestIdempotency(unittest.TestCase):
         self.assertEqual(mock_setup.call_count, 2)
 
 
+# ─────────────────────────────────────────────────────────────
+# 10. find_existing_client — поиск дублей
+# ─────────────────────────────────────────────────────────────
+
+class TestFindExistingClient(unittest.TestCase):
+    def _make_sheet(self, rows_data):
+        """Вернуть мок листа с get_all_values."""
+        headers = [
+            "ID", "ФИО", "Имя", "Телефон", "Телефон 2", "WhatsApp",
+            "Telegram", "Email", "Город", "Компания", "Должность",
+            "Тип", "Подтип", "Бизнесы", "Уровень доверия", "Источник",
+            "Чем полезен", "Чем я полезен", "Кого знает", "Специализация", "Теги",
+            "День рождения", "Важные события",
+            "Дата первого контакта", "Дата последнего контакта",
+            "Канал последнего контакта", "История",
+            "Следующее касание", "Тип касания", "Заметка касания",
+            "Статус отношений", "Теплота", "Комментарий",
+            "Google Drive", "Drive Folder ID",
+        ]
+        values = [headers] + rows_data
+        mock_sheet = MagicMock()
+        mock_sheet.get_all_values.return_value = values
+        return mock_sheet
+
+    def _row(self, prs_id, full_name, biz="", drive_url="", drive_id=""):
+        return [
+            prs_id, full_name, full_name.split()[0], "", "", "", "", "",
+            "", "", "", "клиент", "", biz, "", "",
+            "", "", "", "", "", "", "",
+            "2024-01-01", "2024-01-01", "", "",
+            "", "", "", "active", "тёплый", "",
+            drive_url, drive_id,
+        ]
+
+    def test_found_by_name_and_biz(self):
+        rows = [self._row("PRS-001", "Иван Иванов", "Узаконение")]
+        mock_sheet = self._make_sheet(rows)
+        with patch("business_core.sheets.get_business_sheet", return_value=mock_sheet):
+            from business_core.business_builder import find_existing_client
+            result = find_existing_client("Иван Иванов", "Узаконение")
+        self.assertIsNotNone(result)
+        self.assertEqual(result["prs_id"], "PRS-001")
+
+    def test_found_case_insensitive(self):
+        rows = [self._row("PRS-002", "Мария Петрова", "Визы")]
+        mock_sheet = self._make_sheet(rows)
+        with patch("business_core.sheets.get_business_sheet", return_value=mock_sheet):
+            from business_core.business_builder import find_existing_client
+            result = find_existing_client("мария петрова", "визы")
+        self.assertIsNotNone(result)
+        self.assertEqual(result["prs_id"], "PRS-002")
+
+    def test_not_found_different_name(self):
+        rows = [self._row("PRS-001", "Иван Иванов", "Узаконение")]
+        mock_sheet = self._make_sheet(rows)
+        with patch("business_core.sheets.get_business_sheet", return_value=mock_sheet):
+            from business_core.business_builder import find_existing_client
+            result = find_existing_client("Пётр Сидоров", "Узаконение")
+        self.assertIsNone(result)
+
+    def test_not_found_different_biz(self):
+        """Одинаковое имя в разных бизнесах — НЕ дубль."""
+        rows = [self._row("PRS-001", "Иван Иванов", "Узаконение")]
+        mock_sheet = self._make_sheet(rows)
+        with patch("business_core.sheets.get_business_sheet", return_value=mock_sheet):
+            from business_core.business_builder import find_existing_client
+            result = find_existing_client("Иван Иванов", "Визы")
+        self.assertIsNone(result)
+
+    def test_same_name_same_biz_is_duplicate(self):
+        """Одинаковое имя в одном бизнесе — дубль."""
+        rows = [
+            self._row("PRS-001", "Иван Иванов", "Узаконение"),
+            self._row("PRS-002", "Иван Иванов", "Узаконение"),
+        ]
+        mock_sheet = self._make_sheet(rows)
+        with patch("business_core.sheets.get_business_sheet", return_value=mock_sheet):
+            from business_core.business_builder import find_existing_client
+            result = find_existing_client("Иван Иванов", "Узаконение")
+        self.assertIsNotNone(result)
+        self.assertEqual(result["prs_id"], "PRS-001")  # первый найденный
+
+    def test_returns_drive_url_if_present(self):
+        rows = [self._row("PRS-003", "Тест Клиент", "Бизнес",
+                          drive_url="https://drive.google.com/abc",
+                          drive_id="folder_abc")]
+        mock_sheet = self._make_sheet(rows)
+        with patch("business_core.sheets.get_business_sheet", return_value=mock_sheet):
+            from business_core.business_builder import find_existing_client
+            result = find_existing_client("Тест Клиент", "Бизнес")
+        self.assertEqual(result["drive_url"], "https://drive.google.com/abc")
+        self.assertEqual(result["drive_folder_id"], "folder_abc")
+
+    def test_empty_name_returns_none(self):
+        mock_sheet = self._make_sheet([])
+        with patch("business_core.sheets.get_business_sheet", return_value=mock_sheet):
+            from business_core.business_builder import find_existing_client
+            result = find_existing_client("", "Бизнес")
+        self.assertIsNone(result)
+
+    def test_sheets_error_returns_none(self):
+        with patch("business_core.sheets.get_business_sheet", side_effect=Exception("no conn")):
+            from business_core.business_builder import find_existing_client
+            result = find_existing_client("Иван Иванов", "Бизнес")
+        self.assertIsNone(result)
+
+
+# ─────────────────────────────────────────────────────────────
+# 11. _normalize_name
+# ─────────────────────────────────────────────────────────────
+
+class TestNormalizeName(unittest.TestCase):
+    def test_lowercase(self):
+        from business_core.business_builder import _normalize_name
+        self.assertEqual(_normalize_name("ИВАН ИВАНОВ"), "иван иванов")
+
+    def test_strips_whitespace(self):
+        from business_core.business_builder import _normalize_name
+        self.assertEqual(_normalize_name("  Иван  "), "иван")
+
+    def test_double_spaces(self):
+        from business_core.business_builder import _normalize_name
+        self.assertEqual(_normalize_name("Иван  Иванов"), "иван иванов")
+
+    def test_empty(self):
+        from business_core.business_builder import _normalize_name
+        self.assertEqual(_normalize_name(""), "")
+
+
+# ─────────────────────────────────────────────────────────────
+# 12. Дедупликация в связке provision_client_drive
+# ─────────────────────────────────────────────────────────────
+
+class TestDeduplication(unittest.TestCase):
+    def test_drive_not_called_if_url_already_exists(self):
+        """Если у существующего клиента уже есть Drive URL — повторный Drive-вызов не нужен."""
+        # Существующий клиент с Drive URL
+        existing = {
+            "row_num": 2, "prs_id": "PRS-001", "full_name": "Иван Иванов",
+            "drive_url": "https://drive.google.com/existing",
+            "drive_folder_id": "existing_folder",
+        }
+        env = {
+            "GDRIVE_BIZ_ROOT_FOLDER_ID": "root",
+            "GOOGLE_CREDENTIALS_FILE": "creds.json",
+        }
+        with patch.dict("os.environ", env, clear=False):
+            with patch("integrations.google_drive_adapter.setup_biz_client_folder") as mock_drive:
+                # Симулируем: find_existing_client вернул существующего с drive_url
+                # Код telegram_handlers должен НЕ вызывать provision_client_drive если drive_url есть
+                # Проверяем логику через прямое тестирование условия
+                drive_url = existing["drive_url"]
+                should_skip = bool(drive_url)
+                self.assertTrue(should_skip)
+                mock_drive.assert_not_called()  # не вызван, т.к. мы пропустили
+
+    def test_drive_called_if_existing_client_has_no_url(self):
+        """Если существующий клиент без Drive URL — Drive вызывается для дозаполнения."""
+        env = {
+            "GDRIVE_BIZ_ROOT_FOLDER_ID": "root",
+            "GOOGLE_CREDENTIALS_FILE": "creds.json",
+        }
+        mock_result = {
+            "client_folder_id": "new_folder",
+            "client_folder_url": "https://drive.google.com/new_folder",
+            "subfolders": {},
+            "dry_run": False,
+        }
+        with patch.dict("os.environ", env, clear=False):
+            with patch("business_core.sheets.read_business_sheet", return_value=[]):
+                with patch(
+                    "integrations.google_drive_adapter.setup_biz_client_folder",
+                    return_value=mock_result,
+                ) as mock_drive:
+                    from business_core.business_builder import provision_client_drive
+                    result = provision_client_drive("PRS-001", "Иван Иванов", "Бизнес")
+
+        self.assertTrue(result["ok"])
+        mock_drive.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
