@@ -1705,6 +1705,11 @@ async def startroadmap_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             create_roadmap_stages_from_template,
             ROADMAP_TEMPLATES,
         )
+        from business_core.roadmap_template_manager import (
+            create_stages_from_template_record,
+            find_roadmap_templates_by_service,
+        )
+        from business_core.service_manager import find_service_by_id
 
         obj = find_object_by_id(obj_id)
         if not obj:
@@ -1714,6 +1719,29 @@ async def startroadmap_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         biz_id    = obj.get("biz_id", "")
         client_id = obj.get("client_id", "")
 
+        # ── Определить шаблон ─────────────────────────────────
+        # Приоритет 1: явно переданный template_id
+        # Приоритет 2: Default Roadmap Template ID услуги
+        # Приоритет 3: первый шаблон, связанный с сервисом
+        # Fallback:    старая логика через case_type
+        template_id_to_use = args.get("template_id", "")
+        template_source    = ""
+
+        if not template_id_to_use and service_id:
+            svc = find_service_by_id(service_id)
+            if svc:
+                tmpl_from_svc = svc.get("default_roadmap_template_id", "").strip()
+                if tmpl_from_svc:
+                    template_id_to_use = tmpl_from_svc
+                    template_source    = f"из услуги {service_id}"
+
+        if not template_id_to_use and service_id:
+            linked = find_roadmap_templates_by_service(service_id)
+            if linked:
+                template_id_to_use = linked[0].get("template_id", "")
+                template_source    = f"автовыбор для {service_id}"
+
+        # ── Создать roadmap ────────────────────────────────────
         rm_result = create_roadmap_for_object(
             obj_id=obj_id,
             biz_id=biz_id,
@@ -1729,29 +1757,53 @@ async def startroadmap_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
         roadmap_id = rm_result["roadmap_id"]
 
-        stages_result = create_roadmap_stages_from_template(roadmap_id, case_type)
+        # ── Создать этапы ──────────────────────────────────────
+        stages_result   = None
+        used_template   = False
+
+        if template_id_to_use:
+            stages_result = create_stages_from_template_record(roadmap_id, template_id_to_use)
+            used_template = True
+
+        # Fallback: встроенные шаблоны через case_type
+        if not stages_result or not stages_result.get("ok") or stages_result.get("stages_count", 0) == 0:
+            stages_result_fb = create_roadmap_stages_from_template(roadmap_id, case_type)
+            if stages_result_fb.get("stages_count", 0) > 0:
+                stages_result = stages_result_fb
+                used_template = False
+
+        if not stages_result:
+            stages_result = {"ok": True, "stages_count": 0, "warning": "Шаблон не найден", "stage_ids": []}
+
         update_object_roadmap_id(obj_id, roadmap_id)
 
+        # ── Ответ ──────────────────────────────────────────────
         lines = [
             "✅ *Roadmap создан*\n",
             f"Roadmap ID: `{roadmap_id}`",
             f"Object ID:  `{obj_id}`",
             f"Service ID: `{service_id or '—'}`",
-            f"Case Type:  `{case_type}`",
         ]
+        if template_id_to_use and used_template:
+            lines.append(f"Шаблон: `{template_id_to_use}`"
+                         + (f" _{template_source}_" if template_source else ""))
+        elif case_type and case_type != "general":
+            lines.append(f"Case Type: `{case_type}`")
 
-        if stages_result["warning"]:
+        if stages_result.get("warning") and not stages_result.get("stages_count"):
             lines.append(f"\n⚠️ {stages_result['warning']}")
         else:
-            count = stages_result["stages_count"]
+            count = stages_result.get("stages_count", 0)
             lines.append(f"Этапов создано: {count}")
-            stage_names = ROADMAP_TEMPLATES.get(case_type, [])
-            if stage_names:
-                lines.append("\n*Следующие шаги:*")
-                for i, name in enumerate(stage_names[:5], start=1):
-                    lines.append(f"{i}. {name}")
-                if len(stage_names) > 5:
-                    lines.append(f"   ... (+{len(stage_names) - 5} этапов)")
+            # Показать первые 5 названий
+            if not used_template:
+                stage_names = ROADMAP_TEMPLATES.get(case_type, [])
+                if stage_names:
+                    lines.append("\n*Следующие шаги:*")
+                    for i, name in enumerate(stage_names[:5], start=1):
+                        lines.append(f"{i}. {name}")
+                    if len(stage_names) > 5:
+                        lines.append(f"   ... (+{len(stage_names) - 5} этапов)")
 
         lines.append(f"\nПросмотр этапов: `/stages roadmap_id={roadmap_id}`")
 
@@ -2128,6 +2180,270 @@ async def service_detail_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await _reply(update, f"❌ Ошибка: {e}")
 
 
+# ─────────────────────────────────────────────────────────────
+# /newrtemplate — создать шаблон roadmap (Phase 8B)
+# ─────────────────────────────────────────────────────────────
+
+async def newrtemplate_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Создать шаблон дорожной карты в ROADMAP_TEMPLATE_REGISTRY.
+
+    Форматы:
+      /newrtemplate name="Узаконение частного дома" biz_id=BIZ-001 service_id=SVC-001
+      /newrtemplate name="Глобальный шаблон" case_type=legalization_reconstruction_house
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg())
+        return
+
+    raw  = " ".join(context.args or [])
+    args = _parse_kv_args(raw)
+
+    template_name = (args.get("name") or args.get("template_name")
+                     or args.get("_pos0", ""))
+
+    if not template_name:
+        await _reply(update,
+            "❌ Укажи name шаблона.\n\n"
+            "Пример:\n"
+            '`/newrtemplate name="Узаконение реконструкции" biz_id=BIZ-001 service_id=SVC-001`'
+        )
+        return
+
+    try:
+        from business_core.roadmap_template_manager import create_roadmap_template
+
+        result = create_roadmap_template(
+            template_name=template_name,
+            biz_id=       args.get("biz_id",       ""),
+            service_id=   args.get("service_id",    ""),
+            case_type=    args.get("case_type",     ""),
+            object_type=  args.get("object_type",   ""),
+            description=  args.get("description",   ""),
+            status=       args.get("status",        "active"),
+            notes=        args.get("notes",         ""),
+        )
+
+        if not result["ok"]:
+            await _reply(update, f"❌ Ошибка: {result['error']}")
+            return
+
+        tmpl_id = result["template_id"]
+        lines = [
+            "✅ *Шаблон создан*\n",
+            f"Template ID: `{tmpl_id}`",
+            f"Название: {template_name}",
+        ]
+        if args.get("biz_id"):
+            lines.append(f"Бизнес: `{args['biz_id']}`")
+        if args.get("service_id"):
+            lines.append(f"Услуга: `{args['service_id']}`")
+        if args.get("case_type"):
+            lines.append(f"Case Type: `{args['case_type']}`")
+        if args.get("object_type"):
+            lines.append(f"Тип объекта: {args['object_type']}")
+
+        lines.append(f"\nДобавь этапы: `/addrtemplatestage template_id={tmpl_id} stage_name=\"...\"`")
+
+        await _reply(update, "\n".join(lines))
+
+    except Exception as e:
+        log.error(f"newrtemplate_cmd error: {e}")
+        await _reply(update, f"❌ Ошибка: {e}")
+
+
+# ─────────────────────────────────────────────────────────────
+# /rtemplates — список шаблонов (Phase 8B)
+# ─────────────────────────────────────────────────────────────
+
+async def rtemplates_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Показать шаблоны дорожных карт.
+
+    Форматы:
+      /rtemplates
+      /rtemplates biz_id=BIZ-001
+      /rtemplates service_id=SVC-001
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg())
+        return
+
+    raw  = " ".join(context.args or [])
+    args = _parse_kv_args(raw)
+
+    filter_biz     = args.get("biz_id",     "")
+    filter_service = args.get("service_id", "")
+
+    try:
+        from business_core.roadmap_template_manager import (
+            list_roadmap_templates, find_roadmap_templates_by_service,
+        )
+
+        if filter_service:
+            templates = find_roadmap_templates_by_service(filter_service)
+        else:
+            templates = list_roadmap_templates(biz_id=filter_biz, status="")
+
+        if not templates:
+            await _reply(update,
+                "📋 *Шаблоны roadmap*\n\nПусто. Создай первый: /newrtemplate"
+            )
+            return
+
+        lines = [f"📋 *Шаблоны roadmap* ({len(templates)} шт.)\n"]
+        for t in templates[:20]:
+            tid    = t.get("template_id", "?")
+            name   = t.get("template_name", "?")
+            svc    = t.get("service_id", "")
+            biz    = t.get("biz_id", "")
+            stages = t.get("stages_count", "0")
+            status = t.get("status", "active")
+            icon   = {"active": "✅", "inactive": "⏸", "draft": "📝"}.get(status, "✅")
+            line   = f"{icon} `{tid}` — {name}"
+            meta   = []
+            if biz:
+                meta.append(f"biz: {biz}")
+            if svc:
+                meta.append(f"svc: {svc}")
+            meta.append(f"{stages} эт.")
+            line += "\n  " + " | ".join(meta)
+            lines.append(line)
+            lines.append("")
+
+        await _reply(update, "\n".join(lines))
+
+    except Exception as e:
+        log.error(f"rtemplates_cmd error: {e}")
+        await _reply(update, f"❌ Ошибка: {e}")
+
+
+# ─────────────────────────────────────────────────────────────
+# /addrtemplatestage — добавить этап в шаблон (Phase 8B)
+# ─────────────────────────────────────────────────────────────
+
+async def addrtemplatestage_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Добавить этап в шаблон дорожной карты.
+
+    Форматы:
+      /addrtemplatestage template_id=RTMPL-001 stage_name="Первичный анализ"
+      /addrtemplatestage template_id=RTMPL-001 stage_name="..." order=3 docs="паспорт" days=7
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg())
+        return
+
+    raw  = " ".join(context.args or [])
+    args = _parse_kv_args(raw)
+
+    template_id = args.get("template_id") or args.get("_pos0", "")
+    stage_name  = (args.get("stage_name") or args.get("name")
+                   or args.get("_pos1", ""))
+
+    if not template_id or not stage_name:
+        await _reply(update,
+            "❌ Укажи template\\_id и stage\\_name.\n\n"
+            "Пример:\n"
+            '`/addrtemplatestage template_id=RTMPL-001 stage_name="Первичный анализ объекта"`'
+        )
+        return
+
+    try:
+        from business_core.roadmap_template_manager import add_roadmap_template_stage
+
+        result = add_roadmap_template_stage(
+            template_id=   template_id,
+            stage_name=    stage_name,
+            order=         int(args.get("order", "0")) if args.get("order", "").isdigit() else 0,
+            description=   args.get("description", ""),
+            required_docs= args.get("docs",        ""),
+            responsible=   args.get("responsible", ""),
+            estimated_days=args.get("days",        ""),
+            notes=         args.get("notes",       ""),
+        )
+
+        if not result["ok"]:
+            await _reply(update, f"❌ Ошибка: {result['error']}")
+            return
+
+        await _reply(update,
+            f"✅ Этап добавлен\n\n"
+            f"Stage ID: `{result['stage_id']}`\n"
+            f"Template: `{template_id}`\n"
+            f"Порядок: #{result['order']}\n"
+            f"Название: {stage_name}\n\n"
+            f"Все этапы: `/rtemplatestages template_id={template_id}`"
+        )
+
+    except Exception as e:
+        log.error(f"addrtemplatestage_cmd error: {e}")
+        await _reply(update, f"❌ Ошибка: {e}")
+
+
+# ─────────────────────────────────────────────────────────────
+# /rtemplatestages — этапы шаблона (Phase 8B)
+# ─────────────────────────────────────────────────────────────
+
+async def rtemplatestages_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Показать этапы шаблона дорожной карты.
+
+    Форматы:
+      /rtemplatestages template_id=RTMPL-001
+      /rtemplatestages RTMPL-001
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg())
+        return
+
+    raw  = " ".join(context.args or [])
+    args = _parse_kv_args(raw)
+
+    template_id = args.get("template_id") or args.get("_pos0", "")
+
+    if not template_id:
+        await _reply(update,
+            "❌ Укажи template\\_id.\n\nПример: `/rtemplatestages template_id=RTMPL-001`"
+        )
+        return
+
+    try:
+        from business_core.roadmap_template_manager import (
+            find_template_stages, find_roadmap_template_by_id,
+        )
+
+        tmpl   = find_roadmap_template_by_id(template_id)
+        stages = find_template_stages(template_id)
+
+        if not tmpl and not stages:
+            await _reply(update, f"❌ Шаблон `{template_id}` не найден.")
+            return
+
+        header = f"📋 *Этапы шаблона {template_id}*"
+        if tmpl:
+            header += f" — {tmpl.get('template_name', '')}"
+
+        lines = [header, ""]
+        if not stages:
+            lines.append("Этапов пока нет.")
+            lines.append(f"\nДобавить: `/addrtemplatestage template_id={template_id} stage_name=\"...\"`")
+        else:
+            for s in stages:
+                line = f"*{s['order']}.* {s['stage_name']}"
+                if s.get("estimated_days"):
+                    line += f" _{s['estimated_days']} дн._"
+                if s.get("required_docs"):
+                    line += f"\n  📄 {s['required_docs']}"
+                lines.append(line)
+
+        await _reply(update, "\n".join(lines))
+
+    except Exception as e:
+        log.error(f"rtemplatestages_cmd error: {e}")
+        await _reply(update, f"❌ Ошибка: {e}")
+
+
 def register_business_handlers(app: Application) -> None:
     """
     Зарегистрировать все Business Core handlers в приложении.
@@ -2197,9 +2513,14 @@ def register_business_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("startroadmap", startroadmap_cmd))
     app.add_handler(CommandHandler("stages",       stages_cmd))
     # Phase 8A
-    app.add_handler(CommandHandler("newservice",   newservice_cmd))
-    app.add_handler(CommandHandler("services",     services_cmd))
-    app.add_handler(CommandHandler("service",      service_detail_cmd))
+    app.add_handler(CommandHandler("newservice",       newservice_cmd))
+    app.add_handler(CommandHandler("services",         services_cmd))
+    app.add_handler(CommandHandler("service",          service_detail_cmd))
+    # Phase 8B
+    app.add_handler(CommandHandler("newrtemplate",     newrtemplate_cmd))
+    app.add_handler(CommandHandler("rtemplates",       rtemplates_cmd))
+    app.add_handler(CommandHandler("addrtemplatestage",addrtemplatestage_cmd))
+    app.add_handler(CommandHandler("rtemplatestages",  rtemplatestages_cmd))
 
     # Callback handler для кнопок подтверждения бизнес-контекста (Фаза 5B)
     app.add_handler(CallbackQueryHandler(bc_ctx_callback, pattern=r"^bc_ctx:"))

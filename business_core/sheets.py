@@ -41,6 +41,9 @@ BUSINESS_SHEET_NAMES: dict[str, str] = {
     "relationship_capital":"RELATIONSHIP_CAPITAL",
     "business_branches":   "BUSINESS_BRANCHES",
     "object_registry":     "OBJECT_REGISTRY",   # Phase 6A
+    # Phase 8B: Roadmap Template Registry
+    "roadmap_template_registry": "ROADMAP_TEMPLATE_REGISTRY",
+    "roadmap_template_stages":   "ROADMAP_TEMPLATE_STAGES",
 }
 
 BUSINESS_HEADERS: dict[str, list[str]] = {
@@ -160,6 +163,33 @@ BUSINESS_HEADERS: dict[str, list[str]] = {
         "Created At",
         "Last Updated",
     ],
+    # Phase 8B: шаблоны дорожных карт
+    "roadmap_template_registry": [
+        "Template ID",      # RTMPL-001
+        "Biz ID",           # BIZ-001 (None = глобальный)
+        "Service ID",       # SVC-001 (None = любая)
+        "Template Name",    # человеческое название
+        "Case Type",        # ключ из ROADMAP_TEMPLATES (совместимость)
+        "Object Type",      # тип объекта (частный дом / нежилое / ...)
+        "Description",      # описание шаблона
+        "Status",           # active / inactive / draft
+        "Stages Count",     # сколько этапов (автозаполнение)
+        "Notes",
+        "Created At",
+        "Last Updated",
+    ],
+    "roadmap_template_stages": [
+        "Stage ID",         # TSTG-001
+        "Template ID",      # RTMPL-001
+        "Order",            # порядковый номер
+        "Stage Name",       # название этапа
+        "Description",      # описание
+        "Required Docs",    # необходимые документы
+        "Responsible",      # ответственный по умолчанию
+        "Estimated Days",   # ожидаемое количество дней
+        "Notes",
+        "Created At",
+    ],
 }
 
 # ID-префиксы для generate_next_id
@@ -172,7 +202,10 @@ _ID_PREFIXES: dict[str, str] = {
     "roadmaps":            "RM",
     "roadmap_stages":      "STAGE",
     "materials":           "MAT",
-    "object_registry":     "OBJ",  # Phase 6A
+    "object_registry":     "OBJ",    # Phase 6A
+    # Phase 8B
+    "roadmap_template_registry": "RTMPL",
+    "roadmap_template_stages":   "TSTG",
 }
 
 
