@@ -1636,3 +1636,229 @@ def provision_object_drive(
     except Exception as exc:
         log.warning(f"provision_object_drive({obj_id}) error: {exc}")
         return {"ok": False, "folder_id": None, "folder_url": None, "error": str(exc)}
+
+
+# ═══════════════════════════════════════════════════════════════
+# Phase 7B: Object → Service → Roadmap helpers
+# ═══════════════════════════════════════════════════════════════
+
+def generate_roadmap_id() -> str:
+    """
+    Сгенерировать следующий RM ID из ROADMAPS.
+
+    Формат: RM-001, RM-002, ...
+    Безопасно работает на пустом листе.
+    """
+    try:
+        from business_core.sheets import generate_next_id
+        return generate_next_id("roadmaps")
+    except Exception as exc:
+        log.warning(f"generate_roadmap_id error: {exc}")
+        return "RM-001"
+
+
+def create_roadmap_for_object(
+    obj_id:     str,
+    biz_id:     str,
+    client_id:  str,
+    service_id: str,
+    case_type:  str = "general",
+    title:      str = "",
+    notes:      str = "",
+) -> dict:
+    """
+    Создать roadmap для объекта недвижимости в листе ROADMAPS.
+
+    Args:
+        obj_id:     OBJ-ID объекта (обязательный)
+        biz_id:     BIZ-ID бизнеса (обязательный)
+        client_id:  PRS-ID клиента (обязательный)
+        service_id: SVC-ID услуги
+        case_type:  тип кейса (legalization_reconstruction_house / ...)
+        title:      заголовок roadmap (автогенерируется если пустой)
+        notes:      примечания
+
+    Returns:
+        {
+            "ok":          bool,
+            "roadmap_id":  str,
+            "error":       str | None,
+        }
+    """
+    if not obj_id or not biz_id or not client_id:
+        return {
+            "ok": False, "roadmap_id": "",
+            "error": "Обязательные поля: obj_id, biz_id, client_id",
+        }
+
+    try:
+        from business_core.sheets import append_business_row, generate_next_id
+        now        = datetime.now().strftime("%Y-%m-%d")
+        roadmap_id = generate_roadmap_id()
+
+        # Автогенерация заголовка
+        if not title:
+            title = f"Roadmap {obj_id}" + (f" / {service_id}" if service_id else "")
+
+        # ROADMAPS заголовки:
+        # "Roadmap ID","Business ID","Service ID","City","Client ID","Client Name",
+        # "GTD Project ID","Responsible","Status","Created","Expected","Progress %",
+        # "Stage 1-10 Status","Notes","Last Updated",
+        # "Object ID","Parent Roadmap ID","Case Type"
+        row = [
+            roadmap_id,  # Roadmap ID
+            biz_id,      # Business ID
+            service_id,  # Service ID
+            "",          # City
+            client_id,   # Client ID
+            title,       # Client Name (используем как Title)
+            "",          # GTD Project ID
+            "",          # Responsible
+            "active",    # Status
+            now,         # Created
+            "",          # Expected
+            "0",         # Progress %
+            "", "", "", "", "", "", "", "", "", "",  # Stage 1-10 Status
+            notes,       # Notes
+            now,         # Last Updated
+            obj_id,      # Object ID  (Phase 6A)
+            "",          # Parent Roadmap ID
+            case_type,   # Case Type
+        ]
+        append_business_row("roadmaps", row)
+        log.info(f"create_roadmap_for_object: {roadmap_id} / {obj_id} / {case_type}")
+        return {"ok": True, "roadmap_id": roadmap_id, "error": None}
+
+    except Exception as exc:
+        log.error(f"create_roadmap_for_object error: {exc}")
+        return {"ok": False, "roadmap_id": "", "error": str(exc)}
+
+
+def find_roadmap_by_id(roadmap_id: str) -> Optional[dict]:
+    """Найти roadmap по RM-ID."""
+    if not roadmap_id:
+        return None
+    try:
+        from business_core.sheets import get_business_sheet
+        sheet = get_business_sheet("roadmaps")
+        all_values = sheet.get_all_values()
+        if len(all_values) < 2:
+            return None
+        headers = all_values[0]
+
+        def _col(h):
+            return headers.index(h) if h in headers else None
+
+        def _get(row, h):
+            c = _col(h)
+            return row[c].strip() if c is not None and c < len(row) else ""
+
+        for i, row in enumerate(all_values[1:], start=2):
+            if not row or not row[0]:
+                continue
+            if row[0].strip() == roadmap_id:
+                return {
+                    "row_num":    i,
+                    "roadmap_id": _get(row, "Roadmap ID"),
+                    "biz_id":     _get(row, "Business ID"),
+                    "service_id": _get(row, "Service ID"),
+                    "client_id":  _get(row, "Client ID"),
+                    "title":      _get(row, "Client Name"),
+                    "status":     _get(row, "Status"),
+                    "created":    _get(row, "Created"),
+                    "obj_id":     _get(row, "Object ID"),
+                    "case_type":  _get(row, "Case Type"),
+                    "notes":      _get(row, "Notes"),
+                    "progress":   _get(row, "Progress %"),
+                }
+    except Exception as exc:
+        log.warning(f"find_roadmap_by_id({roadmap_id}) error: {exc}")
+    return None
+
+
+def find_roadmaps_by_object(obj_id: str) -> list[dict]:
+    """Найти все roadmap для объекта по OBJ-ID."""
+    if not obj_id:
+        return []
+    try:
+        from business_core.sheets import get_business_sheet
+        sheet = get_business_sheet("roadmaps")
+        all_values = sheet.get_all_values()
+        if len(all_values) < 2:
+            return []
+        headers = all_values[0]
+
+        def _col(h):
+            return headers.index(h) if h in headers else None
+
+        def _get(row, h):
+            c = _col(h)
+            return row[c].strip() if c is not None and c < len(row) else ""
+
+        obj_col = _col("Object ID")
+        results = []
+        for row in all_values[1:]:
+            if not row or not row[0]:
+                continue
+            if obj_col is not None and obj_col < len(row) and row[obj_col].strip() == obj_id:
+                results.append({
+                    "roadmap_id": _get(row, "Roadmap ID"),
+                    "biz_id":     _get(row, "Business ID"),
+                    "service_id": _get(row, "Service ID"),
+                    "client_id":  _get(row, "Client ID"),
+                    "title":      _get(row, "Client Name"),
+                    "status":     _get(row, "Status"),
+                    "created":    _get(row, "Created"),
+                    "obj_id":     _get(row, "Object ID"),
+                    "case_type":  _get(row, "Case Type"),
+                    "progress":   _get(row, "Progress %"),
+                })
+        return results
+    except Exception as exc:
+        log.warning(f"find_roadmaps_by_object({obj_id}) error: {exc}")
+        return []
+
+
+def update_object_roadmap_id(obj_id: str, roadmap_id: str) -> bool:
+    """
+    Записать Roadmap ID в OBJECT_REGISTRY для объекта.
+
+    Обновляет только если текущее значение пустое, чтобы
+    не затирать уже связанный roadmap.
+
+    Returns:
+        True если обновлено
+    """
+    if not obj_id or not roadmap_id:
+        return False
+    try:
+        from business_core.sheets import get_business_sheet
+        sheet = get_business_sheet("object_registry")
+        all_values = sheet.get_all_values()
+        if len(all_values) < 2:
+            return False
+        headers = all_values[0]
+
+        def _col(h):
+            return headers.index(h) if h in headers else None
+
+        rm_col = _col("Roadmap ID")
+        if rm_col is None:
+            return False
+
+        for i, row in enumerate(all_values[1:], start=2):
+            if not row or not row[0]:
+                continue
+            if row[0].strip() != obj_id:
+                continue
+            current = row[rm_col].strip() if rm_col < len(row) else ""
+            if not current:
+                sheet.update_cell(i, rm_col + 1, roadmap_id)
+                log.info(f"update_object_roadmap_id: {obj_id} → {roadmap_id}")
+                return True
+            # Уже заполнен — не перезаписываем
+            return False
+
+    except Exception as exc:
+        log.warning(f"update_object_roadmap_id({obj_id}) error: {exc}")
+    return False

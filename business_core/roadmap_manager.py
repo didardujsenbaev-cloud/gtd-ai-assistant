@@ -769,3 +769,162 @@ def format_roadmap_digest(roadmaps: list[Roadmap]) -> str:
     ])
 
     return "\n".join(lines)
+
+
+# ═══════════════════════════════════════════════════════════════
+# Phase 7B: Roadmap Templates + Stages
+# ═══════════════════════════════════════════════════════════════
+
+ROADMAP_TEMPLATES: dict[str, list[str]] = {
+    "legalization_reconstruction_house": [
+        "Первичный анализ объекта",
+        "Проверка документов клиента",
+        "Топографическая съемка",
+        "Техническое обследование",
+        "Сейсмостойкое заключение",
+        "Получение АПЗ",
+        "Разработка проекта",
+        "Технический паспорт",
+        "Исполнительная съемка",
+        "Акт ввода в эксплуатацию",
+        "Регистрация в НАО",
+    ],
+    "legalization_new_building": [
+        "Первичный анализ объекта",
+        "Проверка документов клиента",
+        "Получение АПЗ",
+        "Разработка проекта",
+        "Экспертиза проекта",
+        "Уведомление ГАСК",
+        "Исполнительная съемка",
+        "Технический паспорт",
+        "Акт ввода в эксплуатацию",
+        "Регистрация в НАО",
+    ],
+    "legalization_non_residential_reconstruction": [
+        "Первичный анализ объекта",
+        "Проверка правоустанавливающих документов",
+        "Протокол собрания жильцов",
+        "Топографическая съемка",
+        "Получение АПЗ",
+        "Постановление на проектирование",
+        "Разработка рабочего проекта",
+        "Экспертиза проекта",
+        "Уведомление ГАСК",
+        "Декларация",
+        "Технический паспорт",
+        "Землеустроительный проект",
+        "Акт ввода в эксплуатацию",
+        "Регистрация",
+    ],
+}
+
+
+def create_roadmap_stages_from_template(
+    roadmap_id: str,
+    case_type:  str,
+) -> dict:
+    """
+    Создать этапы roadmap в листе ROADMAP_STAGES по шаблону.
+
+    Returns:
+        {
+            "ok":           bool,
+            "stages_count": int,
+            "warning":      str | None,
+            "stage_ids":    list[str],
+        }
+    """
+    if not roadmap_id:
+        return {
+            "ok": False, "stages_count": 0,
+            "warning": "roadmap_id не указан", "stage_ids": [],
+        }
+
+    stage_names = ROADMAP_TEMPLATES.get(case_type, [])
+    if not stage_names:
+        return {
+            "ok": True, "stages_count": 0,
+            "warning": f"Шаблон '{case_type}' не найден — этапы не созданы.",
+            "stage_ids": [],
+        }
+
+    try:
+        from business_core.sheets import append_business_row, generate_next_id
+        now = datetime.now().strftime("%Y-%m-%d %H:%M")
+        stage_ids: list[str] = []
+
+        for order, name in enumerate(stage_names, start=1):
+            stage_id = generate_next_id("roadmap_stages")
+            row = [
+                stage_id,     # Stage ID
+                roadmap_id,   # Roadmap ID
+                str(order),   # Order
+                name,         # Name
+                "pending",    # Status
+                "",           # Due Date
+                "",           # Completed At
+                "",           # GTD Action ID
+                "",           # Responsible
+                "",           # Docs Required
+                "",           # Docs Received
+                "",           # Notes
+            ]
+            append_business_row("roadmap_stages", row)
+            stage_ids.append(stage_id)
+
+        return {
+            "ok": True,
+            "stages_count": len(stage_ids),
+            "warning": None,
+            "stage_ids": stage_ids,
+        }
+
+    except Exception as exc:
+        return {
+            "ok": False,
+            "stages_count": 0,
+            "warning": str(exc),
+            "stage_ids": [],
+        }
+
+
+def get_stages_for_roadmap(roadmap_id: str) -> list[dict]:
+    """Получить все этапы roadmap из ROADMAP_STAGES."""
+    if not roadmap_id:
+        return []
+    try:
+        from business_core.sheets import get_business_sheet
+        sheet      = get_business_sheet("roadmap_stages")
+        all_values = sheet.get_all_values()
+        if len(all_values) < 2:
+            return []
+        headers = all_values[0]
+
+        def _col(h):
+            return headers.index(h) if h in headers else None
+
+        def _get(row, h):
+            c = _col(h)
+            return row[c].strip() if c is not None and c < len(row) else ""
+
+        rm_col  = _col("Roadmap ID")
+        results = []
+        for row in all_values[1:]:
+            if not row or not row[0]:
+                continue
+            if rm_col is not None and rm_col < len(row) and row[rm_col].strip() == roadmap_id:
+                results.append({
+                    "stage_id":   _get(row, "Stage ID"),
+                    "roadmap_id": _get(row, "Roadmap ID"),
+                    "order":      _get(row, "Order"),
+                    "name":       _get(row, "Name"),
+                    "status":     _get(row, "Status"),
+                    "due_date":   _get(row, "Due Date"),
+                    "notes":      _get(row, "Notes"),
+                })
+        results.sort(key=lambda x: int(x["order"]) if x["order"].isdigit() else 0)
+        return results
+    except Exception as exc:
+        log.warning(f"get_stages_for_roadmap({roadmap_id}) error: {exc}")
+        return []

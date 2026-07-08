@@ -241,12 +241,27 @@ async def bc_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 # ─────────────────────────────────────────────────────────────
 
 async def show_roadmaps(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Показать активные дорожные карты из Google Sheets."""
+    """
+    Показать дорожные карты с поддержкой фильтров.
+
+    Форматы:
+      /roadmaps
+      /roadmaps obj_id=OBJ-001
+      /roadmaps biz_id=BIZ-001
+      /roadmaps client_id=PRS-001
+    """
     if not _is_bc_enabled():
         await _reply(update, _bc_disabled_msg())
         return
 
     try:
+        raw = " ".join(context.args or [])
+        args = _parse_kv_args(raw)
+
+        filter_obj_id    = args.get("obj_id")    or args.get("_pos0", "")
+        filter_biz_id    = args.get("biz_id",    "")
+        filter_client_id = args.get("client_id", "")
+
         from business_core.sheets import read_business_sheet
 
         rows = read_business_sheet("roadmaps")
@@ -257,18 +272,36 @@ async def show_roadmaps(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             )
             return
 
+        # Применить фильтры
+        if filter_obj_id:
+            rows = [r for r in rows if r.get("Object ID", "") == filter_obj_id]
+        if filter_biz_id:
+            rows = [r for r in rows if r.get("Business ID", "") == filter_biz_id]
+        if filter_client_id:
+            rows = [r for r in rows if r.get("Client ID", "") == filter_client_id]
+
         active = [r for r in rows if r.get("Status", "") not in ("completed", "cancelled")]
         done   = [r for r in rows if r.get("Status", "") == "completed"]
 
-        lines = [f"🗺 *Дорожные карты* ({len(active)} активных)\n"]
+        filter_info = ""
+        if filter_obj_id:
+            filter_info = f" | obj: {filter_obj_id}"
+        elif filter_biz_id:
+            filter_info = f" | biz: {filter_biz_id}"
+        elif filter_client_id:
+            filter_info = f" | client: {filter_client_id}"
+
+        lines = [f"🗺 *Дорожные карты* ({len(active)} активных{filter_info})\n"]
 
         for r in active:
             rm_id    = r.get("Roadmap ID", "?")
             client   = r.get("Client Name", "?")
             city     = r.get("City", "")
             biz_id   = r.get("Business ID", "")
+            obj_id   = r.get("Object ID", "")
+            svc_id   = r.get("Service ID", "")
+            case_t   = r.get("Case Type", "")
             progress = r.get("Progress %", "0")
-            status   = r.get("Status", "active")
 
             try:
                 pct = float(progress)
@@ -276,25 +309,38 @@ async def show_roadmaps(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 pct = 0.0
 
             filled = int(pct / 10)
-            bar = "█" * filled + "░" * (10 - filled)
+            bar    = "█" * filled + "░" * (10 - filled)
 
             lines.append(
                 f"*{rm_id}* — {client}"
                 + (f", {city}" if city else "")
                 + (f" `[{biz_id}]`" if biz_id else "")
             )
+            if obj_id or svc_id or case_t:
+                meta = []
+                if obj_id:
+                    meta.append(f"OBJ: {obj_id}")
+                if svc_id:
+                    meta.append(f"SVC: {svc_id}")
+                if case_t:
+                    meta.append(f"type: {case_t}")
+                lines.append("  " + " | ".join(meta))
             lines.append(f"  {bar} {pct:.0f}%")
 
-            # Показать текущий этап если есть
+            # Показать текущий этап если есть (legacy Stage X columns)
             for i in range(1, 11):
                 stage_status = r.get(f"Stage {i} Status", "")
                 if stage_status in ("in_progress", "blocked", "waiting"):
                     lines.append(f"  ⬅ Этап {i}: {stage_status}")
                     break
+            lines.append(f"  `/stages roadmap_id={rm_id}`")
             lines.append("")
 
         if done:
             lines.append(f"✅ Завершено: {len(done)}")
+
+        if not active and not done:
+            lines.append("Ничего не найдено по заданному фильтру.")
 
     except Exception as e:
         log.error(f"show_roadmaps error: {e}")
@@ -1604,6 +1650,184 @@ async def objects_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await _reply(update, f"❌ Ошибка: {e}")
 
 
+# ─────────────────────────────────────────────────────────────
+# /startroadmap — создать Roadmap для объекта (Phase 7B)
+# ─────────────────────────────────────────────────────────────
+
+async def startroadmap_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Создать roadmap для объекта по услуге и типу кейса.
+
+    Форматы:
+      /startroadmap obj_id=OBJ-001 service_id=SVC-001 case_type=legalization_reconstruction_house
+      /startroadmap OBJ-001 SVC-001 legalization_reconstruction_house
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg())
+        return
+
+    try:
+        raw = (update.message.text or "").split(None, 1)[1] if context.args else " ".join(context.args or [])
+    except (IndexError, TypeError):
+        raw = ""
+
+    args = _parse_kv_args(raw)
+
+    obj_id     = args.get("obj_id")     or args.get("_pos0", "")
+    service_id = args.get("service_id") or args.get("_pos1", "")
+    case_type  = args.get("case_type")  or args.get("_pos2", "general")
+    title      = args.get("title", "")
+    notes      = args.get("notes", "")
+
+    if not obj_id:
+        await _reply(update,
+            "❌ Укажи obj\\_id объекта.\n\n"
+            "Пример:\n`/startroadmap obj_id=OBJ-001 service_id=SVC-001 "
+            "case_type=legalization_reconstruction_house`"
+        )
+        return
+
+    try:
+        from business_core.business_builder import (
+            find_object_by_id,
+            create_roadmap_for_object,
+            update_object_roadmap_id,
+        )
+        from business_core.roadmap_manager import (
+            create_roadmap_stages_from_template,
+            ROADMAP_TEMPLATES,
+        )
+
+        obj = find_object_by_id(obj_id)
+        if not obj:
+            await _reply(update, f"❌ Объект `{obj_id}` не найден. Проверь /objects")
+            return
+
+        biz_id    = obj.get("biz_id", "")
+        client_id = obj.get("client_id", "")
+
+        rm_result = create_roadmap_for_object(
+            obj_id=obj_id,
+            biz_id=biz_id,
+            client_id=client_id,
+            service_id=service_id,
+            case_type=case_type,
+            title=title,
+            notes=notes,
+        )
+        if not rm_result["ok"]:
+            await _reply(update, f"❌ Не удалось создать roadmap: {rm_result['error']}")
+            return
+
+        roadmap_id = rm_result["roadmap_id"]
+
+        stages_result = create_roadmap_stages_from_template(roadmap_id, case_type)
+        update_object_roadmap_id(obj_id, roadmap_id)
+
+        lines = [
+            "✅ *Roadmap создан*\n",
+            f"Roadmap ID: `{roadmap_id}`",
+            f"Object ID:  `{obj_id}`",
+            f"Service ID: `{service_id or '—'}`",
+            f"Case Type:  `{case_type}`",
+        ]
+
+        if stages_result["warning"]:
+            lines.append(f"\n⚠️ {stages_result['warning']}")
+        else:
+            count = stages_result["stages_count"]
+            lines.append(f"Этапов создано: {count}")
+            stage_names = ROADMAP_TEMPLATES.get(case_type, [])
+            if stage_names:
+                lines.append("\n*Следующие шаги:*")
+                for i, name in enumerate(stage_names[:5], start=1):
+                    lines.append(f"{i}. {name}")
+                if len(stage_names) > 5:
+                    lines.append(f"   ... (+{len(stage_names) - 5} этапов)")
+
+        lines.append(f"\nПросмотр этапов: `/stages roadmap_id={roadmap_id}`")
+
+        await _reply(update, "\n".join(lines))
+
+    except Exception as e:
+        log.error(f"startroadmap_cmd error: {e}")
+        await _reply(update, f"❌ Ошибка: {e}")
+
+
+# ─────────────────────────────────────────────────────────────
+# /stages — показать этапы roadmap (Phase 7B)
+# ─────────────────────────────────────────────────────────────
+
+async def stages_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Показать этапы roadmap.
+
+    Форматы:
+      /stages roadmap_id=RM-001
+      /stages RM-001
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg())
+        return
+
+    try:
+        raw = (update.message.text or "").split(None, 1)[1] if context.args else " ".join(context.args or [])
+    except (IndexError, TypeError):
+        raw = ""
+
+    args       = _parse_kv_args(raw)
+    roadmap_id = args.get("roadmap_id") or args.get("_pos0", "")
+
+    if not roadmap_id:
+        await _reply(update,
+            "❌ Укажи roadmap\\_id.\n\nПример: `/stages roadmap_id=RM-001`"
+        )
+        return
+
+    try:
+        from business_core.roadmap_manager import get_stages_for_roadmap
+        from business_core.business_builder import find_roadmap_by_id
+
+        rm = find_roadmap_by_id(roadmap_id)
+        stages = get_stages_for_roadmap(roadmap_id)
+
+        if not stages and not rm:
+            await _reply(update, f"❌ Roadmap `{roadmap_id}` не найден.")
+            return
+
+        header = f"📋 *Этапы {roadmap_id}*"
+        if rm:
+            header += f" — {rm.get('title', '')}"
+            if rm.get("case_type"):
+                header += f" (`{rm['case_type']}`)"
+
+        lines = [header, ""]
+
+        if not stages:
+            lines.append("Этапы ещё не созданы.")
+        else:
+            status_icons = {
+                "pending":     "⬜",
+                "in_progress": "🔄",
+                "completed":   "✅",
+                "blocked":     "🔴",
+                "waiting":     "⏳",
+                "skipped":     "⏭",
+            }
+            for s in stages:
+                icon = status_icons.get(s["status"], "⬜")
+                line = f"{icon} *{s['order']}.* {s['name']}"
+                if s.get("due_date"):
+                    line += f" _(до {s['due_date']})_"
+                lines.append(line)
+
+        await _reply(update, "\n".join(lines))
+
+    except Exception as e:
+        log.error(f"stages_cmd error: {e}")
+        await _reply(update, f"❌ Ошибка: {e}")
+
+
 def register_business_handlers(app: Application) -> None:
     """
     Зарегистрировать все Business Core handlers в приложении.
@@ -1667,8 +1891,11 @@ def register_business_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("bcdrive",   bc_drive))
     app.add_handler(CommandHandler("initbc",    init_bc))
     # Phase 7A
-    app.add_handler(CommandHandler("newobject", newobject_cmd))
-    app.add_handler(CommandHandler("objects",   objects_cmd))
+    app.add_handler(CommandHandler("newobject",    newobject_cmd))
+    app.add_handler(CommandHandler("objects",      objects_cmd))
+    # Phase 7B
+    app.add_handler(CommandHandler("startroadmap", startroadmap_cmd))
+    app.add_handler(CommandHandler("stages",       stages_cmd))
 
     # Callback handler для кнопок подтверждения бизнес-контекста (Фаза 5B)
     app.add_handler(CallbackQueryHandler(bc_ctx_callback, pattern=r"^bc_ctx:"))
@@ -1676,6 +1903,6 @@ def register_business_handlers(app: Application) -> None:
     log.info(
         "Business Core handlers зарегистрированы: "
         "/bc /bcstatus /roadmaps /clients /newroadmap /newclient /newbiz /initbc /bcdrive "
-        "/newobject /objects "
+        "/newobject /objects /startroadmap /stages "
         "+ bc_ctx callback (Фаза 5B)"
     )
