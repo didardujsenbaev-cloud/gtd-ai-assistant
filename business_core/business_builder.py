@@ -296,9 +296,9 @@ def provision_biz_drive(biz_id: str, biz_name: str) -> dict:
     """
     Создать папку бизнеса в Google Drive.
 
-    Требует GDRIVE_BIZ_ROOT_FOLDER_ID и GOOGLE_CREDENTIALS_FILE.
-    Если переменные не заданы — возвращает {ok: False} без ошибки.
-    Если Drive API упал — возвращает {ok: False, error: str}.
+    Phase 6A: сначала пробует per-biz Drive Root ID из BIZ_REGISTRY,
+    если не задан — fallback на GDRIVE_BIZ_ROOT_FOLDER_ID из .env.
+    Если ни того, ни другого нет — возвращает {ok: False}.
 
     Идемпотентно: если папка уже есть — возвращает её.
 
@@ -314,11 +314,12 @@ def provision_biz_drive(biz_id: str, biz_name: str) -> dict:
             "error":      str | None,
         }
     """
-    gdrive_root = os.getenv("GDRIVE_BIZ_ROOT_FOLDER_ID", "").strip()
+    # Phase 6A: get_business_drive_root_id уже применяет приоритеты
+    gdrive_root = get_business_drive_root_id(biz_id)
     creds_file  = os.getenv("GOOGLE_CREDENTIALS_FILE", "").strip()
 
     if not gdrive_root or not creds_file:
-        log.debug("provision_biz_drive: GDRIVE_BIZ_ROOT_FOLDER_ID или credentials не заданы — пропуск")
+        log.debug("provision_biz_drive: Drive root или credentials не заданы — пропуск")
         return {"ok": False, "folder_id": None, "folder_url": None,
                 "error": "GDRIVE_BIZ_ROOT_FOLDER_ID не задан в .env"}
 
@@ -329,6 +330,7 @@ def provision_biz_drive(biz_id: str, biz_name: str) -> dict:
             biz_id=biz_id,
             biz_name=biz_name,
             dry_run=False,
+            root_folder_id=gdrive_root,  # Phase 6A: явно передаём root
         )
         log.info(f"provision_biz_drive: {biz_id} → {result['business_folder_url']}")
         return {
@@ -399,6 +401,237 @@ def save_drive_info_to_sheets(
 # ─────────────────────────────────────────────────────────────
 # Google Drive интеграция для клиентов
 # ─────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────
+# Multi-Business Config helpers (Phase 6A)
+# ─────────────────────────────────────────────────────────────
+
+#: Допустимые типы бизнес-модели
+BUSINESS_MODEL_TYPES = (
+    "object_based",       # Узаконение — клиент → объект → услуга
+    "person_case_based",  # Визы — клиент/компания → сотрудник → тип визы
+    "program_based",      # Коучинг — клиент → программа
+    "general",            # без специфики
+)
+
+#: Допустимые типы кейса в Roadmap
+ROADMAP_CASE_TYPES = (
+    "legalization_object",
+    "visa_foreigner",
+    "coaching_program",
+    "general",
+)
+
+
+def normalize_biz_ids(value: str) -> list[str]:
+    """
+    Нормализовать строку Biz IDs в список ID.
+
+    Примеры:
+        "BIZ-001"                → ["BIZ-001"]
+        "BIZ-001, BIZ-002"       → ["BIZ-001", "BIZ-002"]
+        ""                       → []
+
+    Args:
+        value: строка из колонки "Biz IDs" в PEOPLE_REGISTRY
+
+    Returns:
+        list[str] — список BIZ-ID (без пустых строк)
+    """
+    if not value or not value.strip():
+        return []
+    return [x.strip() for x in value.replace(";", ",").split(",") if x.strip()]
+
+
+def get_business_config(biz_id: str) -> dict:
+    """
+    Получить конфигурацию бизнеса из BIZ_REGISTRY.
+
+    Безопасная — никогда не бросает исключение.
+    Если новые Phase-6A колонки отсутствуют — возвращает дефолты.
+
+    Args:
+        biz_id: например "BIZ-001"
+
+    Returns:
+        {
+            "id":                   str,
+            "name":                 str,
+            "status":               str,
+            "cities":               list[str],   # из Cities JSON или из "Города"
+            "default_city":         str,
+            "business_model_type":  str,         # object_based / person_case_based / ...
+            "drive_folder_id":      str,         # папка бизнеса (не root)
+            "drive_root_id":        str,         # per-biz Drive root (Phase 6A)
+            "drive_credentials":    str,         # ключ credentials
+            "google_account_email": str,
+            "sendpulse":            str,
+            "waba":                 str,
+            "instagram":            str,
+            "binotel":              str,
+            "found":                bool,        # False если biz_id не найден
+        }
+    """
+    defaults = {
+        "id":                   biz_id,
+        "name":                 "",
+        "status":               "",
+        "cities":               [],
+        "default_city":         "",
+        "business_model_type":  "general",
+        "drive_folder_id":      "",
+        "drive_root_id":        "",
+        "drive_credentials":    "",
+        "google_account_email": "",
+        "sendpulse":            "",
+        "waba":                 "",
+        "instagram":            "",
+        "binotel":              "",
+        "found":                False,
+    }
+
+    try:
+        from business_core.sheets import get_business_sheet
+        sheet = get_business_sheet("biz_registry")
+        all_values = sheet.get_all_values()
+        if len(all_values) < 2:
+            return defaults
+
+        headers = all_values[0]
+
+        def _col(h):
+            return headers.index(h) if h in headers else None
+
+        def _get(row, h, fallback=""):
+            c = _col(h)
+            return (row[c].strip() if c is not None and c < len(row) else "") or fallback
+
+        for row in all_values[1:]:
+            if not row or row[0] != biz_id:
+                continue
+
+            # Города: сначала Cities JSON, потом старое поле "Города"
+            cities_json_raw = _get(row, "Cities JSON")
+            if cities_json_raw:
+                try:
+                    import json
+                    cities = json.loads(cities_json_raw)
+                except Exception:
+                    cities = [c.strip() for c in cities_json_raw.split(",") if c.strip()]
+            else:
+                raw = _get(row, "Города")
+                cities = [c.strip() for c in raw.split(",") if c.strip()]
+
+            return {
+                "id":                   row[0],
+                "name":                 _get(row, "Название"),
+                "status":               _get(row, "Статус"),
+                "cities":               cities,
+                "default_city":         _get(row, "Default City") or (cities[0] if cities else ""),
+                "business_model_type":  _get(row, "Business Model Type", "general"),
+                "drive_folder_id":      _get(row, "Drive Folder ID"),
+                "drive_root_id":        _get(row, "Drive Root ID"),
+                "drive_credentials":    _get(row, "Drive Credentials"),
+                "google_account_email": _get(row, "Google Account Email"),
+                "sendpulse":            _get(row, "SendPulse"),
+                "waba":                 _get(row, "WABA"),
+                "instagram":            _get(row, "Instagram"),
+                "binotel":              _get(row, "Binotel"),
+                "found":                True,
+            }
+    except Exception as exc:
+        log.warning(f"get_business_config({biz_id}) error: {exc}")
+
+    return defaults
+
+
+def get_business_drive_root_id(biz_id: str) -> str:
+    """
+    Получить Drive Root ID для конкретного бизнеса.
+
+    Логика приоритетов:
+    1. BIZ_REGISTRY.Drive Root ID (per-biz, Phase 6A)
+    2. GDRIVE_BIZ_ROOT_FOLDER_ID из .env (глобальный fallback)
+    3. "" (Drive недоступен)
+
+    Args:
+        biz_id: ID бизнеса
+
+    Returns:
+        str — folder ID или "" если не найден
+    """
+    cfg = get_business_config(biz_id)
+    if cfg["drive_root_id"]:
+        log.debug(f"get_business_drive_root_id({biz_id}): per-biz root → {cfg['drive_root_id']}")
+        return cfg["drive_root_id"]
+
+    env_root = os.getenv("GDRIVE_BIZ_ROOT_FOLDER_ID", "").strip()
+    if env_root:
+        log.debug(f"get_business_drive_root_id({biz_id}): global .env root → {env_root}")
+    return env_root
+
+
+def get_business_model_type(biz_id: str) -> str:
+    """
+    Получить тип бизнес-модели.
+
+    Returns:
+        "object_based" | "person_case_based" | "program_based" | "general"
+    """
+    cfg = get_business_config(biz_id)
+    model = cfg.get("business_model_type", "general")
+    return model if model in BUSINESS_MODEL_TYPES else "general"
+
+
+def get_person_biz_ids(person_id: str) -> list[str]:
+    """
+    Получить список BIZ-ID для клиента из PEOPLE_REGISTRY.
+
+    Логика:
+    1. Если заполнена колонка "Biz IDs" — используем её (Phase 6A)
+    2. Иначе ищем biz_id по имени бизнеса из колонки "Бизнесы" (fallback)
+
+    Args:
+        person_id: PRS-ID
+
+    Returns:
+        list[str] — список BIZ-ID (может быть пустым)
+    """
+    try:
+        from business_core.sheets import get_business_sheet
+        sheet = get_business_sheet("people_registry")
+        all_values = sheet.get_all_values()
+        if len(all_values) < 2:
+            return []
+
+        headers = all_values[0]
+
+        def _col(h):
+            return headers.index(h) if h in headers else None
+
+        id_col      = 0
+        biz_ids_col = _col("Biz IDs")
+        biz_col     = _col("Бизнесы")
+
+        for row in all_values[1:]:
+            if not row or row[0] != person_id:
+                continue
+
+            # Phase 6A: Biz IDs
+            if biz_ids_col is not None and biz_ids_col < len(row) and row[biz_ids_col].strip():
+                return normalize_biz_ids(row[biz_ids_col])
+
+            # Fallback: старое поле "Бизнесы" (имя → ищем ID)
+            if biz_col is not None and biz_col < len(row) and row[biz_col].strip():
+                biz_name = row[biz_col].strip()
+                biz_id = _get_biz_id_by_name(biz_name)
+                return [biz_id] if biz_id != biz_name else []  # biz_id == name значит не найден
+
+        return []
+    except Exception as exc:
+        log.warning(f"get_person_biz_ids({person_id}) error: {exc}")
+        return []
+
 
 def _normalize_name(name: str) -> str:
     """Нормализовать имя: trim + lower + убрать двойные пробелы."""
@@ -530,24 +763,26 @@ def provision_client_drive(
             "error":      str | None,
         }
     """
-    gdrive_root = os.getenv("GDRIVE_BIZ_ROOT_FOLDER_ID", "").strip()
-    creds_file  = os.getenv("GOOGLE_CREDENTIALS_FILE", "").strip()
-
-    if not gdrive_root or not creds_file:
-        log.debug("provision_client_drive: GDRIVE_BIZ_ROOT_FOLDER_ID или credentials не заданы — пропуск")
-        return {
-            "ok": False, "folder_id": None, "folder_url": None,
-            "biz_id": None, "error": "GDRIVE_BIZ_ROOT_FOLDER_ID не задан в .env",
-        }
-
     if not biz_name:
         return {
             "ok": False, "folder_id": None, "folder_url": None,
             "biz_id": None, "error": "biz_name не задан",
         }
 
+    # Phase 6A: используем per-biz root если есть, иначе глобальный из .env
+    biz_id_resolved = _get_biz_id_by_name(biz_name)
+    gdrive_root = get_business_drive_root_id(biz_id_resolved)
+    creds_file  = os.getenv("GOOGLE_CREDENTIALS_FILE", "").strip()
+
+    if not gdrive_root or not creds_file:
+        log.debug("provision_client_drive: Drive root или credentials не заданы — пропуск")
+        return {
+            "ok": False, "folder_id": None, "folder_url": None,
+            "biz_id": None, "error": "GDRIVE_BIZ_ROOT_FOLDER_ID не задан в .env",
+        }
+
     try:
-        biz_id = _get_biz_id_by_name(biz_name)
+        biz_id = biz_id_resolved
 
         from integrations.google_drive_adapter import setup_biz_client_folder
         result = setup_biz_client_folder(
@@ -556,6 +791,7 @@ def provision_client_drive(
             client_name=full_name,
             roadmap_id=roadmap_id,
             dry_run=False,
+            root_folder_id=gdrive_root,  # Phase 6A: явно передаём root
         )
         log.info(f"provision_client_drive: {prs_id} / {full_name} → {result['client_folder_url']}")
         return {

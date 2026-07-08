@@ -769,22 +769,25 @@ def _append_to_env(line: str, env_path: str = ".env") -> None:
 # ─────────────────────────────────────────────────────────────
 
 def create_business_folder_structure(
-    biz_id:   str,
-    biz_name: str,
-    dry_run:  bool = False,
+    biz_id:        str,
+    biz_name:      str,
+    dry_run:       bool = False,
+    root_folder_id: Optional[str] = None,
 ) -> dict:
     """
-    Создать структуру папок бизнеса внутри BUSINESS_CORE_DRIVE.
+    Создать структуру папок бизнеса внутри BUSINESS_CORE_DRIVE (или явного root).
 
     Создаёт:
-    BUSINESS_CORE_DRIVE/
+    <root>/
     └── {biz_id}_{biz_name}/
         ├── 01 Стратегия ... 12 Архив
 
     Args:
-        biz_id:   ID бизнеса (например "BIZ-001")
-        biz_name: Название бизнеса (например "Узаконение")
-        dry_run:  True = только логировать
+        biz_id:          ID бизнеса (например "BIZ-001")
+        biz_name:        Название бизнеса (например "Узаконение")
+        dry_run:         True = только логировать
+        root_folder_id:  Явный root folder ID (Phase 6A per-biz Drive root).
+                         Если None — используется GDRIVE_BIZ_ROOT_FOLDER_ID из .env.
 
     Returns:
         {
@@ -794,7 +797,13 @@ def create_business_folder_structure(
           "dry_run":             bool,
         }
     """
-    root_id   = ensure_biz_root_folder_id(ask_confirmation=False)
+    # Phase 6A: если root передан явно — используем его;
+    # иначе старый путь через ensure_biz_root_folder_id()
+    if root_folder_id:
+        root_id = root_folder_id
+        log.debug(f"create_business_folder_structure: using explicit root {root_id}")
+    else:
+        root_id = ensure_biz_root_folder_id(ask_confirmation=False)
     service   = get_drive_service()
     biz_label = f"{biz_id}_{biz_name}"
 
@@ -820,17 +829,18 @@ def create_business_folder_structure(
 
 
 def setup_biz_client_folder(
-    biz_id:      str,
-    biz_name:    str,
-    client_name: str,
-    roadmap_id:  Optional[str] = None,
-    dry_run:     bool = False,
+    biz_id:        str,
+    biz_name:      str,
+    client_name:   str,
+    roadmap_id:    Optional[str] = None,
+    dry_run:       bool = False,
+    root_folder_id: Optional[str] = None,
 ) -> dict:
     """
     Создать папку клиента внутри {biz_id}_{biz_name}/06 Клиенты/.
 
     Структура:
-    BUSINESS_CORE_DRIVE/
+    <root>/
     └── {biz_id}_{biz_name}/
         └── 06 Клиенты/
             └── {client_name}_{roadmap_id}/   (roadmap_id опционально)
@@ -841,16 +851,22 @@ def setup_biz_client_folder(
                 └── 05 Архив
 
     Args:
-        biz_id:      ID бизнеса
-        biz_name:    Название бизнеса
-        client_name: ФИО клиента
-        roadmap_id:  ID карты (опционально, добавляется к имени папки)
-        dry_run:     True = только логировать
+        biz_id:          ID бизнеса
+        biz_name:        Название бизнеса
+        client_name:     ФИО клиента
+        roadmap_id:      ID карты (опционально)
+        dry_run:         True = только логировать
+        root_folder_id:  Явный root folder ID (Phase 6A per-biz Drive root).
+                         Если None — используется GDRIVE_BIZ_ROOT_FOLDER_ID из .env.
 
     Returns:
         {client_folder_id, client_folder_url, subfolders, dry_run}
     """
-    root_id   = ensure_biz_root_folder_id(ask_confirmation=False)
+    if root_folder_id:
+        root_id = root_folder_id
+        log.debug(f"setup_biz_client_folder: using explicit root {root_id}")
+    else:
+        root_id = ensure_biz_root_folder_id(ask_confirmation=False)
     service   = get_drive_service()
     biz_label = f"{biz_id}_{biz_name}"
 

@@ -40,6 +40,7 @@ BUSINESS_SHEET_NAMES: dict[str, str] = {
     "materials":           "MATERIALS",
     "relationship_capital":"RELATIONSHIP_CAPITAL",
     "business_branches":   "BUSINESS_BRANCHES",
+    "object_registry":     "OBJECT_REGISTRY",   # Phase 6A
 }
 
 BUSINESS_HEADERS: dict[str, list[str]] = {
@@ -48,7 +49,14 @@ BUSINESS_HEADERS: dict[str, list[str]] = {
         "Ответственный", "Приоритет", "Дата старта", "Google Drive",
         "Google Sheet", "GTD Project ID", "SendPulse", "Binotel", "WABA",
         "Instagram", "Telegram", "CRM", "Комментарий", "Последнее обновление",
-        "Drive Folder ID",   # Drive ID для идемпотентного обновления (добавлено в конец)
+        "Drive Folder ID",       # Drive ID папки бизнеса (Phase 5)
+        # Phase 6A: Multi-Business Config
+        "Drive Root ID",         # отдельный корневой ID Drive для этого бизнеса
+        "Drive Credentials",     # ключ credentials (default / biz_uzak / biz_visa)
+        "Google Account Email",  # email Google-аккаунта бизнеса
+        "Cities JSON",           # JSON: ["Алматы","Астана","Шымкент"]
+        "Default City",          # город по умолчанию
+        "Business Model Type",   # object_based / person_case_based / program_based
     ],
     "service_catalog": [
         "ID", "Бизнес ID", "Название", "Slug", "Статус", "Город",
@@ -69,8 +77,14 @@ BUSINESS_HEADERS: dict[str, list[str]] = {
         "Канал последнего контакта", "История",
         "Следующее касание", "Тип касания", "Заметка касания",
         "Статус отношений", "Теплота", "Комментарий",
-        "Google Drive",     # ссылка на Drive-папку клиента (добавлено в конец)
-        "Drive Folder ID",  # Drive ID для идемпотентного обновления (добавлено в конец)
+        "Google Drive",      # Drive-ссылка на папку клиента (Phase 5)
+        "Drive Folder ID",   # Drive ID (Phase 5)
+        # Phase 6A: Multi-Business Config
+        "Biz IDs",           # "BIZ-001,BIZ-002" — ID бизнесов (вместо имён)
+        "Company ID",        # PRS-ID компании (для Визы: сотрудник → компания)
+        "Citizenship",       # гражданство (для Визы)
+        "Passport / ID",     # паспорт / ИИН (для Узаконения и Визы)
+        "Primary Biz ID",    # основной бизнес клиента
     ],
     "channel_registry": [
         "ID", "Тип", "Бизнес ID", "Город", "Номер/Аккаунт",
@@ -91,6 +105,10 @@ BUSINESS_HEADERS: dict[str, list[str]] = {
         "Stage 4 Status", "Stage 5 Status", "Stage 6 Status",
         "Stage 7 Status", "Stage 8 Status", "Stage 9 Status",
         "Stage 10 Status", "Notes", "Last Updated",
+        # Phase 6A: Multi-Business
+        "Object ID",          # OBJ-ID (для Узаконения: объект недвижимости)
+        "Parent Roadmap ID",  # RM-ID (если это под-карта другого roadmap)
+        "Case Type",          # legalization_object / visa_foreigner / coaching_program / general
     ],
     "roadmap_stages": [
         "Stage ID", "Roadmap ID", "Order", "Name", "Status",
@@ -114,6 +132,20 @@ BUSINESS_HEADERS: dict[str, list[str]] = {
         "BIZ ID", "Раздел", "Ключ", "Значение",
         "Цель", "Период", "Дата обновления",
     ],
+    # Phase 6A: реестр объектов (недвижимость для Узаконения)
+    "object_registry": [
+        "OBJ ID", "Client ID", "Biz ID", "City",
+        "Address", "Cadastral Number", "Area m2",
+        "Object Type",         # квартира / дом / участок / коммерческая
+        "Object Status",       # в работе / готово / архив
+        "Current Service ID",  # SVC-ID текущей услуги
+        "Roadmap ID",          # RM-ID
+        "Drive Folder ID",     # папка объекта в Drive
+        "Google Drive",        # ссылка на папку
+        "Notes",
+        "Created At",
+        "Last Updated",
+    ],
 }
 
 # ID-префиксы для generate_next_id
@@ -126,6 +158,7 @@ _ID_PREFIXES: dict[str, str] = {
     "roadmaps":            "RM",
     "roadmap_stages":      "STAGE",
     "materials":           "MAT",
+    "object_registry":     "OBJ",  # Phase 6A
 }
 
 

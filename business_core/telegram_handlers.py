@@ -758,11 +758,24 @@ async def newclient_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             find_existing_client,
             provision_client_drive,
             save_client_drive_to_sheets,
+            normalize_biz_ids,
+            _get_biz_id_by_name,
         )
 
         full_name = nc.get("full_name", "")
         biz_name  = nc.get("businesses", "")
         biz_name  = "" if biz_name.startswith("/skip") else biz_name
+
+        # Phase 6A: резолвим biz_id по имени бизнеса
+        biz_id_resolved = ""
+        if biz_name:
+            try:
+                resolved = _get_biz_id_by_name(biz_name)
+                # _get_biz_id_by_name возвращает имя, если ID не найден
+                if resolved and resolved != biz_name:
+                    biz_id_resolved = resolved
+            except Exception:
+                pass
 
         # ── Проверяем дубль ──────────────────────────────────────
         existing = find_existing_client(full_name, biz_name)
@@ -775,16 +788,28 @@ async def newclient_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             short_name = parts[0] if parts else full_name
             now        = datetime.now().strftime("%Y-%m-%d")
 
+            # Phase 6A: Biz IDs как "<BIZ-001>" или "" если не нашли
+            biz_ids_val      = biz_id_resolved if biz_id_resolved else ""
+            primary_biz_val  = biz_id_resolved if biz_id_resolved else ""
+
             row_values = [
                 prs_id, full_name, short_name,
                 nc.get("phone", ""), "", "", "", "",
                 "", "", "",
                 nc.get("person_type", "клиент"), "",
-                biz_name,
+                biz_name,       # старое поле "Бизнесы" — для совместимости
                 "средний", "",
                 "", "", "", "", "",
                 "", "", now, now, "", "",
                 "", "", "", "", "active", "тёплый", "",
+                # Google Drive, Drive Folder ID (добавлены в Phase 5 — пустые сейчас)
+                "", "",
+                # Phase 6A новые поля
+                biz_ids_val,    # Biz IDs
+                "",             # Company ID
+                "",             # Citizenship
+                "",             # Passport / ID
+                primary_biz_val,  # Primary Biz ID
             ]
             append_business_row("people_registry", row_values)
 
