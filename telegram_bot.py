@@ -16,7 +16,12 @@ os.environ["PATH"] = "/opt/homebrew/bin:" + os.environ.get("PATH", "")
 from datetime import date, time, datetime, timedelta
 from dotenv import load_dotenv
 import anthropic
-import whisper
+try:
+    import whisper
+    WHISPER_AVAILABLE = True
+except ImportError:
+    whisper = None
+    WHISPER_AVAILABLE = False
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
@@ -67,9 +72,13 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 TIMEZONE = pytz.timezone("Asia/Almaty")
 
 # Загружаем Whisper один раз при старте (base = быстрая модель)
-print("   Загружаю Whisper модель...", flush=True)
-whisper_model = whisper.load_model("base")
-print("   Whisper готов!", flush=True)
+if WHISPER_AVAILABLE:
+    print("   Загружаю Whisper модель...", flush=True)
+    whisper_model = whisper.load_model("base")
+    print("   Whisper готов!", flush=True)
+else:
+    whisper_model = None
+    print("   ⚠️ Whisper не установлен — голосовые сообщения недоступны", flush=True)
 ai_client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
 EXTRACT_PROMPT = """Ты GTD-ассистент. Посмотри на это изображение/документ и извлеки из него задачи, действия или важную информацию для системы GTD.
@@ -2163,6 +2172,11 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await file.download_to_memory(io.BytesIO())
             await file.download_to_drive(tmp.name)
             tmp_path = tmp.name
+
+        if not whisper_model:
+            os.unlink(tmp_path)
+            await update.message.reply_text("❌ Whisper не установлен — голосовые сообщения недоступны.")
+            return
 
         result = whisper_model.transcribe(tmp_path, language="ru")
         text = result["text"].strip()
