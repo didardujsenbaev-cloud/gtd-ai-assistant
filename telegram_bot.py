@@ -16,12 +16,11 @@ os.environ["PATH"] = "/opt/homebrew/bin:" + os.environ.get("PATH", "")
 from datetime import date, time, datetime, timedelta
 from dotenv import load_dotenv
 import anthropic
-print("DEBUG: telegram_bot.py v2 — whisper import with try/except", flush=True)
 try:
-    import whisper
+    from faster_whisper import WhisperModel as _FasterWhisperModel
     WHISPER_AVAILABLE = True
 except Exception:
-    whisper = None
+    _FasterWhisperModel = None
     WHISPER_AVAILABLE = False
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import (
@@ -74,9 +73,9 @@ TIMEZONE = pytz.timezone("Asia/Almaty")
 
 # Загружаем Whisper один раз при старте (base = быстрая модель)
 if WHISPER_AVAILABLE:
-    print("   Загружаю Whisper модель...", flush=True)
-    whisper_model = whisper.load_model("base")
-    print("   Whisper готов!", flush=True)
+    print("   Загружаю faster-whisper модель...", flush=True)
+    whisper_model = _FasterWhisperModel("base", device="cpu", compute_type="int8")
+    print("   faster-whisper готов!", flush=True)
 else:
     whisper_model = None
     print("   ⚠️ Whisper не установлен — голосовые сообщения недоступны", flush=True)
@@ -2179,8 +2178,8 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ Whisper не установлен — голосовые сообщения недоступны.")
             return
 
-        result = whisper_model.transcribe(tmp_path, language="ru")
-        text = result["text"].strip()
+        segments, _ = whisper_model.transcribe(tmp_path, language="ru")
+        text = " ".join(seg.text for seg in segments).strip()
         os.unlink(tmp_path)
 
         if not text:
