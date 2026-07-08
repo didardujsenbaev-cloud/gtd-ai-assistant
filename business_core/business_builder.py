@@ -633,10 +633,309 @@ def get_person_biz_ids(person_id: str) -> list[str]:
         return []
 
 
-def _normalize_name(name: str) -> str:
-    """Нормализовать имя: trim + lower + убрать двойные пробелы."""
+# ─────────────────────────────────────────────────────────────
+# Phase 6B: расширенная дедупликация клиентов
+# ─────────────────────────────────────────────────────────────
+
+def normalize_person_name(name: str) -> str:
+    """
+    Нормализовать ФИО: trim → убрать множественные пробелы → lower.
+
+    Примеры:
+        "  Иван  Петров " → "иван петров"
+        "ИВАН ПЕТРОВ"     → "иван петров"
+    """
     import re
     return re.sub(r"\s+", " ", name.strip()).lower()
+
+
+def normalize_phone(phone: str) -> str:
+    """
+    Нормализовать телефонный номер: оставить только цифры.
+
+    Примеры:
+        "+7 (777) 123-45-67" → "77771234567"
+        "8 777 123 45 67"    → "87771234567"
+        ""                   → ""
+    """
+    import re
+    if not phone:
+        return ""
+    return re.sub(r"\D", "", phone.strip())
+
+
+def find_existing_person(
+    name:   Optional[str] = None,
+    phone:  Optional[str] = None,
+    biz_id: Optional[str] = None,
+) -> Optional[dict]:
+    """
+    Найти существующего человека в PEOPLE_REGISTRY.
+
+    Стратегия поиска (приоритеты):
+    1. Телефон (нормализованный) + biz_id — сильный идентификатор.
+    2. ФИО (нормализованное) + biz_id.
+
+    Если biz_id не задан — ищем только по имени/телефону (слабый поиск).
+    Если найден — возвращаем все ключевые поля, включая biz_ids.
+
+    Args:
+        name:   ФИО клиента (опционально)
+        phone:  телефон (опционально)
+        biz_id: BIZ-ID для фильтрации (опционально)
+
+    Returns:
+        {
+            "row_num":         int,   # 1-based
+            "prs_id":          str,
+            "full_name":       str,
+            "biz_ids":         list[str],   # из колонки Biz IDs
+            "primary_biz_id":  str,
+            "drive_url":       str,
+            "drive_folder_id": str,
+            "phone_raw":       str,   # телефон как записан в таблице
+        }
+        или None
+    """
+    if not name and not phone:
+        return None
+
+    norm_name  = normalize_person_name(name)  if name  else ""
+    norm_phone = normalize_phone(phone)        if phone else ""
+
+    try:
+        from business_core.sheets import get_business_sheet
+        sheet = get_business_sheet("people_registry")
+        all_values = sheet.get_all_values()
+        if len(all_values) < 2:
+            return None
+
+        headers = all_values[0]
+
+        def _col(h):
+            return headers.index(h) if h in headers else None
+
+        def _get(row, h, fallback=""):
+            c = _col(h)
+            return (row[c].strip() if c is not None and c < len(row) else "") or fallback
+
+        name_col     = _col("ФИО") if _col("ФИО") is not None else 1
+        phone_col    = _col("Телефон")
+        wa_col       = _col("WhatsApp")
+        biz_ids_col  = _col("Biz IDs")
+        old_biz_col  = _col("Бизнесы")
+        drive_col    = _col("Google Drive")
+        drive_id_col = _col("Drive Folder ID")
+        prim_col     = _col("Primary Biz ID")
+
+        def _person_biz_ids(row) -> list[str]:
+            """Возвращает список BIZ-ID из новой или старой колонки."""
+            if biz_ids_col is not None and biz_ids_col < len(row) and row[biz_ids_col].strip():
+                return normalize_biz_ids(row[biz_ids_col])
+            # fallback: старое поле "Бизнесы" — возвращаем как есть (не BIZ-ID, но для сравнения)
+            return []
+
+        for i, row in enumerate(all_values[1:], start=2):
+            if not row or not row[0]:
+                continue
+
+            row_name  = normalize_person_name(row[name_col] if name_col < len(row) else "")
+            row_phone = normalize_phone(row[phone_col] if phone_col is not None and phone_col < len(row) else "")
+            row_wa    = normalize_phone(row[wa_col]    if wa_col   is not None and wa_col   < len(row) else "")
+
+            # Совпадение по телефону (сильный идентификатор)
+            phone_match = bool(
+                norm_phone and (
+                    (row_phone and row_phone == norm_phone) or
+                    (row_wa    and row_wa    == norm_phone)
+                )
+            )
+            # Совпадение по имени
+            name_match = bool(norm_name and row_name == norm_name)
+
+            if not phone_match and not name_match:
+                continue
+
+            person_biz_ids = _person_biz_ids(row)
+
+            # Если biz_id задан — проверяем совпадение
+            if biz_id:
+                # Проверяем и новое поле Biz IDs, и старое "Бизнесы"
+                old_biz = _get(row, "Бизнесы")
+                biz_match = (
+                    biz_id in person_biz_ids or
+                    # резолвим через имя если нет BIZ-ID в записи
+                    (not person_biz_ids and old_biz)
+                )
+                # Если не совпал biz — помечаем как "другой бизнес"
+                same_biz = biz_id in person_biz_ids
+            else:
+                biz_match = True
+                same_biz = True
+
+            if not biz_match and not phone_match and not name_match:
+                continue
+
+            return {
+                "row_num":         i,
+                "prs_id":          row[0],
+                "full_name":       row[name_col] if name_col < len(row) else "",
+                "biz_ids":         person_biz_ids,
+                "primary_biz_id":  _get(row, "Primary Biz ID"),
+                "drive_url":       _get(row, "Google Drive"),
+                "drive_folder_id": _get(row, "Drive Folder ID"),
+                "phone_raw":       row[phone_col] if phone_col is not None and phone_col < len(row) else "",
+                "same_biz":        same_biz,  # True = тот же бизнес, False = другой
+            }
+
+    except Exception as exc:
+        log.warning(f"find_existing_person error: {exc}")
+
+    return None
+
+
+def add_biz_id_to_person(person_id: str, biz_id: str) -> bool:
+    """
+    Добавить biz_id в колонку "Biz IDs" существующего клиента.
+
+    Не дублирует, если biz_id уже есть.
+    Primary Biz ID не перезаписывает если уже заполнен.
+
+    Args:
+        person_id: PRS-ID
+        biz_id:    BIZ-ID для добавления
+
+    Returns:
+        True если обновлено, False если уже было или ошибка
+    """
+    if not person_id or not biz_id:
+        return False
+
+    try:
+        from business_core.sheets import get_business_sheet
+        sheet = get_business_sheet("people_registry")
+        all_values = sheet.get_all_values()
+        if len(all_values) < 2:
+            return False
+
+        headers = all_values[0]
+
+        def _col(h):
+            return headers.index(h) if h in headers else None
+
+        biz_ids_col = _col("Biz IDs")
+        prim_col    = _col("Primary Biz ID")
+
+        for i, row in enumerate(all_values[1:], start=2):
+            if not row or row[0] != person_id:
+                continue
+
+            # Текущие Biz IDs
+            current_ids = normalize_biz_ids(
+                row[biz_ids_col] if biz_ids_col is not None and biz_ids_col < len(row) else ""
+            )
+
+            if biz_id in current_ids:
+                log.debug(f"add_biz_id_to_person: {biz_id} уже есть у {person_id}")
+                return False  # Уже есть — ничего не делаем
+
+            # Добавляем biz_id
+            current_ids.append(biz_id)
+            new_biz_ids_str = ",".join(current_ids)
+
+            # Колонка Biz IDs
+            if biz_ids_col is not None:
+                col_letter = _col_letter(biz_ids_col + 1)
+                sheet.update_cell(i, biz_ids_col + 1, new_biz_ids_str)
+                log.info(f"add_biz_id_to_person: {person_id} → Biz IDs = {new_biz_ids_str}")
+
+            # Primary Biz ID — только если пустой
+            if prim_col is not None:
+                current_prim = row[prim_col].strip() if prim_col < len(row) else ""
+                if not current_prim:
+                    sheet.update_cell(i, prim_col + 1, biz_id)
+                    log.info(f"add_biz_id_to_person: {person_id} → Primary Biz ID = {biz_id}")
+
+            return True
+
+    except Exception as exc:
+        log.warning(f"add_biz_id_to_person({person_id}, {biz_id}) error: {exc}")
+
+    return False
+
+
+def update_person_drive_info(person_id: str, folder_id: str, folder_url: str) -> bool:
+    """
+    Обновить Drive-информацию существующего клиента (дозаполнение).
+
+    Обновляет только если текущие значения пустые — не перезаписывает.
+
+    Args:
+        person_id:  PRS-ID
+        folder_id:  Google Drive folder ID
+        folder_url: Google Drive URL
+
+    Returns:
+        True если обновлено, False если уже было или ошибка
+    """
+    if not person_id or not folder_id:
+        return False
+
+    try:
+        from business_core.sheets import get_business_sheet
+        sheet = get_business_sheet("people_registry")
+        all_values = sheet.get_all_values()
+        if len(all_values) < 2:
+            return False
+
+        headers = all_values[0]
+
+        def _col(h):
+            return headers.index(h) if h in headers else None
+
+        drive_col    = _col("Google Drive")
+        drive_id_col = _col("Drive Folder ID")
+
+        for i, row in enumerate(all_values[1:], start=2):
+            if not row or row[0] != person_id:
+                continue
+
+            updated = False
+
+            if drive_col is not None:
+                current = row[drive_col].strip() if drive_col < len(row) else ""
+                if not current and folder_url:
+                    sheet.update_cell(i, drive_col + 1, folder_url)
+                    updated = True
+
+            if drive_id_col is not None:
+                current = row[drive_id_col].strip() if drive_id_col < len(row) else ""
+                if not current and folder_id:
+                    sheet.update_cell(i, drive_id_col + 1, folder_id)
+                    updated = True
+
+            if updated:
+                log.info(f"update_person_drive_info: {person_id} → Drive дозаполнен")
+            return updated
+
+    except Exception as exc:
+        log.warning(f"update_person_drive_info({person_id}) error: {exc}")
+
+    return False
+
+
+def _col_letter(col_index: int) -> str:
+    """Преобразовать 1-based индекс колонки в букву (A, B, ..., Z, AA, ...)."""
+    result = ""
+    while col_index > 0:
+        col_index, rem = divmod(col_index - 1, 26)
+        result = chr(65 + rem) + result
+    return result
+
+
+def _normalize_name(name: str) -> str:
+    """Нормализовать имя: trim + lower + убрать двойные пробелы."""
+    return normalize_person_name(name)
 
 
 def find_existing_client(full_name: str, biz_name: str = "") -> Optional[dict]:

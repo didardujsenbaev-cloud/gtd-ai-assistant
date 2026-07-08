@@ -755,7 +755,9 @@ async def newclient_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     try:
         from business_core.sheets import append_business_row, generate_next_id
         from business_core.business_builder import (
-            find_existing_client,
+            find_existing_person,
+            add_biz_id_to_person,
+            update_person_drive_info,
             provision_client_drive,
             save_client_drive_to_sheets,
             normalize_biz_ids,
@@ -763,72 +765,91 @@ async def newclient_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         )
 
         full_name = nc.get("full_name", "")
+        phone     = nc.get("phone", "")
         biz_name  = nc.get("businesses", "")
         biz_name  = "" if biz_name.startswith("/skip") else biz_name
 
-        # Phase 6A: резолвим biz_id по имени бизнеса
+        # Phase 6A/6B: резолвим biz_id по имени бизнеса
         biz_id_resolved = ""
         if biz_name:
             try:
                 resolved = _get_biz_id_by_name(biz_name)
-                # _get_biz_id_by_name возвращает имя, если ID не найден
                 if resolved and resolved != biz_name:
                     biz_id_resolved = resolved
             except Exception:
                 pass
 
-        # ── Проверяем дубль ──────────────────────────────────────
-        existing = find_existing_client(full_name, biz_name)
-        is_new   = existing is None
+        # ── Phase 6B: расширенная дедупликация ───────────────────
+        existing = find_existing_person(
+            name=full_name,
+            phone=phone,
+            biz_id=biz_id_resolved or None,
+        )
 
-        if is_new:
-            # Создаём новую запись
+        STATUS_NEW           = "new"
+        STATUS_SAME_BIZ      = "same_biz"
+        STATUS_OTHER_BIZ     = "other_biz"
+
+        if existing is None:
+            client_status = STATUS_NEW
+            prs_id = None
+        elif existing.get("same_biz", True):
+            client_status = STATUS_SAME_BIZ
+            prs_id = existing["prs_id"]
+        else:
+            client_status = STATUS_OTHER_BIZ
+            prs_id = existing["prs_id"]
+
+        # ── Создание новой записи ─────────────────────────────────
+        if client_status == STATUS_NEW:
             prs_id     = generate_next_id("people_registry", "PRS")
             parts      = full_name.split()
             short_name = parts[0] if parts else full_name
             now        = datetime.now().strftime("%Y-%m-%d")
 
-            # Phase 6A: Biz IDs как "<BIZ-001>" или "" если не нашли
-            biz_ids_val      = biz_id_resolved if biz_id_resolved else ""
-            primary_biz_val  = biz_id_resolved if biz_id_resolved else ""
+            biz_ids_val     = biz_id_resolved if biz_id_resolved else ""
+            primary_biz_val = biz_id_resolved if biz_id_resolved else ""
 
             row_values = [
                 prs_id, full_name, short_name,
-                nc.get("phone", ""), "", "", "", "",
+                phone, "", "", "", "",
                 "", "", "",
                 nc.get("person_type", "клиент"), "",
-                biz_name,       # старое поле "Бизнесы" — для совместимости
+                biz_name,           # "Бизнесы" — для совместимости
                 "средний", "",
                 "", "", "", "", "",
                 "", "", now, now, "", "",
                 "", "", "", "", "active", "тёплый", "",
-                # Google Drive, Drive Folder ID (добавлены в Phase 5 — пустые сейчас)
-                "", "",
-                # Phase 6A новые поля
-                biz_ids_val,    # Biz IDs
-                "",             # Company ID
-                "",             # Citizenship
-                "",             # Passport / ID
-                primary_biz_val,  # Primary Biz ID
+                "", "",             # Google Drive, Drive Folder ID (Phase 5)
+                biz_ids_val,        # Biz IDs
+                "",                 # Company ID
+                "",                 # Citizenship
+                "",                 # Passport / ID
+                primary_biz_val,    # Primary Biz ID
             ]
             append_business_row("people_registry", row_values)
 
-            # Обновляем кеш inbox_bridge
             try:
                 from business_core.inbox_bridge import invalidate_cache
                 invalidate_cache()
             except Exception:
                 pass
-        else:
-            prs_id = existing["prs_id"]
 
-        # ── Drive ────────────────────────────────────────────────
+        # ── Добавление biz_id к существующему контакту ───────────
+        elif client_status == STATUS_OTHER_BIZ and biz_id_resolved:
+            try:
+                add_biz_id_to_person(prs_id, biz_id_resolved)
+            except Exception as exc:
+                log.warning(f"newclient add_biz_id error: {exc}")
+
+        # ── Drive ─────────────────────────────────────────────────
         drive_msg = ""
         if biz_name:
-            # Если уже есть ссылка — показываем её без повторного запроса к Drive
-            if not is_new and existing.get("drive_url"):
+            # Уже есть Drive-ссылка — показываем её
+            if existing and existing.get("drive_url"):
                 drive_msg = f"\n📁 Drive: {existing['drive_url']}"
             else:
+                # Создаём/получаем Drive-папку
                 try:
                     drive_result = provision_client_drive(
                         prs_id=prs_id,
@@ -836,9 +857,15 @@ async def newclient_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                         biz_name=biz_name,
                     )
                     if drive_result["ok"]:
-                        save_client_drive_to_sheets(
-                            prs_id, drive_result["folder_id"], drive_result["folder_url"]
-                        )
+                        # Сохраняем в таблицу (идемпотентно — только если пусто)
+                        if client_status == STATUS_NEW:
+                            save_client_drive_to_sheets(
+                                prs_id, drive_result["folder_id"], drive_result["folder_url"]
+                            )
+                        else:
+                            update_person_drive_info(
+                                prs_id, drive_result["folder_id"], drive_result["folder_url"]
+                            )
                         drive_msg = f"\n📁 Drive: {drive_result['folder_url']}"
                     else:
                         err = drive_result.get("error", "")
@@ -848,7 +875,12 @@ async def newclient_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                     log.warning(f"newclient Drive error: {drive_exc}")
 
         # ── Ответ ─────────────────────────────────────────────────
-        header = "✅ *Клиент добавлен!*" if is_new else "ℹ️ *Клиент уже существует, использую существующую запись*"
+        if client_status == STATUS_NEW:
+            header = "✅ *Клиент добавлен!*"
+        elif client_status == STATUS_SAME_BIZ:
+            header = "ℹ️ *Клиент уже существует, использую существующую запись*"
+        else:
+            header = "ℹ️ *Контакт уже был в другом бизнесе, добавил связь с текущим бизнесом*"
 
         await update.message.reply_text(
             f"{header}\n\n"
