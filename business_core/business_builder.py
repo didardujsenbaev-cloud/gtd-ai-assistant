@@ -396,6 +396,150 @@ def save_drive_info_to_sheets(
         return False
 
 
+# ─────────────────────────────────────────────────────────────
+# Google Drive интеграция для клиентов
+# ─────────────────────────────────────────────────────────────
+
+def _get_biz_id_by_name(biz_name: str) -> str:
+    """
+    Найти BIZ-ID по названию бизнеса из BIZ_REGISTRY.
+    Если не найдено — вернуть biz_name как fallback.
+    """
+    try:
+        from business_core.sheets import read_business_sheet
+        rows = read_business_sheet("biz_registry")
+        for row in rows:
+            if row.get("Название", "").strip() == biz_name.strip():
+                return row.get("ID", biz_name)
+    except Exception as exc:
+        log.debug(f"_get_biz_id_by_name: не удалось прочитать BIZ_REGISTRY: {exc}")
+    return biz_name
+
+
+def provision_client_drive(
+    prs_id: str,
+    full_name: str,
+    biz_name: str,
+    roadmap_id: Optional[str] = None,
+) -> dict:
+    """
+    Создать папку клиента в Google Drive внутри папки бизнеса.
+
+    Требует GDRIVE_BIZ_ROOT_FOLDER_ID и GOOGLE_CREDENTIALS_FILE.
+    Если не заданы — возвращает {ok: False} без ошибки.
+    Если Drive API упал — возвращает {ok: False, error: str}.
+
+    Идемпотентно: повторный вызов вернёт существующую папку.
+
+    Args:
+        prs_id:     ID клиента в PEOPLE_REGISTRY (например "PRS-001")
+        full_name:  ФИО клиента
+        biz_name:   Название бизнеса (для поиска biz_id и пути к папке)
+        roadmap_id: ID дорожной карты (опционально — добавляется к имени папки)
+
+    Returns:
+        {
+            "ok":         bool,
+            "folder_id":  str | None,
+            "folder_url": str | None,
+            "biz_id":     str | None,
+            "error":      str | None,
+        }
+    """
+    gdrive_root = os.getenv("GDRIVE_BIZ_ROOT_FOLDER_ID", "").strip()
+    creds_file  = os.getenv("GOOGLE_CREDENTIALS_FILE", "").strip()
+
+    if not gdrive_root or not creds_file:
+        log.debug("provision_client_drive: GDRIVE_BIZ_ROOT_FOLDER_ID или credentials не заданы — пропуск")
+        return {
+            "ok": False, "folder_id": None, "folder_url": None,
+            "biz_id": None, "error": "GDRIVE_BIZ_ROOT_FOLDER_ID не задан в .env",
+        }
+
+    if not biz_name:
+        return {
+            "ok": False, "folder_id": None, "folder_url": None,
+            "biz_id": None, "error": "biz_name не задан",
+        }
+
+    try:
+        biz_id = _get_biz_id_by_name(biz_name)
+
+        from integrations.google_drive_adapter import setup_biz_client_folder
+        result = setup_biz_client_folder(
+            biz_id=biz_id,
+            biz_name=biz_name,
+            client_name=full_name,
+            roadmap_id=roadmap_id,
+            dry_run=False,
+        )
+        log.info(f"provision_client_drive: {prs_id} / {full_name} → {result['client_folder_url']}")
+        return {
+            "ok":         True,
+            "folder_id":  result["client_folder_id"],
+            "folder_url": result["client_folder_url"],
+            "biz_id":     biz_id,
+            "error":      None,
+        }
+    except Exception as exc:
+        log.warning(f"provision_client_drive error (prs_id={prs_id}): {exc}")
+        return {
+            "ok":         False,
+            "folder_id":  None,
+            "folder_url": None,
+            "biz_id":     None,
+            "error":      str(exc),
+        }
+
+
+def save_client_drive_to_sheets(
+    prs_id:     str,
+    folder_id:  str,
+    folder_url: str,
+) -> bool:
+    """
+    Сохранить Drive-ссылку и ID папки клиента в PEOPLE_REGISTRY.
+
+    Ищет строку по prs_id, определяет позицию колонок
+    "Google Drive" и "Drive Folder ID" по реальным заголовкам.
+
+    Args:
+        prs_id:     ID клиента (первая колонка PEOPLE_REGISTRY)
+        folder_id:  Google Drive folder ID
+        folder_url: ссылка на папку клиента
+
+    Returns:
+        True если успешно, False если ошибка или строка не найдена
+    """
+    try:
+        from business_core.sheets import (
+            find_row_by_id, update_business_cell, get_business_sheet,
+        )
+
+        row_result = find_row_by_id("people_registry", prs_id)
+        if not row_result:
+            log.warning(f"save_client_drive_to_sheets: prs_id '{prs_id}' не найден")
+            return False
+
+        row_num, _ = row_result
+        actual_headers = get_business_sheet("people_registry").row_values(1)
+
+        if "Google Drive" in actual_headers:
+            col = actual_headers.index("Google Drive") + 1
+            update_business_cell("people_registry", row_num, col, folder_url)
+            log.debug(f"save_client_drive_to_sheets: 'Google Drive' col={col} ← {folder_url}")
+
+        if "Drive Folder ID" in actual_headers:
+            col = actual_headers.index("Drive Folder ID") + 1
+            update_business_cell("people_registry", row_num, col, folder_id)
+            log.debug(f"save_client_drive_to_sheets: 'Drive Folder ID' col={col} ← {folder_id}")
+
+        return True
+    except Exception as exc:
+        log.warning(f"save_client_drive_to_sheets error: {exc}")
+        return False
+
+
 def get_business_creation_status(result: dict) -> str:
     """Возвращает краткий статус создания бизнеса."""
     biz = result.get("business")

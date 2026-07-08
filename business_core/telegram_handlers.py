@@ -782,10 +782,36 @@ async def newclient_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         except Exception:
             pass
 
+        # Drive — создаём папку клиента (безопасно: не ломает GTD при ошибке)
+        drive_msg = ""
+        biz_name = nc.get("businesses", "")
+        if biz_name and not biz_name.startswith("/skip"):
+            try:
+                from business_core.business_builder import (
+                    provision_client_drive, save_client_drive_to_sheets,
+                )
+                drive_result = provision_client_drive(
+                    prs_id=prs_id,
+                    full_name=full_name,
+                    biz_name=biz_name,
+                )
+                if drive_result["ok"]:
+                    save_client_drive_to_sheets(
+                        prs_id, drive_result["folder_id"], drive_result["folder_url"]
+                    )
+                    drive_msg = f"\n📁 Drive: {drive_result['folder_url']}"
+                else:
+                    err = drive_result.get("error", "")
+                    if err and "не задан" not in err:
+                        drive_msg = f"\n⚠️ Клиент создан, но папка Drive не создана: {err}"
+            except Exception as drive_exc:
+                log.warning(f"newclient Drive error: {drive_exc}")
+
         await update.message.reply_text(
             f"✅ *Клиент добавлен!*\n\n"
             f"🆔 ID: `{prs_id}`\n"
-            f"👤 {full_name}\n\n"
+            f"👤 {full_name}"
+            f"{drive_msg}\n\n"
             f"/clients — посмотреть всех клиентов",
             parse_mode="Markdown",
             reply_markup=ReplyKeyboardRemove(),
