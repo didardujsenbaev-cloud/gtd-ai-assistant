@@ -1233,3 +1233,406 @@ def get_business_creation_status(result: dict) -> str:
         f"✅ [{biz.id}] {biz.name}\n"
         f"   📁 {folders_count} папок · 📋 {projects_count} проектов"
     )
+
+
+# ═══════════════════════════════════════════════════════════════
+# Phase 7A: OBJECT_REGISTRY helpers
+# ═══════════════════════════════════════════════════════════════
+
+def generate_object_id() -> str:
+    """
+    Сгенерировать следующий OBJ ID из OBJECT_REGISTRY.
+
+    Формат: OBJ-001, OBJ-002, ...
+    Безопасно работает на пустом листе.
+
+    Returns:
+        str — следующий OBJ ID
+    """
+    try:
+        from business_core.sheets import generate_next_id
+        return generate_next_id("object_registry")
+    except Exception as exc:
+        log.warning(f"generate_object_id error: {exc}")
+        return "OBJ-001"
+
+
+def create_object_record(
+    client_id:          str,
+    biz_id:             str,
+    city:               str,
+    address:            str,
+    cadastral_number:   str = "",
+    area_m2:            str = "",
+    object_type:        str = "",
+    object_status:      str = "new",
+    current_service_id: str = "",
+    notes:              str = "",
+    drive_folder_id:    str = "",
+    google_drive_url:   str = "",
+) -> dict:
+    """
+    Создать запись объекта недвижимости в OBJECT_REGISTRY.
+
+    Args:
+        client_id:          PRS-ID клиента (обязательный)
+        biz_id:             BIZ-ID бизнеса (обязательный)
+        city:               Город (обязательный)
+        address:            Адрес (обязательный)
+        cadastral_number:   Кадастровый номер
+        area_m2:            Площадь в м²
+        object_type:        Тип объекта (квартира / дом / участок / коммерческая)
+        object_status:      Статус — по умолчанию "new"
+        current_service_id: SVC-ID текущей услуги
+        notes:              Примечания
+        drive_folder_id:    Google Drive Folder ID (если уже известен)
+        google_drive_url:   Google Drive ссылка (если уже известна)
+
+    Returns:
+        {
+            "ok":     bool,
+            "obj_id": str,
+            "error":  str | None,
+        }
+    """
+    if not client_id or not biz_id or not city or not address:
+        return {
+            "ok": False, "obj_id": "",
+            "error": "Обязательные поля: client_id, biz_id, city, address",
+        }
+
+    try:
+        from business_core.sheets import append_business_row
+        now    = datetime.now().strftime("%Y-%m-%d")
+        obj_id = generate_object_id()
+
+        row = [
+            obj_id,           # OBJ ID
+            client_id,        # Client ID
+            biz_id,           # Biz ID
+            city,             # City
+            address,          # Address
+            cadastral_number, # Cadastral Number
+            area_m2,          # Area m2
+            object_type,      # Object Type
+            object_status,    # Object Status
+            current_service_id, # Current Service ID
+            "",               # Roadmap ID (пока пустой)
+            drive_folder_id,  # Drive Folder ID
+            google_drive_url, # Google Drive
+            notes,            # Notes
+            now,              # Created At
+            now,              # Last Updated
+        ]
+        append_business_row("object_registry", row)
+        log.info(f"create_object_record: {obj_id} / {client_id} / {address}")
+        return {"ok": True, "obj_id": obj_id, "error": None}
+
+    except Exception as exc:
+        log.error(f"create_object_record error: {exc}")
+        return {"ok": False, "obj_id": "", "error": str(exc)}
+
+
+def find_objects_by_client(client_id: str, biz_id: Optional[str] = None) -> list[dict]:
+    """
+    Найти объекты клиента в OBJECT_REGISTRY.
+
+    Args:
+        client_id: PRS-ID клиента
+        biz_id:    BIZ-ID для фильтрации (опционально)
+
+    Returns:
+        list[dict] — список объектов (пустой если не найдено)
+    """
+    if not client_id:
+        return []
+
+    try:
+        from business_core.sheets import get_business_sheet
+        sheet = get_business_sheet("object_registry")
+        all_values = sheet.get_all_values()
+        if len(all_values) < 2:
+            return []
+
+        headers = all_values[0]
+
+        def _col(h):
+            return headers.index(h) if h in headers else None
+
+        def _get(row, h):
+            c = _col(h)
+            return (row[c].strip() if c is not None and c < len(row) else "")
+
+        results = []
+        for row in all_values[1:]:
+            if not row or not row[0]:
+                continue
+            if _get(row, "Client ID") != client_id:
+                continue
+            if biz_id and _get(row, "Biz ID") != biz_id:
+                continue
+            results.append({
+                "obj_id":             _get(row, "OBJ ID"),
+                "client_id":          _get(row, "Client ID"),
+                "biz_id":             _get(row, "Biz ID"),
+                "city":               _get(row, "City"),
+                "address":            _get(row, "Address"),
+                "cadastral_number":   _get(row, "Cadastral Number"),
+                "area_m2":            _get(row, "Area m2"),
+                "object_type":        _get(row, "Object Type"),
+                "object_status":      _get(row, "Object Status"),
+                "current_service_id": _get(row, "Current Service ID"),
+                "roadmap_id":         _get(row, "Roadmap ID"),
+                "drive_folder_id":    _get(row, "Drive Folder ID"),
+                "google_drive":       _get(row, "Google Drive"),
+                "notes":              _get(row, "Notes"),
+                "created_at":         _get(row, "Created At"),
+            })
+        return results
+
+    except Exception as exc:
+        log.warning(f"find_objects_by_client({client_id}) error: {exc}")
+        return []
+
+
+def find_object_by_id(obj_id: str) -> Optional[dict]:
+    """
+    Найти объект по OBJ ID.
+
+    Returns:
+        dict или None
+    """
+    if not obj_id:
+        return None
+
+    try:
+        from business_core.sheets import get_business_sheet
+        sheet = get_business_sheet("object_registry")
+        all_values = sheet.get_all_values()
+        if len(all_values) < 2:
+            return None
+
+        headers = all_values[0]
+
+        def _col(h):
+            return headers.index(h) if h in headers else None
+
+        def _get(row, h):
+            c = _col(h)
+            return row[c].strip() if c is not None and c < len(row) else ""
+
+        for i, row in enumerate(all_values[1:], start=2):
+            if not row or not row[0]:
+                continue
+            if _get(row, "OBJ ID") == obj_id:
+                return {
+                    "row_num":            i,
+                    "obj_id":             _get(row, "OBJ ID"),
+                    "client_id":          _get(row, "Client ID"),
+                    "biz_id":             _get(row, "Biz ID"),
+                    "city":               _get(row, "City"),
+                    "address":            _get(row, "Address"),
+                    "cadastral_number":   _get(row, "Cadastral Number"),
+                    "area_m2":            _get(row, "Area m2"),
+                    "object_type":        _get(row, "Object Type"),
+                    "object_status":      _get(row, "Object Status"),
+                    "current_service_id": _get(row, "Current Service ID"),
+                    "roadmap_id":         _get(row, "Roadmap ID"),
+                    "drive_folder_id":    _get(row, "Drive Folder ID"),
+                    "google_drive":       _get(row, "Google Drive"),
+                    "notes":              _get(row, "Notes"),
+                    "created_at":         _get(row, "Created At"),
+                    "last_updated":       _get(row, "Last Updated"),
+                }
+
+    except Exception as exc:
+        log.warning(f"find_object_by_id({obj_id}) error: {exc}")
+
+    return None
+
+
+def update_object_drive_info(
+    obj_id:          str,
+    drive_folder_id: str = "",
+    google_drive_url: str = "",
+) -> bool:
+    """
+    Дозаполнить Drive Folder ID и Google Drive в OBJECT_REGISTRY.
+
+    Обновляет только если текущее значение пустое.
+
+    Args:
+        obj_id:           OBJ ID
+        drive_folder_id:  Google Drive folder ID
+        google_drive_url: Google Drive URL
+
+    Returns:
+        True если обновлено, False если не нашли или уже заполнено
+    """
+    if not obj_id:
+        return False
+
+    try:
+        from business_core.sheets import get_business_sheet
+        sheet = get_business_sheet("object_registry")
+        all_values = sheet.get_all_values()
+        if len(all_values) < 2:
+            return False
+
+        headers = all_values[0]
+
+        def _col(h):
+            return headers.index(h) if h in headers else None
+
+        drive_id_col = _col("Drive Folder ID")
+        drive_url_col = _col("Google Drive")
+        updated = False
+
+        for i, row in enumerate(all_values[1:], start=2):
+            if not row or not row[0]:
+                continue
+            if row[0].strip() != obj_id:
+                continue
+
+            if drive_id_col is not None and drive_folder_id:
+                cur = row[drive_id_col].strip() if drive_id_col < len(row) else ""
+                if not cur:
+                    sheet.update_cell(i, drive_id_col + 1, drive_folder_id)
+                    updated = True
+
+            if drive_url_col is not None and google_drive_url:
+                cur = row[drive_url_col].strip() if drive_url_col < len(row) else ""
+                if not cur:
+                    sheet.update_cell(i, drive_url_col + 1, google_drive_url)
+                    updated = True
+
+            if updated:
+                log.info(f"update_object_drive_info: {obj_id} → Drive дозаполнен")
+            return updated
+
+    except Exception as exc:
+        log.warning(f"update_object_drive_info({obj_id}) error: {exc}")
+
+    return False
+
+
+def provision_object_drive(
+    biz_id:      str,
+    client_id:   str,
+    obj_id:      str,
+    city:        str,
+    address:     str,
+    object_type: str = "",
+) -> dict:
+    """
+    Создать Drive-папку объекта недвижимости.
+
+    Логика:
+    1. Получить Drive root через resolve_drive_root_for_business(biz_id).
+    2. Если root не настроен → ok=False, нет исключения.
+    3. Если у клиента уже есть Drive Folder ID → использовать его.
+    4. Иначе — создать/получить папку клиента через provision_client_drive.
+    5. Создать папку объекта внутри папки клиента.
+    6. Сохранить Drive Folder ID в OBJECT_REGISTRY.
+
+    Returns:
+        {
+            "ok":         bool,
+            "folder_id":  str | None,
+            "folder_url": str | None,
+            "error":      str | None,
+        }
+    """
+    # 1. Drive root
+    root_info = resolve_drive_root_for_business(biz_id)
+    if not root_info["ok"]:
+        return {
+            "ok": False, "folder_id": None, "folder_url": None,
+            "error": root_info.get("error", "Drive root not configured"),
+        }
+
+    creds_file = os.getenv("GOOGLE_CREDENTIALS_FILE", "").strip()
+    if not creds_file:
+        return {
+            "ok": False, "folder_id": None, "folder_url": None,
+            "error": "GOOGLE_CREDENTIALS_FILE не задан",
+        }
+
+    try:
+        # 2. Данные клиента (для имени папки и существующего Drive ID)
+        client_data = find_existing_person(name=None, phone=None, biz_id=biz_id)
+
+        # Ищем клиента по client_id напрямую
+        client_folder_id  = ""
+        client_name       = client_id  # fallback
+        client_drive_url  = ""
+
+        try:
+            from business_core.sheets import get_business_sheet
+            sheet = get_business_sheet("people_registry")
+            all_vals = sheet.get_all_values()
+            if all_vals and len(all_vals) > 1:
+                headers = all_vals[0]
+
+                def _col(h):
+                    return headers.index(h) if h in headers else None
+
+                name_col     = _col("ФИО") or 1
+                drive_col    = _col("Drive Folder ID")
+                drive_url_col = _col("Google Drive")
+
+                for row in all_vals[1:]:
+                    if not row or row[0] != client_id:
+                        continue
+                    client_name      = row[name_col].strip() if name_col < len(row) else client_id
+                    client_folder_id = (row[drive_col].strip()     if drive_col    is not None and drive_col    < len(row) else "")
+                    client_drive_url = (row[drive_url_col].strip() if drive_url_col is not None and drive_url_col < len(row) else "")
+                    break
+        except Exception:
+            pass
+
+        # 3. Папку клиента нужно получить/создать если нет
+        if not client_folder_id:
+            # Получаем имя бизнеса для provision_client_drive
+            biz_cfg  = get_business_config(biz_id)
+            biz_name = biz_cfg.get("name", biz_id)
+            cl_res   = provision_client_drive(
+                prs_id=client_id, full_name=client_name, biz_name=biz_name
+            )
+            if cl_res["ok"]:
+                client_folder_id = cl_res["folder_id"]
+                # Дозаполнить в PEOPLE_REGISTRY
+                update_person_drive_info(client_id, cl_res["folder_id"], cl_res["folder_url"])
+
+        # 4. Создаём папку объекта
+        from integrations.google_drive_adapter import create_object_folder
+        biz_cfg  = get_business_config(biz_id)
+        biz_name = biz_cfg.get("name", biz_id)
+
+        result = create_object_folder(
+            biz_id=biz_id,
+            biz_name=biz_name,
+            client_id=client_id,
+            client_name=client_name,
+            obj_id=obj_id,
+            city=city,
+            address=address,
+            object_type=object_type,
+            client_folder_id=client_folder_id or None,
+            root_folder_id=root_info["root_id"],
+        )
+
+        if result["ok"]:
+            # 5. Сохранить в OBJECT_REGISTRY
+            update_object_drive_info(
+                obj_id,
+                drive_folder_id=result["folder_id"],
+                google_drive_url=result["folder_url"],
+            )
+            log.info(f"provision_object_drive: {obj_id} → {result['folder_url']}")
+
+        return result
+
+    except Exception as exc:
+        log.warning(f"provision_object_drive({obj_id}) error: {exc}")
+        return {"ok": False, "folder_id": None, "folder_url": None, "error": str(exc)}

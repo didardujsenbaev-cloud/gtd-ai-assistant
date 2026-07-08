@@ -1308,6 +1308,302 @@ async def bc_ctx_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 # Регистрация всех handlers
 # ─────────────────────────────────────────────────────────────
 
+# ─────────────────────────────────────────────────────────────
+# Phase 7A: /newobject и /objects
+# ─────────────────────────────────────────────────────────────
+
+def _parse_kv_args(text: str) -> dict:
+    """
+    Разобрать строку аргументов вида:
+      biz_id=BIZ-001 client_id=PRS-001 city=Алматы address="ул. Абая 10"
+
+    Поддерживает значения в кавычках (одинарных или двойных).
+    Ключи — до '=', значения — всё после '=' до следующего ключа.
+    """
+    import re
+    result: dict[str, str] = {}
+    # Паттерн: ключ=значение (значение может быть в "..." или '...' или без)
+    pattern = r'(\w+)=(?:"([^"]*?)"|\'([^\']*?)\'|(\S+))'
+    for m in re.finditer(pattern, text):
+        key = m.group(1)
+        val = m.group(2) or m.group(3) or m.group(4) or ""
+        result[key] = val.strip()
+    return result
+
+
+async def newobject_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /newobject biz_id=BIZ-001 client_id=PRS-001 city=Алматы address="ул. Абая 10"
+               type="частный дом" cadastral="12:34:56" area=120 notes="..."
+
+    Минимальный формат:
+    /newobject BIZ-001 PRS-001 Алматы ул. Абая 10
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg())
+        return
+
+    raw = " ".join(context.args or [])
+    if not raw.strip():
+        await _reply(update, (
+            "❌ Использование:\n"
+            "`/newobject biz_id=BIZ-001 client_id=PRS-001 city=Алматы address=\"ул. Абая 10\"`\n\n"
+            "Необязательные: `type`, `cadastral`, `area`, `notes`"
+        ))
+        return
+
+    # Парсинг аргументов
+    kv = _parse_kv_args(raw)
+
+    biz_id    = kv.get("biz_id", "")
+    client_id = kv.get("client_id", "")
+    city      = kv.get("city", "")
+    address   = kv.get("address", "")
+
+    # Минимальный формат: позиционные аргументы (biz city addr без ключей)
+    if not biz_id or not client_id:
+        parts = raw.split()
+        if len(parts) >= 4:
+            biz_id    = biz_id    or parts[0]
+            client_id = client_id or parts[1]
+            city      = city      or parts[2]
+            address   = address   or " ".join(parts[3:])
+
+    if not biz_id or not client_id or not city or not address:
+        await _reply(update, (
+            "❌ Необходимы: `biz_id`, `client_id`, `city`, `address`\n\n"
+            "Пример:\n"
+            "`/newobject biz_id=BIZ-001 client_id=PRS-001 city=Алматы address=\"ул. Абая 10\"`"
+        ))
+        return
+
+    object_type  = kv.get("type", "")
+    cadastral    = kv.get("cadastral", "")
+    area         = kv.get("area", "")
+    notes        = kv.get("notes", "")
+
+    await update.message.reply_text("⏳ Создаю объект...", parse_mode="Markdown")
+
+    try:
+        from business_core.business_builder import (
+            create_object_record,
+            provision_object_drive,
+            add_biz_id_to_person,
+            find_existing_person,
+        )
+
+        # Проверяем что клиент существует и связан с бизнесом
+        try:
+            from business_core.sheets import get_business_sheet
+            prs_sheet  = get_business_sheet("people_registry")
+            all_vals   = prs_sheet.get_all_values()
+            client_row = None
+            if len(all_vals) > 1:
+                headers = all_vals[0]
+                biz_ids_col = headers.index("Biz IDs") if "Biz IDs" in headers else None
+                prim_col    = headers.index("Primary Biz ID") if "Primary Biz ID" in headers else None
+                for row in all_vals[1:]:
+                    if row and row[0] == client_id:
+                        client_row = row
+                        break
+        except Exception:
+            client_row = None
+
+        if client_row is None:
+            await _reply(update, f"❌ Клиент `{client_id}` не найден в PEOPLE_REGISTRY")
+            return
+
+        # Добавляем biz_id к клиенту если нужно
+        try:
+            biz_ids_in_row = []
+            if biz_ids_col is not None and biz_ids_col < len(client_row):
+                from business_core.business_builder import normalize_biz_ids
+                biz_ids_in_row = normalize_biz_ids(client_row[biz_ids_col])
+            if biz_id not in biz_ids_in_row:
+                add_biz_id_to_person(client_id, biz_id)
+        except Exception:
+            pass
+
+        # Создаём объект в OBJECT_REGISTRY
+        res = create_object_record(
+            client_id=client_id,
+            biz_id=biz_id,
+            city=city,
+            address=address,
+            cadastral_number=cadastral,
+            area_m2=area,
+            object_type=object_type,
+            object_status="new",
+            notes=notes,
+        )
+
+        if not res["ok"]:
+            await _reply(update, f"❌ Ошибка создания объекта: {res['error']}")
+            return
+
+        obj_id = res["obj_id"]
+
+        # Drive (безопасно, не ломает создание объекта)
+        drive_msg = ""
+        try:
+            drive_res = provision_object_drive(
+                biz_id=biz_id,
+                client_id=client_id,
+                obj_id=obj_id,
+                city=city,
+                address=address,
+                object_type=object_type,
+            )
+            if drive_res["ok"]:
+                drive_msg = f"\n📁 [Drive папка]({drive_res['folder_url']})"
+            elif drive_res.get("error") and "не задан" not in drive_res["error"] and "not configured" not in drive_res["error"]:
+                drive_msg = f"\n⚠️ Drive папка не создана: {drive_res['error'][:60]}"
+        except Exception as e:
+            log.warning(f"newobject Drive error: {e}")
+
+        # Ответ
+        type_line = f"\nТип: {object_type}" if object_type else ""
+        cadr_line = f"\nКадастр: {cadastral}" if cadastral else ""
+        area_line = f"\nПлощадь: {area} м²" if area else ""
+
+        await update.message.reply_text(
+            f"✅ *Объект создан*\n\n"
+            f"🆔 OBJ ID: `{obj_id}`\n"
+            f"👤 Клиент: `{client_id}`\n"
+            f"🏢 Бизнес: `{biz_id}`\n"
+            f"📍 Город: {city}\n"
+            f"🏠 Адрес: {address}"
+            f"{type_line}{cadr_line}{area_line}\n"
+            f"📊 Статус: new"
+            f"{drive_msg}\n\n"
+            f"/objects client\\_id={client_id} — объекты клиента",
+            parse_mode="Markdown",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+
+    except Exception as e:
+        log.error(f"newobject_cmd error: {e}")
+        await _reply(update, f"❌ Ошибка: {e}")
+
+
+async def objects_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /objects
+    /objects BIZ-001
+    /objects client_id=PRS-001
+    /objects biz_id=BIZ-001 client_id=PRS-001
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg())
+        return
+
+    raw = " ".join(context.args or [])
+    kv  = _parse_kv_args(raw)
+
+    biz_id    = kv.get("biz_id", "")
+    client_id = kv.get("client_id", "")
+
+    # Позиционный: /objects BIZ-001
+    if not biz_id and raw.strip():
+        first = raw.strip().split()[0]
+        if first.startswith("BIZ-"):
+            biz_id = first
+        elif first.startswith("PRS-"):
+            client_id = first
+
+    try:
+        from business_core.business_builder import find_objects_by_client
+        from business_core.sheets import get_business_sheet
+
+        # Получаем объекты
+        if client_id:
+            objects = find_objects_by_client(client_id, biz_id=biz_id or None)
+        elif biz_id:
+            # Все объекты по бизнесу — читаем лист напрямую
+            sheet     = get_business_sheet("object_registry")
+            all_vals  = sheet.get_all_values()
+            objects   = []
+            if len(all_vals) > 1:
+                headers = all_vals[0]
+                def _col(h):
+                    return headers.index(h) if h in headers else None
+                def _get(row, h):
+                    c = _col(h)
+                    return row[c].strip() if c is not None and c < len(row) else ""
+                for row in all_vals[1:]:
+                    if not row or not row[0]:
+                        continue
+                    if _get(row, "Biz ID") != biz_id:
+                        continue
+                    objects.append({
+                        "obj_id":        _get(row, "OBJ ID"),
+                        "client_id":     _get(row, "Client ID"),
+                        "biz_id":        _get(row, "Biz ID"),
+                        "city":          _get(row, "City"),
+                        "address":       _get(row, "Address"),
+                        "object_type":   _get(row, "Object Type"),
+                        "object_status": _get(row, "Object Status"),
+                        "roadmap_id":    _get(row, "Roadmap ID"),
+                        "google_drive":  _get(row, "Google Drive"),
+                    })
+        else:
+            # Все объекты
+            sheet    = get_business_sheet("object_registry")
+            all_vals = sheet.get_all_values()
+            objects  = []
+            if len(all_vals) > 1:
+                headers = all_vals[0]
+                def _col(h):
+                    return headers.index(h) if h in headers else None
+                def _get(row, h):
+                    c = _col(h)
+                    return row[c].strip() if c is not None and c < len(row) else ""
+                for row in all_vals[1:]:
+                    if not row or not row[0]:
+                        continue
+                    objects.append({
+                        "obj_id":        _get(row, "OBJ ID"),
+                        "client_id":     _get(row, "Client ID"),
+                        "biz_id":        _get(row, "Biz ID"),
+                        "city":          _get(row, "City"),
+                        "address":       _get(row, "Address"),
+                        "object_type":   _get(row, "Object Type"),
+                        "object_status": _get(row, "Object Status"),
+                        "roadmap_id":    _get(row, "Roadmap ID"),
+                        "google_drive":  _get(row, "Google Drive"),
+                    })
+
+        if not objects:
+            filter_desc = ""
+            if biz_id:    filter_desc += f" по бизнесу `{biz_id}`"
+            if client_id: filter_desc += f" по клиенту `{client_id}`"
+            await _reply(update, f"📭 Объекты не найдены{filter_desc}.\n\n`/newobject biz_id=... client_id=... city=... address=...`")
+            return
+
+        MAX_SHOW = 20
+        lines = [f"🏠 *Объекты* ({len(objects)} шт.):\n"]
+        for obj in objects[:MAX_SHOW]:
+            rm    = f" · 🗺 `{obj['roadmap_id']}`" if obj.get("roadmap_id") else ""
+            drive = f" · [📁]({obj['google_drive']})" if obj.get("google_drive") else ""
+            lines.append(
+                f"• `{obj['obj_id']}` | {obj.get('city','')} | {obj.get('address','')[:30]}"
+                f"\n  [{obj.get('object_type','—')}] {obj.get('object_status','—')}"
+                f" · 👤`{obj.get('client_id','')}`{rm}{drive}"
+            )
+        if len(objects) > MAX_SHOW:
+            lines.append(f"\n_...показано {MAX_SHOW} из {len(objects)}_")
+
+        await update.message.reply_text(
+            "\n".join(lines),
+            parse_mode="Markdown",
+            disable_web_page_preview=True,
+        )
+
+    except Exception as e:
+        log.error(f"objects_cmd error: {e}")
+        await _reply(update, f"❌ Ошибка: {e}")
+
+
 def register_business_handlers(app: Application) -> None:
     """
     Зарегистрировать все Business Core handlers в приложении.
@@ -1364,12 +1660,15 @@ def register_business_handlers(app: Application) -> None:
     app.add_handler(newbiz_handler)
 
     # Простые команды
-    app.add_handler(CommandHandler("bc",       bc_dashboard))
-    app.add_handler(CommandHandler("bcstatus", bc_status))
-    app.add_handler(CommandHandler("roadmaps", show_roadmaps))
-    app.add_handler(CommandHandler("clients",  show_clients))
-    app.add_handler(CommandHandler("bcdrive",  bc_drive))
-    app.add_handler(CommandHandler("initbc",   init_bc))
+    app.add_handler(CommandHandler("bc",        bc_dashboard))
+    app.add_handler(CommandHandler("bcstatus",  bc_status))
+    app.add_handler(CommandHandler("roadmaps",  show_roadmaps))
+    app.add_handler(CommandHandler("clients",   show_clients))
+    app.add_handler(CommandHandler("bcdrive",   bc_drive))
+    app.add_handler(CommandHandler("initbc",    init_bc))
+    # Phase 7A
+    app.add_handler(CommandHandler("newobject", newobject_cmd))
+    app.add_handler(CommandHandler("objects",   objects_cmd))
 
     # Callback handler для кнопок подтверждения бизнес-контекста (Фаза 5B)
     app.add_handler(CallbackQueryHandler(bc_ctx_callback, pattern=r"^bc_ctx:"))
@@ -1377,5 +1676,6 @@ def register_business_handlers(app: Application) -> None:
     log.info(
         "Business Core handlers зарегистрированы: "
         "/bc /bcstatus /roadmaps /clients /newroadmap /newclient /newbiz /initbc /bcdrive "
+        "/newobject /objects "
         "+ bc_ctx callback (Фаза 5B)"
     )

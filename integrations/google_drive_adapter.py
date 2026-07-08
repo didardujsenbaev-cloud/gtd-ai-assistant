@@ -996,3 +996,118 @@ def format_client_report(result: dict) -> str:
         lines.append(f"📋 Кейс: [открыть]({cf['case_root_url']})")
 
     return "\n".join(lines)
+
+
+# ─────────────────────────────────────────────────────────────
+# Phase 7A: Object folder (OBJECT_REGISTRY)
+# ─────────────────────────────────────────────────────────────
+
+def _safe_folder_name(s: str, max_len: int = 60) -> str:
+    """Безопасное имя папки: убрать / \\ : * ? \" < > |, обрезать."""
+    import re
+    safe = re.sub(r'[/\\:*?"<>|]', "_", s.strip())
+    safe = re.sub(r"\s+", " ", safe)
+    return safe[:max_len].strip()
+
+
+def create_object_folder(
+    biz_id:           str,
+    biz_name:         str,
+    client_id:        str,
+    client_name:      str,
+    obj_id:           str,
+    city:             str,
+    address:          str,
+    object_type:      str = "",
+    client_folder_id: Optional[str] = None,
+    root_folder_id:   Optional[str] = None,
+    dry_run:          bool = False,
+) -> dict:
+    """
+    Создать папку объекта недвижимости в Google Drive.
+
+    Структура:
+    <root>/
+    └── {biz_id}_{biz_name}/
+        └── 06 Клиенты/
+            └── {client_name}/
+                └── {obj_id}_{city}_{address_slug}/
+                    ├── 01 Документы от клиента
+                    ├── 02 Документы наши
+                    ├── 03 Переписка
+                    ├── 04 Фото и медиа
+                    └── 05 Архив
+
+    Если client_folder_id передан — создаёт папку объекта внутри него напрямую.
+    Если не передан — находит/создаёт бизнес-папку и папку клиента.
+
+    Args:
+        biz_id:           ID бизнеса
+        biz_name:         Название бизнеса
+        client_id:        PRS-ID клиента
+        client_name:      ФИО клиента
+        obj_id:           OBJ-ID объекта
+        city:             Город
+        address:          Адрес
+        object_type:      Тип объекта (опционально)
+        client_folder_id: Готовый ID папки клиента (опционально, ускоряет)
+        root_folder_id:   Drive root (Phase 6C per-biz root или глобальный)
+        dry_run:          True = только логировать
+
+    Returns:
+        {
+            "ok":         bool,
+            "folder_id":  str,
+            "folder_url": str,
+            "error":      str | None,
+        }
+    """
+    try:
+        service = get_drive_service()
+
+        # Имя папки объекта: "{obj_id}_{city}_{address_slug}"
+        addr_slug    = _safe_folder_name(f"{address[:40]}")
+        type_suffix  = f"_{_safe_folder_name(object_type)}" if object_type else ""
+        folder_name  = _safe_folder_name(f"{obj_id}_{city}_{addr_slug}{type_suffix}")
+
+        # Получить/создать папку клиента
+        if client_folder_id:
+            parent_for_obj = client_folder_id
+        else:
+            # Нужен root
+            if root_folder_id:
+                root_id = root_folder_id
+            else:
+                root_id = ensure_biz_root_folder_id(ask_confirmation=False)
+
+            biz_label = f"{biz_id}_{biz_name}"
+            biz_folder_id, _   = get_or_create_folder(service, biz_label,     root_id,       dry_run=dry_run)
+            clients_folder_id, _ = get_or_create_folder(service, "06 Клиенты", biz_folder_id, dry_run=dry_run)
+            parent_for_obj, _  = get_or_create_folder(service, client_name,   clients_folder_id, dry_run=dry_run)
+
+        # Создаём папку объекта (идемпотентно)
+        obj_folder_id, _ = get_or_create_folder(service, folder_name, parent_for_obj, dry_run=dry_run)
+
+        # Стандартные подпапки объекта
+        for sub in [
+            "01 Документы от клиента",
+            "02 Документы наши",
+            "03 Переписка",
+            "04 Фото и медиа",
+            "05 Архив",
+        ]:
+            get_or_create_folder(service, sub, obj_folder_id, dry_run=dry_run)
+
+        obj_url = get_folder_url(obj_folder_id)
+        log.info(f"create_object_folder: {obj_id} → {obj_url}")
+
+        return {
+            "ok":         True,
+            "folder_id":  obj_folder_id,
+            "folder_url": obj_url,
+            "error":      None,
+        }
+
+    except Exception as exc:
+        log.warning(f"create_object_folder({obj_id}) error: {exc}")
+        return {"ok": False, "folder_id": "", "folder_url": "", "error": str(exc)}
