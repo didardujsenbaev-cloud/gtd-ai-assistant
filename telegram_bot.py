@@ -16,10 +16,11 @@ os.environ["PATH"] = "/opt/homebrew/bin:" + os.environ.get("PATH", "")
 from datetime import date, time, datetime, timedelta
 from dotenv import load_dotenv
 import anthropic
+print("DEBUG: telegram_bot.py v2 — whisper import with try/except", flush=True)
 try:
     import whisper
     WHISPER_AVAILABLE = True
-except ImportError:
+except Exception:
     whisper = None
     WHISPER_AVAILABLE = False
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
