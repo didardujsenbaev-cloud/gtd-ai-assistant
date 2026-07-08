@@ -314,14 +314,19 @@ def provision_biz_drive(biz_id: str, biz_name: str) -> dict:
             "error":      str | None,
         }
     """
-    # Phase 6A: get_business_drive_root_id уже применяет приоритеты
-    gdrive_root = get_business_drive_root_id(biz_id)
+    # Phase 6C: resolve_drive_root_for_business возвращает source + ok
+    root_info  = resolve_drive_root_for_business(biz_id)
+    gdrive_root = root_info["root_id"]
     creds_file  = os.getenv("GOOGLE_CREDENTIALS_FILE", "").strip()
 
-    if not gdrive_root or not creds_file:
-        log.debug("provision_biz_drive: Drive root или credentials не заданы — пропуск")
+    if not root_info["ok"] or not gdrive_root:
+        log.debug(f"provision_biz_drive({biz_id}): Drive root не настроен — пропуск")
         return {"ok": False, "folder_id": None, "folder_url": None,
-                "error": "GDRIVE_BIZ_ROOT_FOLDER_ID не задан в .env"}
+                "error": root_info.get("error", "Drive root not configured")}
+
+    if not creds_file:
+        return {"ok": False, "folder_id": None, "folder_url": None,
+                "error": "GOOGLE_CREDENTIALS_FILE не задан в .env"}
 
     try:
         from integrations.google_drive_adapter import create_business_folder_structure
@@ -330,7 +335,7 @@ def provision_biz_drive(biz_id: str, biz_name: str) -> dict:
             biz_id=biz_id,
             biz_name=biz_name,
             dry_run=False,
-            root_folder_id=gdrive_root,  # Phase 6A: явно передаём root
+            root_folder_id=gdrive_root,  # per-biz или глобальный root
         )
         log.info(f"provision_biz_drive: {biz_id} → {result['business_folder_url']}")
         return {
@@ -547,7 +552,7 @@ def get_business_config(biz_id: str) -> dict:
 
 def get_business_drive_root_id(biz_id: str) -> str:
     """
-    Получить Drive Root ID для конкретного бизнеса.
+    Получить Drive Root ID для конкретного бизнеса (строковая версия).
 
     Логика приоритетов:
     1. BIZ_REGISTRY.Drive Root ID (per-biz, Phase 6A)
@@ -560,15 +565,60 @@ def get_business_drive_root_id(biz_id: str) -> str:
     Returns:
         str — folder ID или "" если не найден
     """
-    cfg = get_business_config(biz_id)
-    if cfg["drive_root_id"]:
-        log.debug(f"get_business_drive_root_id({biz_id}): per-biz root → {cfg['drive_root_id']}")
-        return cfg["drive_root_id"]
+    return resolve_drive_root_for_business(biz_id)["root_id"]
+
+
+def resolve_drive_root_for_business(biz_id: str) -> dict:
+    """
+    Разрешить Drive Root для конкретного бизнеса с указанием источника.
+
+    Приоритеты:
+    1. BIZ_REGISTRY.Drive Root ID      → source = "biz_registry"
+    2. GDRIVE_BIZ_ROOT_FOLDER_ID .env  → source = "env"
+    3. Нет root                        → ok = False
+
+    Никогда не бросает исключение — безопасна для использования в GTD-потоке.
+
+    Args:
+        biz_id: ID бизнеса (например "BIZ-001")
+
+    Returns:
+        {
+            "root_id": str,            # "" если не найден
+            "source":  str,            # "biz_registry" | "env" | "none"
+            "ok":      bool,           # False если root не найден
+            "error":   str | None,
+        }
+    """
+    try:
+        cfg = get_business_config(biz_id)
+        if cfg["drive_root_id"]:
+            log.debug(f"resolve_drive_root({biz_id}): per-biz root → {cfg['drive_root_id']}")
+            return {
+                "root_id": cfg["drive_root_id"],
+                "source":  "biz_registry",
+                "ok":      True,
+                "error":   None,
+            }
+    except Exception as exc:
+        log.warning(f"resolve_drive_root({biz_id}): BIZ_REGISTRY error: {exc}")
 
     env_root = os.getenv("GDRIVE_BIZ_ROOT_FOLDER_ID", "").strip()
     if env_root:
-        log.debug(f"get_business_drive_root_id({biz_id}): global .env root → {env_root}")
-    return env_root
+        log.debug(f"resolve_drive_root({biz_id}): global .env root → {env_root}")
+        return {
+            "root_id": env_root,
+            "source":  "env",
+            "ok":      True,
+            "error":   None,
+        }
+
+    return {
+        "root_id": "",
+        "source":  "none",
+        "ok":      False,
+        "error":   "Drive root не настроен: задайте Drive Root ID в BIZ_REGISTRY или GDRIVE_BIZ_ROOT_FOLDER_ID в .env",
+    }
 
 
 def get_business_model_type(biz_id: str) -> str:
@@ -1068,16 +1118,24 @@ def provision_client_drive(
             "biz_id": None, "error": "biz_name не задан",
         }
 
-    # Phase 6A: используем per-biz root если есть, иначе глобальный из .env
+    # Phase 6C: per-biz root через resolve_drive_root_for_business
     biz_id_resolved = _get_biz_id_by_name(biz_name)
-    gdrive_root = get_business_drive_root_id(biz_id_resolved)
+    root_info   = resolve_drive_root_for_business(biz_id_resolved)
+    gdrive_root = root_info["root_id"]
     creds_file  = os.getenv("GOOGLE_CREDENTIALS_FILE", "").strip()
 
-    if not gdrive_root or not creds_file:
-        log.debug("provision_client_drive: Drive root или credentials не заданы — пропуск")
+    if not root_info["ok"] or not gdrive_root:
+        log.debug(f"provision_client_drive({biz_id_resolved}): Drive root не настроен — пропуск")
         return {
             "ok": False, "folder_id": None, "folder_url": None,
-            "biz_id": None, "error": "GDRIVE_BIZ_ROOT_FOLDER_ID не задан в .env",
+            "biz_id": None,
+            "error": root_info.get("error", "Drive root not configured"),
+        }
+
+    if not creds_file:
+        return {
+            "ok": False, "folder_id": None, "folder_url": None,
+            "biz_id": None, "error": "GOOGLE_CREDENTIALS_FILE не задан в .env",
         }
 
     try:
@@ -1090,7 +1148,7 @@ def provision_client_drive(
             client_name=full_name,
             roadmap_id=roadmap_id,
             dry_run=False,
-            root_folder_id=gdrive_root,  # Phase 6A: явно передаём root
+            root_folder_id=gdrive_root,  # per-biz или глобальный root
         )
         log.info(f"provision_client_drive: {prs_id} / {full_name} → {result['client_folder_url']}")
         return {
