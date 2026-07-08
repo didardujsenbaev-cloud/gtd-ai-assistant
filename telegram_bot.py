@@ -11,7 +11,7 @@ import logging
 import tempfile
 import subprocess
 
-# Добавить Homebrew в PATH для ffmpeg
+# Добавить Homebrew и ffmpeg в PATH (для локального запуска)
 os.environ["PATH"] = "/opt/homebrew/bin:" + os.environ.get("PATH", "")
 from datetime import date, time, datetime, timedelta
 from dotenv import load_dotenv
