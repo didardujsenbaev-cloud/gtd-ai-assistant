@@ -395,8 +395,12 @@ class TestStartRoadmapCommand(unittest.TestCase):
     @patch("business_core.business_builder.create_roadmap_for_object")
     @patch("business_core.business_builder.update_object_roadmap_id")
     @patch("business_core.roadmap_manager.create_roadmap_stages_from_template")
+    @patch("business_core.service_manager.find_service_by_id", return_value=None)
+    @patch("business_core.roadmap_template_manager.find_roadmap_templates_by_service",
+           return_value=[])
     async def _run_startroadmap(
         self,
+        mock_find_tmpl, mock_find_svc,
         mock_stages, mock_upd_obj, mock_create_rm, mock_find_obj, mock_enabled,
         text="obj_id=OBJ-001 service_id=SVC-001 case_type=legalization_reconstruction_house",
     ):
