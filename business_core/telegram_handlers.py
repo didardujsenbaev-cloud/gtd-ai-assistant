@@ -2444,6 +2444,367 @@ async def rtemplatestages_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
         await _reply(update, f"❌ Ошибка: {e}")
 
 
+# ─────────────────────────────────────────────────────────────
+# /newsop — создать SOP (Phase 8C)
+# ─────────────────────────────────────────────────────────────
+
+async def newsop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /newsop biz_id=BIZ-001 service_id=SVC-001 template_stage_id=TSTG-001
+            title="Как проверить документы" purpose="..." steps="1. ...; 2. ..." result="..."
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg())
+        return
+    raw  = " ".join(context.args or [])
+    args = _parse_kv_args(raw)
+    title = args.get("title") or args.get("_pos0", "")
+    if not title:
+        await _reply(update,
+            "❌ Укажи title.\n\nПример:\n"
+            '`/newsop biz_id=BIZ-001 template_stage_id=TSTG-001 title="Проверка документов" '
+            'steps="1. Удостоверение; 2. Правоустанавливающий"`'
+        )
+        return
+    try:
+        from business_core.knowledge_manager import create_sop_record
+        result = create_sop_record(
+            title=             title,
+            biz_id=            args.get("biz_id",            ""),
+            service_id=        args.get("service_id",         ""),
+            template_id=       args.get("template_id",        ""),
+            template_stage_id= args.get("template_stage_id",  ""),
+            purpose=           args.get("purpose",            ""),
+            steps=             args.get("steps",              ""),
+            expected_result=   args.get("result",             ""),
+            owner_role=        args.get("owner_role",         ""),
+            notes=             args.get("notes",              ""),
+        )
+        if not result["ok"]:
+            await _reply(update, f"❌ Ошибка: {result['error']}")
+            return
+        sop_id = result["sop_id"]
+        lines = ["✅ *SOP создан*\n", f"SOP ID: `{sop_id}`", f"Название: {title}"]
+        if args.get("template_stage_id"):
+            lines.append(f"Stage: `{args['template_stage_id']}`")
+        lines.append(f"\nПривязать к этапу: `/linkknowledge template_stage_id=... sop_ids={sop_id}`")
+        await _reply(update, "\n".join(lines))
+    except Exception as e:
+        log.error(f"newsop_cmd error: {e}")
+        await _reply(update, f"❌ Ошибка: {e}")
+
+
+# ─────────────────────────────────────────────────────────────
+# /newchecklist — создать чек-лист (Phase 8C)
+# ─────────────────────────────────────────────────────────────
+
+async def newchecklist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /newchecklist biz_id=BIZ-001 template_stage_id=TSTG-001 title="Чек-лист документов"
+                  items="Удостоверение; Правоустанавливающий; Техпаспорт"
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg())
+        return
+    raw  = " ".join(context.args or [])
+    args = _parse_kv_args(raw)
+    title = args.get("title") or args.get("_pos0", "")
+    if not title:
+        await _reply(update,
+            "❌ Укажи title.\n\nПример:\n"
+            '`/newchecklist biz_id=BIZ-001 template_stage_id=TSTG-001 '
+            'title="Документы клиента" items="Удостоверение; Техпаспорт"`'
+        )
+        return
+    try:
+        from business_core.knowledge_manager import create_checklist_record
+        result = create_checklist_record(
+            title=             title,
+            biz_id=            args.get("biz_id",            ""),
+            service_id=        args.get("service_id",         ""),
+            template_id=       args.get("template_id",        ""),
+            template_stage_id= args.get("template_stage_id",  ""),
+            items=             args.get("items",              ""),
+            required_items=    args.get("required",           ""),
+            optional_items=    args.get("optional",           ""),
+            completion_criteria=args.get("criteria",          ""),
+            owner_role=        args.get("owner_role",         ""),
+            notes=             args.get("notes",              ""),
+        )
+        if not result["ok"]:
+            await _reply(update, f"❌ Ошибка: {result['error']}")
+            return
+        chk_id = result["checklist_id"]
+        lines  = ["✅ *Чек-лист создан*\n", f"Checklist ID: `{chk_id}`", f"Название: {title}"]
+        if args.get("template_stage_id"):
+            lines.append(f"Stage: `{args['template_stage_id']}`")
+        if args.get("items"):
+            items = [x.strip() for x in args["items"].split(";") if x.strip()]
+            lines.append(f"Пунктов: {len(items)}")
+        lines.append(f"\nПривязать: `/linkknowledge template_stage_id=... checklist_ids={chk_id}`")
+        await _reply(update, "\n".join(lines))
+    except Exception as e:
+        log.error(f"newchecklist_cmd error: {e}")
+        await _reply(update, f"❌ Ошибка: {e}")
+
+
+# ─────────────────────────────────────────────────────────────
+# /newdoctemplate — создать шаблон документа (Phase 8C)
+# ─────────────────────────────────────────────────────────────
+
+async def newdoctemplate_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /newdoctemplate biz_id=BIZ-001 template_stage_id=TSTG-001
+                    title="Запрос документов" type=message_template description="..."
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg())
+        return
+    raw  = " ".join(context.args or [])
+    args = _parse_kv_args(raw)
+    title = args.get("title") or args.get("_pos0", "")
+    if not title:
+        await _reply(update,
+            "❌ Укажи title.\n\nПример:\n"
+            '`/newdoctemplate biz_id=BIZ-001 template_stage_id=TSTG-001 '
+            'title="Запрос документов" type=message_template`'
+        )
+        return
+    try:
+        from business_core.knowledge_manager import create_document_template_record
+        result = create_document_template_record(
+            title=             title,
+            biz_id=            args.get("biz_id",            ""),
+            service_id=        args.get("service_id",         ""),
+            template_id=       args.get("template_id",        ""),
+            template_stage_id= args.get("template_stage_id",  ""),
+            document_type=     args.get("type",               ""),
+            description=       args.get("description",        ""),
+            notes=             args.get("notes",              ""),
+        )
+        if not result["ok"]:
+            await _reply(update, f"❌ Ошибка: {result['error']}")
+            return
+        doc_id = result["doc_template_id"]
+        lines  = ["✅ *Шаблон документа создан*\n",
+                  f"Document Template ID: `{doc_id}`", f"Название: {title}"]
+        if args.get("type"):
+            lines.append(f"Тип: {args['type']}")
+        if args.get("template_stage_id"):
+            lines.append(f"Stage: `{args['template_stage_id']}`")
+        lines.append(f"\nПривязать: `/linkknowledge template_stage_id=... document_template_ids={doc_id}`")
+        await _reply(update, "\n".join(lines))
+    except Exception as e:
+        log.error(f"newdoctemplate_cmd error: {e}")
+        await _reply(update, f"❌ Ошибка: {e}")
+
+
+# ─────────────────────────────────────────────────────────────
+# /newfaq — создать FAQ (Phase 8C)
+# ─────────────────────────────────────────────────────────────
+
+async def newfaq_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /newfaq biz_id=BIZ-001 template_stage_id=TSTG-001
+            question="Можно ли начать без техпаспорта?"
+            answer="Можно провести первичный анализ, но для запуска нужен."
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg())
+        return
+    raw  = " ".join(context.args or [])
+    args = _parse_kv_args(raw)
+    question = args.get("question") or args.get("q", "") or args.get("_pos0", "")
+    answer   = args.get("answer")   or args.get("a", "") or args.get("_pos1", "")
+    if not question:
+        await _reply(update,
+            "❌ Укажи question.\n\nПример:\n"
+            '`/newfaq biz_id=BIZ-001 template_stage_id=TSTG-001 '
+            'question="Можно без техпаспорта?" answer="Нет, нужен."`'
+        )
+        return
+    try:
+        from business_core.knowledge_manager import create_faq_record
+        result = create_faq_record(
+            question=          question,
+            answer=            answer,
+            biz_id=            args.get("biz_id",            ""),
+            service_id=        args.get("service_id",         ""),
+            template_id=       args.get("template_id",        ""),
+            template_stage_id= args.get("template_stage_id",  ""),
+            category=          args.get("category",           ""),
+            notes=             args.get("notes",              ""),
+        )
+        if not result["ok"]:
+            await _reply(update, f"❌ Ошибка: {result['error']}")
+            return
+        faq_id = result["faq_id"]
+        lines  = ["✅ *FAQ создан*\n", f"FAQ ID: `{faq_id}`",
+                  f"Вопрос: {question[:80]}"]
+        if answer:
+            lines.append(f"Ответ: {answer[:80]}")
+        if args.get("template_stage_id"):
+            lines.append(f"Stage: `{args['template_stage_id']}`")
+        lines.append(f"\nПривязать: `/linkknowledge template_stage_id=... faq_ids={faq_id}`")
+        await _reply(update, "\n".join(lines))
+    except Exception as e:
+        log.error(f"newfaq_cmd error: {e}")
+        await _reply(update, f"❌ Ошибка: {e}")
+
+
+# ─────────────────────────────────────────────────────────────
+# /linkknowledge — привязать knowledge к этапу шаблона (Phase 8C)
+# ─────────────────────────────────────────────────────────────
+
+async def linkknowledge_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /linkknowledge template_stage_id=TSTG-001 sop_ids=SOP-001
+                   checklist_ids=CHK-001 document_template_ids=DOC-001 faq_ids=FAQ-001
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg())
+        return
+    raw  = " ".join(context.args or [])
+    args = _parse_kv_args(raw)
+    template_stage_id = args.get("template_stage_id") or args.get("_pos0", "")
+    if not template_stage_id:
+        await _reply(update,
+            "❌ Укажи template\\_stage\\_id.\n\nПример:\n"
+            "`/linkknowledge template_stage_id=TSTG-001 sop_ids=SOP-001 checklist_ids=CHK-001`"
+        )
+        return
+
+    def _split(val: str) -> list[str]:
+        return [x.strip() for x in val.replace(";", ",").split(",") if x.strip()]
+
+    sop_ids    = _split(args.get("sop_ids",               ""))
+    chk_ids    = _split(args.get("checklist_ids",          ""))
+    mat_ids    = _split(args.get("material_ids",           "") or args.get("materials", ""))
+    doc_ids    = _split(args.get("document_template_ids",  ""))
+    faq_ids    = _split(args.get("faq_ids",                ""))
+
+    try:
+        from business_core.knowledge_manager import link_knowledge_to_template_stage
+        result = link_knowledge_to_template_stage(
+            template_stage_id=     template_stage_id,
+            sop_ids=               sop_ids   or None,
+            checklist_ids=         chk_ids   or None,
+            material_ids=          mat_ids   or None,
+            document_template_ids= doc_ids   or None,
+            faq_ids=               faq_ids   or None,
+        )
+        if not result["ok"]:
+            await _reply(update, f"❌ Ошибка: {result['error']}")
+            return
+        summary = []
+        if sop_ids:    summary.append(f"SOP: {', '.join(sop_ids)}")
+        if chk_ids:    summary.append(f"CHK: {', '.join(chk_ids)}")
+        if mat_ids:    summary.append(f"MAT: {', '.join(mat_ids)}")
+        if doc_ids:    summary.append(f"DOC: {', '.join(doc_ids)}")
+        if faq_ids:    summary.append(f"FAQ: {', '.join(faq_ids)}")
+        await _reply(update,
+            f"✅ *Knowledge привязан*\n\n"
+            f"Stage: `{template_stage_id}`\n"
+            + ("\n".join(summary) if summary else "Ничего не изменено")
+            + f"\n\nПросмотр: `/stageknowledge template_stage_id={template_stage_id}`"
+        )
+    except Exception as e:
+        log.error(f"linkknowledge_cmd error: {e}")
+        await _reply(update, f"❌ Ошибка: {e}")
+
+
+# ─────────────────────────────────────────────────────────────
+# /stageknowledge — knowledge по этапу (Phase 8C)
+# ─────────────────────────────────────────────────────────────
+
+async def stageknowledge_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /stageknowledge template_stage_id=TSTG-001
+    /stageknowledge stage_id=STAGE-001
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg())
+        return
+    raw  = " ".join(context.args or [])
+    args = _parse_kv_args(raw)
+
+    template_stage_id = args.get("template_stage_id") or ""
+    real_stage_id     = args.get("stage_id",           "") or args.get("_pos0", "")
+
+    if not template_stage_id and not real_stage_id:
+        await _reply(update,
+            "❌ Укажи template\\_stage\\_id или stage\\_id.\n\n"
+            "Примеры:\n"
+            "`/stageknowledge template_stage_id=TSTG-001`\n"
+            "`/stageknowledge stage_id=STAGE-001`"
+        )
+        return
+
+    try:
+        from business_core.knowledge_manager import (
+            find_knowledge_by_template_stage, get_knowledge_for_stage,
+            find_sop_by_id, find_checklist_by_id,
+            find_document_template_by_id, find_faq_by_id,
+        )
+
+        if template_stage_id:
+            knowledge = find_knowledge_by_template_stage(template_stage_id)
+            header    = f"📚 *Knowledge для шаблона {template_stage_id}*"
+        else:
+            knowledge = get_knowledge_for_stage(real_stage_id, is_template=False)
+            header    = f"📚 *Knowledge для этапа {real_stage_id}*"
+
+        lines = [header, ""]
+        any_found = False
+
+        for sop_id in knowledge.get("sop_ids", []):
+            sop = find_sop_by_id(sop_id)
+            if sop:
+                lines.append(f"📋 *SOP* `{sop_id}`: {sop.get('Title', sop_id)}")
+                if sop.get("Steps"):
+                    lines.append(f"   Шаги: {sop['Steps'][:100]}")
+                any_found = True
+
+        for chk_id in knowledge.get("checklist_ids", []):
+            chk = find_checklist_by_id(chk_id)
+            if chk:
+                lines.append(f"☑️ *Чек-лист* `{chk_id}`: {chk.get('Title', chk_id)}")
+                if chk.get("Items"):
+                    items = [x.strip() for x in chk["Items"].split(";") if x.strip()]
+                    for item in items[:5]:
+                        lines.append(f"   • {item}")
+                any_found = True
+
+        for doc_id in knowledge.get("document_template_ids", []):
+            doc = find_document_template_by_id(doc_id)
+            if doc:
+                lines.append(f"📄 *Шаблон* `{doc_id}`: {doc.get('Title', doc_id)}")
+                any_found = True
+
+        for faq_id in knowledge.get("faq_ids", []):
+            faq = find_faq_by_id(faq_id)
+            if faq:
+                lines.append(f"❓ *FAQ* `{faq_id}`: {faq.get('Question', faq_id)[:80]}")
+                if faq.get("Answer"):
+                    lines.append(f"   💬 {faq['Answer'][:100]}")
+                any_found = True
+
+        if knowledge.get("material_ids"):
+            lines.append(f"📦 *Materials*: {', '.join(knowledge['material_ids'])}")
+            any_found = True
+
+        if not any_found:
+            lines.append("Нет привязанных материалов.")
+            stage_ref = template_stage_id or real_stage_id
+            lines.append(f"\nДобавить: `/linkknowledge template_stage_id={stage_ref} sop_ids=...`")
+
+        await _reply(update, "\n".join(lines))
+
+    except Exception as e:
+        log.error(f"stageknowledge_cmd error: {e}")
+        await _reply(update, f"❌ Ошибка: {e}")
+
+
 def register_business_handlers(app: Application) -> None:
     """
     Зарегистрировать все Business Core handlers в приложении.
@@ -2521,6 +2882,13 @@ def register_business_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("rtemplates",       rtemplates_cmd))
     app.add_handler(CommandHandler("addrtemplatestage",addrtemplatestage_cmd))
     app.add_handler(CommandHandler("rtemplatestages",  rtemplatestages_cmd))
+    # Phase 8C
+    app.add_handler(CommandHandler("newsop",           newsop_cmd))
+    app.add_handler(CommandHandler("newchecklist",     newchecklist_cmd))
+    app.add_handler(CommandHandler("newdoctemplate",   newdoctemplate_cmd))
+    app.add_handler(CommandHandler("newfaq",           newfaq_cmd))
+    app.add_handler(CommandHandler("linkknowledge",    linkknowledge_cmd))
+    app.add_handler(CommandHandler("stageknowledge",   stageknowledge_cmd))
 
     # Callback handler для кнопок подтверждения бизнес-контекста (Фаза 5B)
     app.add_handler(CallbackQueryHandler(bc_ctx_callback, pattern=r"^bc_ctx:"))

@@ -429,11 +429,22 @@ def create_stages_from_template_record(roadmap_id: str, template_id: str) -> dic
 
     try:
         from business_core.sheets import append_business_row, generate_next_id
+        from business_core.knowledge_manager import find_knowledge_by_template_stage
         now       = datetime.now().strftime("%Y-%m-%d %H:%M")
         stage_ids = []
 
         for ts in template_stages:
-            stage_id = generate_next_id("roadmap_stages")
+            stage_id         = generate_next_id("roadmap_stages")
+            template_stage_id = ts.get("stage_id", "")
+
+            # Получаем knowledge IDs из шаблонного этапа
+            knowledge        = find_knowledge_by_template_stage(template_stage_id) if template_stage_id else {}
+            sop_ids          = ",".join(knowledge.get("sop_ids",               []))
+            checklist_ids    = ",".join(knowledge.get("checklist_ids",         []))
+            material_ids     = ",".join(knowledge.get("material_ids",          []))
+            doc_template_ids = ",".join(knowledge.get("document_template_ids", []))
+            faq_ids          = ",".join(knowledge.get("faq_ids",               []))
+
             row = [
                 stage_id,                    # Stage ID
                 roadmap_id,                  # Roadmap ID
@@ -447,6 +458,12 @@ def create_stages_from_template_record(roadmap_id: str, template_id: str) -> dic
                 ts.get("required_docs", ""), # Docs Required
                 "",                          # Docs Received
                 ts.get("notes", ""),         # Notes
+                # Phase 8C: knowledge IDs скопированы из шаблона
+                sop_ids,                     # SOP IDs
+                checklist_ids,               # Checklist IDs
+                material_ids,                # Materials IDs
+                doc_template_ids,            # Document Template IDs
+                faq_ids,                     # FAQ IDs
             ]
             append_business_row("roadmap_stages", row)
             stage_ids.append(stage_id)

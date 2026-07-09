@@ -44,6 +44,11 @@ BUSINESS_SHEET_NAMES: dict[str, str] = {
     # Phase 8B: Roadmap Template Registry
     "roadmap_template_registry": "ROADMAP_TEMPLATE_REGISTRY",
     "roadmap_template_stages":   "ROADMAP_TEMPLATE_STAGES",
+    # Phase 8C: Knowledge Core
+    "sop_registry":               "SOP_REGISTRY",
+    "checklist_registry":         "CHECKLIST_REGISTRY",
+    "document_template_registry": "DOCUMENT_TEMPLATE_REGISTRY",
+    "faq_registry":               "FAQ_REGISTRY",
 }
 
 BUSINESS_HEADERS: dict[str, list[str]] = {
@@ -131,6 +136,9 @@ BUSINESS_HEADERS: dict[str, list[str]] = {
         "Stage ID", "Roadmap ID", "Order", "Name", "Status",
         "Due Date", "Completed At", "GTD Action ID",
         "Responsible", "Docs Required", "Docs Received", "Notes",
+        # Phase 8C: Knowledge bindings (добавлены в конец)
+        "SOP IDs", "Checklist IDs", "Materials IDs",
+        "Document Template IDs", "FAQ IDs",
     ],
     "materials": [
         "Material ID", "Source", "Received At", "GTD Reference Row",
@@ -189,6 +197,37 @@ BUSINESS_HEADERS: dict[str, list[str]] = {
         "Estimated Days",   # ожидаемое количество дней
         "Notes",
         "Created At",
+        # Phase 8C: Knowledge bindings (добавлены в конец)
+        "SOP IDs",                  # SOP-001,SOP-002
+        "Checklist IDs",            # CHK-001,CHK-002
+        "Materials IDs",            # MAT-001
+        "Document Template IDs",    # DOC-001
+        "FAQ IDs",                  # FAQ-001
+    ],
+    # Phase 8C: Knowledge Core registries
+    "sop_registry": [
+        "SOP ID", "Biz ID", "Service ID", "Template ID", "Template Stage ID",
+        "Title", "Purpose", "Steps", "Expected Result", "Owner Role",
+        "Drive File ID", "Google Drive", "Version", "Status", "Notes",
+        "Created At", "Last Updated",
+    ],
+    "checklist_registry": [
+        "Checklist ID", "Biz ID", "Service ID", "Template ID", "Template Stage ID",
+        "Title", "Items", "Required Items", "Optional Items",
+        "Completion Criteria", "Owner Role",
+        "Drive File ID", "Google Drive", "Version", "Status", "Notes",
+        "Created At", "Last Updated",
+    ],
+    "document_template_registry": [
+        "Document Template ID", "Biz ID", "Service ID", "Template ID", "Template Stage ID",
+        "Title", "Document Type", "Description",
+        "Drive File ID", "Google Drive", "Version", "Status", "Notes",
+        "Created At", "Last Updated",
+    ],
+    "faq_registry": [
+        "FAQ ID", "Biz ID", "Service ID", "Template ID", "Template Stage ID",
+        "Question", "Answer", "Category", "Status", "Notes",
+        "Created At", "Last Updated",
     ],
 }
 
@@ -206,6 +245,11 @@ _ID_PREFIXES: dict[str, str] = {
     # Phase 8B
     "roadmap_template_registry": "RTMPL",
     "roadmap_template_stages":   "TSTG",
+    # Phase 8C
+    "sop_registry":               "SOP",
+    "checklist_registry":         "CHK",
+    "document_template_registry": "DOC",
+    "faq_registry":               "FAQ",
 }
 
 
