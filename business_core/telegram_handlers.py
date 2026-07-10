@@ -1720,26 +1720,72 @@ async def startroadmap_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         client_id = obj.get("client_id", "")
 
         # ── Определить шаблон ─────────────────────────────────
-        # Приоритет 1: явно переданный template_id
+        # Приоритет 1: явно переданный template_id (с валидацией)
         # Приоритет 2: Default Roadmap Template ID услуги
         # Приоритет 3: первый шаблон, связанный с сервисом
         # Fallback:    старая логика через case_type
-        template_id_to_use = args.get("template_id", "")
-        template_source    = ""
+        from business_core.roadmap_template_manager import find_roadmap_template_by_id
 
-        if not template_id_to_use and service_id:
-            svc = find_service_by_id(service_id)
+        explicit_template_id = args.get("template_id", "").strip()
+        template_id_to_use   = ""
+        template_source      = ""
+
+        if explicit_template_id:
+            # ── Валидация явно переданного template_id ─────────
+            tmpl_rec = find_roadmap_template_by_id(explicit_template_id)
+            if not tmpl_rec:
+                await _reply(update,
+                    f"❌ Шаблон `{explicit_template_id}` не найден в ROADMAP\\_TEMPLATE\\_REGISTRY.\n\n"
+                    f"Проверь список шаблонов для услуги:\n"
+                    f"`/rtemplates service_id={service_id}`"
+                )
+                return
+
+            tmpl_svc = tmpl_rec.get("service_id", "").strip()
+            if service_id and tmpl_svc and tmpl_svc != service_id:
+                await _reply(update,
+                    f"❌ Шаблон `{explicit_template_id}` принадлежит услуге `{tmpl_svc}`, "
+                    f"а не `{service_id}`.\n\n"
+                    f"Укажи шаблон из правильной услуги:\n"
+                    f"`/rtemplates service_id={service_id}`"
+                )
+                return
+
+            template_id_to_use = explicit_template_id
+            template_source    = "явно указан"
+
+        else:
+            # ── Автовыбор шаблона ──────────────────────────────
+            svc = find_service_by_id(service_id) if service_id else None
             if svc:
                 tmpl_from_svc = svc.get("default_roadmap_template_id", "").strip()
                 if tmpl_from_svc:
                     template_id_to_use = tmpl_from_svc
-                    template_source    = f"из услуги {service_id}"
+                    template_source    = f"default для {service_id}"
 
-        if not template_id_to_use and service_id:
-            linked = find_roadmap_templates_by_service(service_id)
-            if linked:
-                template_id_to_use = linked[0].get("template_id", "")
-                template_source    = f"автовыбор для {service_id}"
+            if not template_id_to_use and service_id:
+                linked = find_roadmap_templates_by_service(service_id)
+                if linked:
+                    template_id_to_use = linked[0].get("template_id", "")
+                    template_source    = f"автовыбор для {service_id}"
+
+                    # ── Подсказка: несколько шаблонов доступно ─
+                    if len(linked) > 1:
+                        hint_lines = [
+                            f"ℹ️ Для услуги `{service_id}` найдено несколько шаблонов "
+                            f"(используется первый):\n"
+                        ]
+                        for t in linked:
+                            tid   = t.get("template_id", "")
+                            tname = t.get("template_name", tid)
+                            marker = " ← *выбран*" if tid == template_id_to_use else ""
+                            hint_lines.append(f"• `{tid}` — {tname}{marker}")
+                        hint_lines.append(
+                            f"\nЧтобы выбрать конкретный шаблон:\n"
+                            f"`/startroadmap obj_id={obj_id} service_id={service_id} "
+                            f"template_id=RMT-...`"
+                        )
+                        await _reply(update, "\n".join(hint_lines))
 
         # ── Создать roadmap ────────────────────────────────────
         rm_result = create_roadmap_for_object(
