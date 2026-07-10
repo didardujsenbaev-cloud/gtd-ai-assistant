@@ -294,6 +294,9 @@ def _get_service_account_email() -> str:
 # Основные функции доступа
 # ─────────────────────────────────────────────────────────────
 
+_SS_CACHE: dict = {}   # {"ss": spreadsheet, "ts": float}
+_SS_CACHE_TTL = 300    # 5 минут — Spreadsheet-объект стабилен
+
 def get_business_spreadsheet() -> gspread.Spreadsheet:
     """
     Открыть таблицу Business Core по BUSINESS_SPREADSHEET_ID.
@@ -309,10 +312,25 @@ def get_business_spreadsheet() -> gspread.Spreadsheet:
             "Добавьте: BUSINESS_SPREADSHEET_ID=<id таблицы Business Core>\n"
             "ID находится в URL: docs.google.com/spreadsheets/d/<ВОТ_ЭТО>/edit"
         )
+    # Spreadsheet-объект кэшируем 5 минут
+    cached_ss = _SS_CACHE.get("ss")
+    if cached_ss and (_time.time() - _SS_CACHE.get("ts", 0)) < _SS_CACHE_TTL:
+        return cached_ss
+
     client = _get_biz_client()
     try:
-        return client.open_by_key(biz_id)
+        ss = client.open_by_key(biz_id)
+        _SS_CACHE["ss"] = ss
+        _SS_CACHE["ts"] = _time.time()
+        return ss
     except gspread.exceptions.APIError as e:
+        err_str = str(e)
+        if "429" in err_str or "Quota" in err_str or "RATE_LIMIT" in err_str:
+            raise PermissionError(
+                f"Google Sheets API лимит превышен (429 Quota Exceeded).\n"
+                f"Подождите 1-2 минуты и повторите. Таблица: {biz_id}\n"
+                f"Ошибка: {e}"
+            ) from e
         raise PermissionError(
             f"Нет доступа к BUSINESS_CORE таблице (ID: {biz_id})\n"
             f"Убедитесь что дали доступ service account: "
@@ -321,10 +339,27 @@ def get_business_spreadsheet() -> gspread.Spreadsheet:
         ) from e
 
 
+# Кэш worksheet-объектов: { sheet_name: (worksheet, timestamp) }
+# TTL 30 секунд — снижает количество API вызовов при batch-операциях
+import time as _time
+_SHEET_CACHE: dict = {}
+_SHEET_CACHE_TTL = 30  # секунд
+
+
+def _invalidate_sheet_cache(name: str | None = None) -> None:
+    """Сбросить кэш: для конкретного листа или весь."""
+    global _SHEET_CACHE
+    if name is None:
+        _SHEET_CACHE = {}
+    else:
+        _SHEET_CACHE.pop(name, None)
+
+
 def get_business_sheet(name: str) -> gspread.Worksheet:
     """
     Получить лист по короткому ключу из BUSINESS_SHEET_NAMES.
     Если листа нет — создаёт его с заголовками.
+    Worksheet-объекты кэшируются на 30 секунд для снижения нагрузки на API.
 
     Args:
         name: ключ из BUSINESS_SHEET_NAMES (например 'biz_registry')
@@ -339,11 +374,18 @@ def get_business_sheet(name: str) -> gspread.Worksheet:
             f"Допустимые ключи: {valid}"
         )
 
+    # Проверяем кэш
+    cached = _SHEET_CACHE.get(name)
+    if cached:
+        sheet, ts = cached
+        if _time.time() - ts < _SHEET_CACHE_TTL:
+            return sheet
+
     sheet_name = BUSINESS_SHEET_NAMES[name]
     ss = get_business_spreadsheet()
 
     try:
-        return ss.worksheet(sheet_name)
+        sheet = ss.worksheet(sheet_name)
     except gspread.exceptions.WorksheetNotFound:
         log.info(f"Лист '{sheet_name}' не найден — создаю...")
         headers = BUSINESS_HEADERS.get(name, [])
@@ -352,7 +394,9 @@ def get_business_sheet(name: str) -> gspread.Worksheet:
         if headers:
             sheet.append_row(headers, value_input_option="USER_ENTERED")
             log.info(f"Заголовки добавлены: {sheet_name} ({len(headers)} колонок)")
-        return sheet
+
+    _SHEET_CACHE[name] = (sheet, _time.time())
+    return sheet
 
 
 def ensure_headers(sheet: gspread.Worksheet, headers: list[str]) -> bool:
