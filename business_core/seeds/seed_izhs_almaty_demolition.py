@@ -301,11 +301,18 @@ SOP_DATA = dict(
 # Idempotency helpers
 # ═══════════════════════════════════════════════════════════════
 
+def _is_quota_error(e: Exception) -> bool:
+    return "429" in str(e) or "Quota exceeded" in str(e)
+
+
 def _service_exists() -> bool:
     try:
         from business_core.service_manager import find_service_by_id
         return find_service_by_id(SERVICE_ID) is not None
     except Exception as e:
+        if _is_quota_error(e):
+            log.warning(f"_service_exists: quota error — assuming EXISTS to avoid duplicate. {e}")
+            return True
         log.warning(f"_service_exists check error: {e}")
         return False
 
@@ -315,6 +322,9 @@ def _template_exists() -> bool:
         from business_core.roadmap_template_manager import find_roadmap_template_by_id
         return find_roadmap_template_by_id(TEMPLATE_ID) is not None
     except Exception as e:
+        if _is_quota_error(e):
+            log.warning(f"_template_exists: quota error — assuming EXISTS to avoid duplicate. {e}")
+            return True
         log.warning(f"_template_exists check error: {e}")
         return False
 
@@ -324,6 +334,9 @@ def _stages_count() -> int:
         from business_core.roadmap_template_manager import find_template_stages
         return len(find_template_stages(TEMPLATE_ID))
     except Exception as e:
+        if _is_quota_error(e):
+            log.warning(f"_stages_count: quota error — assuming all 9 exist to avoid duplicates. {e}")
+            return len(STAGES)
         log.warning(f"_stages_count check error: {e}")
         return 0
 
@@ -333,6 +346,9 @@ def _checklist_exists() -> bool:
         from business_core.knowledge_manager import find_checklist_by_id
         return find_checklist_by_id(CHECKLIST_ID) is not None
     except Exception as e:
+        if _is_quota_error(e):
+            log.warning(f"_checklist_exists: quota error — assuming EXISTS to avoid duplicate. {e}")
+            return True
         log.warning(f"_checklist_exists check error: {e}")
         return False
 
@@ -342,6 +358,9 @@ def _sop_exists() -> bool:
         from business_core.knowledge_manager import find_sop_by_id
         return find_sop_by_id(SOP_ID) is not None
     except Exception as e:
+        if _is_quota_error(e):
+            log.warning(f"_sop_exists: quota error — assuming EXISTS to avoid duplicate. {e}")
+            return True
         log.warning(f"_sop_exists check error: {e}")
         return False
 
