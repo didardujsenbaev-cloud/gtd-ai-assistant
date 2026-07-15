@@ -536,6 +536,46 @@ def append_business_row(sheet_key: str, values: list) -> int:
     return next_row
 
 
+def batch_append_business_rows(sheet_key: str, rows: list[list]) -> int:
+    """
+    Записать несколько строк одним API-вызовом (batch write).
+
+    Намного эффективнее чем вызывать append_business_row() в цикле:
+    вместо N*2 запросов — всего 2 запроса (get_all_values + update).
+
+    Args:
+        sheet_key: ключ из BUSINESS_SHEET_NAMES
+        rows: список строк, каждая строка — список значений
+
+    Returns:
+        Номер первой записанной строки (1-based)
+    """
+    if not rows:
+        return 0
+
+    sheet    = get_business_sheet(sheet_key)
+    all_rows = sheet.get_all_values()
+    start    = len(all_rows) + 1
+
+    headers = BUSINESS_HEADERS.get(sheet_key, [])
+    n_cols  = len(headers) if headers else max(len(r) for r in rows)
+
+    # Дополняем все строки до одинаковой ширины
+    padded = []
+    for row in rows:
+        if len(row) < n_cols:
+            row = row + [""] * (n_cols - len(row))
+        padded.append(row)
+
+    end_row = start + len(padded) - 1
+    end_col = _col_letter(n_cols)
+    range_name = f"A{start}:{end_col}{end_row}"
+
+    sheet.update(values=padded, range_name=range_name)
+    log.debug(f"batch_append_business_rows: {sheet_key} → строки {start}-{end_row} ({len(padded)} шт.)")
+    return start
+
+
 def read_business_sheet(sheet_key: str) -> list[dict]:
     """
     Прочитать все записи листа как список словарей.

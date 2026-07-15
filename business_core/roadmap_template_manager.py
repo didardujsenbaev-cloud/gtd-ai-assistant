@@ -428,13 +428,14 @@ def create_stages_from_template_record(roadmap_id: str, template_id: str) -> dic
         }
 
     try:
-        from business_core.sheets import append_business_row, generate_next_id
+        from business_core.sheets import batch_append_business_rows, generate_next_id
         from business_core.knowledge_manager import find_knowledge_by_template_stage
         now       = datetime.now().strftime("%Y-%m-%d %H:%M")
         stage_ids = []
+        rows      = []
 
         for ts in template_stages:
-            stage_id         = generate_next_id("roadmap_stages")
+            stage_id          = generate_next_id("roadmap_stages")
             template_stage_id = ts.get("stage_id", "")
 
             # Получаем knowledge IDs из шаблонного этапа
@@ -465,8 +466,12 @@ def create_stages_from_template_record(roadmap_id: str, template_id: str) -> dic
                 doc_template_ids,            # Document Template IDs
                 faq_ids,                     # FAQ IDs
             ]
-            append_business_row("roadmap_stages", row)
+            rows.append(row)
             stage_ids.append(stage_id)
+
+        # Batch-запись всех этапов одним API-вызовом вместо N отдельных
+        if rows:
+            batch_append_business_rows("roadmap_stages", rows)
 
         return {
             "ok": True,
