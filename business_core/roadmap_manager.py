@@ -889,6 +889,148 @@ def create_roadmap_stages_from_template(
         }
 
 
+# ═══════════════════════════════════════════════════════════════
+# Commercial Milestones — коммерческие этапы оплаты
+# ═══════════════════════════════════════════════════════════════
+
+COMMERCIAL_MILESTONES_MAP: dict[str, list[dict]] = {
+    "RMT-IZH-ALM-STANDARD-002": [
+        {
+            "id":           "CM-1",
+            "title":        "Анализ / проверка возможности оформления",
+            "price":        150_000,
+            "currency":     "KZT",
+            "stage_orders": list(range(1, 5)),    # этапы 1–4
+            "result":       "Понятен путь оформления, риски и возможность запуска следующего этапа.",
+            "important":    "Этап 1 не гарантирует получение АПЗ.",
+        },
+        {
+            "id":           "CM-2",
+            "title":        "Документы до АПЗ / проектно-разрешительный этап",
+            "price":        500_000,
+            "currency":     "KZT",
+            "stage_orders": list(range(5, 11)),   # этапы 5–10
+            "result":       "Пакет подготовлен, подача выполнена, получен результат по АПЗ: АПЗ / замечания / отказ.",
+            "important":    "АПЗ зависит от госоргана. При отказе этап считается выполненным, если подготовка и подача сделаны.",
+        },
+        {
+            "id":           "CM-3",
+            "title":        "Технический паспорт / акт ввода / регистрация",
+            "price":        300_000,
+            "currency":     "KZT",
+            "stage_orders": list(range(11, 14)),  # этапы 11–13
+            "result":       "Объект оформлен и изменения зарегистрированы.",
+            "important":    "Финальный этап запускается после оплаты этапа 3.",
+        },
+    ],
+}
+
+
+def _resolve_template_id(roadmap: dict) -> str:
+    """
+    Определить template_id для roadmap (read-only, не пишет в Sheets):
+    1. из notes по паттерну template_id=RMT-...
+    2. из default_roadmap_template_id услуги
+    3. из первого шаблона, привязанного к service_id
+    Возвращает '' если не удалось определить.
+    """
+    import re
+    notes = roadmap.get("notes", "")
+    m = re.search(r"template_id\s*=\s*(RMT-\S+)", notes, re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+
+    service_id = roadmap.get("service_id", "").strip()
+    if service_id:
+        try:
+            from business_core.service_manager import find_service_by_id
+            svc = find_service_by_id(service_id)
+            if svc:
+                tid = svc.get("default_roadmap_template_id", "").strip()
+                if tid:
+                    return tid
+        except Exception:
+            pass
+
+        try:
+            from business_core.roadmap_template_manager import find_roadmap_templates_by_service
+            linked = find_roadmap_templates_by_service(service_id)
+            if linked:
+                return linked[0].get("template_id", "")
+        except Exception:
+            pass
+
+    return ""
+
+
+def get_commercial_milestones_for_roadmap(roadmap_id: str) -> dict:
+    """
+    Read-only: получить коммерческие этапы оплаты для roadmap.
+
+    Returns:
+        {
+            "ok":          bool,
+            "error":       str | None,
+            "roadmap":     dict | None,
+            "template_id": str,
+            "milestones":  list[dict],  — milestones с loaded_stages и stage_range
+            "stages":      list[dict],  — сырые этапы из Sheets
+            "total_price": int,
+        }
+    """
+    if not roadmap_id:
+        return {
+            "ok": False, "error": "roadmap_id не указан", "roadmap": None,
+            "template_id": "", "milestones": [], "stages": [], "total_price": 0,
+        }
+
+    try:
+        from business_core.business_builder import find_roadmap_by_id as _find_rm
+        roadmap = _find_rm(roadmap_id)
+    except Exception as exc:
+        return {
+            "ok": False, "error": str(exc), "roadmap": None,
+            "template_id": "", "milestones": [], "stages": [], "total_price": 0,
+        }
+
+    if not roadmap:
+        return {
+            "ok": False, "error": f"Roadmap {roadmap_id} не найден",
+            "roadmap": None, "template_id": "", "milestones": [], "stages": [], "total_price": 0,
+        }
+
+    template_id    = _resolve_template_id(roadmap)
+    milestones_cfg = COMMERCIAL_MILESTONES_MAP.get(template_id, [])
+    stages         = get_stages_for_roadmap(roadmap_id)
+
+    stage_by_order: dict[int, dict] = {}
+    for s in stages:
+        try:
+            stage_by_order[int(s.get("order", 0))] = s
+        except (ValueError, TypeError):
+            pass
+
+    populated: list[dict] = []
+    for cm in milestones_cfg:
+        orders = cm["stage_orders"]
+        populated.append({
+            **cm,
+            "loaded_stages": [stage_by_order[o] for o in orders if o in stage_by_order],
+            "stage_range":   f"{orders[0]}–{orders[-1]}" if orders else "",
+        })
+
+    total = sum(cm["price"] for cm in milestones_cfg)
+    return {
+        "ok":          True,
+        "error":       None,
+        "roadmap":     roadmap,
+        "template_id": template_id,
+        "milestones":  populated,
+        "stages":      stages,
+        "total_price": total,
+    }
+
+
 def get_stages_for_roadmap(roadmap_id: str) -> list[dict]:
     """Получить все этапы roadmap из ROADMAP_STAGES."""
     if not roadmap_id:

@@ -4459,6 +4459,7 @@ def main():
             BotCommand("newsop",          "Создать SOP"),
             BotCommand("newchecklist",    "Создать чек-лист"),
             BotCommand("stageknowledge",  "Знания для этапа"),
+            BotCommand("milestones",      "Коммерческие этапы оплаты"),
         ]
         await application.bot.set_my_commands(commands)
 

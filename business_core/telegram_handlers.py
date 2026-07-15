@@ -2851,6 +2851,88 @@ async def stageknowledge_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await _reply(update, f"❌ Ошибка: {e}")
 
 
+async def milestones_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /milestones roadmap_id=RM-022
+
+    Read-only: показать коммерческие этапы оплаты по roadmap.
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg())
+        return
+
+    try:
+        raw = (update.message.text or "").split(None, 1)[1] if context.args else " ".join(context.args or [])
+    except (IndexError, TypeError):
+        raw = ""
+
+    args       = _parse_kv_args(raw)
+    roadmap_id = (args.get("roadmap_id") or args.get("_pos0", "")).strip()
+
+    if not roadmap_id:
+        await _reply(update,
+            "ℹ️ *Использование:* `/milestones roadmap_id=RM-022`\n\n"
+            "Команда показывает коммерческие этапы оплаты по roadmap.\n\n"
+            "Пример:\n`/milestones roadmap_id=RM-022`"
+        )
+        return
+
+    try:
+        from business_core.roadmap_manager import get_commercial_milestones_for_roadmap
+
+        data = get_commercial_milestones_for_roadmap(roadmap_id)
+
+        if not data["ok"]:
+            await _reply(update, f"❌ {data['error']}")
+            return
+
+        rm          = data["roadmap"]
+        template_id = data["template_id"]
+
+        if not data["milestones"]:
+            if template_id:
+                msg = (
+                    f"ℹ️ Для roadmap `{roadmap_id}` коммерческие этапы не настроены.\n\n"
+                    f"Шаблон `{template_id}` пока не имеет маппинга коммерческих этапов.\n"
+                    f"Проверьте `SOP-IZH-COMMERCIAL-MILESTONES-001` или добавьте mapping."
+                )
+            else:
+                msg = (
+                    f"ℹ️ Для roadmap `{roadmap_id}` коммерческие этапы не настроены.\n\n"
+                    "Не удалось определить template\\_id для roadmap.\n"
+                    "Для этого шаблона коммерческие этапы ещё не настроены. "
+                    "Проверьте `SOP-IZH-COMMERCIAL-MILESTONES-001` или добавьте mapping."
+                )
+            await _reply(update, msg)
+            return
+
+        lines = [
+            f"💰 *Коммерческие этапы: {roadmap_id}*",
+            f"Object:   `{rm.get('obj_id',     '—')}`",
+            f"Service:  `{rm.get('service_id', '—')}`",
+            f"Template: `{template_id}`",
+            "",
+        ]
+
+        for i, ms in enumerate(data["milestones"], 1):
+            price_fmt = f"{ms['price']:,}".replace(",", " ")
+            lines.append(f"*{i}) {ms['title']} — {price_fmt} тг*")
+            lines.append(f"Рабочие этапы: {ms['stage_range']}")
+            lines.append(f"Результат: {ms['result']}")
+            if ms.get("important"):
+                lines.append(f"⚠️ Важно: _{ms['important']}_")
+            lines.append("")
+
+        total_fmt = f"{data['total_price']:,}".replace(",", " ")
+        lines.append(f"💵 *Итого: {total_fmt} тг*")
+
+        await _reply(update, "\n".join(lines))
+
+    except Exception as e:
+        log.error(f"milestones_cmd error: {e}")
+        await _reply(update, f"❌ Ошибка: {e}")
+
+
 def register_business_handlers(app: Application) -> None:
     """
     Зарегистрировать все Business Core handlers в приложении.
@@ -2935,6 +3017,8 @@ def register_business_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("newfaq",           newfaq_cmd))
     app.add_handler(CommandHandler("linkknowledge",    linkknowledge_cmd))
     app.add_handler(CommandHandler("stageknowledge",   stageknowledge_cmd))
+    # Phase 8D
+    app.add_handler(CommandHandler("milestones",       milestones_cmd))
 
     # Callback handler для кнопок подтверждения бизнес-контекста (Фаза 5B)
     app.add_handler(CallbackQueryHandler(bc_ctx_callback, pattern=r"^bc_ctx:"))
@@ -2944,5 +3028,6 @@ def register_business_handlers(app: Application) -> None:
         "/bc /bcstatus /roadmaps /clients /newroadmap /newclient /newbiz /initbc /bcdrive "
         "/newobject /objects /startroadmap /stages "
         "/newservice /services /service "
+        "/milestones "
         "+ bc_ctx callback (Фаза 5B)"
     )
