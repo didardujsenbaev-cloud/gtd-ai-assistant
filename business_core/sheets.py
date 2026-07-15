@@ -576,6 +576,42 @@ def batch_append_business_rows(sheet_key: str, rows: list[list]) -> int:
     return start
 
 
+def _unique_header_names(headers: list[str]) -> list[str]:
+    """Сделать заголовки уникальными — gspread падает на дубликатах в get_all_records()."""
+    counts: dict[str, int] = {}
+    result: list[str] = []
+    for raw in headers:
+        name = (raw or "").strip()
+        if not name:
+            counts["_empty"] = counts.get("_empty", 0) + 1
+            n = counts["_empty"]
+            result.append(f"_col{n}" if n > 1 else "_col")
+            continue
+        if name in counts:
+            counts[name] += 1
+            result.append(f"{name} ({counts[name]})")
+        else:
+            counts[name] = 1
+            result.append(name)
+    return result
+
+
+def _values_to_records(all_values: list[list[str]]) -> list[dict]:
+    """Преобразовать get_all_values() в list[dict], устойчиво к дублирующимся заголовкам."""
+    if len(all_values) < 2:
+        return []
+    headers = _unique_header_names(all_values[0])
+    records: list[dict] = []
+    for row in all_values[1:]:
+        if not row or not any(cell.strip() for cell in row):
+            continue
+        records.append({
+            headers[j]: row[j].strip() if j < len(row) else ""
+            for j in range(len(headers))
+        })
+    return records
+
+
 def read_business_sheet(sheet_key: str) -> list[dict]:
     """
     Прочитать все записи листа как список словарей.
@@ -587,7 +623,7 @@ def read_business_sheet(sheet_key: str) -> list[dict]:
         list[dict] — каждый словарь = одна строка (ключи = заголовки)
     """
     sheet = get_business_sheet(sheet_key)
-    return sheet.get_all_records()
+    return _values_to_records(sheet.get_all_values())
 
 
 def update_business_cell(sheet_key: str, row: int, col: int, value) -> None:
@@ -616,7 +652,7 @@ def find_row_by_id(sheet_key: str, record_id: str) -> tuple[int, dict] | None:
     if len(all_values) < 2:
         return None
 
-    headers = all_values[0]
+    headers = _unique_header_names(all_values[0])
     for i, row in enumerate(all_values[1:], start=2):
         if row and row[0] == record_id:
             row_dict = {headers[j]: row[j] if j < len(row) else "" for j in range(len(headers))}
