@@ -4429,6 +4429,41 @@ def main():
         time=time(hour=10, minute=30, tzinfo=TIMEZONE),
     )
 
+    # Авторегистрация команд в Telegram (меню "/")
+    async def post_init(application: Application) -> None:
+        from telegram import BotCommand
+        commands = [
+            # GTD Core
+            BotCommand("start",           "Главное меню"),
+            BotCommand("help",            "Помощь и список команд"),
+            BotCommand("inbox",           "Показать Inbox"),
+            BotCommand("next",            "Следующие действия"),
+            BotCommand("projects",        "Список проектов"),
+            BotCommand("waiting",         "Жду от..."),
+            BotCommand("someday",         "Когда-нибудь"),
+            BotCommand("done",            "Завершить задачу"),
+            BotCommand("review",          "Еженедельный обзор"),
+            BotCommand("stats",           "Статистика GTD"),
+            BotCommand("now",             "Фокус прямо сейчас"),
+            # Business Core
+            BotCommand("bc",              "Business Core — дашборд"),
+            BotCommand("services",        "Список услуг"),
+            BotCommand("newservice",      "Создать услугу"),
+            BotCommand("objects",         "Список объектов"),
+            BotCommand("newobject",       "Создать объект"),
+            BotCommand("clients",         "Список клиентов"),
+            BotCommand("roadmaps",        "Список роадмапов"),
+            BotCommand("startroadmap",    "Запустить роадмап"),
+            BotCommand("stages",          "Этапы роадмапа"),
+            BotCommand("rtemplates",      "Шаблоны роадмапов"),
+            BotCommand("newsop",          "Создать SOP"),
+            BotCommand("newchecklist",    "Создать чек-лист"),
+            BotCommand("stageknowledge",  "Знания для этапа"),
+        ]
+        await application.bot.set_my_commands(commands)
+
+    app.post_init = post_init
+
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
