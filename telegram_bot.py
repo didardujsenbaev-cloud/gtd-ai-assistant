@@ -4388,6 +4388,7 @@ def main():
     try:
         from business_core.telegram_handlers import register_business_handlers
         register_business_handlers(app)
+        print("   ✅ Business Core handlers загружены (включая /milestones)")
     except Exception as _bc_err:
         print(f"   ⚠️  Business Core handlers не загружены: {_bc_err}")
     # ────────────────────────────────────────────────────────

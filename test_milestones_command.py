@@ -227,8 +227,8 @@ class TestMilestonesFindsRoadmap(unittest.TestCase):
                     _make_context(["roadmap_id=RM-999"]),
                 )
             )
-        self.assertEqual(len(replies), 1)
-        self.assertIn("❌", replies[0])
+        self.assertGreaterEqual(len(replies), 1)
+        self.assertIn("❌", replies[-1])
 
     def test_2_positional_arg_works(self):
         """2: /milestones RM-022 без ключа работает."""
@@ -388,8 +388,8 @@ class TestMilestonesMap(unittest.TestCase):
                     _make_context(["roadmap_id=RM-022"]),
                 )
             )
-        self.assertEqual(len(replies), 1)
-        text = replies[0]
+        self.assertGreaterEqual(len(replies), 1)
+        text = replies[-1]
         self.assertIn("1)", text)
         self.assertIn("2)", text)
         self.assertIn("3)", text)
@@ -478,7 +478,7 @@ class TestTotalPrice(unittest.TestCase):
                     _make_context(["roadmap_id=RM-022"]),
                 )
             )
-        self.assertIn("950", replies[0])
+        self.assertIn("950", replies[-1])
 
 
 # ────────────────────────────────────────────────────────────
@@ -641,8 +641,8 @@ class TestUnsupportedTemplate(unittest.TestCase):
                     _make_context(["roadmap_id=RM-022"]),
                 )
             )
-        self.assertEqual(len(replies), 1)
-        self.assertIn("SOP-IZH-COMMERCIAL-MILESTONES-001", replies[0])
+        self.assertGreaterEqual(len(replies), 1)
+        self.assertIn("SOP-IZH-COMMERCIAL-MILESTONES-001", replies[-1])
 
     def test_7_no_template_id_shows_info_message(self):
         """7: если template_id не определён — понятное сообщение."""
@@ -665,7 +665,7 @@ class TestUnsupportedTemplate(unittest.TestCase):
                     _make_context(["roadmap_id=RM-022"]),
                 )
             )
-        self.assertIn("не настроены", replies[0])
+        self.assertIn("не настроены", replies[-1])
 
     def test_7_resolve_template_from_notes(self):
         """7: _resolve_template_id читает template_id из notes roadmap."""

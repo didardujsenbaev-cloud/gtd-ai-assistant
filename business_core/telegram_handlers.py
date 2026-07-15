@@ -2862,8 +2862,9 @@ async def milestones_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     try:
-        raw = (update.message.text or "").split(None, 1)[1] if context.args else " ".join(context.args or [])
-    except (IndexError, TypeError):
+        parts = (update.message.text or "").split(None, 1)
+        raw = parts[1] if len(parts) > 1 else " ".join(context.args or [])
+    except (IndexError, TypeError, AttributeError):
         raw = ""
 
     args       = _parse_kv_args(raw)
@@ -2877,10 +2878,13 @@ async def milestones_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return
 
+    await _reply(update, f"⏳ Загружаю коммерческие этапы для `{roadmap_id}`...")
+
     try:
+        import asyncio
         from business_core.roadmap_manager import get_commercial_milestones_for_roadmap
 
-        data = get_commercial_milestones_for_roadmap(roadmap_id)
+        data = await asyncio.to_thread(get_commercial_milestones_for_roadmap, roadmap_id)
 
         if not data["ok"]:
             await _reply(update, f"❌ {data['error']}")
