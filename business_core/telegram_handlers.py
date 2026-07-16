@@ -2884,7 +2884,10 @@ async def milestones_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         import asyncio
         from business_core.roadmap_manager import get_commercial_milestones_for_roadmap
 
-        data = await asyncio.to_thread(get_commercial_milestones_for_roadmap, roadmap_id)
+        data = await asyncio.to_thread(
+            get_commercial_milestones_for_roadmap,
+            roadmap_id,
+        )
 
         if not data["ok"]:
             await _reply(update, f"❌ {data['error']}")

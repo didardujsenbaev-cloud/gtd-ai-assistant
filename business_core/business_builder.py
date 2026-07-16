@@ -1735,45 +1735,52 @@ def create_roadmap_for_object(
 
 
 def find_roadmap_by_id(roadmap_id: str) -> Optional[dict]:
-    """Найти roadmap по RM-ID."""
+    """Найти roadmap по RM-ID без полного чтения листа ROADMAPS."""
     if not roadmap_id:
         return None
+
     try:
         from business_core.sheets import get_business_sheet
+
         sheet = get_business_sheet("roadmaps")
-        all_values = sheet.get_all_values()
-        if len(all_values) < 2:
+
+        # Roadmap ID хранится в первом столбце.
+        # Ищем только нужную строку вместо get_all_values().
+        cell = sheet.find(roadmap_id, in_column=1)
+
+        if not cell:
             return None
-        headers = all_values[0]
 
-        def _col(h):
-            return headers.index(h) if h in headers else None
+        headers = sheet.row_values(1)
+        row = sheet.row_values(cell.row)
 
-        def _get(row, h):
-            c = _col(h)
-            return row[c].strip() if c is not None and c < len(row) else ""
+        def _col(header):
+            return headers.index(header) if header in headers else None
 
-        for i, row in enumerate(all_values[1:], start=2):
-            if not row or not row[0]:
-                continue
-            if row[0].strip() == roadmap_id:
-                return {
-                    "row_num":    i,
-                    "roadmap_id": _get(row, "Roadmap ID"),
-                    "biz_id":     _get(row, "Business ID"),
-                    "service_id": _get(row, "Service ID"),
-                    "client_id":  _get(row, "Client ID"),
-                    "title":      _get(row, "Client Name"),
-                    "status":     _get(row, "Status"),
-                    "created":    _get(row, "Created"),
-                    "obj_id":     _get(row, "Object ID"),
-                    "case_type":  _get(row, "Case Type"),
-                    "notes":      _get(row, "Notes"),
-                    "progress":   _get(row, "Progress %"),
-                }
+        def _get(header):
+            column = _col(header)
+            if column is None or column >= len(row):
+                return ""
+            return str(row[column]).strip()
+
+        return {
+            "row_num":    cell.row,
+            "roadmap_id": _get("Roadmap ID"),
+            "biz_id":     _get("Business ID"),
+            "service_id": _get("Service ID"),
+            "client_id":  _get("Client ID"),
+            "title":      _get("Client Name"),
+            "status":     _get("Status"),
+            "created":    _get("Created"),
+            "obj_id":     _get("Object ID"),
+            "case_type":  _get("Case Type"),
+            "notes":      _get("Notes"),
+            "progress":   _get("Progress %"),
+        }
+
     except Exception as exc:
         log.warning(f"find_roadmap_by_id({roadmap_id}) error: {exc}")
-    return None
+        return None
 
 
 def find_roadmaps_by_object(obj_id: str) -> list[dict]:

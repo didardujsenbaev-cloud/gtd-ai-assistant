@@ -1001,12 +1001,14 @@ def get_commercial_milestones_for_roadmap(roadmap_id: str) -> dict:
 
     template_id    = _resolve_template_id(roadmap)
     milestones_cfg = COMMERCIAL_MILESTONES_MAP.get(template_id, [])
+    stages         = get_stages_for_roadmap(roadmap_id)
 
-    # Для отображения commercial milestones не требуется читать весь
-    # ROADMAP_STAGES. Диапазоны этапов уже заданы в mapping.
-    # Это исключает лишний Google Sheets API request и зависания команды.
-    stages: list[dict] = []
     stage_by_order: dict[int, dict] = {}
+    for s in stages:
+        try:
+            stage_by_order[int(s.get("order", 0))] = s
+        except (ValueError, TypeError):
+            pass
 
     populated: list[dict] = []
     for cm in milestones_cfg:
