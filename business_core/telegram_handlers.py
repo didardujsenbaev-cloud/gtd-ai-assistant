@@ -799,7 +799,12 @@ async def newclient_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     nc = context.user_data.get("nc", {})
 
     try:
-        from business_core.sheets import append_business_row, generate_next_id
+        from business_core.sheets import (
+            append_business_row,
+            generate_next_id,
+            get_business_sheet,
+            row_from_header_map,
+        )
         from business_core.business_builder import (
             find_existing_person,
             add_biz_id_to_person,
@@ -856,23 +861,41 @@ async def newclient_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             biz_ids_val     = biz_id_resolved if biz_id_resolved else ""
             primary_biz_val = biz_id_resolved if biz_id_resolved else ""
 
-            row_values = [
-                prs_id, full_name, short_name,
-                phone, "", "", "", "",
-                "", "", "",
-                nc.get("person_type", "клиент"), "",
-                biz_name,           # "Бизнесы" — для совместимости
-                "средний", "",
-                "", "", "", "", "",
-                "", "", now, now, "", "",
-                "", "", "", "", "active", "тёплый", "",
-                "", "",             # Google Drive, Drive Folder ID (Phase 5)
-                biz_ids_val,        # Biz IDs
-                "",                 # Company ID
-                "",                 # Citizenship
-                "",                 # Passport / ID
-                primary_biz_val,    # Primary Biz ID
+            # Phase 10.2B.4: строка формируется по ФАКТИЧЕСКИМ заголовкам
+            # листа PEOPLE_REGISTRY, а не по жёсткой позиции — не зависит
+            # от порядка колонок и не смещает значения в чужие колонки
+            # (см. Phase 10.2B.3: подтверждённое смещение "active"/"тёплый").
+            sheet   = get_business_sheet("people_registry")
+            headers = sheet.row_values(1)
+
+            required_headers = [
+                "ID", "ФИО", "Телефон",
+                "Статус отношений", "Теплота", "Комментарий",
+                "Biz IDs", "Primary Biz ID",
+                "Дата первого контакта", "Дата последнего контакта",
             ]
+            missing_headers = [h for h in required_headers if h not in headers]
+            if missing_headers:
+                raise ValueError(
+                    f"PEOPLE_REGISTRY: отсутствуют обязательные колонки {missing_headers}. "
+                    f"Запись клиента остановлена, ничего не записано."
+                )
+
+            row_values = row_from_header_map(headers, {
+                "ID":     prs_id,
+                "ФИО":    full_name,
+                "Имя":    short_name,
+                "Телефон": phone,
+                "Тип":    nc.get("person_type", "клиент"),
+                "Бизнесы": biz_name,
+                "Уровень доверия": "средний",
+                "Дата первого контакта":    now,
+                "Дата последнего контакта": now,
+                "Статус отношений": "active",
+                "Теплота":           "тёплый",
+                "Biz IDs":           biz_ids_val,
+                "Primary Biz ID":    primary_biz_val,
+            })
             append_business_row("people_registry", row_values)
 
             try:
