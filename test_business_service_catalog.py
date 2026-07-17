@@ -462,6 +462,8 @@ class TestNewserviceCommand(unittest.TestCase):
             update.effective_chat.id  = 123
 
             with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
+                 patch("business_core.sheets.find_row_by_id",
+                       return_value=(2, {"ID": "BIZ-001"})), \
                  patch("business_core.service_manager.create_service_record",
                        return_value={"ok": True, "service_id": "SVC-001", "error": None}):
                 await newservice_cmd(update, context)

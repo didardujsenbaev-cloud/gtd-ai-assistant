@@ -2148,28 +2148,69 @@ async def newservice_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     """
     Создать новую услугу в SERVICE_CATALOG.
 
-    Форматы:
+    Формат (строго key=value, позиционный ввод не поддерживается):
       /newservice biz_id=BIZ-001 name="Узаконение реконструкции" category="узаконение" ...
-      /newservice BIZ-001 "Узаконение реконструкции частного дома"
     """
     if not _is_bc_enabled():
         await _reply(update, _bc_disabled_msg())
         return
 
+    known_keys = {
+        "biz_id", "name", "service_name", "category", "city", "object_type",
+        "client_type", "description", "what_included", "what_not_included",
+        "price_from", "price_to", "currency", "duration", "documents",
+        "template", "risks", "contractors", "materials", "status", "notes",
+    }
+    usage_hint = (
+        "Пример:\n"
+        "`/newservice biz_id=BIZ-001 name=\"Узаконение реконструкции\" "
+        "city=Алматы price_from=1500000 duration=\"3-4 месяца\"`"
+    )
+
     raw  = " ".join(context.args or [])
     args = _parse_kv_args(raw)
 
-    biz_id       = args.get("biz_id")       or args.get("_pos0", "")
-    service_name = (args.get("name") or args.get("service_name")
-                    or args.get("_pos1", ""))
+    # Phase 10.2D: positional fallback (_pos0/_pos1) удалён — любой
+    # свободный текст или ввод без key=value отклоняется, вместо того
+    # чтобы тихо интерпретироваться как biz_id/name (см. инцидент SVC-001,
+    # где случайное сообщение создало реальную запись в SERVICE_CATALOG).
+    positional_tokens = [k for k in args if k.startswith("_pos")]
+    if not args or positional_tokens:
+        await _reply(update,
+            "❌ Используй формат key=value (без key=value ввод не принимается).\n\n"
+            + usage_hint
+        )
+        return
+
+    unknown_keys = sorted(k for k in args if k not in known_keys)
+    if unknown_keys:
+        await _reply(update,
+            f"❌ Неизвестные параметры: {', '.join(unknown_keys)}\n\n"
+            + usage_hint
+        )
+        return
+
+    biz_id       = (args.get("biz_id") or "").strip()
+    service_name = (args.get("name") or args.get("service_name") or "").strip()
 
     if not biz_id or not service_name:
         await _reply(update,
             "❌ Укажи biz\\_id и name.\n\n"
-            "Пример:\n"
-            "`/newservice biz_id=BIZ-001 name=\"Узаконение реконструкции\" "
-            "city=Алматы price_from=1500000 duration=\"3-4 месяца\"`"
+            + usage_hint
         )
+        return
+
+    # Проверяем, что biz_id реально существует в BIZ_REGISTRY —
+    # раньше любая непустая строка принималась без проверки.
+    try:
+        from business_core.sheets import find_row_by_id
+        biz_row = find_row_by_id("biz_registry", biz_id)
+    except Exception as exc:
+        log.warning(f"newservice_cmd: не удалось проверить biz_id '{biz_id}': {exc}")
+        biz_row = None
+
+    if biz_row is None:
+        await _reply(update, f"❌ Бизнес `{biz_id}` не найден в BIZ_REGISTRY")
         return
 
     try:
