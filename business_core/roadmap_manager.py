@@ -1346,3 +1346,117 @@ def recalculate_roadmap_progress(roadmap_id: str) -> dict:
         return {"ok": False, "error": str(exc),
                 "roadmap_id": roadmap_id, "old_progress": "", "new_progress": new_progress,
                 "done_count": done_count, "total_count": total_count, "changed": False}
+
+
+def should_complete_roadmap(stages: list[dict], progress_pct: int) -> bool:
+    """
+    Phase 9E.2: чистая функция — определить, завершён ли roadmap.
+
+    Не обращается к Sheets. Roadmap считается завершённым только если
+    ОДНОВРЕМЕННО:
+      - есть хотя бы один этап;
+      - progress_pct == 100;
+      - статус КАЖДОГО этапа входит в DONE_SET (done, skipped).
+
+    Legacy-значения (not_started, waiting, "completed" как статус этапа),
+    пустые и любые неизвестные строки — не входят в DONE_SET, поэтому
+    любой такой этап автоматически даёт False.
+
+    Args:
+        stages:       список dict с ключом 'status' (формат
+                      get_stages_for_roadmap).
+        progress_pct: рассчитанный процент (обычно из calculate_progress).
+
+    Returns:
+        bool
+    """
+    if not stages:
+        return False
+    if progress_pct != 100:
+        return False
+    return all(s.get("status", "") in DONE_SET for s in stages)
+
+
+def maybe_complete_roadmap(
+    roadmap_id: str,
+    stages: Optional[list[dict]] = None,
+    progress_pct: Optional[int] = None,
+) -> dict:
+    """
+    Phase 9E.2: автоматически перевести Roadmap active -> completed,
+    если он действительно завершён (см. should_complete_roadmap).
+
+    Если stages/progress_pct не переданы — читает и считает их сама
+    (get_stages_for_roadmap + calculate_progress), чтобы не заставлять
+    вызывающего дублировать логику, если он ими не располагает.
+
+    Пишет ТОЛЬКО колонку Status в найденной строке ROADMAPS, и только
+    в направлении active -> completed:
+      - Status уже 'completed'      -> идемпотентный результат, без записи;
+      - Status любой другой (кроме active/completed, напр. draft/paused/
+        cancelled) -> НЕ меняется, без записи;
+      - Status == 'active', но условия завершения не выполнены -> без записи;
+      - Status == 'active' и условия выполнены -> записывает 'completed'.
+
+    Никогда не переводит completed обратно в active. Не трогает Progress %,
+    не трогает ROADMAP_STAGES, не трогает другие roadmap, не пишет историю.
+
+    Returns:
+        {
+            "ok":         bool,
+            "error":      str | None,
+            "roadmap_id": str,
+            "old_status": str,
+            "new_status": str,
+            "changed":    bool,
+        }
+    """
+    if not roadmap_id:
+        return {"ok": False, "error": "roadmap_id не указан", "roadmap_id": "",
+                "old_status": "", "new_status": "", "changed": False}
+
+    try:
+        from business_core.sheets import get_business_sheet, get_header_index_map
+
+        sheet = get_business_sheet("roadmaps")
+        cell = sheet.find(roadmap_id, in_column=1)
+        if not cell:
+            return {"ok": False, "error": f"Roadmap '{roadmap_id}' не найден",
+                    "roadmap_id": roadmap_id, "old_status": "", "new_status": "", "changed": False}
+
+        headers = sheet.row_values(1)
+        idx = get_header_index_map(headers)
+
+        if "Status" not in idx:
+            return {"ok": False, "error": "В листе ROADMAPS отсутствует колонка 'Status'",
+                    "roadmap_id": roadmap_id, "old_status": "", "new_status": "", "changed": False}
+
+        row = sheet.row_values(cell.row)
+        current_status = row[idx["Status"]].strip() if idx["Status"] < len(row) else ""
+
+        if current_status == "completed":
+            return {"ok": True, "error": None, "roadmap_id": roadmap_id,
+                    "old_status": "completed", "new_status": "completed", "changed": False}
+
+        if current_status != "active":
+            return {"ok": True, "error": None, "roadmap_id": roadmap_id,
+                    "old_status": current_status, "new_status": current_status, "changed": False}
+
+        if stages is None:
+            stages = get_stages_for_roadmap(roadmap_id)
+        if progress_pct is None:
+            progress_pct = calculate_progress(stages)
+
+        if not should_complete_roadmap(stages, progress_pct):
+            return {"ok": True, "error": None, "roadmap_id": roadmap_id,
+                    "old_status": "active", "new_status": "active", "changed": False}
+
+        sheet.update_cell(cell.row, idx["Status"] + 1, "completed")
+
+        return {"ok": True, "error": None, "roadmap_id": roadmap_id,
+                "old_status": "active", "new_status": "completed", "changed": True}
+
+    except Exception as exc:
+        log.error(f"maybe_complete_roadmap({roadmap_id}) error: {exc}")
+        return {"ok": False, "error": str(exc), "roadmap_id": roadmap_id,
+                "old_status": "", "new_status": "", "changed": False}

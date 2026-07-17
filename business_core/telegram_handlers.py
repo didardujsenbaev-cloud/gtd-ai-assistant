@@ -1952,9 +1952,11 @@ async def updatestage_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     Меняет только колонки Status (и Notes, если notes передан) в найденной
     строке ROADMAP_STAGES. После успешного изменения статуса автоматически
-    пересчитывает Progress % roadmap (Phase 9E.1) — вызывается только если
-    статус этапа валиден и этап найден. Не меняет статус Roadmap, не
-    реализует автозавершение Roadmap, не пишет историю.
+    пересчитывает Progress % roadmap (Phase 9E.1) и, если roadmap реально
+    завершён (все этапы done/skipped, Progress % == 100, Status == active),
+    переводит его в completed (Phase 9E.2) — вызывается только если статус
+    этапа валиден и этап найден. Не пишет историю, не делает массовых
+    обновлений, не открывает completed обратно в active.
     """
     if not _is_bc_enabled():
         await _reply(update, _bc_disabled_msg())
@@ -1987,6 +1989,7 @@ async def updatestage_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         from business_core.roadmap_manager import (
             update_stage_status_in_sheet,
             recalculate_roadmap_progress,
+            maybe_complete_roadmap,
         )
 
         result = update_stage_status_in_sheet(stage_id, status, notes=notes)
@@ -2020,6 +2023,24 @@ async def updatestage_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     lines.append(
                         f"Progress Roadmap `{roadmap_id}` уже {progress['new_progress']}%"
                     )
+
+                # Phase 9E.2: автозавершение roadmap — только если Progress %
+                # реально пересчитан. progress_pct передаётся напрямую, чтобы
+                # не пересчитывать его повторно; список этапов
+                # maybe_complete_roadmap при необходимости читает сам.
+                completion = maybe_complete_roadmap(
+                    roadmap_id, progress_pct=progress["new_progress"],
+                )
+                if completion["ok"]:
+                    if completion["changed"]:
+                        lines.append(
+                            f"✅ Roadmap `{roadmap_id}` завершён: "
+                            f"{completion['old_status']} → {completion['new_status']}"
+                        )
+                    elif completion["old_status"] == "completed":
+                        lines.append(
+                            f"ℹ️ Roadmap `{roadmap_id}` уже имеет статус `completed`"
+                        )
 
         if notes is not None:
             lines.append(f"Notes обновлены: {notes}")

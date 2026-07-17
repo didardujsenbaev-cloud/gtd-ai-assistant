@@ -166,7 +166,10 @@ class TestRecalculateCalledOnlyOnSuccess(unittest.TestCase):
                                      "roadmap_id": "RM-001", "old_status": "pending",
                                      "new_status": "done", "changed": True}), \
                  patch("business_core.roadmap_manager.recalculate_roadmap_progress",
-                       side_effect=fake_recalc):
+                       side_effect=fake_recalc), \
+                 patch("business_core.roadmap_manager.maybe_complete_roadmap",
+                       return_value={"ok": True, "error": None, "roadmap_id": "RM-001",
+                                     "old_status": "active", "new_status": "active", "changed": False}):
                 await th.updatestage_cmd(upd, ctx)
 
         _run(run())
@@ -234,7 +237,10 @@ class TestRecalculateCalledOnlyOnSuccess(unittest.TestCase):
                                      "roadmap_id": "RM-001", "old_status": "done",
                                      "new_status": "done", "changed": False}), \
                  patch("business_core.roadmap_manager.recalculate_roadmap_progress",
-                       side_effect=fake_recalc):
+                       side_effect=fake_recalc), \
+                 patch("business_core.roadmap_manager.maybe_complete_roadmap",
+                       return_value={"ok": True, "error": None, "roadmap_id": "RM-001",
+                                     "old_status": "active", "new_status": "active", "changed": False}):
                 await th.updatestage_cmd(upd, ctx)
 
         _run(run())
@@ -265,7 +271,10 @@ class TestReplyFormat(unittest.TestCase):
                  patch("business_core.roadmap_manager.recalculate_roadmap_progress",
                        return_value={"ok": True, "error": None, "roadmap_id": "RM-001",
                                      "old_progress": "33", "new_progress": 67,
-                                     "done_count": 2, "total_count": 3, "changed": True}):
+                                     "done_count": 2, "total_count": 3, "changed": True}), \
+                 patch("business_core.roadmap_manager.maybe_complete_roadmap",
+                       return_value={"ok": True, "error": None, "roadmap_id": "RM-001",
+                                     "old_status": "active", "new_status": "active", "changed": False}):
                 await th.updatestage_cmd(upd, ctx)
 
         _run(run())
@@ -292,7 +301,10 @@ class TestReplyFormat(unittest.TestCase):
                  patch("business_core.roadmap_manager.recalculate_roadmap_progress",
                        return_value={"ok": True, "error": None, "roadmap_id": "RM-001",
                                      "old_progress": "67", "new_progress": 67,
-                                     "done_count": 2, "total_count": 3, "changed": False}):
+                                     "done_count": 2, "total_count": 3, "changed": False}), \
+                 patch("business_core.roadmap_manager.maybe_complete_roadmap",
+                       return_value={"ok": True, "error": None, "roadmap_id": "RM-001",
+                                     "old_status": "active", "new_status": "active", "changed": False}):
                 await th.updatestage_cmd(upd, ctx)
 
         _run(run())
@@ -319,7 +331,10 @@ class TestReplyFormat(unittest.TestCase):
                  patch("business_core.roadmap_manager.recalculate_roadmap_progress",
                        return_value={"ok": True, "error": None, "roadmap_id": "RM-001",
                                      "old_progress": "0", "new_progress": 0,
-                                     "done_count": 0, "total_count": 3, "changed": False}):
+                                     "done_count": 0, "total_count": 3, "changed": False}), \
+                 patch("business_core.roadmap_manager.maybe_complete_roadmap",
+                       return_value={"ok": True, "error": None, "roadmap_id": "RM-001",
+                                     "old_status": "active", "new_status": "active", "changed": False}):
                 await th.updatestage_cmd(upd, ctx)
 
         _run(run())
