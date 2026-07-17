@@ -48,31 +48,63 @@ Stages работают.
 
 ---
 
-## Последняя проблема
+## BUG-001 — закрыт
 
-Команда
+Проблема:
 
-/milestones
+Roadmap, созданный с явным template_id (например RMT-IZH-ALM-STANDARD-002),
 
-работает.
+позже в /milestones определялся как другой шаблон
 
-Но обнаружен BUG.
+(RMT-IZH-ALM-LEGALIZATION-001), либо (после промежуточного фикса)
 
-Roadmap RM-022 и RM-026 определяются как
+как OBJ-001 — значение колонки Object ID.
 
-RMT-IZH-ALM-LEGALIZATION-001
+Причина:
 
-хотя ожидался
+1. template_id не сохранялся в листе ROADMAPS — /milestones пересчитывал
 
-RMT-IZH-ALM-STANDARD-002
+   его заново через эвристику и получал шаблон по умолчанию для услуги.
 
-Необходимо проверить:
+2. После добавления колонки Template ID запись в ROADMAPS велась
 
-- сохранение template_id
+   позиционно, без учёта фактических заголовков живого листа —
 
-- чтение template_id
+   из-за исторического расхождения между кодом и реальными заголовками
 
-- функцию *resolve*template_id()
+   новая колонка легла на данные Object ID.
+
+Исправлено:
+
+- create_roadmap_for_object и find_roadmap_by_id читают и пишут
+
+  ROADMAPS по фактическим именам заголовков, а не по позиции.
+
+- /milestones исправлен: _resolve_template_id приоритетно использует
+
+  сохранённый template_id.
+
+- Добавлена безопасная идемпотентная миграция заголовков ROADMAPS
+
+  (migrate_roadmaps_headers.py, dry-run по умолчанию, требует YES
+
+  для live-запуска, меняет только строку заголовков).
+
+- Миграция заголовков ROADMAPS выполнена в проде (--live, подтверждено YES).
+
+  Заголовки 25–28 приведены к: Object ID, Parent Roadmap ID, Case Type,
+
+  Template ID. Ни одна строка данных не изменена (27/27 строк идентичны).
+
+- Проверено на roadmap RM-027: template_id читается как
+
+  RMT-IZH-ALM-STANDARD-002, /milestones (get_commercial_milestones_for_roadmap)
+
+  возвращает 3 коммерческих этапа (950 000 тг) корректно.
+
+Статус:
+
+Закрыто.
 
 ---
 
