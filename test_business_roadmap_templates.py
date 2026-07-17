@@ -72,12 +72,15 @@ RM_STAGE_HEADERS = [
     "Stage ID", "Roadmap ID", "Order", "Name", "Status",
     "Due Date", "Completed At", "GTD Action ID",
     "Responsible", "Docs Required", "Docs Received", "Notes",
+    "SOP IDs", "Checklist IDs", "Materials IDs",
+    "Document Template IDs", "FAQ IDs",
 ]
 
 
 def _ws(rows):
     ws = MagicMock()
     ws.get_all_values.return_value = rows
+    ws.row_values.side_effect = lambda r: rows[r - 1] if 0 <= r - 1 < len(rows) else []
     ws.update_cell = MagicMock()
     ws.append_row  = MagicMock()
     return ws
@@ -364,11 +367,16 @@ class TestCreateStagesFromTemplateRecord(unittest.TestCase):
         ]
         appended = []
 
-        def capture(key, row):
-            appended.append(row)
+        def capture(key, rows):
+            appended.extend(rows)
 
         with patch.object(m, "find_template_stages", return_value=template_stages), \
-             patch("business_core.sheets.append_business_row", side_effect=capture), \
+             patch("business_core.sheets.get_business_sheet",
+                   return_value=_rmstage_sheet()), \
+             patch("business_core.sheets.batch_append_business_rows",
+                   side_effect=capture), \
+             patch("business_core.knowledge_manager.find_knowledge_by_template_stage",
+                   return_value={}), \
              patch("business_core.sheets.generate_next_id",
                    side_effect=["STAGE-001", "STAGE-002"]):
             result = m.create_stages_from_template_record("RM-001", "RTMPL-001")
@@ -379,6 +387,9 @@ class TestCreateStagesFromTemplateRecord(unittest.TestCase):
         for row in appended:
             self.assertIn("RM-001", row)
             self.assertIn("pending", row)
+            idx = {h: i for i, h in enumerate(RM_STAGE_HEADERS)}
+            self.assertEqual(row[idx["Roadmap ID"]], "RM-001")
+            self.assertEqual(row[idx["Status"]], "pending")
 
     def test_K_empty_template_returns_warning(self):
         """K: шаблон без этапов → warning, не падает."""
@@ -395,6 +406,181 @@ class TestCreateStagesFromTemplateRecord(unittest.TestCase):
         m = _fresh()
         result = m.create_stages_from_template_record("", "RTMPL-001")
         self.assertFalse(result["ok"])
+
+
+# ────────────────────────────────────────────────────────────
+# Phase 10.2B.1: create_stages_from_template_record — header-safety
+# ────────────────────────────────────────────────────────────
+
+class TestCreateStagesFromTemplateRecordHeaderSafety(unittest.TestCase):
+
+    _TEMPLATE_STAGES = [
+        {"stage_id": "TSTG-001", "template_id": "RTMPL-001", "order": "1",
+         "stage_name": "Диагностика", "description": "", "required_docs": "Паспорт",
+         "responsible": "Дидар", "estimated_days": "", "notes": "Заметка"},
+    ]
+
+    def _knowledge(self):
+        return {
+            "sop_ids": ["SOP-001"], "checklist_ids": ["CHK-001"],
+            "material_ids": ["MAT-001"], "document_template_ids": ["DOC-001"],
+            "faq_ids": ["FAQ-001"],
+        }
+
+    def test_standard_header_order_produces_correct_row(self):
+        """1: стандартный порядок заголовков — значения на своих местах."""
+        m = _fresh()
+        sheet = _rmstage_sheet()
+        captured = []
+
+        with patch.object(m, "find_template_stages", return_value=self._TEMPLATE_STAGES), \
+             patch("business_core.sheets.get_business_sheet", return_value=sheet), \
+             patch("business_core.sheets.batch_append_business_rows",
+                   side_effect=lambda k, rows: captured.extend(rows)), \
+             patch("business_core.knowledge_manager.find_knowledge_by_template_stage",
+                   return_value=self._knowledge()), \
+             patch("business_core.sheets.generate_next_id", return_value="STAGE-001"):
+            result = m.create_stages_from_template_record("RM-001", "RTMPL-001")
+
+        self.assertTrue(result["ok"])
+        idx = {h: i for i, h in enumerate(RM_STAGE_HEADERS)}
+        row = captured[0]
+        self.assertEqual(row[idx["Stage ID"]], "STAGE-001")
+        self.assertEqual(row[idx["Roadmap ID"]], "RM-001")
+        self.assertEqual(row[idx["Order"]], "1")
+        self.assertEqual(row[idx["Name"]], "Диагностика")
+        self.assertEqual(row[idx["Status"]], "pending")
+        self.assertEqual(row[idx["Responsible"]], "Дидар")
+        self.assertEqual(row[idx["Docs Required"]], "Паспорт")
+        self.assertEqual(row[idx["Notes"]], "Заметка")
+        self.assertEqual(row[idx["SOP IDs"]], "SOP-001")
+        self.assertEqual(row[idx["Checklist IDs"]], "CHK-001")
+        self.assertEqual(row[idx["Materials IDs"]], "MAT-001")
+        self.assertEqual(row[idx["Document Template IDs"]], "DOC-001")
+        self.assertEqual(row[idx["FAQ IDs"]], "FAQ-001")
+        # Поля, которые всегда пустые
+        self.assertEqual(row[idx["Due Date"]], "")
+        self.assertEqual(row[idx["Completed At"]], "")
+        self.assertEqual(row[idx["GTD Action ID"]], "")
+        self.assertEqual(row[idx["Docs Received"]], "")
+
+    def test_shuffled_header_order_gives_same_values_by_name(self):
+        """2: результат не зависит от перестановки заголовков листа."""
+        m = _fresh()
+        shuffled = [
+            "FAQ IDs", "Notes", "Stage ID", "Docs Received", "Roadmap ID",
+            "Document Template IDs", "Order", "Responsible", "Name",
+            "Materials IDs", "Status", "Checklist IDs", "Due Date",
+            "Docs Required", "SOP IDs", "Completed At", "GTD Action ID",
+        ]
+        self.assertCountEqual(shuffled, RM_STAGE_HEADERS,
+                              "перемешанный набор должен содержать те же заголовки")
+        sheet = _ws([shuffled])
+        captured = []
+
+        with patch.object(m, "find_template_stages", return_value=self._TEMPLATE_STAGES), \
+             patch("business_core.sheets.get_business_sheet", return_value=sheet), \
+             patch("business_core.sheets.batch_append_business_rows",
+                   side_effect=lambda k, rows: captured.extend(rows)), \
+             patch("business_core.knowledge_manager.find_knowledge_by_template_stage",
+                   return_value=self._knowledge()), \
+             patch("business_core.sheets.generate_next_id", return_value="STAGE-001"):
+            result = m.create_stages_from_template_record("RM-001", "RTMPL-001")
+
+        self.assertTrue(result["ok"])
+        idx = {h: i for i, h in enumerate(shuffled)}
+        row = captured[0]
+        self.assertEqual(row[idx["Roadmap ID"]], "RM-001")
+        self.assertEqual(row[idx["Status"]], "pending")
+        self.assertEqual(row[idx["Name"]], "Диагностика")
+        self.assertEqual(row[idx["SOP IDs"]], "SOP-001")
+        self.assertEqual(row[idx["FAQ IDs"]], "FAQ-001")
+        self.assertEqual(len(row), len(shuffled))
+
+    def test_unknown_extra_columns_remain_empty(self):
+        """4: неизвестные дополнительные колонки листа остаются пустыми."""
+        m = _fresh()
+        with_extra = RM_STAGE_HEADERS + ["Custom Future Field"]
+        sheet = _ws([with_extra])
+        captured = []
+
+        with patch.object(m, "find_template_stages", return_value=self._TEMPLATE_STAGES), \
+             patch("business_core.sheets.get_business_sheet", return_value=sheet), \
+             patch("business_core.sheets.batch_append_business_rows",
+                   side_effect=lambda k, rows: captured.extend(rows)), \
+             patch("business_core.knowledge_manager.find_knowledge_by_template_stage",
+                   return_value={}), \
+             patch("business_core.sheets.generate_next_id", return_value="STAGE-001"):
+            result = m.create_stages_from_template_record("RM-001", "RTMPL-001")
+
+        self.assertTrue(result["ok"])
+        idx = {h: i for i, h in enumerate(with_extra)}
+        row = captured[0]
+        self.assertEqual(row[idx["Custom Future Field"]], "")
+        self.assertEqual(len(row), len(with_extra))
+
+    def test_batch_append_called_exactly_once(self):
+        """5: batch append вызывается один раз для всех этапов шаблона."""
+        m = _fresh()
+        two_stages = self._TEMPLATE_STAGES + [
+            {"stage_id": "TSTG-002", "template_id": "RTMPL-001", "order": "2",
+             "stage_name": "Сбор документов", "description": "", "required_docs": "",
+             "responsible": "", "estimated_days": "", "notes": ""},
+        ]
+        sheet = _rmstage_sheet()
+        calls = []
+
+        with patch.object(m, "find_template_stages", return_value=two_stages), \
+             patch("business_core.sheets.get_business_sheet", return_value=sheet), \
+             patch("business_core.sheets.batch_append_business_rows",
+                   side_effect=lambda k, rows: calls.append((k, rows))), \
+             patch("business_core.knowledge_manager.find_knowledge_by_template_stage",
+                   return_value={}), \
+             patch("business_core.sheets.generate_next_id",
+                   side_effect=["STAGE-001", "STAGE-002"]):
+            result = m.create_stages_from_template_record("RM-001", "RTMPL-001")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(len(calls), 1, "batch_append_business_rows должен вызываться ровно один раз")
+        key, rows = calls[0]
+        self.assertEqual(key, "roadmap_stages")
+        self.assertEqual(len(rows), 2)
+
+    def test_stage_count_and_ids_unchanged(self):
+        """6: количество этапов и stage_ids соответствуют шаблону."""
+        m = _fresh()
+        two_stages = self._TEMPLATE_STAGES + [
+            {"stage_id": "TSTG-002", "template_id": "RTMPL-001", "order": "2",
+             "stage_name": "Сбор документов", "description": "", "required_docs": "",
+             "responsible": "", "estimated_days": "", "notes": ""},
+        ]
+        sheet = _rmstage_sheet()
+
+        with patch.object(m, "find_template_stages", return_value=two_stages), \
+             patch("business_core.sheets.get_business_sheet", return_value=sheet), \
+             patch("business_core.sheets.batch_append_business_rows"), \
+             patch("business_core.knowledge_manager.find_knowledge_by_template_stage",
+                   return_value={}), \
+             patch("business_core.sheets.generate_next_id",
+                   side_effect=["STAGE-001", "STAGE-002"]):
+            result = m.create_stages_from_template_record("RM-001", "RTMPL-001")
+
+        self.assertEqual(result["stages_count"], 2)
+        self.assertEqual(result["stage_ids"], ["STAGE-001", "STAGE-002"])
+
+    def test_empty_template_behavior_unchanged_no_sheet_access(self):
+        """7: пустой шаблон — поведение (warning, ok=True, 0 этапов) не изменилось,
+        и обращения к листу ROADMAP_STAGES не происходит вовсе."""
+        m = _fresh()
+        with patch.object(m, "find_template_stages", return_value=[]), \
+             patch("business_core.sheets.get_business_sheet") as mock_get_sheet:
+            result = m.create_stages_from_template_record("RM-001", "RTMPL-001")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["stages_count"], 0)
+        self.assertIsNotNone(result["warning"])
+        self.assertEqual(result["stage_ids"], [])
+        mock_get_sheet.assert_not_called()
 
 
 # ────────────────────────────────────────────────────────────

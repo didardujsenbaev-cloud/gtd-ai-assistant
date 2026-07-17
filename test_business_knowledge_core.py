@@ -451,12 +451,22 @@ class TestStartRoadmapCopiesKnowledge(unittest.TestCase):
             "material_ids": [], "document_template_ids": ["DOC-001"], "faq_ids": [],
         }
         appended = []
+        rm_stage_headers = [
+            "Stage ID", "Roadmap ID", "Order", "Name", "Status",
+            "Due Date", "Completed At", "GTD Action ID",
+            "Responsible", "Docs Required", "Docs Received", "Notes",
+            "SOP IDs", "Checklist IDs", "Materials IDs",
+            "Document Template IDs", "FAQ IDs",
+        ]
+        sheet = MagicMock()
+        sheet.row_values.return_value = rm_stage_headers
 
         with patch.object(rtm, "find_template_stages", return_value=template_stages), \
              patch("business_core.knowledge_manager.find_knowledge_by_template_stage",
                    return_value=knowledge_mock), \
-             patch("business_core.sheets.append_business_row",
-                   side_effect=lambda k, r: appended.append(r)), \
+             patch("business_core.sheets.get_business_sheet", return_value=sheet), \
+             patch("business_core.sheets.batch_append_business_rows",
+                   side_effect=lambda k, rows: appended.extend(rows)), \
              patch("business_core.sheets.generate_next_id", return_value="STAGE-001"):
             result = rtm.create_stages_from_template_record("RM-001", "RTMPL-001")
 
@@ -482,11 +492,21 @@ class TestStartRoadmapCopiesKnowledge(unittest.TestCase):
             "sop_ids": [], "checklist_ids": [], "material_ids": [],
             "document_template_ids": [], "faq_ids": [],
         }
+        rm_stage_headers = [
+            "Stage ID", "Roadmap ID", "Order", "Name", "Status",
+            "Due Date", "Completed At", "GTD Action ID",
+            "Responsible", "Docs Required", "Docs Received", "Notes",
+            "SOP IDs", "Checklist IDs", "Materials IDs",
+            "Document Template IDs", "FAQ IDs",
+        ]
+        sheet = MagicMock()
+        sheet.row_values.return_value = rm_stage_headers
 
         with patch.object(rtm, "find_template_stages", return_value=template_stages), \
              patch("business_core.knowledge_manager.find_knowledge_by_template_stage",
                    return_value=empty_knowledge), \
-             patch("business_core.sheets.append_business_row"), \
+             patch("business_core.sheets.get_business_sheet", return_value=sheet), \
+             patch("business_core.sheets.batch_append_business_rows"), \
              patch("business_core.sheets.generate_next_id", return_value="STAGE-002"):
             result = rtm.create_stages_from_template_record("RM-001", "RTMPL-001")
 

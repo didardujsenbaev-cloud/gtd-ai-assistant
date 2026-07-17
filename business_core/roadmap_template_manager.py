@@ -428,11 +428,22 @@ def create_stages_from_template_record(roadmap_id: str, template_id: str) -> dic
         }
 
     try:
-        from business_core.sheets import batch_append_business_rows, generate_next_id
+        from business_core.sheets import (
+            batch_append_business_rows,
+            generate_next_id,
+            get_business_sheet,
+            row_from_header_map,
+        )
         from business_core.knowledge_manager import find_knowledge_by_template_stage
         now       = datetime.now().strftime("%Y-%m-%d %H:%M")
         stage_ids = []
         rows      = []
+
+        # Phase 10.2B.1: строка формируется по ФАКТИЧЕСКИМ заголовкам
+        # листа ROADMAP_STAGES, а не по жёсткой позиции — не зависит от
+        # порядка колонок и не молчит, если ожидаемая колонка отсутствует.
+        sheet   = get_business_sheet("roadmap_stages")
+        headers = sheet.row_values(1)
 
         for ts in template_stages:
             stage_id          = generate_next_id("roadmap_stages")
@@ -446,26 +457,25 @@ def create_stages_from_template_record(roadmap_id: str, template_id: str) -> dic
             doc_template_ids = ",".join(knowledge.get("document_template_ids", []))
             faq_ids          = ",".join(knowledge.get("faq_ids",               []))
 
-            row = [
-                stage_id,                    # Stage ID
-                roadmap_id,                  # Roadmap ID
-                ts.get("order", ""),         # Order
-                ts.get("stage_name", ""),    # Name
-                "pending",                   # Status
-                "",                          # Due Date
-                "",                          # Completed At
-                "",                          # GTD Action ID
-                ts.get("responsible", ""),   # Responsible
-                ts.get("required_docs", ""), # Docs Required
-                "",                          # Docs Received
-                ts.get("notes", ""),         # Notes
+            values = {
+                "Stage ID":     stage_id,
+                "Roadmap ID":   roadmap_id,
+                "Order":        ts.get("order", ""),
+                "Name":         ts.get("stage_name", ""),
+                "Status":       "pending",
+                "Responsible":  ts.get("responsible", ""),
+                "Docs Required": ts.get("required_docs", ""),
+                "Notes":        ts.get("notes", ""),
                 # Phase 8C: knowledge IDs скопированы из шаблона
-                sop_ids,                     # SOP IDs
-                checklist_ids,               # Checklist IDs
-                material_ids,                # Materials IDs
-                doc_template_ids,            # Document Template IDs
-                faq_ids,                     # FAQ IDs
-            ]
+                "SOP IDs":                 sop_ids,
+                "Checklist IDs":           checklist_ids,
+                "Materials IDs":           material_ids,
+                "Document Template IDs":   doc_template_ids,
+                "FAQ IDs":                 faq_ids,
+                # Due Date / Completed At / GTD Action ID / Docs Received
+                # намеренно не переданы — остаются "" (как и раньше).
+            }
+            row = row_from_header_map(headers, values)
             rows.append(row)
             stage_ids.append(stage_id)
 
