@@ -430,37 +430,28 @@ async def show_clients(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 # ─────────────────────────────────────────────────────────────
 
 async def newroadmap_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Старт диалога создания дорожной карты."""
+    """
+    Phase 10.2E: /newroadmap deprecated — вместо legacy-диалога сразу
+    отправляет redirect на /startroadmap и завершает разговор. Не
+    обращается к Google Sheets, не создаёт conversation state.
+    """
     if not _is_bc_enabled():
         await _reply(update, _bc_disabled_msg())
         return ConversationHandler.END
 
-    try:
-        from business_core.sheets import read_business_sheet
-        rows = read_business_sheet("biz_registry")
-        active_biz = [r for r in rows if r.get("Статус", "") in ("active", "test")]
-    except Exception:
-        active_biz = []
+    context.user_data.pop("nr", None)
 
-    context.user_data["nr"] = {}
-
-    if active_biz:
-        biz_names = [r.get("Название", "?") for r in active_biz[:8]]
-        keyboard = [[name] for name in biz_names] + [["❌ Отмена"]]
-        reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
-        await update.message.reply_text(
-            "🗺 *Новая дорожная карта*\n\n"
-            "Выбери бизнес или напиши название:",
-            parse_mode="Markdown",
-            reply_markup=reply_markup,
-        )
-    else:
-        await update.message.reply_text(
-            "🗺 *Новая дорожная карта*\n\n"
-            "Введи название или ID бизнеса (например: Узаконение):",
-            parse_mode="Markdown",
-        )
-    return NR_BUSINESS
+    await update.message.reply_text(
+        "🗺 Команда /newroadmap больше не используется.\n\n"
+        "Создание дорожной карты теперь выполняется через /startroadmap.\n\n"
+        "Сначала создайте или выберите объект:\n"
+        "- /newobject\n"
+        "- /objects\n\n"
+        "Затем используйте:\n"
+        "`/startroadmap obj_id=OBJ-... service_id=SVC-... case_type=...`",
+        parse_mode="Markdown",
+    )
+    return ConversationHandler.END
 
 
 async def newroadmap_business(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
