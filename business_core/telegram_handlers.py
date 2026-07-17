@@ -1936,6 +1936,80 @@ async def stages_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 # ─────────────────────────────────────────────────────────────
+# /updatestage — обновить статус этапа (Phase 9B)
+# ─────────────────────────────────────────────────────────────
+
+async def updatestage_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Обновить статус этапа дорожной карты.
+
+    Форматы:
+      /updatestage stage_id=STAGE-xxx status=done
+      /updatestage stage_id=STAGE-xxx status=blocked notes="Ожидаем документы клиента"
+
+    status принимает только: pending, in_progress, blocked, done, skipped.
+    notes с пробелами нужно указывать в кавычках (как и в остальных командах).
+
+    Меняет только колонки Status (и Notes, если notes передан) в найденной
+    строке ROADMAP_STAGES. Не пересчитывает Progress %, не меняет статус
+    Roadmap, не пишет историю.
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg())
+        return
+
+    try:
+        raw = (update.message.text or "").split(None, 1)[1] if context.args else " ".join(context.args or [])
+    except (IndexError, TypeError):
+        raw = ""
+
+    args = _parse_kv_args(raw)
+
+    stage_id = args.get("stage_id") or args.get("_pos0", "")
+    status   = args.get("status")   or args.get("_pos1", "")
+    notes    = args.get("notes")
+
+    if not stage_id or not status:
+        from business_core.roadmap_manager import STAGE_STATUS_CANONICAL
+        await _reply(update,
+            "❌ Укажи stage\\_id и status.\n\n"
+            f"Допустимые статусы: `{', '.join(STAGE_STATUS_CANONICAL)}`\n\n"
+            "Примеры:\n"
+            "`/updatestage stage_id=STAGE-001-01 status=done`\n"
+            "`/updatestage stage_id=STAGE-001-01 status=blocked "
+            "notes=\"Ожидаем документы клиента\"`"
+        )
+        return
+
+    try:
+        from business_core.roadmap_manager import update_stage_status_in_sheet
+
+        result = update_stage_status_in_sheet(stage_id, status, notes=notes)
+
+        if not result["ok"]:
+            await _reply(update, f"❌ {result['error']}")
+            return
+
+        if result["changed"]:
+            lines = [
+                f"✅ Этап `{stage_id}`: {result['old_status']} → {result['new_status']}",
+            ]
+        else:
+            lines = [
+                f"ℹ️ Этап `{stage_id}` уже имел статус `{result['new_status']}` "
+                "(изменений нет, повтор безопасен).",
+            ]
+        if notes is not None:
+            lines.append(f"Notes обновлены: {notes}")
+
+        await _reply(update, "\n".join(lines))
+
+    except Exception as e:
+        log.error(f"updatestage_cmd error: {e}")
+        await _reply(update, f"❌ Ошибка: {e}")
+
+
+# ─────────────────────────────────────────────────────────────
 # /newservice — создать услугу (Phase 8A)
 # ─────────────────────────────────────────────────────────────
 
@@ -3009,6 +3083,8 @@ def register_business_handlers(app: Application) -> None:
     # Phase 7B
     app.add_handler(CommandHandler("startroadmap", startroadmap_cmd))
     app.add_handler(CommandHandler("stages",       stages_cmd))
+    # Phase 9B
+    app.add_handler(CommandHandler("updatestage",  updatestage_cmd))
     # Phase 8A
     app.add_handler(CommandHandler("newservice",       newservice_cmd))
     app.add_handler(CommandHandler("services",         services_cmd))
@@ -3034,7 +3110,7 @@ def register_business_handlers(app: Application) -> None:
     log.info(
         "Business Core handlers зарегистрированы: "
         "/bc /bcstatus /roadmaps /clients /newroadmap /newclient /newbiz /initbc /bcdrive "
-        "/newobject /objects /startroadmap /stages "
+        "/newobject /objects /startroadmap /stages /updatestage "
         "/newservice /services /service "
         "/milestones "
         "+ bc_ctx callback (Фаза 5B)"

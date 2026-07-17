@@ -29,6 +29,18 @@ log = logging.getLogger(__name__)
 STAGE_STATUSES = ("not_started", "in_progress", "waiting", "blocked", "done")
 ROADMAP_STATUSES = ("active", "completed", "on_hold", "cancelled")
 
+# Phase 9B: канонический словарь статусов РЕАЛЬНОГО этапа (лист
+# ROADMAP_STAGES), не путать со STAGE_STATUSES выше — та константа
+# принадлежит мёртвой in-memory модели (Roadmap/RoadmapStage,
+# update_stage_status/advance_stage) и Sheets не касается.
+#
+# Legacy-значения, встречающиеся в живых данных ROADMAP_STAGES
+# ("not_started" — из /newroadmap) и на уровне ROADMAPS.Status
+# ("completed"), в этот словарь намеренно НЕ входят: /updatestage
+# принимает только эти пять значений на запись, хотя существующие
+# этапы с legacy-статусом по-прежнему читаются без ошибок.
+STAGE_STATUS_CANONICAL = ("pending", "in_progress", "blocked", "done", "skipped")
+
 STATUS_ICONS = {
     "not_started": "⬜",
     "in_progress":  "🔵",
@@ -1075,3 +1087,147 @@ def get_stages_for_roadmap(roadmap_id: str) -> list[dict]:
     except Exception as exc:
         log.warning(f"get_stages_for_roadmap({roadmap_id}) error: {exc}")
         return []
+
+
+def find_stage_by_id(stage_id: str) -> Optional[dict]:
+    """
+    Найти один этап по Stage ID в листе ROADMAP_STAGES.
+
+    Read-only. Читает по ФАКТИЧЕСКИМ именам заголовков (не по позиции) —
+    тот же паттерн, что и find_roadmap_by_id в business_builder.py, чтобы
+    не повторить баг с рассинхроном заголовков и данных (см. RM-027).
+
+    Существующий этап с legacy-статусом (например 'not_started' из
+    /newroadmap) читается как есть, без ошибки — статус не валидируется
+    здесь, только при записи через update_stage_status_in_sheet.
+
+    Returns:
+        dict с полями row_num, stage_id, roadmap_id, order, name, status,
+        due_date, completed_at, responsible, notes — или None, если этап
+        не найден.
+    """
+    if not stage_id:
+        return None
+
+    try:
+        from business_core.sheets import get_business_sheet, read_row_by_headers
+
+        sheet = get_business_sheet("roadmap_stages")
+        cell = sheet.find(stage_id, in_column=1)
+        if not cell:
+            return None
+
+        headers = sheet.row_values(1)
+        row = sheet.row_values(cell.row)
+
+        wanted = [
+            "Stage ID", "Roadmap ID", "Order", "Name", "Status",
+            "Due Date", "Completed At", "Responsible", "Notes",
+        ]
+        v = read_row_by_headers(headers, row, wanted)
+
+        return {
+            "row_num":      cell.row,
+            "stage_id":     v["Stage ID"],
+            "roadmap_id":   v["Roadmap ID"],
+            "order":        v["Order"],
+            "name":         v["Name"],
+            "status":       v["Status"],
+            "due_date":     v["Due Date"],
+            "completed_at": v["Completed At"],
+            "responsible":  v["Responsible"],
+            "notes":        v["Notes"],
+        }
+
+    except Exception as exc:
+        log.warning(f"find_stage_by_id({stage_id}) error: {exc}")
+        return None
+
+
+def update_stage_status_in_sheet(
+    stage_id: str,
+    new_status: str,
+    notes: Optional[str] = None,
+) -> dict:
+    """
+    Обновить статус этапа в листе ROADMAP_STAGES (Phase 9B — /updatestage).
+
+    Пишет ТОЛЬКО колонку Status (и, если notes передан явно, колонку
+    Notes) — по имени заголовка, точечно в найденную строку. Никакие
+    другие колонки (Order, Name, Due Date, Responsible, Docs Required/
+    Received, знаниевые поля) и никакие другие строки не трогаются.
+    Не пересчитывает Progress %, не меняет статус Roadmap, не пишет
+    историю.
+
+    Args:
+        stage_id:   ID этапа (STAGE-...)
+        new_status: один из STAGE_STATUS_CANONICAL (pending / in_progress /
+                    blocked / done / skipped). Legacy-значения
+                    (not_started, completed, waiting) и любые другие
+                    строки отклоняются.
+        notes:      если передан (не None) — записывается в колонку Notes.
+                    Если не передан — колонка Notes не трогается.
+
+    Returns:
+        {
+            "ok":          bool,
+            "error":       str | None,
+            "stage_id":    str,
+            "old_status":  str,
+            "new_status":  str,
+            "changed":     bool,  # False если статус совпал с уже стоявшим
+        }
+    """
+    if not stage_id:
+        return {"ok": False, "error": "stage_id не указан",
+                "stage_id": "", "old_status": "", "new_status": new_status, "changed": False}
+
+    if new_status not in STAGE_STATUS_CANONICAL:
+        return {
+            "ok": False,
+            "error": (
+                f"Недопустимый статус '{new_status}'. "
+                f"Допустимые значения: {', '.join(STAGE_STATUS_CANONICAL)}"
+            ),
+            "stage_id": stage_id, "old_status": "", "new_status": new_status, "changed": False,
+        }
+
+    stage = find_stage_by_id(stage_id)
+    if not stage:
+        return {"ok": False, "error": f"Этап '{stage_id}' не найден",
+                "stage_id": stage_id, "old_status": "", "new_status": new_status, "changed": False}
+
+    try:
+        from business_core.sheets import get_business_sheet, get_header_index_map
+
+        sheet = get_business_sheet("roadmap_stages")
+        headers = sheet.row_values(1)
+        idx = get_header_index_map(headers)
+
+        if "Status" not in idx:
+            return {"ok": False, "error": "В листе ROADMAP_STAGES отсутствует колонка 'Status'",
+                    "stage_id": stage_id, "old_status": stage["status"], "new_status": new_status, "changed": False}
+
+        row_num = stage["row_num"]
+        old_status = stage["status"]
+
+        sheet.update_cell(row_num, idx["Status"] + 1, new_status)
+
+        if notes is not None:
+            if "Notes" not in idx:
+                return {"ok": False, "error": "В листе ROADMAP_STAGES отсутствует колонка 'Notes'",
+                        "stage_id": stage_id, "old_status": old_status, "new_status": new_status, "changed": True}
+            sheet.update_cell(row_num, idx["Notes"] + 1, notes)
+
+        return {
+            "ok": True, "error": None,
+            "stage_id": stage_id,
+            "old_status": old_status,
+            "new_status": new_status,
+            "changed": old_status != new_status,
+        }
+
+    except Exception as exc:
+        log.error(f"update_stage_status_in_sheet({stage_id}) error: {exc}")
+        return {"ok": False, "error": str(exc),
+                "stage_id": stage_id, "old_status": "", "new_status": new_status, "changed": False}
