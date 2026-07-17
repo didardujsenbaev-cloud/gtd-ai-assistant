@@ -108,6 +108,122 @@ Roadmap, созданный с явным template_id (например RMT-IZH-
 
 ---
 
+## Phase 9A–9E.2 — Stage Management и Roadmap Engine
+
+Завершена серия фаз, построившая полноценный Sheets-backed движок
+
+этапов и прогресса Roadmap поверх фундамента, заложенного при
+
+исправлении BUG-001.
+
+### Phase 9A — ROADMAP_STAGES schema/header migration
+
+Живой лист ROADMAP_STAGES имел только 12 подписанных заголовков,
+
+хотя код (create_stages_from_template_record) годами писал 5
+
+дополнительных знаниевых полей (SOP IDs, Checklist IDs, Materials IDs,
+
+Document Template IDs, FAQ IDs) в колонки 13–17 без подписей.
+
+Добавлена safe idempotent миграция (migrate_roadmap_stages_headers.py,
+
+тот же паттерн dry-run/YES, что и для ROADMAPS) и выполнена в проде.
+
+Данные не затронуты.
+
+### Phase 9B — канонические статусы этапов и /updatestage
+
+Введён единственный канонический словарь статусов реального этапа:
+
+pending, in_progress, blocked, done, skipped.
+
+Добавлены find_stage_by_id() и update_stage_status_in_sheet()
+
+(header-safe, пишут только Status и, при явной передаче, Notes).
+
+Добавлена команда /updatestage stage_id=... status=... [notes=...].
+
+Legacy-значения (not_started, waiting, completed как статус этапа)
+
+не принимаются на запись, но существующие этапы с такими статусами
+
+читаются без ошибок.
+
+### Phase 9C — расчёт Progress %
+
+Добавлены calculate_progress() (чистая функция) и
+
+recalculate_roadmap_progress() (Sheets-backed, пишет только Progress %).
+
+Формула и решения по skipped/округлению зафиксированы в DECISIONS.md
+
+(ADR: Progress Calculation).
+
+### Phase 9D — /recalcprogress
+
+Добавлена команда ручного пересчёта Progress % без изменения других
+
+полей: /recalcprogress roadmap_id=RM-xxx.
+
+### Phase 9E.1 — автоматический пересчёт после изменения этапа
+
+/updatestage теперь автоматически вызывает recalculate_roadmap_progress
+
+после успешного изменения статуса этапа. Ответ показывает старый и
+
+новый Progress %.
+
+### Phase 9E.2 — автоматическое завершение Roadmap
+
+Добавлены should_complete_roadmap() (чистая функция) и
+
+maybe_complete_roadmap() (Sheets-backed, пишет только Status,
+
+только active → completed). /updatestage автоматически переводит
+
+Roadmap в completed, когда прогресс достигает 100% при всех этапах
+
+в done/skipped. Правила зафиксированы в DECISIONS.md
+
+(ADR: Roadmap Automatic Completion).
+
+### Текущая рабочая цепочка
+
+```
+/startroadmap
+  → создание Roadmap (create_roadmap_for_object)
+  → создание Stages (create_stages_from_template_record /
+                      create_roadmap_stages_from_template)
+
+/updatestage stage_id=... status=...
+  → update_stage_status_in_sheet   (Status/Notes этапа)
+  → recalculate_roadmap_progress   (Progress % roadmap)
+  → maybe_complete_roadmap         (active → completed, если готово)
+```
+
+Каждый шаг header-safe (пишет по имени колонки, не по позиции),
+
+идемпотентен и не трогает поля за пределами своей ответственности.
+
+### Текущий статус
+
+Phase 9 завершена.
+
+Phase 10.1 (Core Architecture Audit, read-only) завершён — см.
+
+DECISIONS.md и NEXT_TASKS.md.
+
+Следующая техническая фаза — Phase 10.2B (Header-safe refactoring
+
+оставшихся позиционных записей в create_stages_from_template_record,
+
+create_roadmap_template, add_roadmap_template_stage,
+
+create_object_record и /newroadmap).
+
+---
+
 ## Правило
 
 Перед изменением кода:
