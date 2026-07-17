@@ -1951,8 +1951,10 @@ async def updatestage_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     notes с пробелами нужно указывать в кавычках (как и в остальных командах).
 
     Меняет только колонки Status (и Notes, если notes передан) в найденной
-    строке ROADMAP_STAGES. Не пересчитывает Progress %, не меняет статус
-    Roadmap, не пишет историю.
+    строке ROADMAP_STAGES. После успешного изменения статуса автоматически
+    пересчитывает Progress % roadmap (Phase 9E.1) — вызывается только если
+    статус этапа валиден и этап найден. Не меняет статус Roadmap, не
+    реализует автозавершение Roadmap, не пишет историю.
     """
     if not _is_bc_enabled():
         await _reply(update, _bc_disabled_msg())
@@ -1982,7 +1984,10 @@ async def updatestage_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     try:
-        from business_core.roadmap_manager import update_stage_status_in_sheet
+        from business_core.roadmap_manager import (
+            update_stage_status_in_sheet,
+            recalculate_roadmap_progress,
+        )
 
         result = update_stage_status_in_sheet(stage_id, status, notes=notes)
 
@@ -1999,6 +2004,23 @@ async def updatestage_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 f"ℹ️ Этап `{stage_id}` уже имел статус `{result['new_status']}` "
                 "(изменений нет, повтор безопасен).",
             ]
+
+        # Phase 9E.1: пересчёт Progress % только после валидного и
+        # существующего этапа (result["ok"] уже гарантирует это выше).
+        roadmap_id = result.get("roadmap_id", "")
+        if roadmap_id:
+            progress = recalculate_roadmap_progress(roadmap_id)
+            if progress["ok"]:
+                if progress["changed"]:
+                    lines.append(
+                        f"Progress Roadmap `{roadmap_id}`: "
+                        f"{progress['old_progress']}% → {progress['new_progress']}%"
+                    )
+                else:
+                    lines.append(
+                        f"Progress Roadmap `{roadmap_id}` уже {progress['new_progress']}%"
+                    )
+
         if notes is not None:
             lines.append(f"Notes обновлены: {notes}")
 

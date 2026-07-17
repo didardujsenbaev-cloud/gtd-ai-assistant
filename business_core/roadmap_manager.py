@@ -1182,6 +1182,7 @@ def update_stage_status_in_sheet(
             "ok":          bool,
             "error":       str | None,
             "stage_id":    str,
+            "roadmap_id":  str,   # '' если этап не найден/статус невалиден
             "old_status":  str,
             "new_status":  str,
             "changed":     bool,  # False если статус совпал с уже стоявшим
@@ -1189,7 +1190,7 @@ def update_stage_status_in_sheet(
     """
     if not stage_id:
         return {"ok": False, "error": "stage_id не указан",
-                "stage_id": "", "old_status": "", "new_status": new_status, "changed": False}
+                "stage_id": "", "roadmap_id": "", "old_status": "", "new_status": new_status, "changed": False}
 
     if new_status not in STAGE_STATUS_CANONICAL:
         return {
@@ -1198,13 +1199,15 @@ def update_stage_status_in_sheet(
                 f"Недопустимый статус '{new_status}'. "
                 f"Допустимые значения: {', '.join(STAGE_STATUS_CANONICAL)}"
             ),
-            "stage_id": stage_id, "old_status": "", "new_status": new_status, "changed": False,
+            "stage_id": stage_id, "roadmap_id": "", "old_status": "", "new_status": new_status, "changed": False,
         }
 
     stage = find_stage_by_id(stage_id)
     if not stage:
         return {"ok": False, "error": f"Этап '{stage_id}' не найден",
-                "stage_id": stage_id, "old_status": "", "new_status": new_status, "changed": False}
+                "stage_id": stage_id, "roadmap_id": "", "old_status": "", "new_status": new_status, "changed": False}
+
+    roadmap_id = stage["roadmap_id"]
 
     try:
         from business_core.sheets import get_business_sheet, get_header_index_map
@@ -1215,7 +1218,8 @@ def update_stage_status_in_sheet(
 
         if "Status" not in idx:
             return {"ok": False, "error": "В листе ROADMAP_STAGES отсутствует колонка 'Status'",
-                    "stage_id": stage_id, "old_status": stage["status"], "new_status": new_status, "changed": False}
+                    "stage_id": stage_id, "roadmap_id": roadmap_id,
+                    "old_status": stage["status"], "new_status": new_status, "changed": False}
 
         row_num = stage["row_num"]
         old_status = stage["status"]
@@ -1225,12 +1229,14 @@ def update_stage_status_in_sheet(
         if notes is not None:
             if "Notes" not in idx:
                 return {"ok": False, "error": "В листе ROADMAP_STAGES отсутствует колонка 'Notes'",
-                        "stage_id": stage_id, "old_status": old_status, "new_status": new_status, "changed": True}
+                        "stage_id": stage_id, "roadmap_id": roadmap_id,
+                        "old_status": old_status, "new_status": new_status, "changed": True}
             sheet.update_cell(row_num, idx["Notes"] + 1, notes)
 
         return {
             "ok": True, "error": None,
             "stage_id": stage_id,
+            "roadmap_id": roadmap_id,
             "old_status": old_status,
             "new_status": new_status,
             "changed": old_status != new_status,
@@ -1239,7 +1245,7 @@ def update_stage_status_in_sheet(
     except Exception as exc:
         log.error(f"update_stage_status_in_sheet({stage_id}) error: {exc}")
         return {"ok": False, "error": str(exc),
-                "stage_id": stage_id, "old_status": "", "new_status": new_status, "changed": False}
+                "stage_id": stage_id, "roadmap_id": "", "old_status": "", "new_status": new_status, "changed": False}
 
 
 def calculate_progress(stages: list[dict]) -> int:

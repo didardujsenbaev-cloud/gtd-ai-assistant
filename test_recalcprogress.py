@@ -233,13 +233,22 @@ class TestUpdateStageUntouched(unittest.TestCase):
         src = (WORKSPACE / "business_core" / "telegram_handlers.py").read_text(encoding="utf-8")
         self.assertEqual(src.count('CommandHandler("updatestage"'), 1)
 
-    def test_updatestage_does_not_call_recalculate(self):
+    def test_updatestage_calls_recalculate_only_on_success(self):
+        """Phase 9E.1: /updatestage теперь вызывает recalculate_roadmap_progress,
+        но только после успешного (валидный статус, существующий этап)
+        обновления — не при ошибках. Полное покрытие в test_updatestage_progress.py."""
         src = (WORKSPACE / "business_core" / "telegram_handlers.py").read_text(encoding="utf-8")
         import re
         match = re.search(
             r"async def updatestage_cmd.*?(?=\nasync def |\Z)", src, re.DOTALL)
         self.assertIsNotNone(match)
-        self.assertNotIn("recalculate_roadmap_progress", match.group(0))
+        body = match.group(0)
+        self.assertIn("recalculate_roadmap_progress", body)
+        # вызов должен идти строго после проверки result["ok"] (после return
+        # на ошибке), а не до неё
+        idx_error_check = body.index('if not result["ok"]')
+        idx_recalc_call = body.index("recalculate_roadmap_progress(roadmap_id)")
+        self.assertLess(idx_error_check, idx_recalc_call)
 
 
 # ────────────────────────────────────────────────────────────
