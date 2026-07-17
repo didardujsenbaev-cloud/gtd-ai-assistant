@@ -442,12 +442,17 @@ class TestGTDAndEnvUntouched(unittest.TestCase):
         mtime_after = os.path.getmtime(env_path)
         self.assertEqual(mtime_before, mtime_after)
 
-    def test_telegram_handlers_does_not_call_recalculate_yet(self):
-        """Phase 9C: recalculate_roadmap_progress НЕ должен вызываться
-        автоматически из /updatestage или где-либо ещё в telegram_handlers."""
+    def test_updatestage_does_not_call_recalculate(self):
+        """Phase 9C/9D: recalculate_roadmap_progress НЕ должен вызываться
+        автоматически из /updatestage — только вручную через /recalcprogress
+        (Phase 9D), которая явно вызывает его сама и тестируется отдельно
+        в test_recalcprogress.py."""
+        import re
         th_path = WORKSPACE / "business_core" / "telegram_handlers.py"
         src = th_path.read_text(encoding="utf-8")
-        self.assertNotIn("recalculate_roadmap_progress", src)
+        match = re.search(r"async def updatestage_cmd.*?(?=\nasync def |\Z)", src, re.DOTALL)
+        self.assertIsNotNone(match)
+        self.assertNotIn("recalculate_roadmap_progress", match.group(0))
 
 
 if __name__ == "__main__":

@@ -2010,6 +2010,71 @@ async def updatestage_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 # ─────────────────────────────────────────────────────────────
+# /recalcprogress — ручной пересчёт Progress % (Phase 9D)
+# ─────────────────────────────────────────────────────────────
+
+async def recalcprogress_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Пересчитать Progress % дорожной карты по фактическим статусам этапов.
+
+    Формат:
+      /recalcprogress roadmap_id=RM-xxx
+
+    Вызывает существующую recalculate_roadmap_progress() — пишет ТОЛЬКО
+    колонку Progress % в ROADMAPS. Не меняет Status roadmap, не меняет
+    ROADMAP_STAGES, не пишет историю. Пересчёт вручную, не связан с
+    /updatestage.
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg())
+        return
+
+    try:
+        raw = (update.message.text or "").split(None, 1)[1] if context.args else " ".join(context.args or [])
+    except (IndexError, TypeError):
+        raw = ""
+
+    args = _parse_kv_args(raw)
+    roadmap_id = args.get("roadmap_id") or args.get("_pos0", "")
+
+    if not roadmap_id:
+        await _reply(update,
+            "❌ Укажи roadmap\\_id.\n\n"
+            "Пример:\n`/recalcprogress roadmap_id=RM-027`"
+        )
+        return
+
+    try:
+        from business_core.roadmap_manager import recalculate_roadmap_progress
+
+        result = recalculate_roadmap_progress(roadmap_id)
+
+        if not result["ok"]:
+            await _reply(update, f"❌ {result['error']}")
+            return
+
+        if result["changed"]:
+            lines = [
+                f"✅ Roadmap `{roadmap_id}`: Progress "
+                f"{result['old_progress']}% → {result['new_progress']}%",
+            ]
+        else:
+            lines = [
+                f"ℹ️ Roadmap `{roadmap_id}`: Progress уже {result['new_progress']}% "
+                "(изменений нет)",
+            ]
+        lines.append(
+            f"Завершено этапов: {result['done_count']} из {result['total_count']}"
+        )
+
+        await _reply(update, "\n".join(lines))
+
+    except Exception as e:
+        log.error(f"recalcprogress_cmd error: {e}")
+        await _reply(update, f"❌ Ошибка: {e}")
+
+
+# ─────────────────────────────────────────────────────────────
 # /newservice — создать услугу (Phase 8A)
 # ─────────────────────────────────────────────────────────────
 
@@ -3085,6 +3150,8 @@ def register_business_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("stages",       stages_cmd))
     # Phase 9B
     app.add_handler(CommandHandler("updatestage",  updatestage_cmd))
+    # Phase 9D
+    app.add_handler(CommandHandler("recalcprogress", recalcprogress_cmd))
     # Phase 8A
     app.add_handler(CommandHandler("newservice",       newservice_cmd))
     app.add_handler(CommandHandler("services",         services_cmd))
@@ -3110,7 +3177,7 @@ def register_business_handlers(app: Application) -> None:
     log.info(
         "Business Core handlers зарегистрированы: "
         "/bc /bcstatus /roadmaps /clients /newroadmap /newclient /newbiz /initbc /bcdrive "
-        "/newobject /objects /startroadmap /stages /updatestage "
+        "/newobject /objects /startroadmap /stages /updatestage /recalcprogress "
         "/newservice /services /service "
         "/milestones "
         "+ bc_ctx callback (Фаза 5B)"
