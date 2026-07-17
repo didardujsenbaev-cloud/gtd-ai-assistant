@@ -1302,28 +1302,51 @@ def create_object_record(
         }
 
     try:
-        from business_core.sheets import append_business_row
+        from business_core.sheets import (
+            append_business_row,
+            get_business_sheet,
+            row_from_header_map,
+        )
         now    = datetime.now().strftime("%Y-%m-%d")
         obj_id = generate_object_id()
 
-        row = [
-            obj_id,           # OBJ ID
-            client_id,        # Client ID
-            biz_id,           # Biz ID
-            city,             # City
-            address,          # Address
-            cadastral_number, # Cadastral Number
-            area_m2,          # Area m2
-            object_type,      # Object Type
-            object_status,    # Object Status
-            current_service_id, # Current Service ID
-            "",               # Roadmap ID (пока пустой)
-            drive_folder_id,  # Drive Folder ID
-            google_drive_url, # Google Drive
-            notes,            # Notes
-            now,              # Created At
-            now,              # Last Updated
+        # Phase 10.2B.5: строка формируется по ФАКТИЧЕСКИМ заголовкам
+        # листа OBJECT_REGISTRY, а не по жёсткой позиции — не зависит
+        # от порядка колонок и не смещает значения в чужие колонки.
+        sheet   = get_business_sheet("object_registry")
+        headers = sheet.row_values(1)
+
+        required_headers = [
+            "OBJ ID", "Client ID", "Biz ID", "City", "Address",
+            "Cadastral Number", "Area m2", "Object Type", "Object Status",
+            "Current Service ID", "Roadmap ID", "Drive Folder ID",
+            "Google Drive", "Notes", "Created At", "Last Updated",
         ]
+        missing_headers = [h for h in required_headers if h not in headers]
+        if missing_headers:
+            raise ValueError(
+                f"OBJECT_REGISTRY: отсутствуют обязательные колонки {missing_headers}. "
+                f"Запись объекта остановлена, ничего не записано."
+            )
+
+        row = row_from_header_map(headers, {
+            "OBJ ID":             obj_id,
+            "Client ID":          client_id,
+            "Biz ID":             biz_id,
+            "City":               city,
+            "Address":            address,
+            "Cadastral Number":   cadastral_number,
+            "Area m2":            area_m2,
+            "Object Type":        object_type,
+            "Object Status":      object_status,
+            "Current Service ID": current_service_id,
+            "Roadmap ID":         "",
+            "Drive Folder ID":    drive_folder_id,
+            "Google Drive":       google_drive_url,
+            "Notes":              notes,
+            "Created At":         now,
+            "Last Updated":       now,
+        })
         append_business_row("object_registry", row)
         log.info(f"create_object_record: {obj_id} / {client_id} / {address}")
         return {"ok": True, "obj_id": obj_id, "error": None}

@@ -89,6 +89,7 @@ def _make_obj_row(obj_id, client_id, biz_id, city="Алматы", address="ул.
 def _mock_sheet(headers, rows):
     m = MagicMock()
     m.get_all_values.return_value = [headers] + rows
+    m.row_values.return_value = headers
     m.update_cell = MagicMock()
     return m
 
@@ -130,11 +131,13 @@ class TestGenerateObjectId(unittest.TestCase):
 
 class TestCreateObjectRecord(unittest.TestCase):
 
+    @patch("business_core.sheets.get_business_sheet")
     @patch("business_core.business_builder.generate_object_id")
     @patch("business_core.sheets.append_business_row")
-    def test_creates_row_with_required_fields(self, mock_append, mock_gen_id):  # C
+    def test_creates_row_with_required_fields(self, mock_append, mock_gen_id, mock_get_sheet):  # C
         """C. Запись содержит обязательные поля."""
         mock_gen_id.return_value = "OBJ-001"
+        mock_get_sheet.return_value = _mock_sheet(OBJ_HEADERS, [])
         from business_core.business_builder import create_object_record
         result = create_object_record(
             client_id="PRS-001",
@@ -152,11 +155,13 @@ class TestCreateObjectRecord(unittest.TestCase):
         self.assertEqual(row[3], "Алматы")    # City
         self.assertEqual(row[4], "ул. Абая 10")  # Address
 
+    @patch("business_core.sheets.get_business_sheet")
     @patch("business_core.business_builder.generate_object_id")
     @patch("business_core.sheets.append_business_row")
-    def test_default_status_is_new(self, mock_append, mock_gen_id):  # D
+    def test_default_status_is_new(self, mock_append, mock_gen_id, mock_get_sheet):  # D
         """D. object_status по умолчанию "new"."""
         mock_gen_id.return_value = "OBJ-002"
+        mock_get_sheet.return_value = _mock_sheet(OBJ_HEADERS, [])
         from business_core.business_builder import create_object_record
         result = create_object_record(
             client_id="PRS-001", biz_id="BIZ-001",
