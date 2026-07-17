@@ -76,16 +76,35 @@ FAKE_STAGES = [
 # 1. create_roadmap_for_object() записывает template_id
 # ────────────────────────────────────────────────────────────
 
-class TestTemplateIdWrite(unittest.TestCase):
+CANONICAL_ROADMAPS_HEADERS = [
+    "Roadmap ID", "Business ID", "Service ID", "City", "Client ID",
+    "Client Name", "GTD Project ID", "Responsible", "Status",
+    "Created", "Expected", "Progress %",
+    "Stage 1 Status", "Stage 2 Status", "Stage 3 Status",
+    "Stage 4 Status", "Stage 5 Status", "Stage 6 Status",
+    "Stage 7 Status", "Stage 8 Status", "Stage 9 Status",
+    "Stage 10 Status", "Notes", "Last Updated",
+    "Object ID", "Parent Roadmap ID", "Case Type", "Template ID",
+]
 
-    def test_1_template_id_appended_to_row(self):
+
+class TestTemplateIdWrite(unittest.TestCase):
+    """create_roadmap_for_object должен писать по фактическим именам
+    заголовков листа, а не по жёсткой позиции (см. регрессию RM-027)."""
+
+    def _fake_sheet(self, headers: list[str]):
+        sheet = MagicMock()
+        sheet.row_values.return_value = list(headers)
+        return sheet
+
+    def test_1_template_id_written_under_correct_header_name(self):
         bb = _fresh_bb()
         rows = []
+        sheet = self._fake_sheet(CANONICAL_ROADMAPS_HEADERS)
 
-        with patch("business_core.sheets.append_business_row",
+        with patch("business_core.sheets.get_business_sheet", return_value=sheet), \
+             patch("business_core.sheets.append_business_row",
                    side_effect=lambda k, r: rows.append((k, r))), \
-             patch("business_core.sheets.ensure_roadmap_template_id_column",
-                   return_value=True) as ensure_mock, \
              patch.object(bb, "generate_roadmap_id", return_value="RM-500"):
             result = bb.create_roadmap_for_object(
                 obj_id="OBJ-001", biz_id="BIZ-001", client_id="PRS-001",
@@ -95,24 +114,61 @@ class TestTemplateIdWrite(unittest.TestCase):
 
         self.assertTrue(result["ok"])
         self.assertEqual(result["roadmap_id"], "RM-500")
-        ensure_mock.assert_called_once()
 
         self.assertEqual(len(rows), 1)
         sheet_key, row = rows[0]
         self.assertEqual(sheet_key, "roadmaps")
-        self.assertEqual(row[-1], "RMT-IZH-ALM-STANDARD-002",
-                         "template_id должен быть последним значением строки")
-        self.assertEqual(row[-2], "legalization", "Case Type перед Template ID")
+        idx = {h: i for i, h in enumerate(CANONICAL_ROADMAPS_HEADERS)}
+        self.assertEqual(row[idx["Template ID"]], "RMT-IZH-ALM-STANDARD-002")
+        self.assertEqual(row[idx["Case Type"]], "legalization")
+        self.assertEqual(row[idx["Object ID"]], "OBJ-001",
+                         "Object ID должен попасть именно под колонку Object ID, "
+                         "а не под Template ID (регрессия RM-027)")
+
+    def test_1_header_order_may_differ_write_still_correct(self):
+        """Порядок заголовков в живом листе может отличаться от канонического —
+        запись всё равно должна попасть в правильные колонки по имени."""
+        bb = _fresh_bb()
+        rows = []
+        shuffled = [
+            "Roadmap ID", "Template ID", "Business ID", "Service ID", "City",
+            "Client ID", "Client Name", "GTD Project ID", "Responsible",
+            "Status", "Created", "Expected", "Progress %",
+            "Stage 1 Status", "Stage 2 Status", "Stage 3 Status",
+            "Stage 4 Status", "Stage 5 Status", "Stage 6 Status",
+            "Stage 7 Status", "Stage 8 Status", "Stage 9 Status",
+            "Stage 10 Status", "Notes", "Last Updated",
+            "Case Type", "Object ID", "Parent Roadmap ID",
+        ]
+        sheet = self._fake_sheet(shuffled)
+
+        with patch("business_core.sheets.get_business_sheet", return_value=sheet), \
+             patch("business_core.sheets.append_business_row",
+                   side_effect=lambda k, r: rows.append((k, r))), \
+             patch.object(bb, "generate_roadmap_id", return_value="RM-503"):
+            result = bb.create_roadmap_for_object(
+                obj_id="OBJ-009", biz_id="BIZ-001", client_id="PRS-001",
+                service_id="SVC-IZH-001", case_type="general",
+                template_id="RMT-IZH-ALM-STANDARD-002",
+            )
+
+        self.assertTrue(result["ok"])
+        row = rows[0][1]
+        idx = {h: i for i, h in enumerate(shuffled)}
+        self.assertEqual(row[idx["Template ID"]], "RMT-IZH-ALM-STANDARD-002")
+        self.assertEqual(row[idx["Object ID"]], "OBJ-009")
+        self.assertEqual(row[idx["Case Type"]], "general")
+        self.assertEqual(row[idx["Parent Roadmap ID"]], "")
 
     def test_1_empty_template_id_writes_empty_string(self):
         """Без template_id (старый вызов /startroadmap без явного шаблона) — пустая строка, не падает."""
         bb = _fresh_bb()
         rows = []
+        sheet = self._fake_sheet(CANONICAL_ROADMAPS_HEADERS)
 
-        with patch("business_core.sheets.append_business_row",
+        with patch("business_core.sheets.get_business_sheet", return_value=sheet), \
+             patch("business_core.sheets.append_business_row",
                    side_effect=lambda k, r: rows.append((k, r))), \
-             patch("business_core.sheets.ensure_roadmap_template_id_column",
-                   return_value=True), \
              patch.object(bb, "generate_roadmap_id", return_value="RM-501"):
             result = bb.create_roadmap_for_object(
                 obj_id="OBJ-002", biz_id="BIZ-001", client_id="PRS-001",
@@ -120,23 +176,32 @@ class TestTemplateIdWrite(unittest.TestCase):
             )
 
         self.assertTrue(result["ok"])
-        self.assertEqual(rows[0][1][-1], "")
+        idx = {h: i for i, h in enumerate(CANONICAL_ROADMAPS_HEADERS)}
+        self.assertEqual(rows[0][1][idx["Template ID"]], "")
 
-    def test_1_ensure_column_called_before_write(self):
-        """Колонка гарантируется существующей перед каждой записью (идемпотентно)."""
+    def test_1_missing_header_returns_clear_error_no_write(self):
+        """Если в живом листе нет нужной колонки (например Template ID ещё
+        не мигрирован) — понятная ошибка, а не запись в чужую позицию."""
         bb = _fresh_bb()
-        calls = []
+        rows = []
+        # Лист без Object ID / Parent Roadmap ID / Case Type / Template ID —
+        # ровно та ситуация, что была в проде до миграции.
+        old_headers = CANONICAL_ROADMAPS_HEADERS[:24]  # только до "Last Updated"
+        sheet = self._fake_sheet(old_headers)
 
-        with patch("business_core.sheets.append_business_row", return_value=5), \
-             patch("business_core.sheets.ensure_roadmap_template_id_column",
-                   side_effect=lambda: calls.append("ensure") or True), \
-             patch.object(bb, "generate_roadmap_id", return_value="RM-502"):
-            bb.create_roadmap_for_object(
-                obj_id="OBJ-003", biz_id="BIZ-001", client_id="PRS-001",
+        with patch("business_core.sheets.get_business_sheet", return_value=sheet), \
+             patch("business_core.sheets.append_business_row",
+                   side_effect=lambda k, r: rows.append((k, r))), \
+             patch.object(bb, "generate_roadmap_id", return_value="RM-504"):
+            result = bb.create_roadmap_for_object(
+                obj_id="OBJ-010", biz_id="BIZ-001", client_id="PRS-001",
                 service_id="SVC-IZH-001", template_id="RMT-X",
             )
 
-        self.assertEqual(calls, ["ensure"])
+        self.assertFalse(result["ok"])
+        self.assertIn("Object ID", result["error"])
+        self.assertIn("Template ID", result["error"])
+        self.assertEqual(rows, [], "при отсутствующих колонках запись не должна происходить вовсе")
 
 
 # ────────────────────────────────────────────────────────────

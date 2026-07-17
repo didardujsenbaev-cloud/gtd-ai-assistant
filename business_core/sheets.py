@@ -438,8 +438,71 @@ def ensure_headers(sheet: gspread.Worksheet, headers: list[str]) -> bool:
     return False
 
 
+def get_header_index_map(headers: list[str]) -> dict[str, int]:
+    """
+    Отображение 'имя заголовка' -> 0-based индекс колонки.
+    При дублирующихся именах заголовков побеждает первое вхождение.
+    """
+    idx: dict[str, int] = {}
+    for i, h in enumerate(headers):
+        if h and h not in idx:
+            idx[h] = i
+    return idx
+
+
+def row_from_header_map(headers: list[str], values: dict[str, str]) -> list[str]:
+    """
+    Собрать строку данных длиной len(headers), расставив значения по
+    ФАКТИЧЕСКИМ именам заголовков листа — а не по позиции в BUSINESS_HEADERS.
+
+    Колонки, для которых значение не передано, остаются пустой строкой.
+
+    Raises:
+        ValueError: если в values есть ключ (имя колонки), отсутствующий
+            среди фактических заголовков листа — чтобы никогда не записать
+            значение в чужую/неправильную колонку молча.
+    """
+    idx = get_header_index_map(headers)
+    missing = sorted(k for k in values if k not in idx)
+    if missing:
+        raise ValueError(
+            f"В листе ROADMAPS отсутствуют колонки: {missing}. "
+            f"Сначала выполните миграцию заголовков (migrate_roadmaps_headers.py)."
+        )
+    row = [""] * len(headers)
+    for key, val in values.items():
+        row[idx[key]] = val
+    return row
+
+
+def read_row_by_headers(headers: list[str], row: list[str], wanted: list[str]) -> dict[str, str]:
+    """
+    Прочитать значения строки по ФАКТИЧЕСКИМ именам заголовков листа.
+    Для заголовка, которого нет в headers, или значения за пределами row
+    возвращает ''.
+    """
+    idx = get_header_index_map(headers)
+    result: dict[str, str] = {}
+    for h in wanted:
+        i = idx.get(h)
+        result[h] = str(row[i]).strip() if (i is not None and i < len(row)) else ""
+    return result
+
+
 def ensure_roadmap_template_id_column() -> bool:
     """
+    УСТАРЕЛО: используйте migrate_roadmaps_headers.py.
+
+    Этот helper слепо дописывал колонку 'Template ID' в конец листа
+    ROADMAPS по фактической ДЛИНЕ строки заголовков — без проверки того,
+    что колонки перед ней (Object ID / Parent Roadmap ID / Case Type)
+    реально там присутствуют как заголовки. На проде это привело к тому,
+    что 'Template ID' был подписан над колонкой, где физически лежали
+    данные Object ID (см. RM-027).
+
+    Оставлен только для обратной совместимости существующих тестов;
+    create_roadmap_for_object больше его не вызывает.
+
     Идемпотентно добавить колонку 'Template ID' в конец листа ROADMAPS,
     если её там ещё нет.
 

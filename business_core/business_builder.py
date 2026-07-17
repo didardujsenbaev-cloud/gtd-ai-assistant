@@ -1696,8 +1696,8 @@ def create_roadmap_for_object(
     try:
         from business_core.sheets import (
             append_business_row,
-            generate_next_id,
-            ensure_roadmap_template_id_column,
+            get_business_sheet,
+            row_from_header_map,
         )
         now        = datetime.now().strftime("%Y-%m-%d")
         roadmap_id = generate_roadmap_id()
@@ -1706,34 +1706,40 @@ def create_roadmap_for_object(
         if not title:
             title = f"Roadmap {obj_id}" + (f" / {service_id}" if service_id else "")
 
-        ensure_roadmap_template_id_column()
+        # Строка собирается по ФАКТИЧЕСКИМ заголовкам листа, а не по
+        # жёстко заданным позициям — так запись никогда не съедет
+        # относительно реального расположения колонок (см. баг RM-027,
+        # где Object ID оказался записан под колонкой 'Template ID').
+        sheet   = get_business_sheet("roadmaps")
+        headers = sheet.row_values(1)
 
-        # ROADMAPS заголовки:
-        # "Roadmap ID","Business ID","Service ID","City","Client ID","Client Name",
-        # "GTD Project ID","Responsible","Status","Created","Expected","Progress %",
-        # "Stage 1-10 Status","Notes","Last Updated",
-        # "Object ID","Parent Roadmap ID","Case Type","Template ID"
-        row = [
-            roadmap_id,  # Roadmap ID
-            biz_id,      # Business ID
-            service_id,  # Service ID
-            "",          # City
-            client_id,   # Client ID
-            title,       # Client Name (используем как Title)
-            "",          # GTD Project ID
-            "",          # Responsible
-            "active",    # Status
-            now,         # Created
-            "",          # Expected
-            "0",         # Progress %
-            "", "", "", "", "", "", "", "", "", "",  # Stage 1-10 Status
-            notes,       # Notes
-            now,         # Last Updated
-            obj_id,      # Object ID  (Phase 6A)
-            "",          # Parent Roadmap ID
-            case_type,   # Case Type
-            template_id, # Template ID
-        ]
+        values = {
+            "Roadmap ID":        roadmap_id,
+            "Business ID":       biz_id,
+            "Service ID":        service_id,
+            "City":              "",
+            "Client ID":         client_id,
+            "Client Name":       title,
+            "GTD Project ID":    "",
+            "Responsible":       "",
+            "Status":            "active",
+            "Created":           now,
+            "Expected":          "",
+            "Progress %":        "0",
+            "Notes":             notes,
+            "Last Updated":      now,
+            "Object ID":         obj_id,
+            "Parent Roadmap ID": "",
+            "Case Type":         case_type,
+            "Template ID":       template_id,
+        }
+
+        try:
+            row = row_from_header_map(headers, values)
+        except ValueError as header_exc:
+            log.error(f"create_roadmap_for_object: {header_exc}")
+            return {"ok": False, "roadmap_id": "", "error": str(header_exc)}
+
         append_business_row("roadmaps", row)
         log.info(f"create_roadmap_for_object: {roadmap_id} / {obj_id} / {case_type}")
         return {"ok": True, "roadmap_id": roadmap_id, "error": None}
@@ -1749,7 +1755,7 @@ def find_roadmap_by_id(roadmap_id: str) -> Optional[dict]:
         return None
 
     try:
-        from business_core.sheets import get_business_sheet
+        from business_core.sheets import get_business_sheet, read_row_by_headers
 
         sheet = get_business_sheet("roadmaps")
 
@@ -1763,29 +1769,27 @@ def find_roadmap_by_id(roadmap_id: str) -> Optional[dict]:
         headers = sheet.row_values(1)
         row = sheet.row_values(cell.row)
 
-        def _col(header):
-            return headers.index(header) if header in headers else None
-
-        def _get(header):
-            column = _col(header)
-            if column is None or column >= len(row):
-                return ""
-            return str(row[column]).strip()
+        wanted = [
+            "Roadmap ID", "Business ID", "Service ID", "Client ID", "Client Name",
+            "Status", "Created", "Object ID", "Case Type", "Notes", "Progress %",
+            "Template ID",
+        ]
+        v = read_row_by_headers(headers, row, wanted)
 
         return {
-            "row_num":    cell.row,
-            "roadmap_id": _get("Roadmap ID"),
-            "biz_id":     _get("Business ID"),
-            "service_id": _get("Service ID"),
-            "client_id":  _get("Client ID"),
-            "title":      _get("Client Name"),
-            "status":     _get("Status"),
-            "created":    _get("Created"),
-            "obj_id":     _get("Object ID"),
-            "case_type":  _get("Case Type"),
-            "notes":      _get("Notes"),
-            "progress":   _get("Progress %"),
-            "template_id": _get("Template ID"),
+            "row_num":     cell.row,
+            "roadmap_id":  v["Roadmap ID"],
+            "biz_id":      v["Business ID"],
+            "service_id":  v["Service ID"],
+            "client_id":   v["Client ID"],
+            "title":       v["Client Name"],
+            "status":      v["Status"],
+            "created":     v["Created"],
+            "obj_id":      v["Object ID"],
+            "case_type":   v["Case Type"],
+            "notes":       v["Notes"],
+            "progress":    v["Progress %"],
+            "template_id": v["Template ID"],
         }
 
     except Exception as exc:

@@ -60,6 +60,7 @@ def _make_sheet(rows: list[list[str]]) -> MagicMock:
     """Create a mock gspread worksheet."""
     ws = MagicMock()
     ws.get_all_values.return_value = rows
+    ws.row_values.side_effect = lambda r: rows[r - 1] if 0 <= r - 1 < len(rows) else []
     ws.update_cell = MagicMock()
     ws.append_row  = MagicMock()
     return ws
@@ -74,7 +75,7 @@ def _make_roadmaps_sheet(extra_rows: list[list[str]] | None = None) -> MagicMock
         "Stage 4 Status", "Stage 5 Status", "Stage 6 Status",
         "Stage 7 Status", "Stage 8 Status", "Stage 9 Status",
         "Stage 10 Status", "Notes", "Last Updated",
-        "Object ID", "Parent Roadmap ID", "Case Type",
+        "Object ID", "Parent Roadmap ID", "Case Type", "Template ID",
     ]
     rows = [headers] + (extra_rows or [])
     return _make_sheet(rows)
@@ -150,14 +151,17 @@ class TestCreateRoadmapForObject(unittest.TestCase):
         import business_core.business_builder as bb
         return bb
 
-    @patch("business_core.sheets.get_business_sheet")
-    @patch("business_core.sheets.append_business_row")
-    def test_C_creates_roadmap_with_object_id(self, mock_append, mock_get):
+    def test_C_creates_roadmap_with_object_id(self):
         """C: create_roadmap_for_object → содержит Object ID."""
-        mock_get.return_value = _make_roadmaps_sheet()
         bb = self._reload_bb()
 
-        with patch("business_core.sheets.append_business_row") as mock_ap, \
+        # get_business_sheet патчится ПОСЛЕ _reload_bb(), иначе перезагрузка
+        # модулей сотрёт патч, и create_roadmap_for_object уйдёт в реальный
+        # Google Sheets API (тот же паттерн, что уже использовался ниже
+        # для append_business_row/generate_next_id).
+        with patch("business_core.sheets.get_business_sheet",
+                   return_value=_make_roadmaps_sheet()), \
+             patch("business_core.sheets.append_business_row") as mock_ap, \
              patch("business_core.sheets.generate_next_id", return_value="RM-001"):
             result = bb.create_roadmap_for_object(
                 obj_id="OBJ-001",
@@ -172,13 +176,13 @@ class TestCreateRoadmapForObject(unittest.TestCase):
             # Object ID должен быть в row (после "Last Updated")
             self.assertIn("OBJ-001", appended_row)
 
-    @patch("business_core.sheets.get_business_sheet")
-    def test_D_saves_biz_client_service(self, mock_get):
+    def test_D_saves_biz_client_service(self):
         """D: create_roadmap_for_object сохраняет biz_id, client_id, service_id."""
-        mock_get.return_value = _make_roadmaps_sheet()
         bb = self._reload_bb()
 
-        with patch("business_core.sheets.append_business_row") as mock_ap, \
+        with patch("business_core.sheets.get_business_sheet",
+                   return_value=_make_roadmaps_sheet()), \
+             patch("business_core.sheets.append_business_row") as mock_ap, \
              patch("business_core.sheets.generate_next_id", return_value="RM-001"):
             result = bb.create_roadmap_for_object(
                 obj_id="OBJ-002",
