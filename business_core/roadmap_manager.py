@@ -929,11 +929,16 @@ COMMERCIAL_MILESTONES_MAP: dict[str, list[dict]] = {
 def _resolve_template_id(roadmap: dict) -> str:
     """
     Определить template_id для roadmap (read-only, не пишет в Sheets):
-    1. из notes по паттерну template_id=RMT-...
-    2. из default_roadmap_template_id услуги
-    3. из первого шаблона, привязанного к service_id
+    0. из сохранённого поля template_id (колонка Template ID в ROADMAPS)
+    1. из notes по паттерну template_id=RMT-... (fallback для старых roadmap)
+    2. из default_roadmap_template_id услуги (fallback для старых roadmap)
+    3. из первого шаблона, привязанного к service_id (fallback для старых roadmap)
     Возвращает '' если не удалось определить.
     """
+    saved = roadmap.get("template_id", "").strip()
+    if saved:
+        return saved
+
     import re
     notes = roadmap.get("notes", "")
     m = re.search(r"template_id\s*=\s*(RMT-\S+)", notes, re.IGNORECASE)

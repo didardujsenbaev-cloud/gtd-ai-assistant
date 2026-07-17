@@ -131,6 +131,7 @@ BUSINESS_HEADERS: dict[str, list[str]] = {
         "Object ID",          # OBJ-ID (для Узаконения: объект недвижимости)
         "Parent Roadmap ID",  # RM-ID (если это под-карта другого roadmap)
         "Case Type",          # legalization_object / visa_foreigner / coaching_program / general
+        "Template ID",        # RMT-... шаблон, использованный при /startroadmap
     ],
     "roadmap_stages": [
         "Stage ID", "Roadmap ID", "Order", "Name", "Status",
@@ -435,6 +436,35 @@ def ensure_headers(sheet: gspread.Worksheet, headers: list[str]) -> bool:
         + "   Автоперезапись отключена. Проверьте вручную."
     )
     return False
+
+
+def ensure_roadmap_template_id_column() -> bool:
+    """
+    Идемпотентно добавить колонку 'Template ID' в конец листа ROADMAPS,
+    если её там ещё нет.
+
+    - Не создаёт новый лист.
+    - Не меняет порядок и содержимое существующих колонок и строк.
+    - Если колонка уже есть — ничего не делает.
+
+    Returns:
+        True если колонка присутствует (уже была или только что добавлена).
+    """
+    try:
+        sheet = get_business_sheet("roadmaps")
+        headers = sheet.row_values(1)
+
+        if "Template ID" in headers:
+            return True
+
+        next_col = len(headers) + 1
+        sheet.update_cell(1, next_col, "Template ID")
+        log.info(f"ROADMAPS: добавлена колонка 'Template ID' (позиция {next_col})")
+        return True
+
+    except Exception as exc:
+        log.warning(f"ensure_roadmap_template_id_column error: {exc}")
+        return False
 
 
 # ─────────────────────────────────────────────────────────────

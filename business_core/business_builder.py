@@ -1658,25 +1658,27 @@ def generate_roadmap_id() -> str:
 
 
 def create_roadmap_for_object(
-    obj_id:     str,
-    biz_id:     str,
-    client_id:  str,
-    service_id: str,
-    case_type:  str = "general",
-    title:      str = "",
-    notes:      str = "",
+    obj_id:      str,
+    biz_id:      str,
+    client_id:   str,
+    service_id:  str,
+    case_type:   str = "general",
+    title:       str = "",
+    notes:       str = "",
+    template_id: str = "",
 ) -> dict:
     """
     Создать roadmap для объекта недвижимости в листе ROADMAPS.
 
     Args:
-        obj_id:     OBJ-ID объекта (обязательный)
-        biz_id:     BIZ-ID бизнеса (обязательный)
-        client_id:  PRS-ID клиента (обязательный)
-        service_id: SVC-ID услуги
-        case_type:  тип кейса (legalization_reconstruction_house / ...)
-        title:      заголовок roadmap (автогенерируется если пустой)
-        notes:      примечания
+        obj_id:      OBJ-ID объекта (обязательный)
+        biz_id:      BIZ-ID бизнеса (обязательный)
+        client_id:   PRS-ID клиента (обязательный)
+        service_id:  SVC-ID услуги
+        case_type:   тип кейса (legalization_reconstruction_house / ...)
+        title:       заголовок roadmap (автогенерируется если пустой)
+        notes:       примечания
+        template_id: RMT-... шаблон, фактически использованный для этапов
 
     Returns:
         {
@@ -1692,7 +1694,11 @@ def create_roadmap_for_object(
         }
 
     try:
-        from business_core.sheets import append_business_row, generate_next_id
+        from business_core.sheets import (
+            append_business_row,
+            generate_next_id,
+            ensure_roadmap_template_id_column,
+        )
         now        = datetime.now().strftime("%Y-%m-%d")
         roadmap_id = generate_roadmap_id()
 
@@ -1700,11 +1706,13 @@ def create_roadmap_for_object(
         if not title:
             title = f"Roadmap {obj_id}" + (f" / {service_id}" if service_id else "")
 
+        ensure_roadmap_template_id_column()
+
         # ROADMAPS заголовки:
         # "Roadmap ID","Business ID","Service ID","City","Client ID","Client Name",
         # "GTD Project ID","Responsible","Status","Created","Expected","Progress %",
         # "Stage 1-10 Status","Notes","Last Updated",
-        # "Object ID","Parent Roadmap ID","Case Type"
+        # "Object ID","Parent Roadmap ID","Case Type","Template ID"
         row = [
             roadmap_id,  # Roadmap ID
             biz_id,      # Business ID
@@ -1724,6 +1732,7 @@ def create_roadmap_for_object(
             obj_id,      # Object ID  (Phase 6A)
             "",          # Parent Roadmap ID
             case_type,   # Case Type
+            template_id, # Template ID
         ]
         append_business_row("roadmaps", row)
         log.info(f"create_roadmap_for_object: {roadmap_id} / {obj_id} / {case_type}")
@@ -1776,6 +1785,7 @@ def find_roadmap_by_id(roadmap_id: str) -> Optional[dict]:
             "case_type":  _get("Case Type"),
             "notes":      _get("Notes"),
             "progress":   _get("Progress %"),
+            "template_id": _get("Template ID"),
         }
 
     except Exception as exc:

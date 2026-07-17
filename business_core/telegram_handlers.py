@@ -1796,6 +1796,7 @@ async def startroadmap_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             case_type=case_type,
             title=title,
             notes=notes,
+            template_id=template_id_to_use,
         )
         if not rm_result["ok"]:
             await _reply(update, f"❌ Не удалось создать roadmap: {rm_result['error']}")
