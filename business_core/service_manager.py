@@ -159,60 +159,91 @@ def create_service_record(
         }
 
     try:
-        from business_core.sheets import append_business_row, generate_next_id
+        from business_core.sheets import (
+            append_business_row,
+            get_business_sheet,
+            row_from_header_map,
+        )
         now        = datetime.now().strftime("%Y-%m-%d")
         service_id = generate_service_id()
         status     = normalize_service_status(status)
         if not currency:
             currency = "KZT"
-
-        # Строка для SERVICE_CATALOG (соответствует порядку колонок):
-        # "ID","Бизнес ID","Название","Slug","Статус","Город",
-        # "Цена мин","Цена макс","Срок","Описание",
-        # "Этап 1".."Этап 10",
-        # "Документы от клиента","Документы наши",
-        # "Чек-лист производства","Чек-лист закрытия",
-        # "Риски","Шаблоны","Инструкция","Комментарий",
-        # (Phase 8A) "Service Name","Service Category","Object Type","Client Type",
-        #            "What Included","What Not Included","Currency",
-        #            "Required Documents","Default Roadmap Template ID",
-        #            "Contractors Needed","Materials IDs","Created At","Last Updated"
         slug = _make_slug(service_name)
-        row = [
-            service_id,         # ID
-            biz_id,             # Бизнес ID
-            service_name,       # Название
-            slug,               # Slug
-            status,             # Статус
-            city,               # Город
-            price_from,         # Цена мин
-            price_to,           # Цена макс
-            estimated_duration, # Срок
-            description,        # Описание
-            "", "", "", "", "", "", "", "", "", "",  # Этап 1-10
-            required_documents, # Документы от клиента
-            "",                 # Документы наши
-            "",                 # Чек-лист производства
-            "",                 # Чек-лист закрытия
-            risks,              # Риски
-            default_roadmap_template_id,  # Шаблоны
-            "",                 # Инструкция
-            notes,              # Комментарий
-            # Phase 8A новые колонки
-            service_name,       # Service Name
-            service_category,   # Service Category
-            object_type,        # Object Type
-            client_type,        # Client Type
-            what_included,      # What Included
-            what_not_included,  # What Not Included
-            currency,           # Currency
-            required_documents, # Required Documents
-            default_roadmap_template_id,  # Default Roadmap Template ID
-            contractors_needed, # Contractors Needed
-            materials_ids,      # Materials IDs
-            now,                # Created At
-            now,                # Last Updated
+
+        # Phase 10.2B.6B: строка формируется по ФАКТИЧЕСКИМ заголовкам
+        # листа SERVICE_CATALOG, а не по жёсткой позиции — не зависит
+        # от порядка колонок (см. Phase 10.2B.6A: миграция подписала
+        # 13 ранее пустых заголовков Phase 8A на их канонических местах).
+        sheet   = get_business_sheet("service_catalog")
+        headers = sheet.row_values(1)
+
+        from collections import Counter
+        duplicate_headers = sorted(
+            h for h, c in Counter(headers).items() if h and c > 1
+        )
+        if duplicate_headers:
+            raise ValueError(
+                f"SERVICE_CATALOG: обнаружены дублирующиеся заголовки "
+                f"{duplicate_headers}. Запись услуги остановлена, ничего не записано."
+            )
+
+        required_headers = [
+            "ID", "Бизнес ID", "Название", "Slug", "Статус", "Город",
+            "Цена мин", "Цена макс", "Срок", "Описание",
+            "Этап 1", "Этап 2", "Этап 3", "Этап 4", "Этап 5",
+            "Этап 6", "Этап 7", "Этап 8", "Этап 9", "Этап 10",
+            "Документы от клиента", "Документы наши",
+            "Чек-лист производства", "Чек-лист закрытия",
+            "Риски", "Шаблоны", "Инструкция", "Комментарий",
+            "Service Name", "Service Category", "Object Type", "Client Type",
+            "What Included", "What Not Included", "Currency",
+            "Required Documents", "Default Roadmap Template ID",
+            "Contractors Needed", "Materials IDs", "Created At", "Last Updated",
         ]
+        missing_headers = [h for h in required_headers if h not in headers]
+        if missing_headers:
+            raise ValueError(
+                f"SERVICE_CATALOG: отсутствуют обязательные колонки {missing_headers}. "
+                f"Запись услуги остановлена, ничего не записано."
+            )
+
+        row = row_from_header_map(headers, {
+            "ID":             service_id,
+            "Бизнес ID":      biz_id,
+            "Название":       service_name,
+            "Slug":           slug,
+            "Статус":         status,
+            "Город":          city,
+            "Цена мин":       price_from,
+            "Цена макс":      price_to,
+            "Срок":           estimated_duration,
+            "Описание":       description,
+            "Этап 1": "", "Этап 2": "", "Этап 3": "", "Этап 4": "", "Этап 5": "",
+            "Этап 6": "", "Этап 7": "", "Этап 8": "", "Этап 9": "", "Этап 10": "",
+            "Документы от клиента":          required_documents,
+            "Документы наши":                "",
+            "Чек-лист производства":         "",
+            "Чек-лист закрытия":             "",
+            "Риски":                         risks,
+            "Шаблоны":                       default_roadmap_template_id,
+            "Инструкция":                    "",
+            "Комментарий":                   notes,
+            # Phase 8A новые колонки
+            "Service Name":                  service_name,
+            "Service Category":              service_category,
+            "Object Type":                   object_type,
+            "Client Type":                   client_type,
+            "What Included":                 what_included,
+            "What Not Included":             what_not_included,
+            "Currency":                      currency,
+            "Required Documents":            required_documents,
+            "Default Roadmap Template ID":   default_roadmap_template_id,
+            "Contractors Needed":            contractors_needed,
+            "Materials IDs":                 materials_ids,
+            "Created At":                    now,
+            "Last Updated":                  now,
+        })
         append_business_row("service_catalog", row)
         log.info(f"create_service_record: {service_id} / {biz_id} / {service_name}")
         return {"ok": True, "service_id": service_id, "error": None}

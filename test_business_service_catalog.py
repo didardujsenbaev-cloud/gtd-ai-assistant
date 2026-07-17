@@ -75,6 +75,7 @@ def _make_svc_sheet(extra_rows=None) -> MagicMock:
     ws = MagicMock()
     rows = [SVC_HEADERS_OLD] + (extra_rows or [])
     ws.get_all_values.return_value = rows
+    ws.row_values.return_value = SVC_HEADERS_OLD
     ws.update_cell = MagicMock()
     ws.append_row  = MagicMock()
     return ws
@@ -177,7 +178,8 @@ class TestCreateServiceRecord(unittest.TestCase):
             appended.append(row)
 
         with patch("business_core.sheets.append_business_row", side_effect=capture), \
-             patch("business_core.sheets.generate_next_id", return_value="SVC-001"):
+             patch("business_core.sheets.generate_next_id", return_value="SVC-001"), \
+             patch("business_core.sheets.get_business_sheet", return_value=_make_svc_sheet()):
             result = sm.create_service_record(
                 biz_id="BIZ-001",
                 service_name="Узаконение реконструкции",
@@ -211,7 +213,8 @@ class TestCreateServiceRecord(unittest.TestCase):
             appended.append(row)
 
         with patch("business_core.sheets.append_business_row", side_effect=capture), \
-             patch("business_core.sheets.generate_next_id", return_value="SVC-001"):
+             patch("business_core.sheets.generate_next_id", return_value="SVC-001"), \
+             patch("business_core.sheets.get_business_sheet", return_value=_make_svc_sheet()):
             result = sm.create_service_record(
                 biz_id="BIZ-001", service_name="Test Service"
             )
@@ -229,7 +232,8 @@ class TestCreateServiceRecord(unittest.TestCase):
             appended.append(row)
 
         with patch("business_core.sheets.append_business_row", side_effect=capture), \
-             patch("business_core.sheets.generate_next_id", return_value="SVC-001"):
+             patch("business_core.sheets.generate_next_id", return_value="SVC-001"), \
+             patch("business_core.sheets.get_business_sheet", return_value=_make_svc_sheet()):
             result = sm.create_service_record(
                 biz_id="BIZ-001", service_name="Test Service"
             )
@@ -247,7 +251,8 @@ class TestCreateServiceRecord(unittest.TestCase):
             appended.append(row)
 
         with patch("business_core.sheets.append_business_row", side_effect=capture), \
-             patch("business_core.sheets.generate_next_id", return_value="SVC-001"):
+             patch("business_core.sheets.generate_next_id", return_value="SVC-001"), \
+             patch("business_core.sheets.get_business_sheet", return_value=_make_svc_sheet()):
             result = sm.create_service_record(
                 biz_id="BIZ-001", service_name="Test", currency="USD"
             )
