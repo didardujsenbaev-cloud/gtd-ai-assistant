@@ -871,26 +871,35 @@ def create_roadmap_stages_from_template(
         }
 
     try:
-        from business_core.sheets import append_business_row, generate_next_id
+        from business_core.sheets import (
+            append_business_row,
+            generate_next_id,
+            get_business_sheet,
+            row_from_header_map,
+        )
         now = datetime.now().strftime("%Y-%m-%d %H:%M")
         stage_ids: list[str] = []
 
+        # Phase 10.2B.2: строка формируется по ФАКТИЧЕСКИМ заголовкам
+        # листа ROADMAP_STAGES, а не по жёсткой позиции — не зависит от
+        # порядка колонок и не молчит, если ожидаемая колонка отсутствует.
+        # Заголовки читаются один раз на весь вызов функции.
+        sheet   = get_business_sheet("roadmap_stages")
+        headers = sheet.row_values(1)
+
         for order, name in enumerate(stage_names, start=1):
             stage_id = generate_next_id("roadmap_stages")
-            row = [
-                stage_id,     # Stage ID
-                roadmap_id,   # Roadmap ID
-                str(order),   # Order
-                name,         # Name
-                "pending",    # Status
-                "",           # Due Date
-                "",           # Completed At
-                "",           # GTD Action ID
-                "",           # Responsible
-                "",           # Docs Required
-                "",           # Docs Received
-                "",           # Notes
-            ]
+            values = {
+                "Stage ID":   stage_id,
+                "Roadmap ID": roadmap_id,
+                "Order":      str(order),
+                "Name":       name,
+                "Status":     "pending",
+                # Due Date / Completed At / GTD Action ID / Responsible /
+                # Docs Required / Docs Received / Notes намеренно не
+                # переданы — остаются "" (как и раньше).
+            }
+            row = row_from_header_map(headers, values)
             append_business_row("roadmap_stages", row)
             stage_ids.append(stage_id)
 

@@ -362,7 +362,9 @@ class TestCreateRoadmapStages(unittest.TestCase):
         def capture_row(sheet_key, row):
             appended_rows.append(row)
 
-        with patch("business_core.sheets.append_business_row", side_effect=capture_row), \
+        with patch("business_core.sheets.get_business_sheet",
+                   return_value=_make_stages_sheet()), \
+             patch("business_core.sheets.append_business_row", side_effect=capture_row), \
              patch("business_core.sheets.generate_next_id", side_effect=[
                  f"STAGE-{i:03d}" for i in range(1, stage_count + 1)
              ]):
@@ -370,6 +372,211 @@ class TestCreateRoadmapStages(unittest.TestCase):
 
         for row in appended_rows:
             self.assertIn("RM-005", row)
+
+
+# ────────────────────────────────────────────────────────────
+# Phase 10.2B.2: create_roadmap_stages_from_template — header-safety
+# ────────────────────────────────────────────────────────────
+
+class TestCreateRoadmapStagesHeaderSafety(unittest.TestCase):
+
+    def _reload_rm(self):
+        for key in list(sys.modules.keys()):
+            if "business_core" in key:
+                del sys.modules[key]
+        import business_core.roadmap_manager as rm
+        return rm
+
+    def test_standard_header_order_produces_correct_row(self):
+        """1: стандартный порядок заголовков — значения на своих местах."""
+        rm = self._reload_rm()
+        headers = [
+            "Stage ID", "Roadmap ID", "Order", "Name", "Status",
+            "Due Date", "Completed At", "GTD Action ID",
+            "Responsible", "Docs Required", "Docs Received", "Notes",
+        ]
+        sheet = _make_sheet([headers])
+        captured = []
+
+        with patch("business_core.sheets.get_business_sheet", return_value=sheet), \
+             patch("business_core.sheets.append_business_row",
+                   side_effect=lambda k, row: captured.append(row)), \
+             patch("business_core.sheets.generate_next_id", return_value="STAGE-001"):
+            result = rm.create_roadmap_stages_from_template(
+                "RM-001", "legalization_new_building")
+
+        self.assertTrue(result["ok"])
+        idx = {h: i for i, h in enumerate(headers)}
+        row = captured[0]
+        self.assertEqual(row[idx["Stage ID"]], "STAGE-001")
+        self.assertEqual(row[idx["Roadmap ID"]], "RM-001")
+        self.assertEqual(row[idx["Order"]], "1")
+        self.assertEqual(row[idx["Name"]], rm.ROADMAP_TEMPLATES["legalization_new_building"][0])
+        self.assertEqual(row[idx["Status"]], "pending")
+        self.assertEqual(row[idx["Due Date"]], "")
+        self.assertEqual(row[idx["Completed At"]], "")
+        self.assertEqual(row[idx["GTD Action ID"]], "")
+        self.assertEqual(row[idx["Responsible"]], "")
+        self.assertEqual(row[idx["Docs Required"]], "")
+        self.assertEqual(row[idx["Docs Received"]], "")
+        self.assertEqual(row[idx["Notes"]], "")
+
+    def test_shuffled_header_order_gives_same_values_by_name(self):
+        """2: результат не зависит от перестановки заголовков листа."""
+        rm = self._reload_rm()
+        standard = [
+            "Stage ID", "Roadmap ID", "Order", "Name", "Status",
+            "Due Date", "Completed At", "GTD Action ID",
+            "Responsible", "Docs Required", "Docs Received", "Notes",
+        ]
+        shuffled = [
+            "Notes", "Status", "Stage ID", "Docs Received", "Roadmap ID",
+            "Due Date", "Order", "Responsible", "Name",
+            "Docs Required", "Completed At", "GTD Action ID",
+        ]
+        self.assertCountEqual(shuffled, standard)
+        sheet = _make_sheet([shuffled])
+        captured = []
+
+        with patch("business_core.sheets.get_business_sheet", return_value=sheet), \
+             patch("business_core.sheets.append_business_row",
+                   side_effect=lambda k, row: captured.append(row)), \
+             patch("business_core.sheets.generate_next_id", return_value="STAGE-001"):
+            result = rm.create_roadmap_stages_from_template(
+                "RM-001", "legalization_new_building")
+
+        self.assertTrue(result["ok"])
+        idx = {h: i for i, h in enumerate(shuffled)}
+        row = captured[0]
+        self.assertEqual(row[idx["Roadmap ID"]], "RM-001")
+        self.assertEqual(row[idx["Status"]], "pending")
+        self.assertEqual(row[idx["Name"]], rm.ROADMAP_TEMPLATES["legalization_new_building"][0])
+        self.assertEqual(len(row), len(shuffled))
+
+    def test_unknown_extra_columns_remain_empty(self):
+        """4: неизвестные дополнительные колонки листа (напр. Phase 8C
+        knowledge-поля, которых эта функция не заполняет) остаются пустыми."""
+        rm = self._reload_rm()
+        headers = [
+            "Stage ID", "Roadmap ID", "Order", "Name", "Status",
+            "Due Date", "Completed At", "GTD Action ID",
+            "Responsible", "Docs Required", "Docs Received", "Notes",
+            "SOP IDs", "Checklist IDs", "Materials IDs",
+            "Document Template IDs", "FAQ IDs",
+        ]
+        sheet = _make_sheet([headers])
+        captured = []
+
+        with patch("business_core.sheets.get_business_sheet", return_value=sheet), \
+             patch("business_core.sheets.append_business_row",
+                   side_effect=lambda k, row: captured.append(row)), \
+             patch("business_core.sheets.generate_next_id", return_value="STAGE-001"):
+            result = rm.create_roadmap_stages_from_template(
+                "RM-001", "legalization_new_building")
+
+        self.assertTrue(result["ok"])
+        idx = {h: i for i, h in enumerate(headers)}
+        row = captured[0]
+        for extra in ("SOP IDs", "Checklist IDs", "Materials IDs",
+                      "Document Template IDs", "FAQ IDs"):
+            self.assertEqual(row[idx[extra]], "")
+        self.assertEqual(len(row), len(headers))
+
+    def test_headers_read_exactly_once_per_call(self):
+        """5: заголовки читаются один раз за весь вызов функции,
+        а не на каждый этап."""
+        rm = self._reload_rm()
+        headers = [
+            "Stage ID", "Roadmap ID", "Order", "Name", "Status",
+            "Due Date", "Completed At", "GTD Action ID",
+            "Responsible", "Docs Required", "Docs Received", "Notes",
+        ]
+        sheet = _make_sheet([headers])
+        stage_count = len(rm.ROADMAP_TEMPLATES["legalization_new_building"])
+        self.assertGreater(stage_count, 1, "нужен шаблон из нескольких этапов")
+
+        with patch("business_core.sheets.get_business_sheet", return_value=sheet), \
+             patch("business_core.sheets.append_business_row"), \
+             patch("business_core.sheets.generate_next_id", side_effect=[
+                 f"STAGE-{i:03d}" for i in range(1, stage_count + 1)
+             ]):
+            result = rm.create_roadmap_stages_from_template(
+                "RM-001", "legalization_new_building")
+
+        self.assertTrue(result["ok"])
+        row_values_calls = [c for c in sheet.row_values.call_args_list if c.args == (1,)]
+        self.assertEqual(len(row_values_calls), 1,
+                         "row_values(1) должен вызываться ровно один раз на весь вызов функции")
+
+    def test_write_call_count_matches_stage_count(self):
+        """6: append_business_row вызывается прежнее количество раз (по разу на этап)."""
+        rm = self._reload_rm()
+        sheet = _make_stages_sheet()
+        stage_count = len(rm.ROADMAP_TEMPLATES["legalization_reconstruction_house"])
+
+        with patch("business_core.sheets.get_business_sheet", return_value=sheet), \
+             patch("business_core.sheets.append_business_row") as mock_ap, \
+             patch("business_core.sheets.generate_next_id", side_effect=[
+                 f"STAGE-{i:03d}" for i in range(1, stage_count + 1)
+             ]):
+            result = rm.create_roadmap_stages_from_template(
+                "RM-001", "legalization_reconstruction_house")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(mock_ap.call_count, stage_count)
+
+    def test_stage_count_and_ids_unchanged(self):
+        """7/8: количество этапов и stage_ids не изменились."""
+        rm = self._reload_rm()
+        sheet = _make_stages_sheet()
+        stage_count = len(rm.ROADMAP_TEMPLATES["legalization_non_residential_reconstruction"])
+        expected_ids = [f"STAGE-{i:03d}" for i in range(1, stage_count + 1)]
+
+        with patch("business_core.sheets.get_business_sheet", return_value=sheet), \
+             patch("business_core.sheets.append_business_row"), \
+             patch("business_core.sheets.generate_next_id", side_effect=expected_ids):
+            result = rm.create_roadmap_stages_from_template(
+                "RM-001", "legalization_non_residential_reconstruction")
+
+        self.assertEqual(result["stages_count"], stage_count)
+        self.assertEqual(result["stage_ids"], expected_ids)
+
+    def test_empty_template_unchanged_no_sheet_access(self):
+        """9: пустой/неизвестный шаблон — поведение не изменилось, и
+        обращения к листу ROADMAP_STAGES не происходит вовсе."""
+        rm = self._reload_rm()
+        with patch("business_core.sheets.get_business_sheet") as mock_get_sheet:
+            result = rm.create_roadmap_stages_from_template("RM-001", "unknown_case_xyz")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["stages_count"], 0)
+        self.assertIsNotNone(result["warning"])
+        self.assertEqual(result["stage_ids"], [])
+        mock_get_sheet.assert_not_called()
+
+    def test_missing_required_header_returns_error_without_write(self):
+        """10: отсутствует обязательный заголовок (Status) — запись не
+        выполняется, ok=False, существующий контракт ошибки сохранён."""
+        rm = self._reload_rm()
+        incomplete_headers = [
+            "Stage ID", "Roadmap ID", "Order", "Name",
+            # "Status" отсутствует
+            "Due Date", "Completed At", "GTD Action ID",
+            "Responsible", "Docs Required", "Docs Received", "Notes",
+        ]
+        sheet = _make_sheet([incomplete_headers])
+
+        with patch("business_core.sheets.get_business_sheet", return_value=sheet), \
+             patch("business_core.sheets.append_business_row") as mock_ap, \
+             patch("business_core.sheets.generate_next_id", return_value="STAGE-001"):
+            result = rm.create_roadmap_stages_from_template(
+                "RM-001", "legalization_new_building")
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["stages_count"], 0)
+        self.assertIsNotNone(result["warning"])
+        self.assertEqual(result["stage_ids"], [])
+        mock_ap.assert_not_called()
 
 
 # ────────────────────────────────────────────────────────────
