@@ -3178,6 +3178,50 @@ async def milestones_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await _reply(update, f"❌ Ошибка: {e}")
 
 
+# ─────────────────────────────────────────────────────────────
+# /report — Business Core read-only report (Phase 11B)
+# ─────────────────────────────────────────────────────────────
+
+async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Read-only отчёт Business Core: attention / statistics / quality / progress.
+
+    Вся бизнес-логика — в business_core.report_manager; этот handler
+    только собирает snapshot, прогоняет его через pure build_*() функции
+    и отправляет результат render_report().
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg())
+        return
+
+    try:
+        from business_core.report_manager import (
+            collect_snapshot,
+            build_attention,
+            build_statistics,
+            build_quality,
+            build_progress,
+            render_report,
+        )
+
+        snapshot   = collect_snapshot()
+        attention  = build_attention(snapshot)
+        statistics = build_statistics(snapshot)
+        quality    = build_quality(snapshot)
+        progress   = build_progress(snapshot)
+
+        text = render_report(
+            attention, statistics, quality, progress,
+            snapshot_errors=snapshot.get("errors"),
+        )
+
+        await _reply(update, text)
+
+    except Exception as e:
+        log.error(f"report_cmd error: {e}")
+        await _reply(update, f"❌ Ошибка построения отчёта: {e}")
+
+
 def register_business_handlers(app: Application) -> None:
     """
     Зарегистрировать все Business Core handlers в приложении.
@@ -3268,6 +3312,8 @@ def register_business_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("stageknowledge",   stageknowledge_cmd))
     # Phase 8D
     app.add_handler(CommandHandler("milestones",       milestones_cmd))
+    # Phase 11B
+    app.add_handler(CommandHandler("report",           report_cmd))
 
     # Callback handler для кнопок подтверждения бизнес-контекста (Фаза 5B)
     app.add_handler(CallbackQueryHandler(bc_ctx_callback, pattern=r"^bc_ctx:"))
@@ -3277,6 +3323,6 @@ def register_business_handlers(app: Application) -> None:
         "/bc /bcstatus /roadmaps /clients /newroadmap /newclient /newbiz /initbc /bcdrive "
         "/newobject /objects /startroadmap /stages /updatestage /recalcprogress "
         "/newservice /services /service "
-        "/milestones "
+        "/milestones /report "
         "+ bc_ctx callback (Фаза 5B)"
     )
