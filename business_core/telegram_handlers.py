@@ -695,7 +695,12 @@ async def newclient_start(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await _reply(update, _bc_disabled_msg())
         return ConversationHandler.END
 
+    # Phase 11J: свежий вход в /newclient (в т.ч. через allow_reentry)
+    # обязан сбросить и draft, и предыдущий confirmed snapshot — иначе
+    # повторный вход мог бы оставить старый snapshot от прошлой,
+    # незавершённой попытки.
     context.user_data["nc"] = {}
+    context.user_data.pop("nc_confirmed_snapshot", None)
     await update.message.reply_text(
         "👤 *Новый клиент*\n\nВведи ФИО клиента:",
         parse_mode="Markdown",
@@ -776,6 +781,15 @@ async def newclient_biz(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
             one_time_keyboard=True,
         ),
     )
+
+    # Phase 11J: неизменяемый snapshot того, что показано в карточке
+    # подтверждения. newclient_confirm() обязан сохранять ТОЛЬКО этот
+    # snapshot, а не перечитывать context.user_data["nc"] заново — иначе
+    # любое последующее изменение draft (повторный вход в состояние,
+    # запоздавшее/дублирующееся обновление и т.п.) может привести к
+    # сохранению данных, которые пользователь не подтверждал.
+    context.user_data["nc_confirmed_snapshot"] = dict(nc)
+
     return NC_CONFIRM
 
 
@@ -785,15 +799,29 @@ async def newclient_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if "Отмена" in text:
         await update.message.reply_text("Отменено.", reply_markup=ReplyKeyboardRemove())
         context.user_data.pop("nc", None)
+        context.user_data.pop("nc_confirmed_snapshot", None)
         return ConversationHandler.END
 
-    nc = context.user_data.get("nc", {})
+    # Phase 11J: сохраняем ТОЛЬКО неизменяемый snapshot, показанный в
+    # карточке подтверждения (newclient_biz()) — никогда не перечитываем
+    # context.user_data["nc"] здесь, т.к. draft мог измениться между
+    # показом карточки и обработкой ответа пользователя.
+    nc = context.user_data.get("nc_confirmed_snapshot")
+    if nc is None:
+        await update.message.reply_text(
+            "❌ Не найдены подтверждённые данные клиента. Начни заново: /newclient",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        context.user_data.pop("nc", None)
+        context.user_data.pop("nc_confirmed_snapshot", None)
+        return ConversationHandler.END
 
     try:
         from business_core.sheets import (
             append_business_row,
             generate_next_id,
             get_business_sheet,
+            read_business_sheet,
             row_from_header_map,
         )
         from business_core.business_builder import (
@@ -811,13 +839,27 @@ async def newclient_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         biz_name  = nc.get("businesses", "")
         biz_name  = "" if biz_name.startswith("/skip") else biz_name
 
-        # Phase 6A/6B: резолвим biz_id по имени бизнеса
+        # Phase 6A/6B: резолвим biz_id по имени бизнеса.
+        # Phase 11J: _get_biz_id_by_name() ищет только по названию и при
+        # отсутствии совпадения возвращает вход без изменений — это не
+        # отличить от "нашли ID, совпадающий по строке с названием". Если
+        # пользователь ввёл уже готовый Biz ID (например "BIZ-001") напрямую,
+        # а не выбрал название из клавиатуры, добавляем отдельную проверку
+        # по колонке "ID" в BIZ_REGISTRY, чтобы Biz IDs/Primary Biz ID не
+        # оставались пустыми.
         biz_id_resolved = ""
         if biz_name:
             try:
                 resolved = _get_biz_id_by_name(biz_name)
                 if resolved and resolved != biz_name:
                     biz_id_resolved = resolved
+                else:
+                    known_ids = {
+                        r.get("ID", "").strip()
+                        for r in read_business_sheet("biz_registry")
+                    }
+                    if biz_name.strip() in known_ids:
+                        biz_id_resolved = biz_name.strip()
             except Exception:
                 pass
 
@@ -935,22 +977,38 @@ async def newclient_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                     log.warning(f"newclient Drive error: {drive_exc}")
 
         # ── Ответ ─────────────────────────────────────────────────
+        # Phase 11J: запись уже сохранена в Sheets к этому моменту —
+        # ошибка форматирования ответа не должна выглядеть как ошибка
+        # сохранения. parse_mode=None (без Markdown) — full_name и
+        # drive_msg содержат динамические пользовательские данные и URL,
+        # которые могут содержать "_"/"*"/"[" и ломать Markdown-парсер
+        # (см. Phase 10.2D/11E: сломанный Drive URL с "_" вызывал
+        # "Can't parse entities").
         if client_status == STATUS_NEW:
-            header = "✅ *Клиент добавлен!*"
+            header = "✅ Клиент добавлен!"
         elif client_status == STATUS_SAME_BIZ:
-            header = "ℹ️ *Клиент уже существует, использую существующую запись*"
+            header = "ℹ️ Клиент уже существует, использую существующую запись"
         else:
-            header = "ℹ️ *Контакт уже был в другом бизнесе, добавил связь с текущим бизнесом*"
+            header = "ℹ️ Контакт уже был в другом бизнесе, добавил связь с текущим бизнесом"
 
-        await update.message.reply_text(
-            f"{header}\n\n"
-            f"🆔 ID: `{prs_id}`\n"
-            f"👤 {full_name}"
-            f"{drive_msg}\n\n"
-            f"/clients — посмотреть всех клиентов",
-            parse_mode="Markdown",
-            reply_markup=ReplyKeyboardRemove(),
-        )
+        try:
+            await update.message.reply_text(
+                f"{header}\n\n"
+                f"🆔 ID: {prs_id}\n"
+                f"👤 {full_name}"
+                f"{drive_msg}\n\n"
+                f"/clients — посмотреть всех клиентов",
+                reply_markup=ReplyKeyboardRemove(),
+            )
+        except Exception as notify_exc:
+            # Persistence (append_business_row / add_biz_id_to_person)
+            # уже отработала успешно — сообщаем об успехе, а не о
+            # несуществующей ошибке сохранения.
+            log.warning(f"newclient_confirm notify error: {notify_exc}")
+            await update.message.reply_text(
+                f"✅ Клиент сохранён (ID: {prs_id}), но не удалось отобразить полную карточку.",
+                reply_markup=ReplyKeyboardRemove(),
+            )
 
     except Exception as e:
         log.error(f"newclient_confirm error: {e}")
@@ -960,11 +1018,13 @@ async def newclient_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         )
 
     context.user_data.pop("nc", None)
+    context.user_data.pop("nc_confirmed_snapshot", None)
     return ConversationHandler.END
 
 
 async def newclient_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.pop("nc", None)
+    context.user_data.pop("nc_confirmed_snapshot", None)
     await update.message.reply_text("Отменено.", reply_markup=ReplyKeyboardRemove())
     return ConversationHandler.END
 

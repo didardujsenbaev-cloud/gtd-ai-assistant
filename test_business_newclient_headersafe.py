@@ -65,13 +65,18 @@ def _make_update_context(full_name="Иван Иванов", phone="+77771234567"
     update.message.text = "Подтверждаю"
     update.message.reply_text = AsyncMock()
     context = MagicMock()
+    nc = {
+        "full_name": full_name,
+        "phone": phone,
+        "businesses": businesses,
+        "person_type": person_type,
+    }
+    # Phase 11J: newclient_confirm() читает только "nc_confirmed_snapshot"
+    # (immutable snapshot, взятый в newclient_biz() до показа карточки
+    # подтверждения) — "nc" оставлен тоже для полноты мока состояния.
     context.user_data = {
-        "nc": {
-            "full_name": full_name,
-            "phone": phone,
-            "businesses": businesses,
-            "person_type": person_type,
-        }
+        "nc": dict(nc),
+        "nc_confirmed_snapshot": dict(nc),
     }
     return update, context
 
