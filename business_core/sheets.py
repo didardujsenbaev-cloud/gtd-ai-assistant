@@ -757,6 +757,31 @@ def find_row_by_id(sheet_key: str, record_id: str) -> tuple[int, dict] | None:
 # ID генератор
 # ─────────────────────────────────────────────────────────────
 
+def _next_ids_from_values(all_values: list, prefix: str, count: int) -> list[str]:
+    """
+    Вычислить `count` последовательных ID вида PREFIX-N+1..PREFIX-N+count
+    из уже прочитанных значений листа (первая колонка, без заголовка).
+
+    Anchored-регексп `^{prefix}-(\\d+)$` намеренно требует точного
+    совпадения всей строки — legacy ID вида "STAGE-001-01" не матчится
+    и не влияет на последовательность; существующие дубли (несколько
+    строк с одинаковым числовым суффиксом) учитываются как одно и то
+    же значение максимума, не приводя к повторной выдаче того же ID.
+    """
+    import re
+
+    numbers = []
+    pattern = re.compile(rf"^{re.escape(prefix)}-(\d+)$", re.IGNORECASE)
+    for row in all_values[1:]:
+        if row and row[0]:
+            m = pattern.match(str(row[0]))
+            if m:
+                numbers.append(int(m.group(1)))
+
+    next_num = max(numbers, default=0) + 1
+    return [f"{prefix}-{n:03d}" for n in range(next_num, next_num + count)]
+
+
 def generate_next_id(sheet_key: str, prefix: str | None = None) -> str:
     """
     Сгенерировать следующий ID для записи.
@@ -776,8 +801,6 @@ def generate_next_id(sheet_key: str, prefix: str | None = None) -> str:
         generate_next_id("people_registry")        → "PRS-001"
         generate_next_id("roadmap_stages", "STAGE")→ "STAGE-001"
     """
-    import re
-
     if prefix is None:
         prefix = _ID_PREFIXES.get(sheet_key, sheet_key.upper()[:3])
 
@@ -787,17 +810,42 @@ def generate_next_id(sheet_key: str, prefix: str | None = None) -> str:
     except Exception:
         return f"{prefix}-001"
 
-    # Ищем числа в первой колонке (пропускаем заголовок)
-    numbers = []
-    pattern = re.compile(rf"^{re.escape(prefix)}-(\d+)$", re.IGNORECASE)
-    for row in all_values[1:]:
-        if row and row[0]:
-            m = pattern.match(str(row[0]))
-            if m:
-                numbers.append(int(m.group(1)))
+    return _next_ids_from_values(all_values, prefix, 1)[0]
 
-    next_num = max(numbers, default=0) + 1
-    return f"{prefix}-{next_num:03d}"
+
+def generate_next_ids(sheet_key: str, count: int, prefix: str | None = None) -> list[str]:
+    """
+    Сгенерировать `count` уникальных последовательных ID одним чтением листа.
+
+    Предназначен для batch-создания нескольких строк, которые будут
+    записаны одним вызовом batch_append_business_rows() ПОСЛЕ цикла —
+    т.е. ни одна из генерируемых строк ещё не персистентна в момент
+    вызова. Один вызов generate_next_id() на каждую строку в таком
+    цикле вернул бы один и тот же ID для всех строк, т.к. каждый вызов
+    видит одно и то же (ещё не обновлённое) состояние листа.
+
+    Args:
+        sheet_key: ключ листа (определяет дефолтный префикс)
+        count: сколько последовательных ID сгенерировать
+        prefix: явный префикс (если None — берётся из _ID_PREFIXES)
+
+    Returns:
+        Список из `count` строк вида ["STAGE-001", "STAGE-002", ...].
+        Пустой список, если count <= 0.
+    """
+    if count <= 0:
+        return []
+
+    if prefix is None:
+        prefix = _ID_PREFIXES.get(sheet_key, sheet_key.upper()[:3])
+
+    try:
+        sheet = get_business_sheet(sheet_key)
+        all_values = sheet.get_all_values()
+    except Exception:
+        all_values = [[]]
+
+    return _next_ids_from_values(all_values, prefix, count)
 
 
 # ─────────────────────────────────────────────────────────────

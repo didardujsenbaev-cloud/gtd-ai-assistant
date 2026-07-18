@@ -430,7 +430,7 @@ def create_stages_from_template_record(roadmap_id: str, template_id: str) -> dic
     try:
         from business_core.sheets import (
             batch_append_business_rows,
-            generate_next_id,
+            generate_next_ids,
             get_business_sheet,
             row_from_header_map,
         )
@@ -445,8 +445,14 @@ def create_stages_from_template_record(roadmap_id: str, template_id: str) -> dic
         sheet   = get_business_sheet("roadmap_stages")
         headers = sheet.row_values(1)
 
-        for ts in template_stages:
-            stage_id          = generate_next_id("roadmap_stages")
+        # Phase 11F: все Stage ID для этого batch резервируются ОДНИМ
+        # чтением листа до цикла — иначе generate_next_id() внутри цикла
+        # видел бы одно и то же (ещё не записанное) состояние листа на
+        # каждой итерации и вернул бы один и тот же ID для всех строк
+        # (см. Phase 11E production bug).
+        new_stage_ids = generate_next_ids("roadmap_stages", len(template_stages))
+
+        for ts, stage_id in zip(template_stages, new_stage_ids):
             template_stage_id = ts.get("stage_id", "")
 
             # Получаем knowledge IDs из шаблонного этапа
