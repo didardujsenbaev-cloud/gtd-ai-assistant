@@ -3282,6 +3282,38 @@ async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await _reply(update, f"❌ Ошибка построения отчёта: {e}")
 
 
+async def version_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Read-only build/deploy provenance (Phase 12A).
+
+    Не обращается к Google Sheets/Drive — только читает bundled VERSION
+    файл и Railway environment variables. Существует, чтобы можно было
+    подтвердить "production действительно на этом коммите" без SSH
+    (см. Phase 11H/11I: `railway redeploy` может незаметно оставить
+    старый build запущенным).
+    """
+    try:
+        from business_core.version_info import get_version_info
+
+        info = get_version_info()
+        lines = [
+            "🏷 Build info",
+            "",
+            f"Commit: {info['commit_sha']}",
+            f"Source: {info['source']}",
+            f"Build time: {info['build_timestamp']}",
+            f"Environment: {info['environment']}",
+            f"Deployment ID: {info['deployment_id']}",
+        ]
+        if info["warning"]:
+            lines.append(f"⚠️ Warning: {info['warning']}")
+        await _reply(update, "\n".join(lines))
+
+    except Exception as e:
+        log.error(f"version_cmd error: {e}")
+        await _reply(update, f"❌ Ошибка получения версии: {e}")
+
+
 def register_business_handlers(app: Application) -> None:
     """
     Зарегистрировать все Business Core handlers в приложении.
@@ -3374,6 +3406,8 @@ def register_business_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("milestones",       milestones_cmd))
     # Phase 11B
     app.add_handler(CommandHandler("report",           report_cmd))
+    # Phase 12A
+    app.add_handler(CommandHandler("version",          version_cmd))
 
     # Callback handler для кнопок подтверждения бизнес-контекста (Фаза 5B)
     app.add_handler(CallbackQueryHandler(bc_ctx_callback, pattern=r"^bc_ctx:"))
