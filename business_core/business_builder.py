@@ -1082,6 +1082,71 @@ def _get_biz_id_by_name(biz_name: str) -> str:
     return biz_name
 
 
+def _normalize_biz_key(s: str) -> str:
+    """trim + casefold + схлопнуть внутренние пробелы — для сравнения
+    названий/ID бизнеса без учёта регистра и лишних пробелов."""
+    return " ".join((s or "").strip().casefold().split())
+
+
+def resolve_business(value: str) -> dict:
+    """
+    Phase 13A: единый resolver бизнеса — принимает Biz ID ("BIZ-001"),
+    точное название, название в другом регистре или с лишними пробелами
+    и резолвит его в ОДИН канонический Biz ID.
+
+    Не использует fuzzy-matching намеренно (см. Phase 13A) — только
+    trim/casefold/схлопывание пробелов, чтобы не привязать клиента к
+    неверному бизнесу по случайному частичному совпадению.
+
+    Returns:
+        {"ok": True, "biz_id": "BIZ-001", "biz_name": "Узаконение недвижимости"}
+        или
+        {"ok": False, "reason": "not_found" | "ambiguous",
+         "active_businesses": [{"id": "BIZ-001", "name": "..."}, ...]}
+    """
+    from business_core.sheets import read_business_sheet
+
+    try:
+        rows = read_business_sheet("biz_registry")
+    except Exception as exc:
+        log.warning(f"resolve_business: не удалось прочитать BIZ_REGISTRY: {exc}")
+        rows = []
+
+    active_businesses = [
+        {"id": r.get("ID", ""), "name": r.get("Название", "")}
+        for r in rows
+        if r.get("Статус", "") == "active"
+    ]
+
+    key = _normalize_biz_key(value)
+    if not key:
+        return {"ok": False, "reason": "not_found", "active_businesses": active_businesses}
+
+    id_matches = {
+        r.get("ID", "") for r in rows
+        if _normalize_biz_key(r.get("ID", "")) == key
+    }
+    if len(id_matches) == 1:
+        biz_id = next(iter(id_matches))
+        biz_row = next((r for r in rows if r.get("ID", "") == biz_id), {})
+        return {"ok": True, "biz_id": biz_id, "biz_name": biz_row.get("Название", "")}
+    if len(id_matches) > 1:
+        return {"ok": False, "reason": "ambiguous", "active_businesses": active_businesses}
+
+    name_matches = {
+        r.get("ID", "") for r in rows
+        if _normalize_biz_key(r.get("Название", "")) == key
+    }
+    if len(name_matches) == 1:
+        biz_id = next(iter(name_matches))
+        biz_row = next((r for r in rows if r.get("ID", "") == biz_id), {})
+        return {"ok": True, "biz_id": biz_id, "biz_name": biz_row.get("Название", "")}
+    if len(name_matches) > 1:
+        return {"ok": False, "reason": "ambiguous", "active_businesses": active_businesses}
+
+    return {"ok": False, "reason": "not_found", "active_businesses": active_businesses}
+
+
 def provision_client_drive(
     prs_id: str,
     full_name: str,

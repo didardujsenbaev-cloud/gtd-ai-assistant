@@ -60,7 +60,8 @@ def _make_people_sheet(headers: list, existing_rows: list | None = None) -> Magi
 
 
 def _make_update_context(full_name="Иван Иванов", phone="+77771234567",
-                          businesses="ТестБизнес", person_type="клиент"):
+                          businesses="ТестБизнес", person_type="клиент",
+                          biz_id_resolved="BIZ-001"):
     update = MagicMock()
     update.message.text = "Подтверждаю"
     update.message.reply_text = AsyncMock()
@@ -70,6 +71,10 @@ def _make_update_context(full_name="Иван Иванов", phone="+77771234567"
         "phone": phone,
         "businesses": businesses,
         "person_type": person_type,
+        # Phase 13A: резолвинг бизнеса теперь происходит в newclient_biz()
+        # (через resolve_business()), ДО показа карточки подтверждения —
+        # newclient_confirm() лишь читает уже готовый biz_id_resolved.
+        "biz_id_resolved": biz_id_resolved,
     }
     # Phase 11J: newclient_confirm() читает только "nc_confirmed_snapshot"
     # (immutable snapshot, взятый в newclient_biz() до показа карточки
@@ -96,7 +101,7 @@ def _run_newclient_confirm(sheet, find_existing_return=None, biz_id_resolved="BI
     """
     async def run():
         newclient_confirm = _fresh_import()
-        update, context = _make_update_context()
+        update, context = _make_update_context(biz_id_resolved=biz_id_resolved)
 
         with patch("business_core.sheets.get_business_sheet", return_value=sheet), \
              patch("business_core.sheets.generate_next_id", return_value="PRS-999"), \
@@ -106,9 +111,7 @@ def _run_newclient_confirm(sheet, find_existing_return=None, biz_id_resolved="BI
              patch("business_core.business_builder.update_person_drive_info") as mock_upd_drive, \
              patch("business_core.business_builder.save_client_drive_to_sheets") as mock_save_drive, \
              patch("business_core.business_builder.provision_client_drive",
-                   return_value={"ok": False, "error": "Drive не задан для этого бизнеса"}), \
-             patch("business_core.business_builder._get_biz_id_by_name",
-                   return_value=biz_id_resolved):
+                   return_value={"ok": False, "error": "Drive не задан для этого бизнеса"}):
             await newclient_confirm(update, context)
 
         return update, context, mock_add_biz, mock_upd_drive, mock_save_drive

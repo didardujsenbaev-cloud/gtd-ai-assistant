@@ -48,6 +48,9 @@ log = logging.getLogger(__name__)
 NR_BUSINESS, NR_CLIENT, NR_SERVICE, NR_CITY, NR_DAYS, NR_CONFIRM = range(6)
 NC_NAME, NC_PHONE, NC_TYPE, NC_BIZ, NC_CONFIRM = range(10, 15)
 NB_NAME, NB_CITIES, NB_PRIORITY, NB_CONFIRM = range(20, 24)
+# Phase 13A
+EC_FIELD, EC_VALUE, EC_CONFIRM = range(30, 33)
+EO_FIELD, EO_VALUE, EO_CONFIRM = range(40, 43)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -762,7 +765,34 @@ async def newclient_biz(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         await update.message.reply_text("Отменено.", reply_markup=ReplyKeyboardRemove())
         return ConversationHandler.END
 
-    nc["businesses"] = "" if text.startswith("/skip") else text
+    if text.startswith("/skip"):
+        nc["businesses"] = ""
+        nc["biz_id_resolved"] = ""
+    else:
+        # Phase 13A: единый resolver бизнеса (BIZ-ID / точное название /
+        # другой регистр / лишние пробелы -> один канонический BIZ-ID).
+        # Если не резолвится — не сохраняем пустой Biz ID молча:
+        # показываем ошибку и список активных бизнесов, остаёмся в этом
+        # же состоянии, чтобы пользователь ввёл бизнес заново.
+        from business_core.business_builder import resolve_business
+
+        resolved = resolve_business(text)
+        if not resolved["ok"]:
+            active = resolved.get("active_businesses", [])
+            lines = ["❌ Бизнес не распознан: «{}»".format(text)]
+            if resolved.get("reason") == "ambiguous":
+                lines[0] = "❌ Название неоднозначно, совпало несколько бизнесов: «{}»".format(text)
+            lines.append("")
+            lines.append("Доступные активные бизнесы:")
+            for b in active:
+                lines.append(f"  {b['id']} — {b['name']}")
+            lines.append("")
+            lines.append("Введи бизнес заново (ID или точное название), или /skip:")
+            await update.message.reply_text("\n".join(lines))
+            return NC_BIZ
+
+        nc["businesses"] = resolved["biz_name"]
+        nc["biz_id_resolved"] = resolved["biz_id"]
 
     lines = [
         "📋 *Проверь данные клиента:*",
@@ -821,7 +851,6 @@ async def newclient_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             append_business_row,
             generate_next_id,
             get_business_sheet,
-            read_business_sheet,
             row_from_header_map,
         )
         from business_core.business_builder import (
@@ -831,7 +860,6 @@ async def newclient_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             provision_client_drive,
             save_client_drive_to_sheets,
             normalize_biz_ids,
-            _get_biz_id_by_name,
         )
 
         full_name = nc.get("full_name", "")
@@ -839,29 +867,12 @@ async def newclient_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         biz_name  = nc.get("businesses", "")
         biz_name  = "" if biz_name.startswith("/skip") else biz_name
 
-        # Phase 6A/6B: резолвим biz_id по имени бизнеса.
-        # Phase 11J: _get_biz_id_by_name() ищет только по названию и при
-        # отсутствии совпадения возвращает вход без изменений — это не
-        # отличить от "нашли ID, совпадающий по строке с названием". Если
-        # пользователь ввёл уже готовый Biz ID (например "BIZ-001") напрямую,
-        # а не выбрал название из клавиатуры, добавляем отдельную проверку
-        # по колонке "ID" в BIZ_REGISTRY, чтобы Biz IDs/Primary Biz ID не
-        # оставались пустыми.
-        biz_id_resolved = ""
-        if biz_name:
-            try:
-                resolved = _get_biz_id_by_name(biz_name)
-                if resolved and resolved != biz_name:
-                    biz_id_resolved = resolved
-                else:
-                    known_ids = {
-                        r.get("ID", "").strip()
-                        for r in read_business_sheet("biz_registry")
-                    }
-                    if biz_name.strip() in known_ids:
-                        biz_id_resolved = biz_name.strip()
-            except Exception:
-                pass
+        # Phase 13A: бизнес уже резолвлен единым resolve_business() в
+        # newclient_biz() ДО показа карточки подтверждения — snapshot
+        # содержит готовый biz_id_resolved, здесь его нужно только читать,
+        # не резолвить заново (иначе снова возможен разрыв между тем, что
+        # подтвердил пользователь, и тем, что сохраняется).
+        biz_id_resolved = nc.get("biz_id_resolved", "")
 
         # ── Phase 6B: расширенная дедупликация ───────────────────
         existing = find_existing_person(
@@ -1025,6 +1036,478 @@ async def newclient_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 async def newclient_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.pop("nc", None)
     context.user_data.pop("nc_confirmed_snapshot", None)
+    await update.message.reply_text("Отменено.", reply_markup=ReplyKeyboardRemove())
+    return ConversationHandler.END
+
+
+# ─────────────────────────────────────────────────────────────
+# /editclient — безопасное редактирование PEOPLE_REGISTRY (Phase 13A)
+# ─────────────────────────────────────────────────────────────
+#
+# Root cause этой фазы: не было способа исправить опечатку клиента без
+# прямой правки Google Sheets. Архитектура повторяет immutable-snapshot
+# паттерн /newclient (Phase 11J): поле выбирается -> вводится новое
+# значение -> строится карточка "было/станет" -> снимается snapshot ->
+# ТОЛЬКО после явного подтверждения выполняется ОДНА точечная запись
+# в уже найденную (перечитанную заново) строку. ID/Drive Folder ID/
+# Created At никогда не трогаются.
+
+EDITCLIENT_FIELDS = {
+    "Имя (ФИО)": "full_name",
+    "Телефон": "phone",
+    "Бизнес": "business",
+    "Комментарий": "notes",
+}
+
+
+async def editclient_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """
+    /editclient client_id=PRS-001
+
+    Загружает клиента, показывает текущие значения и предлагает выбрать
+    ОДНО поле для изменения. Ничего не пишет в Sheets на этом шаге.
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg())
+        return ConversationHandler.END
+
+    raw = " ".join(context.args or [])
+    kv = _parse_kv_args(raw)
+    client_id = kv.get("client_id") or kv.get("_pos0", "")
+
+    if not client_id:
+        await update.message.reply_text(
+            "❌ Укажи client_id.\n\nПример:\n/editclient client_id=PRS-001"
+        )
+        return ConversationHandler.END
+
+    from business_core.sheets import find_row_by_id
+    found = find_row_by_id("people_registry", client_id)
+    if not found:
+        await update.message.reply_text(f"❌ Клиент {client_id} не найден.")
+        return ConversationHandler.END
+
+    row_number, row = found
+    context.user_data["ec"] = {
+        "client_id": client_id,
+        "row_number": row_number,
+        "current": row,
+    }
+    context.user_data.pop("ec_confirmed_snapshot", None)
+
+    lines = [
+        "✏️ Редактирование клиента",
+        "",
+        f"ID: {client_id}",
+        f"ФИО: {row.get('ФИО', '')}",
+        f"Телефон: {row.get('Телефон', '')}",
+        f"Бизнес: {row.get('Бизнесы', '')} (Biz IDs: {row.get('Biz IDs', '')})",
+        f"Комментарий: {row.get('Комментарий', '')}",
+        "",
+        "Выбери поле для изменения:",
+    ]
+    keyboard = [[k] for k in EDITCLIENT_FIELDS] + [["❌ Отмена"]]
+    await update.message.reply_text(
+        "\n".join(lines),
+        reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True),
+    )
+    return EC_FIELD
+
+
+def _editclient_current_display(current: dict, field_key: str) -> str:
+    return {
+        "full_name": current.get("ФИО", ""),
+        "phone": current.get("Телефон", ""),
+        "business": current.get("Бизнесы", ""),
+        "notes": current.get("Комментарий", ""),
+    }[field_key]
+
+
+async def editclient_field(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text.strip()
+    if text == "❌ Отмена":
+        context.user_data.pop("ec", None)
+        context.user_data.pop("ec_confirmed_snapshot", None)
+        await update.message.reply_text("Отменено.", reply_markup=ReplyKeyboardRemove())
+        return ConversationHandler.END
+
+    field_key = EDITCLIENT_FIELDS.get(text)
+    if not field_key:
+        await update.message.reply_text("❌ Выбери поле из списка ниже.")
+        return EC_FIELD
+
+    context.user_data["ec"]["field"] = field_key
+    current_display = _editclient_current_display(context.user_data["ec"]["current"], field_key)
+
+    await update.message.reply_text(
+        f"Текущее значение: {current_display or '—'}\n\nВведи новое значение:",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    return EC_VALUE
+
+
+async def editclient_value(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text.strip()
+    ec = context.user_data["ec"]
+    field_key = ec["field"]
+    current = ec["current"]
+
+    if not text:
+        await update.message.reply_text("❌ Значение не может быть пустым. Введи новое значение:")
+        return EC_VALUE
+
+    old_value = _editclient_current_display(current, field_key)
+
+    if field_key == "business":
+        from business_core.business_builder import resolve_business
+        resolved = resolve_business(text)
+        if not resolved["ok"]:
+            active = resolved.get("active_businesses", [])
+            lines = [f"❌ Бизнес не распознан: «{text}»"]
+            if resolved.get("reason") == "ambiguous":
+                lines[0] = f"❌ Название неоднозначно, совпало несколько бизнесов: «{text}»"
+            lines.append("")
+            lines.append("Доступные активные бизнесы:")
+            for b in active:
+                lines.append(f"  {b['id']} — {b['name']}")
+            lines.append("")
+            lines.append("Введи бизнес заново (ID или точное название):")
+            await update.message.reply_text("\n".join(lines))
+            return EC_VALUE
+        ec["new_biz_id"] = resolved["biz_id"]
+        ec["new_biz_name"] = resolved["biz_name"]
+        new_value_display = resolved["biz_name"]
+    else:
+        new_value_display = text
+
+    ec["new_value"] = text
+    ec["old_value_display"] = old_value
+    ec["new_value_display"] = new_value_display
+
+    field_labels = {v: k for k, v in EDITCLIENT_FIELDS.items()}
+    await update.message.reply_text(
+        f"📋 Подтверди изменение:\n\n"
+        f"Поле: {field_labels[field_key]}\n"
+        f"Было: {old_value or '—'}\n"
+        f"Станет: {new_value_display or '—'}",
+        reply_markup=ReplyKeyboardMarkup(
+            [["✅ Сохранить"], ["❌ Отмена"]],
+            resize_keyboard=True, one_time_keyboard=True,
+        ),
+    )
+
+    # Phase 13A: immutable snapshot того, что показано в карточке
+    # подтверждения — editclient_confirm() сохраняет только его.
+    context.user_data["ec_confirmed_snapshot"] = dict(ec)
+    return EC_CONFIRM
+
+
+async def editclient_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text.strip()
+
+    if "Отмена" in text:
+        context.user_data.pop("ec", None)
+        context.user_data.pop("ec_confirmed_snapshot", None)
+        await update.message.reply_text("Отменено.", reply_markup=ReplyKeyboardRemove())
+        return ConversationHandler.END
+
+    snap = context.user_data.get("ec_confirmed_snapshot")
+    if snap is None:
+        await update.message.reply_text(
+            "❌ Не найдены подтверждённые данные для сохранения. Начни заново: /editclient",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        context.user_data.pop("ec", None)
+        context.user_data.pop("ec_confirmed_snapshot", None)
+        return ConversationHandler.END
+
+    try:
+        from business_core.sheets import find_row_by_id, get_business_sheet
+
+        client_id = snap["client_id"]
+        field_key = snap["field"]
+
+        # Перечитываем строку прямо перед записью — защита от staleness
+        # между показом карточки и подтверждением.
+        found = find_row_by_id("people_registry", client_id)
+        if not found:
+            await update.message.reply_text(
+                f"❌ Клиент {client_id} больше не найден — изменение не выполнено.",
+                reply_markup=ReplyKeyboardRemove(),
+            )
+        else:
+            row_number, _live_row = found
+            sheet = get_business_sheet("people_registry")
+            headers = sheet.row_values(1)
+
+            def _col(name):
+                return headers.index(name) + 1 if name in headers else None
+
+            if field_key == "full_name":
+                fio_col   = _col("ФИО")
+                short_col = _col("Имя")
+                if fio_col:
+                    sheet.update_cell(row_number, fio_col, snap["new_value"])
+                if short_col:
+                    parts = snap["new_value"].split()
+                    sheet.update_cell(row_number, short_col, parts[0] if parts else snap["new_value"])
+            elif field_key == "phone":
+                col = _col("Телефон")
+                if col:
+                    sheet.update_cell(row_number, col, snap["new_value"])
+            elif field_key == "business":
+                biz_ids_col     = _col("Biz IDs")
+                primary_col     = _col("Primary Biz ID")
+                biz_display_col = _col("Бизнесы")
+                if biz_ids_col:
+                    sheet.update_cell(row_number, biz_ids_col, snap["new_biz_id"])
+                if primary_col:
+                    sheet.update_cell(row_number, primary_col, snap["new_biz_id"])
+                if biz_display_col:
+                    sheet.update_cell(row_number, biz_display_col, snap["new_biz_name"])
+            elif field_key == "notes":
+                col = _col("Комментарий")
+                if col:
+                    sheet.update_cell(row_number, col, snap["new_value"])
+
+            field_labels = {v: k for k, v in EDITCLIENT_FIELDS.items()}
+            await update.message.reply_text(
+                f"✅ Клиент {client_id} обновлён\n\n"
+                f"Поле: {field_labels[field_key]}\n"
+                f"Было: {snap['old_value_display'] or '—'}\n"
+                f"Стало: {snap['new_value_display'] or '—'}",
+                reply_markup=ReplyKeyboardRemove(),
+            )
+
+    except Exception as e:
+        log.error(f"editclient_confirm error: {e}")
+        await update.message.reply_text(
+            f"❌ Ошибка сохранения: {e}",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+
+    context.user_data.pop("ec", None)
+    context.user_data.pop("ec_confirmed_snapshot", None)
+    return ConversationHandler.END
+
+
+async def editclient_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data.pop("ec", None)
+    context.user_data.pop("ec_confirmed_snapshot", None)
+    await update.message.reply_text("Отменено.", reply_markup=ReplyKeyboardRemove())
+    return ConversationHandler.END
+
+
+# ─────────────────────────────────────────────────────────────
+# /editobject — безопасное редактирование OBJECT_REGISTRY (Phase 13A)
+# ─────────────────────────────────────────────────────────────
+#
+# Object ID / Client ID / Drive Folder ID / Created At / Roadmap ID
+# никогда не изменяются этой командой. Client ID сознательно НЕ входит
+# в первую версию — архитектура связей объект/Drive/roadmap не даёт
+# безопасно сменить владельца объекта одной точечной правкой ячейки.
+
+EDITOBJECT_FIELDS = {
+    "Адрес": "address",
+    "Тип объекта": "object_type",
+    "Комментарий": "notes",
+}
+
+
+async def editobject_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """/editobject object_id=OBJ-001"""
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg())
+        return ConversationHandler.END
+
+    raw = " ".join(context.args or [])
+    kv = _parse_kv_args(raw)
+    obj_id = kv.get("object_id") or kv.get("obj_id") or kv.get("_pos0", "")
+
+    if not obj_id:
+        await update.message.reply_text(
+            "❌ Укажи object_id.\n\nПример:\n/editobject object_id=OBJ-001"
+        )
+        return ConversationHandler.END
+
+    from business_core.sheets import find_row_by_id
+    found = find_row_by_id("object_registry", obj_id)
+    if not found:
+        await update.message.reply_text(f"❌ Объект {obj_id} не найден.")
+        return ConversationHandler.END
+
+    row_number, row = found
+    context.user_data["eo"] = {
+        "obj_id": obj_id,
+        "row_number": row_number,
+        "current": row,
+    }
+    context.user_data.pop("eo_confirmed_snapshot", None)
+
+    lines = [
+        "✏️ Редактирование объекта",
+        "",
+        f"OBJ ID: {obj_id}",
+        f"Адрес: {row.get('Address', '')}",
+        f"Тип объекта: {row.get('Object Type', '')}",
+        f"Комментарий: {row.get('Notes', '')}",
+        "",
+        "Выбери поле для изменения:",
+    ]
+    keyboard = [[k] for k in EDITOBJECT_FIELDS] + [["❌ Отмена"]]
+    await update.message.reply_text(
+        "\n".join(lines),
+        reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True),
+    )
+    return EO_FIELD
+
+
+def _editobject_current_display(current: dict, field_key: str) -> str:
+    return {
+        "address": current.get("Address", ""),
+        "object_type": current.get("Object Type", ""),
+        "notes": current.get("Notes", ""),
+    }[field_key]
+
+
+async def editobject_field(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text.strip()
+    if text == "❌ Отмена":
+        context.user_data.pop("eo", None)
+        context.user_data.pop("eo_confirmed_snapshot", None)
+        await update.message.reply_text("Отменено.", reply_markup=ReplyKeyboardRemove())
+        return ConversationHandler.END
+
+    field_key = EDITOBJECT_FIELDS.get(text)
+    if not field_key:
+        await update.message.reply_text("❌ Выбери поле из списка ниже.")
+        return EO_FIELD
+
+    context.user_data["eo"]["field"] = field_key
+    current_display = _editobject_current_display(context.user_data["eo"]["current"], field_key)
+
+    extra = ""
+    if field_key == "address":
+        extra = "\n\n⚠️ Имя Drive-папки при этом НЕ переименовывается."
+
+    await update.message.reply_text(
+        f"Текущее значение: {current_display or '—'}{extra}\n\nВведи новое значение:",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    return EO_VALUE
+
+
+async def editobject_value(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text.strip()
+    eo = context.user_data["eo"]
+    field_key = eo["field"]
+
+    if not text:
+        await update.message.reply_text("❌ Значение не может быть пустым. Введи новое значение:")
+        return EO_VALUE
+
+    old_value = _editobject_current_display(eo["current"], field_key)
+    eo["new_value"] = text
+    eo["old_value_display"] = old_value
+    eo["new_value_display"] = text
+
+    field_labels = {v: k for k, v in EDITOBJECT_FIELDS.items()}
+    extra = "\n⚠️ Имя Drive-папки останется прежним." if field_key == "address" else ""
+    await update.message.reply_text(
+        f"📋 Подтверди изменение:\n\n"
+        f"Поле: {field_labels[field_key]}\n"
+        f"Было: {old_value or '—'}\n"
+        f"Станет: {text or '—'}"
+        f"{extra}",
+        reply_markup=ReplyKeyboardMarkup(
+            [["✅ Сохранить"], ["❌ Отмена"]],
+            resize_keyboard=True, one_time_keyboard=True,
+        ),
+    )
+
+    context.user_data["eo_confirmed_snapshot"] = dict(eo)
+    return EO_CONFIRM
+
+
+async def editobject_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text.strip()
+
+    if "Отмена" in text:
+        context.user_data.pop("eo", None)
+        context.user_data.pop("eo_confirmed_snapshot", None)
+        await update.message.reply_text("Отменено.", reply_markup=ReplyKeyboardRemove())
+        return ConversationHandler.END
+
+    snap = context.user_data.get("eo_confirmed_snapshot")
+    if snap is None:
+        await update.message.reply_text(
+            "❌ Не найдены подтверждённые данные для сохранения. Начни заново: /editobject",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        context.user_data.pop("eo", None)
+        context.user_data.pop("eo_confirmed_snapshot", None)
+        return ConversationHandler.END
+
+    try:
+        from business_core.sheets import find_row_by_id, get_business_sheet
+        from datetime import datetime as _dt
+
+        obj_id = snap["obj_id"]
+        field_key = snap["field"]
+
+        found = find_row_by_id("object_registry", obj_id)
+        if not found:
+            await update.message.reply_text(
+                f"❌ Объект {obj_id} больше не найден — изменение не выполнено.",
+                reply_markup=ReplyKeyboardRemove(),
+            )
+        else:
+            row_number, _live_row = found
+            sheet = get_business_sheet("object_registry")
+            headers = sheet.row_values(1)
+
+            def _col(name):
+                return headers.index(name) + 1 if name in headers else None
+
+            field_to_column = {
+                "address": "Address",
+                "object_type": "Object Type",
+                "notes": "Notes",
+            }
+            col = _col(field_to_column[field_key])
+            if col:
+                sheet.update_cell(row_number, col, snap["new_value"])
+
+            last_updated_col = _col("Last Updated")
+            if last_updated_col:
+                sheet.update_cell(row_number, last_updated_col, _dt.now().strftime("%Y-%m-%d"))
+
+            field_labels = {v: k for k, v in EDITOBJECT_FIELDS.items()}
+            extra = "\n⚠️ Имя Drive-папки осталось прежним." if field_key == "address" else ""
+            await update.message.reply_text(
+                f"✅ Объект {obj_id} обновлён\n\n"
+                f"Поле: {field_labels[field_key]}\n"
+                f"Было: {snap['old_value_display'] or '—'}\n"
+                f"Стало: {snap['new_value_display'] or '—'}"
+                f"{extra}",
+                reply_markup=ReplyKeyboardRemove(),
+            )
+
+    except Exception as e:
+        log.error(f"editobject_confirm error: {e}")
+        await update.message.reply_text(
+            f"❌ Ошибка сохранения: {e}",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+
+    context.user_data.pop("eo", None)
+    context.user_data.pop("eo_confirmed_snapshot", None)
+    return ConversationHandler.END
+
+
+async def editobject_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data.pop("eo", None)
+    context.user_data.pop("eo_confirmed_snapshot", None)
     await update.message.reply_text("Отменено.", reply_markup=ReplyKeyboardRemove())
     return ConversationHandler.END
 
@@ -3364,10 +3847,36 @@ def register_business_handlers(app: Application) -> None:
         allow_reentry=True,
     )
 
+    # ConversationHandler — редактирование клиента (Phase 13A)
+    editclient_handler = ConversationHandler(
+        entry_points=[CommandHandler("editclient", editclient_start)],
+        states={
+            EC_FIELD:   [MessageHandler(filters.TEXT & ~filters.COMMAND, editclient_field)],
+            EC_VALUE:   [MessageHandler(filters.TEXT & ~filters.COMMAND, editclient_value)],
+            EC_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, editclient_confirm)],
+        },
+        fallbacks=[CommandHandler("cancel", editclient_cancel)],
+        allow_reentry=True,
+    )
+
+    # ConversationHandler — редактирование объекта (Phase 13A)
+    editobject_handler = ConversationHandler(
+        entry_points=[CommandHandler("editobject", editobject_start)],
+        states={
+            EO_FIELD:   [MessageHandler(filters.TEXT & ~filters.COMMAND, editobject_field)],
+            EO_VALUE:   [MessageHandler(filters.TEXT & ~filters.COMMAND, editobject_value)],
+            EO_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, editobject_confirm)],
+        },
+        fallbacks=[CommandHandler("cancel", editobject_cancel)],
+        allow_reentry=True,
+    )
+
     # Регистрируем ConversationHandlers первыми
     app.add_handler(newroadmap_handler)
     app.add_handler(newclient_handler)
     app.add_handler(newbiz_handler)
+    app.add_handler(editclient_handler)
+    app.add_handler(editobject_handler)
 
     # Простые команды
     app.add_handler(CommandHandler("bc",        bc_dashboard))
