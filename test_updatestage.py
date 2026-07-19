@@ -256,17 +256,35 @@ class TestUpdateStageStatusValidation(unittest.TestCase):
 class TestUpdateStageStatusWrite(unittest.TestCase):
 
     def test_writes_only_status_column_without_notes(self):
+        """Non-'done' status without notes writes only Status (Phase 14A:
+        'done' additionally auto-fills Completed At — see the dedicated
+        test below for that case)."""
         rm = _fresh_rm()
         sheet = _make_stage_sheet()
         with patch("business_core.sheets.get_business_sheet", return_value=sheet):
-            result = rm.update_stage_status_in_sheet("STAGE-001-01", "done")
+            result = rm.update_stage_status_in_sheet("STAGE-001-01", "blocked")
 
         self.assertTrue(result["ok"])
         self.assertEqual(sheet.update_cell.call_count, 1)
         row_num, col, value = sheet.update_cell.call_args[0]
         self.assertEqual(row_num, 2)
         self.assertEqual(col, STAGES_HEADERS.index("Status") + 1)
-        self.assertEqual(value, "done")
+        self.assertEqual(value, "blocked")
+
+    def test_done_status_also_autofills_completed_at(self):
+        """Phase 14A: переход в 'done' дополнительно заполняет Completed At —
+        единственное дополнительное поле, которое трогает эта функция."""
+        rm = _fresh_rm()
+        sheet = _make_stage_sheet()
+        with patch("business_core.sheets.get_business_sheet", return_value=sheet):
+            result = rm.update_stage_status_in_sheet("STAGE-001-01", "done")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(sheet.update_cell.call_count, 2)
+        calls = {call.args[1]: call.args[2] for call in sheet.update_cell.call_args_list}
+        self.assertEqual(calls[STAGES_HEADERS.index("Status") + 1], "done")
+        self.assertIn(STAGES_HEADERS.index("Completed At") + 1, calls)
+        self.assertRegex(calls[STAGES_HEADERS.index("Completed At") + 1], r"^\d{4}-\d{2}-\d{2}$")
 
     def test_writes_status_and_notes_when_notes_provided(self):
         rm = _fresh_rm()
@@ -292,12 +310,14 @@ class TestUpdateStageStatusWrite(unittest.TestCase):
 
     def test_does_not_touch_other_columns(self):
         """Order/Name/Due Date/Responsible/Docs Required/знаниевые поля —
-        ни разу не участвуют в update_cell."""
+        ни разу не участвуют в update_cell (non-'done' status — see
+        test_done_status_also_autofills_completed_at for the one
+        intentional exception on 'done')."""
         rm = _fresh_rm()
         sheet = _make_stage_sheet()
         with patch("business_core.sheets.get_business_sheet", return_value=sheet):
             rm.update_stage_status_in_sheet(
-                "STAGE-001-01", "done", notes="готово")
+                "STAGE-001-01", "blocked", notes="ожидаем документы")
 
         written_cols = {call.args[1] for call in sheet.update_cell.call_args_list}
         protected = {

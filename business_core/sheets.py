@@ -140,6 +140,12 @@ BUSINESS_HEADERS: dict[str, list[str]] = {
         # Phase 8C: Knowledge bindings (добавлены в конец)
         "SOP IDs", "Checklist IDs", "Materials IDs",
         "Document Template IDs", "FAQ IDs",
+        # Phase 14A: Stage Management Core (добавлены в конец — существующие
+        # строки/колонки не трогаются, header-safe чтение/запись отдаёт
+        # "" для новых колонок в старых строках). Checklist Status/Docs
+        # Status намеренно не добавлены — Phase 14A ограничена базовым
+        # управлением этапом (см. Phase 14A scope decision).
+        "Start Date", "Priority", "Blocking Reason",
     ],
     "materials": [
         "Material ID", "Source", "Received At", "GTD Reference Row",

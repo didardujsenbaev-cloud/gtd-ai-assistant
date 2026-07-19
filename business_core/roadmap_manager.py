@@ -1235,6 +1235,25 @@ def update_stage_status_in_sheet(
 
         sheet.update_cell(row_num, idx["Status"] + 1, new_status)
 
+        # Phase 14A: автозаполнение дат жизненного цикла этапа.
+        # - Completed At заполняется КАЖДЫЙ раз при переходе в 'done' —
+        #   отражает время последнего завершения (переоткрытие и повторное
+        #   завершение обновляет дату, а не оставляет устаревшую).
+        # - Start Date заполняется ТОЛЬКО если ещё пусто при переходе в
+        #   'in_progress' — не затирает вручную выставленную дату начала
+        #   при повторных переходах туда-обратно.
+        # Ни то, ни другое не трогает следующий этап и не пересчитывает
+        # Progress % — это по-прежнему делает отдельный вызывающий код.
+        if new_status == "done" and "Completed At" in idx:
+            sheet.update_cell(row_num, idx["Completed At"] + 1, datetime.now().strftime("%Y-%m-%d"))
+
+        if new_status == "in_progress" and "Start Date" in idx:
+            current_row = sheet.row_values(row_num)
+            start_col = idx["Start Date"]
+            current_start = current_row[start_col].strip() if start_col < len(current_row) else ""
+            if not current_start:
+                sheet.update_cell(row_num, start_col + 1, datetime.now().strftime("%Y-%m-%d"))
+
         if notes is not None:
             if "Notes" not in idx:
                 return {"ok": False, "error": "В листе ROADMAP_STAGES отсутствует колонка 'Notes'",

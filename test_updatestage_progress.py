@@ -431,15 +431,17 @@ class TestEndToEndSheetsIntegration(unittest.TestCase):
         self.assertNotIn(ROADMAPS_HEADERS.index("Status") + 1, written_cols)
 
     def test_stage_row_only_status_and_no_extra_writes_after(self):
-        """После update_stage_status_in_sheet (пишет только Status/Notes)
-        recalculate_roadmap_progress не должен ничего ЕЩЁ писать в
-        ROADMAP_STAGES."""
+        """После update_stage_status_in_sheet (пишет Status, и для 'done'
+        дополнительно Completed At — Phase 14A) recalculate_roadmap_progress
+        не должен ничего ЕЩЁ писать в ROADMAP_STAGES."""
         upd, stages_sheet, roadmaps_sheet = self._run_full_command(status="done")
-        # update_stage_status_in_sheet пишет Status (1 вызов, notes не передан)
-        self.assertEqual(stages_sheet.update_cell.call_count, 1)
-        row_num, col, value = stages_sheet.update_cell.call_args[0]
-        self.assertEqual(col, STAGES_HEADERS.index("Status") + 1)
-        self.assertEqual(value, "done")
+        # update_stage_status_in_sheet пишет Status + Completed At для 'done'
+        # (notes не передан) — recalculate_roadmap_progress не добавляет
+        # ничего сверху.
+        self.assertEqual(stages_sheet.update_cell.call_count, 2)
+        calls = {c.args[1]: c.args[2] for c in stages_sheet.update_cell.call_args_list}
+        self.assertEqual(calls[STAGES_HEADERS.index("Status") + 1], "done")
+        self.assertIn(STAGES_HEADERS.index("Completed At") + 1, calls)
 
     def test_only_target_roadmap_row_written(self):
         upd, stages_sheet, roadmaps_sheet = self._run_full_command(
@@ -509,7 +511,9 @@ class TestUpdateStageStatusReturnsRoadmapId(unittest.TestCase):
 
     def test_core_logic_unchanged_still_writes_only_status(self):
         """Добавление roadmap_id в возвращаемое значение не должно менять
-        основную логику записи (по-прежнему только Status/Notes)."""
+        основную логику записи для non-'done' статусов (по-прежнему
+        только Status/Notes — 'done' отдельно автозаполняет Completed At,
+        см. test_updatestage.py)."""
         rm = _fresh_rm()
         stage_row = _stage_row(status="pending")
         sheet = MagicMock()
@@ -519,7 +523,7 @@ class TestUpdateStageStatusReturnsRoadmapId(unittest.TestCase):
         sheet.row_values.side_effect = lambda r: STAGES_HEADERS if r == 1 else stage_row
 
         with patch("business_core.sheets.get_business_sheet", return_value=sheet):
-            rm.update_stage_status_in_sheet("STAGE-001", "done")
+            rm.update_stage_status_in_sheet("STAGE-001", "blocked")
 
         self.assertEqual(sheet.update_cell.call_count, 1)
         row_num, col, value = sheet.update_cell.call_args[0]

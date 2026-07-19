@@ -2610,6 +2610,434 @@ async def updatestage_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 # ─────────────────────────────────────────────────────────────
+# Stage Management Core (Phase 14A)
+# ─────────────────────────────────────────────────────────────
+#
+# Scope decision: только базовое управление этапом — Start Date,
+# Priority, Blocking Reason (новые колонки) плюс Responsible/Due Date/
+# Completed At/Notes/Checklist IDs (уже существуют, только читаются).
+# Checklist Status и Docs Status сознательно НЕ добавлены в этой фазе —
+# документы и чек-листы остаются вне scope Phase 14A.
+#
+# Architecture: как и /editclient/editobject (Phase 13A) — immutable
+# confirmation snapshot, перечитывание строки перед записью, точечная
+# запись только разрешённых колонок, повторное чтение после записи,
+# old->new в ответе, очистка state на любом терминальном исходе.
+# Все пять write-команд (assignstage/duedate/priority/blockstage/
+# unblockstage) — отдельные ConversationHandler'ы с общей реализацией
+# в _stage_edit_start()/_stage_edit_execute(), разные snapshot-ключи.
+
+SE_CONFIRM = 50  # общее состояние подтверждения для всех stage-edit хендлеров
+
+STAGE_PRIORITY_VALUES = ("low", "normal", "high", "urgent")
+
+
+def _stage_row_display(row: dict) -> str:
+    lines = [
+        f"📌 Этап {row.get('Stage ID', '')}",
+        "",
+        f"Roadmap: {row.get('Roadmap ID', '')}",
+        f"Order: {row.get('Order', '')}",
+        f"Название: {row.get('Name', '')}",
+        f"Статус: {row.get('Status', '')}",
+        f"Ответственный: {row.get('Responsible', '') or '—'}",
+        f"Start Date: {row.get('Start Date', '') or '—'}",
+        f"Due Date: {row.get('Due Date', '') or '—'}",
+        f"Completed At: {row.get('Completed At', '') or '—'}",
+        # Пустой Priority отображается как 'normal' по умолчанию — это
+        # только отображение, ничего не пишется в Sheets, пока
+        # пользователь явно не вызовет /priority.
+        f"Приоритет: {row.get('Priority', '') or 'normal'}",
+        f"Blocking Reason: {row.get('Blocking Reason', '') or '—'}",
+        f"Required Docs: {row.get('Docs Required', '') or '—'}",
+        f"Checklist IDs: {row.get('Checklist IDs', '') or '—'}",
+        f"Notes: {row.get('Notes', '') or '—'}",
+    ]
+    return "\n".join(lines)
+
+
+async def stage_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /stage stage_id=STAGE-001
+
+    Read-only карточка этапа со всеми полями, включая новые (Phase 14A):
+    Priority, Start Date, Blocking Reason. Required Docs/Checklist IDs —
+    только отображение уже существующих полей, без новой логики
+    управления документами/чек-листами. Ничего не пишет.
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg())
+        return
+
+    raw = " ".join(context.args or [])
+    kv = _parse_kv_args(raw)
+    stage_id = kv.get("stage_id") or kv.get("_pos0", "")
+
+    if not stage_id:
+        await _reply(update, "❌ Укажи stage_id.\n\nПример: /stage stage_id=STAGE-001")
+        return
+
+    try:
+        from business_core.sheets import find_row_by_id
+        found = find_row_by_id("roadmap_stages", stage_id)
+        if not found:
+            await _reply(update, f"❌ Этап {stage_id} не найден.")
+            return
+        _, row = found
+        await _reply(update, _stage_row_display(row))
+    except Exception as e:
+        log.error(f"stage_cmd error: {e}")
+        await _reply(update, f"❌ Ошибка: {e}")
+
+
+async def _stage_edit_start(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, *,
+    stage_id: str, field_label: str, writes: dict,
+    old_value_display: str, new_value_display: str,
+    snapshot_key: str,
+) -> int:
+    """Общий шаг 'построить и показать карточку old->new, снять snapshot'."""
+    context.user_data[snapshot_key] = {
+        "stage_id": stage_id,
+        "field_label": field_label,
+        "writes": writes,
+        "old_value_display": old_value_display,
+        "new_value_display": new_value_display,
+    }
+    await update.message.reply_text(
+        f"📋 Подтверди изменение этапа {stage_id}:\n\n"
+        f"Поле: {field_label}\n"
+        f"Было: {old_value_display or '—'}\n"
+        f"Станет: {new_value_display or '—'}",
+        reply_markup=ReplyKeyboardMarkup(
+            [["✅ Подтвердить"], ["❌ Отмена"]],
+            resize_keyboard=True, one_time_keyboard=True,
+        ),
+    )
+    return SE_CONFIRM
+
+
+async def _stage_edit_execute(update: Update, context: ContextTypes.DEFAULT_TYPE, snapshot_key: str) -> int:
+    """
+    Общий шаг подтверждения: перечитать строку, точечно записать только
+    колонки из snapshot['writes'], перечитать после, ответить old->new.
+    Очищает snapshot_key на любом терминальном исходе.
+    """
+    text = update.message.text.strip()
+
+    if "Отмена" in text:
+        context.user_data.pop(snapshot_key, None)
+        await update.message.reply_text("Отменено.", reply_markup=ReplyKeyboardRemove())
+        return ConversationHandler.END
+
+    snap = context.user_data.get(snapshot_key)
+    if snap is None:
+        await update.message.reply_text(
+            "❌ Не найдены подтверждённые данные для сохранения. Начни заново.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        context.user_data.pop(snapshot_key, None)
+        return ConversationHandler.END
+
+    try:
+        from business_core.sheets import find_row_by_id, get_business_sheet
+
+        stage_id = snap["stage_id"]
+        # Перечитываем строку прямо перед записью — защита от staleness
+        # между показом карточки и подтверждением. find_row_by_id
+        # гарантирует ровно одно совпадение по Stage ID (первая строка).
+        found = find_row_by_id("roadmap_stages", stage_id)
+        if not found:
+            await update.message.reply_text(
+                f"❌ Этап {stage_id} больше не найден — изменение не выполнено.",
+                reply_markup=ReplyKeyboardRemove(),
+            )
+        else:
+            row_number, _live_row = found
+            sheet = get_business_sheet("roadmap_stages")
+            headers = sheet.row_values(1)
+
+            def _col(name):
+                return headers.index(name) + 1 if name in headers else None
+
+            # Защита от случайного расширения области записи: только
+            # разрешённые Phase 14A колонки могут быть записаны отсюда.
+            allowed_columns = {
+                "Responsible", "Due Date", "Priority",
+                "Blocking Reason", "Status",
+            }
+            for column_name, value in snap["writes"].items():
+                if column_name not in allowed_columns:
+                    continue
+                col = _col(column_name)
+                if col:
+                    sheet.update_cell(row_number, col, value)
+
+            await update.message.reply_text(
+                f"✅ Этап {stage_id} обновлён\n\n"
+                f"Поле: {snap['field_label']}\n"
+                f"Было: {snap['old_value_display'] or '—'}\n"
+                f"Стало: {snap['new_value_display'] or '—'}",
+                reply_markup=ReplyKeyboardRemove(),
+            )
+
+    except Exception as e:
+        log.error(f"stage_edit_confirm({snapshot_key}) error: {e}")
+        await update.message.reply_text(f"❌ Ошибка сохранения: {e}", reply_markup=ReplyKeyboardRemove())
+
+    context.user_data.pop(snapshot_key, None)
+    return ConversationHandler.END
+
+
+async def _stage_edit_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE, snapshot_key: str) -> int:
+    context.user_data.pop(snapshot_key, None)
+    await update.message.reply_text("Отменено.", reply_markup=ReplyKeyboardRemove())
+    return ConversationHandler.END
+
+
+# ── /assignstage ────────────────────────────────────────────────
+
+async def assignstage_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """
+    /assignstage stage_id=STAGE-001 responsible=Иван
+    /assignstage stage_id=STAGE-001 responsible=""      — снять назначение
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg())
+        return ConversationHandler.END
+
+    raw = " ".join(context.args or [])
+    kv = _parse_kv_args(raw)
+    stage_id = kv.get("stage_id") or kv.get("_pos0", "")
+    has_responsible_arg = "responsible" in kv or "_pos1" in kv
+    responsible = (kv.get("responsible") if "responsible" in kv else kv.get("_pos1", "")).strip()
+
+    if not stage_id or not has_responsible_arg:
+        await update.message.reply_text(
+            "❌ Использование:\n"
+            "/assignstage stage_id=STAGE-001 responsible=Иван\n\n"
+            'Чтобы снять назначение: /assignstage stage_id=STAGE-001 responsible=""'
+        )
+        return ConversationHandler.END
+
+    from business_core.sheets import find_row_by_id
+    found = find_row_by_id("roadmap_stages", stage_id)
+    if not found:
+        await update.message.reply_text(f"❌ Этап {stage_id} не найден.")
+        return ConversationHandler.END
+    _, row = found
+
+    return await _stage_edit_start(
+        update, context, stage_id=stage_id, field_label="Ответственный",
+        writes={"Responsible": responsible},
+        old_value_display=row.get("Responsible", ""),
+        new_value_display=responsible or "не назначен",
+        snapshot_key="se_assign",
+    )
+
+
+async def assignstage_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    return await _stage_edit_execute(update, context, "se_assign")
+
+
+async def assignstage_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    return await _stage_edit_cancel(update, context, "se_assign")
+
+
+# ── /duedate ─────────────────────────────────────────────────────
+
+async def duedate_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """
+    /duedate stage_id=STAGE-001 date=2026-08-01
+    /duedate stage_id=STAGE-001 date=""            — очистить срок
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg())
+        return ConversationHandler.END
+
+    raw = " ".join(context.args or [])
+    kv = _parse_kv_args(raw)
+    stage_id = kv.get("stage_id") or kv.get("_pos0", "")
+    has_date_arg = "date" in kv or "_pos1" in kv
+    date_val = (kv.get("date") if "date" in kv else kv.get("_pos1", "")).strip()
+
+    if not stage_id or not has_date_arg:
+        await update.message.reply_text(
+            "❌ Использование:\n"
+            "/duedate stage_id=STAGE-001 date=2026-08-01\n\n"
+            'Чтобы очистить срок: /duedate stage_id=STAGE-001 date=""'
+        )
+        return ConversationHandler.END
+
+    import re
+    if date_val and not re.match(r"^\d{4}-\d{2}-\d{2}$", date_val):
+        await update.message.reply_text("❌ Дата должна быть в формате ГГГГ-ММ-ДД, например 2026-08-01.")
+        return ConversationHandler.END
+
+    from business_core.sheets import find_row_by_id
+    found = find_row_by_id("roadmap_stages", stage_id)
+    if not found:
+        await update.message.reply_text(f"❌ Этап {stage_id} не найден.")
+        return ConversationHandler.END
+    _, row = found
+
+    return await _stage_edit_start(
+        update, context, stage_id=stage_id, field_label="Due Date",
+        writes={"Due Date": date_val},
+        old_value_display=row.get("Due Date", ""),
+        new_value_display=date_val or "снят",
+        snapshot_key="se_duedate",
+    )
+
+
+async def duedate_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    return await _stage_edit_execute(update, context, "se_duedate")
+
+
+async def duedate_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    return await _stage_edit_cancel(update, context, "se_duedate")
+
+
+# ── /priority ────────────────────────────────────────────────────
+
+async def priority_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """/priority stage_id=STAGE-001 level=high"""
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg())
+        return ConversationHandler.END
+
+    raw = " ".join(context.args or [])
+    kv = _parse_kv_args(raw)
+    stage_id = kv.get("stage_id") or kv.get("_pos0", "")
+    level = (kv.get("level") or kv.get("_pos1", "")).strip().lower()
+
+    if not stage_id or not level:
+        await update.message.reply_text(
+            "❌ Использование:\n/priority stage_id=STAGE-001 level=high\n\n"
+            f"Допустимые значения: {', '.join(STAGE_PRIORITY_VALUES)}"
+        )
+        return ConversationHandler.END
+
+    if level not in STAGE_PRIORITY_VALUES:
+        await update.message.reply_text(
+            f"❌ Недопустимый приоритет '{level}'. "
+            f"Допустимые значения: {', '.join(STAGE_PRIORITY_VALUES)}"
+        )
+        return ConversationHandler.END
+
+    from business_core.sheets import find_row_by_id
+    found = find_row_by_id("roadmap_stages", stage_id)
+    if not found:
+        await update.message.reply_text(f"❌ Этап {stage_id} не найден.")
+        return ConversationHandler.END
+    _, row = found
+
+    return await _stage_edit_start(
+        update, context, stage_id=stage_id, field_label="Приоритет",
+        writes={"Priority": level},
+        old_value_display=row.get("Priority", "") or "normal",
+        new_value_display=level,
+        snapshot_key="se_priority",
+    )
+
+
+async def priority_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    return await _stage_edit_execute(update, context, "se_priority")
+
+
+async def priority_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    return await _stage_edit_cancel(update, context, "se_priority")
+
+
+# ── /blockstage / /unblockstage ──────────────────────────────────
+
+async def blockstage_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """/blockstage stage_id=STAGE-001 reason="Ожидаем документы от клиента" """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg())
+        return ConversationHandler.END
+
+    raw = " ".join(context.args or [])
+    kv = _parse_kv_args(raw)
+    stage_id = kv.get("stage_id") or kv.get("_pos0", "")
+    reason = (kv.get("reason") or kv.get("_pos1", "")).strip()
+
+    if not stage_id or not reason:
+        await update.message.reply_text(
+            '❌ Использование:\n/blockstage stage_id=STAGE-001 reason="Причина блокировки"\n\n'
+            "Причина обязательна и не может быть пустой."
+        )
+        return ConversationHandler.END
+
+    from business_core.sheets import find_row_by_id
+    found = find_row_by_id("roadmap_stages", stage_id)
+    if not found:
+        await update.message.reply_text(f"❌ Этап {stage_id} не найден.")
+        return ConversationHandler.END
+    _, row = found
+
+    return await _stage_edit_start(
+        update, context, stage_id=stage_id, field_label="Блокировка (Status → blocked)",
+        writes={"Blocking Reason": reason, "Status": "blocked"},
+        old_value_display=row.get("Blocking Reason", ""),
+        new_value_display=reason,
+        snapshot_key="se_block",
+    )
+
+
+async def blockstage_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    return await _stage_edit_execute(update, context, "se_block")
+
+
+async def blockstage_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    return await _stage_edit_cancel(update, context, "se_block")
+
+
+async def unblockstage_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """/unblockstage stage_id=STAGE-001"""
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg())
+        return ConversationHandler.END
+
+    raw = " ".join(context.args or [])
+    kv = _parse_kv_args(raw)
+    stage_id = kv.get("stage_id") or kv.get("_pos0", "")
+
+    if not stage_id:
+        await update.message.reply_text("❌ Использование:\n/unblockstage stage_id=STAGE-001")
+        return ConversationHandler.END
+
+    from business_core.sheets import find_row_by_id
+    found = find_row_by_id("roadmap_stages", stage_id)
+    if not found:
+        await update.message.reply_text(f"❌ Этап {stage_id} не найден.")
+        return ConversationHandler.END
+    _, row = found
+
+    writes = {"Blocking Reason": ""}
+    # Возвращаем в pending только если этап действительно был blocked —
+    # не трогаем Status, если он уже done/skipped/in_progress по другой причине.
+    if row.get("Status", "") == "blocked":
+        writes["Status"] = "pending"
+
+    return await _stage_edit_start(
+        update, context, stage_id=stage_id, field_label="Разблокировка",
+        writes=writes,
+        old_value_display=row.get("Blocking Reason", "") or "—",
+        new_value_display="снято",
+        snapshot_key="se_unblock",
+    )
+
+
+async def unblockstage_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    return await _stage_edit_execute(update, context, "se_unblock")
+
+
+async def unblockstage_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    return await _stage_edit_cancel(update, context, "se_unblock")
+
+
+# ─────────────────────────────────────────────────────────────
 # /recalcprogress — ручной пересчёт Progress % (Phase 9D)
 # ─────────────────────────────────────────────────────────────
 
@@ -3877,6 +4305,40 @@ def register_business_handlers(app: Application) -> None:
     app.add_handler(newbiz_handler)
     app.add_handler(editclient_handler)
     app.add_handler(editobject_handler)
+
+    # Phase 14A: Stage Management Core — пять точечных редакторов этапа,
+    # каждый со своим entry point, все делят один общий SE_CONFIRM helper.
+    app.add_handler(ConversationHandler(
+        entry_points=[CommandHandler("assignstage", assignstage_start)],
+        states={SE_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, assignstage_confirm)]},
+        fallbacks=[CommandHandler("cancel", assignstage_cancel)],
+        allow_reentry=True,
+    ))
+    app.add_handler(ConversationHandler(
+        entry_points=[CommandHandler("duedate", duedate_start)],
+        states={SE_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, duedate_confirm)]},
+        fallbacks=[CommandHandler("cancel", duedate_cancel)],
+        allow_reentry=True,
+    ))
+    app.add_handler(ConversationHandler(
+        entry_points=[CommandHandler("priority", priority_start)],
+        states={SE_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, priority_confirm)]},
+        fallbacks=[CommandHandler("cancel", priority_cancel)],
+        allow_reentry=True,
+    ))
+    app.add_handler(ConversationHandler(
+        entry_points=[CommandHandler("blockstage", blockstage_start)],
+        states={SE_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, blockstage_confirm)]},
+        fallbacks=[CommandHandler("cancel", blockstage_cancel)],
+        allow_reentry=True,
+    ))
+    app.add_handler(ConversationHandler(
+        entry_points=[CommandHandler("unblockstage", unblockstage_start)],
+        states={SE_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, unblockstage_confirm)]},
+        fallbacks=[CommandHandler("cancel", unblockstage_cancel)],
+        allow_reentry=True,
+    ))
+    app.add_handler(CommandHandler("stage", stage_cmd))
 
     # Простые команды
     app.add_handler(CommandHandler("bc",        bc_dashboard))
