@@ -966,6 +966,23 @@ def list_folder_contents(
     return result.get("files", [])
 
 
+def trash_file(service, file_id: str) -> dict:
+    """
+    Phase 15B: переместить файл в Trash (компенсация после неудачной
+    записи в DOCUMENT_REGISTRY при успешной Drive upload). Не удаляет
+    файл безвозвратно — только помечает trashed=True, обратимо через
+    Drive UI при необходимости ручной проверки.
+
+    Returns:
+        {"ok": True} или {"ok": False, "error": str}
+    """
+    try:
+        service.files().update(fileId=file_id, body={"trashed": True}).execute()
+        return {"ok": True, "error": ""}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
 def get_file_id_from_input(value: str) -> str:
     """
     Phase 15A: извлечь Drive file ID из URL или вернуть значение как есть,

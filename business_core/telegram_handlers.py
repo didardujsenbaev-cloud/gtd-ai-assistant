@@ -23,8 +23,10 @@ Business Core — Telegram handlers.
 
 from __future__ import annotations
 
+import io
 import logging
 import os
+import tempfile
 from datetime import datetime
 from typing import Optional
 
@@ -53,6 +55,8 @@ EC_FIELD, EC_VALUE, EC_CONFIRM = range(30, 33)
 EO_FIELD, EO_VALUE, EO_CONFIRM = range(40, 43)
 # Phase 15A
 RD_CONFIRM = 60
+# Phase 15B
+UD_FILE, UD_DETAILS, UD_CONFIRM = range(70, 73)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -3381,6 +3385,534 @@ async def docs4stage_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 # ─────────────────────────────────────────────────────────────
+# Telegram Document Upload Foundation (Phase 15B)
+# ─────────────────────────────────────────────────────────────
+#
+# Scope: upload exactly ONE Telegram document to an existing Drive
+# folder and register exactly one DOCUMENT_REGISTRY row (Version=1,
+# Status=uploaded). No /approvedoc, /rejectdoc, /docversions, OCR,
+# bulk upload, keyword-based document-type guessing, or new Drive
+# folder architecture — see the Phase 15B review gate for the full
+# exclusion list.
+#
+# Flow (three states, same immutable-snapshot architecture as
+# /registerdoc, /editclient, /editobject):
+#   UD_FILE    — waiting for the Telegram document itself. Any other
+#                media type (photo/voice/video/audio/text/album) is
+#                rejected with a clear message, conversation stays in
+#                UD_FILE so the user can retry without restarting.
+#   UD_DETAILS — waiting for one command-style line with business=,
+#                name= (required) and optional client=/object=/
+#                roadmap=/stage=/template=/notes=, reusing the exact
+#                same _parse_kv_args()/resolve_and_validate_links()
+#                pattern as /registerdoc. Once links resolve, the
+#                target Drive folder is picked (Object -> Client ->
+#                Business, most-specific-first; Stage folder is never
+#                attempted — ROADMAP_STAGES has no Drive Folder ID
+#                column). If no folder is found, the operation stops
+#                here — nothing is downloaded, nothing is uploaded.
+#                A confirmation snapshot is taken at this point.
+#   UD_CONFIRM — on "✅ Подтвердить": re-validates the resolved links
+#                (staleness guard), downloads the Telegram file body
+#                for the FIRST time, uploads it to the resolved folder,
+#                reads back authoritative Drive metadata, generates
+#                DREG/DFAM ids from one sheet read, writes exactly one
+#                row. If the registry write fails after a successful
+#                Drive upload, the uploaded file is trashed as
+#                compensation (never left behind silently, never
+#                retried automatically, never a partially-written row).
+#
+# Idempotency: the snapshot carries an "op_state" (pending -> processing)
+# set synchronously (no `await` in between check and set) at the very
+# top of uploaddoc_confirm(), before any Telegram/Drive/Sheets I/O. A
+# duplicate tap on "✅ Подтвердить" arriving while the first tap's I/O
+# is still in flight sees op_state == "processing" and gets a safe
+# no-op reply — it never re-downloads, re-uploads, or re-registers.
+
+UPLOADDOC_REQUIRED_ARGS = ("business", "name")
+
+
+async def uploaddoc_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """/uploaddoc — начать загрузку одного документа."""
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg())
+        return ConversationHandler.END
+
+    context.user_data.pop("ud", None)
+    context.user_data.pop("ud_confirmed_snapshot", None)
+
+    await update.message.reply_text(
+        "📎 Отправь один документ (Telegram document — файл, не фото и не голосовое).\n\n"
+        "/cancel — отменить."
+    )
+    return UD_FILE
+
+
+async def uploaddoc_receive_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    message = update.message
+    doc = message.document if message else None
+
+    if doc is None:
+        await update.message.reply_text(
+            "⚠️ Поддерживается только один Telegram document (файл).\n"
+            "Фото, голосовые, видео, аудио и текст без файла не подходят.\n\n"
+            "Отправь документ или /cancel."
+        )
+        return UD_FILE
+
+    if getattr(message, "media_group_id", None):
+        await update.message.reply_text(
+            "⚠️ Групповая отправка (альбом) не поддерживается — пришли один документ отдельным сообщением.\n\n"
+            "Отправь документ или /cancel."
+        )
+        return UD_FILE
+
+    context.user_data["ud"] = {
+        "tg_file_id": doc.file_id,
+        "tg_file_unique_id": doc.file_unique_id,
+        "tg_file_name": doc.file_name or "document",
+        "tg_mime_type": doc.mime_type or "application/octet-stream",
+        "tg_file_size": doc.file_size,
+        "uploaded_by": _telegram_username(update),
+    }
+
+    await update.message.reply_text(
+        "✅ Файл получен: " + (doc.file_name or "(без имени)") + "\n\n"
+        "Теперь одной строкой укажи данные документа:\n\n"
+        'business=BIZ-001 name="Технический паспорт"\n\n'
+        "Опционально: client=, object=, roadmap=, stage=, template=, notes=\n\n"
+        "/cancel — отменить."
+    )
+    return UD_DETAILS
+
+
+async def uploaddoc_receive_details(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    draft = context.user_data.get("ud")
+    if draft is None:
+        await update.message.reply_text(
+            "❌ Файл не найден в текущей сессии. Начни заново: /uploaddoc",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        context.user_data.pop("ud_confirmed_snapshot", None)
+        return ConversationHandler.END
+
+    raw = update.message.text or ""
+    kv = _parse_kv_args(raw)
+
+    business_id = kv.get("business", "").strip()
+    name = kv.get("name", "").strip()
+    client_id = kv.get("client", "").strip()
+    object_id = kv.get("object", "").strip()
+    roadmap_id = kv.get("roadmap", "").strip()
+    stage_id = kv.get("stage", "").strip()
+    template_id = kv.get("template", "").strip()
+    notes = kv.get("notes", "").strip()
+
+    missing = [a for a in UPLOADDOC_REQUIRED_ARGS if not kv.get(a, "").strip()]
+    if missing:
+        await update.message.reply_text(
+            "❌ Использование:\n"
+            'business=BIZ-001 name="Технический паспорт"\n\n'
+            "Опционально: client=, object=, roadmap=, stage=, template=, notes=\n\n"
+            f"Отсутствуют обязательные поля: {', '.join(missing)}"
+        )
+        return UD_DETAILS
+
+    try:
+        from business_core.document_registry_manager import (
+            resolve_and_validate_links, resolve_target_drive_folder,
+        )
+
+        validation = resolve_and_validate_links(
+            business_id=business_id, client_id=client_id, object_id=object_id,
+            roadmap_id=roadmap_id, stage_id=stage_id, document_template_id=template_id,
+        )
+        if not validation["ok"]:
+            await update.message.reply_text(f"❌ {validation['error']}")
+            context.user_data.pop("ud", None)
+            return ConversationHandler.END
+
+        resolved = validation["resolved"]
+
+        folder = resolve_target_drive_folder(
+            business_id=resolved["business_id"],
+            client_id=resolved["client_id"],
+            object_id=resolved["object_id"],
+            stage_id=resolved["stage_id"],
+        )
+        if not folder["ok"]:
+            await update.message.reply_text(f"❌ {folder['error']}")
+            context.user_data.pop("ud", None)
+            return ConversationHandler.END
+
+        # Best-effort friendly folder name for the confirmation card —
+        # never blocks registration if this read-only lookup fails.
+        folder_name = ""
+        try:
+            from integrations.google_drive_adapter import get_drive_service, get_file_metadata
+            service = get_drive_service()
+            meta = get_file_metadata(service, folder["folder_id"])
+            if meta.get("ok"):
+                folder_name = meta.get("name", "")
+        except Exception:
+            pass
+
+    except Exception as e:
+        log.error(f"uploaddoc_receive_details error: {e}")
+        await update.message.reply_text(f"❌ Ошибка: {e}")
+        context.user_data.pop("ud", None)
+        return ConversationHandler.END
+
+    snapshot = {
+        **draft,
+        "business_id": resolved["business_id"],
+        "client_id": resolved["client_id"],
+        "object_id": resolved["object_id"],
+        "roadmap_id": resolved["roadmap_id"],
+        "stage_id": resolved["stage_id"],
+        "document_template_id": resolved["document_template_id"],
+        "document_name": name,
+        "notes": notes,
+        "folder_id": folder["folder_id"],
+        "folder_level": folder["level"],
+        "folder_source_id": folder["source_id"],
+        "folder_name": folder_name,
+        "op_state": "pending",
+    }
+    context.user_data["ud_confirmed_snapshot"] = snapshot
+    context.user_data.pop("ud", None)
+
+    size_line = f"{snapshot['tg_file_size']} B" if snapshot.get("tg_file_size") else "—"
+    folder_label = f"{folder['level']} {folder['source_id']}" if folder["level"] else "—"
+    if folder_name:
+        folder_label += f" — {folder_name}"
+
+    lines = [
+        "📋 Подтверди загрузку документа:",
+        "",
+        f"Document Name: {name}",
+        f"Telegram File Name: {snapshot['tg_file_name']}",
+        f"Mime Type: {snapshot['tg_mime_type']}",
+        f"File Size: {size_line}",
+        f"Business ID: {resolved['business_id'] or '—'}",
+        f"Client ID: {resolved['client_id'] or '—'}",
+        f"Object ID: {resolved['object_id'] or '—'}",
+        f"Roadmap ID: {resolved['roadmap_id'] or '—'}",
+        f"Stage ID: {resolved['stage_id'] or '—'}",
+        f"Document Template ID: {resolved['document_template_id'] or '—'}",
+        f"Target Drive Folder: {folder_label} ({folder['folder_id']})",
+        f"Uploaded By: {snapshot['uploaded_by'] or '—'}",
+    ]
+    if notes:
+        lines.append(f"Notes: {notes}")
+
+    await update.message.reply_text(
+        "\n".join(lines),
+        reply_markup=ReplyKeyboardMarkup(
+            [["✅ Подтвердить"], ["❌ Отмена"]],
+            resize_keyboard=True, one_time_keyboard=True,
+        ),
+    )
+    return UD_CONFIRM
+
+
+async def uploaddoc_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text.strip()
+
+    if "Отмена" in text:
+        context.user_data.pop("ud_confirmed_snapshot", None)
+        context.user_data.pop("ud", None)
+        await update.message.reply_text("Отменено.", reply_markup=ReplyKeyboardRemove())
+        return ConversationHandler.END
+
+    snap = context.user_data.get("ud_confirmed_snapshot")
+    if snap is None:
+        await update.message.reply_text(
+            "❌ Нет подтверждённых данных для загрузки (возможно, уже загружено или отменено). "
+            "Начни заново: /uploaddoc",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return ConversationHandler.END
+
+    op_state = snap.get("op_state")
+    if op_state == "processing":
+        await update.message.reply_text(
+            "⏳ Загрузка уже выполняется, подожди результата.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return UD_CONFIRM
+    if op_state == "completed":
+        context.user_data.pop("ud_confirmed_snapshot", None)
+        await update.message.reply_text(
+            "✅ Этот документ уже был загружен.", reply_markup=ReplyKeyboardRemove(),
+        )
+        return ConversationHandler.END
+    if op_state == "verification_failed":
+        context.user_data.pop("ud_confirmed_snapshot", None)
+        await update.message.reply_text(
+            "⚠️ Регистрация уже выполнена, но post-write verification не прошла ранее. "
+            "Повторная загрузка не выполняется — требуется ручная проверка.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return ConversationHandler.END
+
+    # Atomic guard: set BEFORE any `await` so a duplicate tap arriving
+    # while this invocation is mid-flight sees "processing", not "pending".
+    snap["op_state"] = "processing"
+
+    tmp_path = None
+    try:
+        from business_core.document_registry_manager import resolve_and_validate_links
+
+        # Staleness guard: re-check the resolved links still hold right
+        # before doing any Telegram/Drive/Sheets I/O.
+        revalidation = resolve_and_validate_links(
+            business_id=snap["business_id"], client_id=snap["client_id"],
+            object_id=snap["object_id"], roadmap_id=snap["roadmap_id"],
+            stage_id=snap["stage_id"], document_template_id=snap["document_template_id"],
+        )
+        if not revalidation["ok"]:
+            await update.message.reply_text(
+                f"❌ Связи изменились и больше не подтверждаются: {revalidation['error']}\n"
+                "Начни заново: /uploaddoc",
+                reply_markup=ReplyKeyboardRemove(),
+            )
+            context.user_data.pop("ud_confirmed_snapshot", None)
+            return ConversationHandler.END
+
+        try:
+            tg_file = await context.bot.get_file(snap["tg_file_id"])
+            buf = io.BytesIO()
+            await tg_file.download_to_memory(buf)
+            file_bytes = buf.getvalue()
+        except Exception as e:
+            log.error(f"uploaddoc_confirm: Telegram download error: {e}")
+            await update.message.reply_text(
+                f"❌ Не удалось скачать файл из Telegram: {e}",
+                reply_markup=ReplyKeyboardRemove(),
+            )
+            context.user_data.pop("ud_confirmed_snapshot", None)
+            return ConversationHandler.END
+
+        from integrations.google_drive_adapter import (
+            get_drive_service, upload_file, get_file_metadata, trash_file,
+        )
+
+        service = get_drive_service()
+
+        with tempfile.NamedTemporaryFile(delete=False) as tmp:
+            tmp.write(file_bytes)
+            tmp_path = tmp.name
+
+        try:
+            upload_result = upload_file(
+                service, tmp_path, snap["folder_id"],
+                filename=snap["tg_file_name"], mime_type=snap["tg_mime_type"],
+            )
+        except Exception as e:
+            log.error(f"uploaddoc_confirm: Drive upload error: {e}")
+            await update.message.reply_text(
+                f"❌ Ошибка загрузки в Google Drive: {e}",
+                reply_markup=ReplyKeyboardRemove(),
+            )
+            context.user_data.pop("ud_confirmed_snapshot", None)
+            return ConversationHandler.END
+
+        drive_file_id = upload_result["file_id"]
+
+        # Read back authoritative Drive metadata — never construct the
+        # URL manually, never substitute Telegram-side name/mime for a
+        # successful registration. If this read fails OR returns
+        # incomplete data (missing name/mime_type/webViewLink), the
+        # upload is compensated (trashed) and NO registry row is written
+        # — Telegram metadata is only ever shown in error messages, never
+        # used to complete a registration.
+        meta = get_file_metadata(service, drive_file_id)
+        metadata_complete = bool(
+            meta.get("ok") and meta.get("name") and meta.get("mime_type") and meta.get("web_view_link")
+        )
+        if not metadata_complete:
+            log.error(
+                f"uploaddoc_confirm: Drive metadata read failed or incomplete for "
+                f"{drive_file_id}: {meta}"
+            )
+            cleanup = trash_file(service, drive_file_id)
+            if cleanup.get("ok"):
+                await update.message.reply_text(
+                    "❌ Не удалось получить полные метаданные файла из Google Drive после загрузки — "
+                    "регистрация не выполнена.\n"
+                    "Загруженный файл в Google Drive перемещён в корзину (компенсация выполнена).",
+                    reply_markup=ReplyKeyboardRemove(),
+                )
+            else:
+                parts = [
+                    "❌ Не удалось получить полные метаданные файла из Google Drive после загрузки — "
+                    "регистрация не выполнена.",
+                    f"⚠️ Очистка Drive-файла НЕ удалась: {cleanup.get('error')}",
+                    f"Orphan Drive File ID: {drive_file_id}",
+                ]
+                if meta.get("web_view_link"):
+                    parts.append(f"Drive URL: {meta['web_view_link']}")
+                parts.append("Требуется ручная очистка.")
+                await update.message.reply_text("\n".join(parts), reply_markup=ReplyKeyboardRemove())
+            context.user_data.pop("ud_confirmed_snapshot", None)
+            return ConversationHandler.END
+
+        real_name = meta["name"]
+        real_mime = meta["mime_type"]
+        web_view_link = meta["web_view_link"]
+
+        from business_core.sheets import (
+            append_business_row, find_row_by_id,
+            get_business_sheet, row_from_header_map,
+        )
+        from business_core.document_registry_manager import compute_next_document_and_family_ids
+
+        sheet = get_business_sheet("document_registry")
+        all_values = sheet.get_all_values()
+        headers = all_values[0] if all_values else []
+        document_id, family_id = compute_next_document_and_family_ids(all_values)
+
+        now = _now_utc_str()
+        row = row_from_header_map(headers, {
+            "Document ID": document_id,
+            "Document Family ID": family_id,
+            "Version": "1",
+            "Business ID": snap["business_id"],
+            "Client ID": snap["client_id"],
+            "Object ID": snap["object_id"],
+            "Roadmap ID": snap["roadmap_id"],
+            "Stage ID": snap["stage_id"],
+            "Document Template ID": snap["document_template_id"],
+            "Document Name": snap["document_name"],
+            "Status": "uploaded",
+            "Drive File ID": drive_file_id,
+            "Drive File URL": web_view_link,
+            "File Name": real_name,
+            "Mime Type": real_mime,
+            "Uploaded At": now,
+            "Uploaded By": snap["uploaded_by"],
+            "Notes": snap["notes"],
+            "Created At": now,
+            "Updated At": now,
+        })
+
+        try:
+            append_business_row("document_registry", row)
+        except Exception as e:
+            log.error(f"uploaddoc_confirm: DOCUMENT_REGISTRY write failed: {e}")
+            cleanup = trash_file(service, drive_file_id)
+            if cleanup.get("ok"):
+                await update.message.reply_text(
+                    f"❌ Не удалось сохранить запись в DOCUMENT_REGISTRY: {e}\n"
+                    "Загруженный файл в Google Drive перемещён в корзину (компенсация выполнена) — "
+                    "запись не создана.",
+                    reply_markup=ReplyKeyboardRemove(),
+                )
+            else:
+                await update.message.reply_text(
+                    f"❌ Не удалось сохранить запись в DOCUMENT_REGISTRY: {e}\n"
+                    f"⚠️ Очистка Drive-файла НЕ удалась: {cleanup.get('error')}\n"
+                    f"Orphan Drive File ID: {drive_file_id}\n"
+                    f"Drive URL: {web_view_link or '(нет ссылки)'}\n"
+                    "Требуется ручная очистка.",
+                    reply_markup=ReplyKeyboardRemove(),
+                )
+            context.user_data.pop("ud_confirmed_snapshot", None)
+            return ConversationHandler.END
+
+        # Post-write verification: re-read and compare against the
+        # immutable snapshot + authoritative Drive metadata. A missing
+        # row or any mismatch NEVER triggers a second write/upload — the
+        # row may already exist, so we also never trash the Drive file
+        # here (only a registry-write EXCEPTION, handled above, does
+        # that). We report a distinct manual-verification result and
+        # end the operation as terminal (no return to "pending").
+        expected = {
+            "Document ID": document_id, "Document Family ID": family_id, "Version": "1",
+            "Business ID": snap["business_id"], "Client ID": snap["client_id"],
+            "Object ID": snap["object_id"], "Roadmap ID": snap["roadmap_id"],
+            "Stage ID": snap["stage_id"], "Document Template ID": snap["document_template_id"],
+            "Document Name": snap["document_name"], "Status": "uploaded",
+            "Drive File ID": drive_file_id, "Drive File URL": web_view_link,
+            "File Name": real_name, "Mime Type": real_mime,
+        }
+        found = find_row_by_id("document_registry", document_id)
+        if not found:
+            log.error(
+                f"uploaddoc_confirm: post-write re-read did not find {document_id} "
+                f"(expected={expected})"
+            )
+            snap["op_state"] = "verification_failed"
+            await update.message.reply_text(
+                "⚠️ Document registered, but post-write verification failed.\n"
+                "Manual verification is required.\n"
+                f"Document ID: {document_id}\n"
+                f"Drive File ID: {drive_file_id}",
+                reply_markup=ReplyKeyboardRemove(),
+            )
+            context.user_data.pop("ud_confirmed_snapshot", None)
+            return ConversationHandler.END
+
+        _, saved_row = found
+        mismatches = {k: {"expected": v, "actual": saved_row.get(k)}
+                      for k, v in expected.items() if saved_row.get(k) != v}
+        if mismatches:
+            log.error(
+                f"uploaddoc_confirm: post-write verification mismatch for {document_id}: {mismatches}"
+            )
+            snap["op_state"] = "verification_failed"
+            await update.message.reply_text(
+                "⚠️ Document registered, but post-write verification failed.\n"
+                "Manual verification is required.\n"
+                f"Document ID: {document_id}\n"
+                f"Drive File ID: {drive_file_id}",
+                reply_markup=ReplyKeyboardRemove(),
+            )
+            context.user_data.pop("ud_confirmed_snapshot", None)
+            return ConversationHandler.END
+
+        await update.message.reply_text(
+            f"✅ Документ загружен и зарегистрирован\n\n"
+            f"Document ID: {saved_row.get('Document ID')}\n"
+            f"Document Family ID: {saved_row.get('Document Family ID')}\n"
+            f"Version: {saved_row.get('Version')}\n"
+            f"Название: {saved_row.get('Document Name')}\n"
+            f"Файл: {saved_row.get('File Name')}\n"
+            f"Drive URL: {saved_row.get('Drive File URL')}\n"
+            f"Business ID: {saved_row.get('Business ID') or '—'}\n"
+            f"Client ID: {saved_row.get('Client ID') or '—'}\n"
+            f"Object ID: {saved_row.get('Object ID') or '—'}\n"
+            f"Roadmap ID: {saved_row.get('Roadmap ID') or '—'}\n"
+            f"Stage ID: {saved_row.get('Stage ID') or '—'}\n"
+            f"Document Template ID: {saved_row.get('Document Template ID') or '—'}\n"
+            f"Статус: {saved_row.get('Status')}",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+
+    except Exception as e:
+        log.error(f"uploaddoc_confirm error: {e}")
+        await update.message.reply_text(f"❌ Ошибка: {e}", reply_markup=ReplyKeyboardRemove())
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+    context.user_data.pop("ud_confirmed_snapshot", None)
+    context.user_data.pop("ud", None)
+    return ConversationHandler.END
+
+
+async def uploaddoc_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data.pop("ud", None)
+    context.user_data.pop("ud_confirmed_snapshot", None)
+    await update.message.reply_text("Отменено.", reply_markup=ReplyKeyboardRemove())
+    return ConversationHandler.END
+
+
+# ─────────────────────────────────────────────────────────────
 # /recalcprogress — ручной пересчёт Progress % (Phase 9D)
 # ─────────────────────────────────────────────────────────────
 
@@ -4692,6 +5224,18 @@ def register_business_handlers(app: Application) -> None:
     ))
     app.add_handler(CommandHandler("doc", doc_cmd))
     app.add_handler(CommandHandler("docs4stage", docs4stage_cmd))
+
+    # Phase 15B: Telegram Document Upload Foundation
+    app.add_handler(ConversationHandler(
+        entry_points=[CommandHandler("uploaddoc", uploaddoc_start)],
+        states={
+            UD_FILE: [MessageHandler(filters.ALL & ~filters.COMMAND, uploaddoc_receive_file)],
+            UD_DETAILS: [MessageHandler(filters.TEXT & ~filters.COMMAND, uploaddoc_receive_details)],
+            UD_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, uploaddoc_confirm)],
+        },
+        fallbacks=[CommandHandler("cancel", uploaddoc_cancel)],
+        allow_reentry=True,
+    ))
 
     # Простые команды
     app.add_handler(CommandHandler("bc",        bc_dashboard))

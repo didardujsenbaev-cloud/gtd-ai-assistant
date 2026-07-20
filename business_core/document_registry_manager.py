@@ -272,6 +272,65 @@ def resolve_and_validate_links(
     }
 
 
+def resolve_target_drive_folder(
+    business_id: str,
+    client_id: str = "",
+    object_id: str = "",
+    stage_id: str = "",
+) -> dict:
+    """
+    Phase 15B: выбрать существующую целевую Drive-папку для загрузки
+    документа, most-specific-first: Object -> Client -> Business.
+
+    Stage folder намеренно НЕ поддерживается: ROADMAP_STAGES не имеет
+    колонки "Drive Folder ID" в текущей схеме (см. BUSINESS_HEADERS
+    ["roadmap_stages"] в business_core/sheets.py) — придумывать или
+    создавать Stage-папку запрещено условиями Phase 15B, поэтому
+    stage_id здесь принимается только для единообразия сигнатуры и
+    никогда не используется для выбора папки.
+
+    Ни одна папка не создаётся — используется только уже существующий
+    и непустой "Drive Folder ID" на найденном уровне.
+
+    Returns:
+        {"ok": True, "folder_id": str, "level": "object"|"client"|"business",
+         "source_id": str}
+        или
+        {"ok": False, "error": str}
+    """
+    from business_core.sheets import read_business_sheet
+
+    if object_id:
+        objects = read_business_sheet("object_registry")
+        obj = next((o for o in objects if o.get("OBJ ID", "") == object_id), None)
+        folder_id = (obj or {}).get("Drive Folder ID", "").strip()
+        if folder_id:
+            return {"ok": True, "folder_id": folder_id, "level": "object", "source_id": object_id}
+
+    if client_id:
+        people = read_business_sheet("people_registry")
+        person = next((p for p in people if p.get("ID", "") == client_id), None)
+        folder_id = (person or {}).get("Drive Folder ID", "").strip()
+        if folder_id:
+            return {"ok": True, "folder_id": folder_id, "level": "client", "source_id": client_id}
+
+    if business_id:
+        bizzes = read_business_sheet("biz_registry")
+        biz = next((b for b in bizzes if b.get("ID", "") == business_id), None)
+        folder_id = (biz or {}).get("Drive Folder ID", "").strip()
+        if folder_id:
+            return {"ok": True, "folder_id": folder_id, "level": "business", "source_id": business_id}
+
+    return {
+        "ok": False,
+        "error": (
+            "Не найдена ни одна существующая целевая папка Drive "
+            "(пустой 'Drive Folder ID' у Object/Client/Business). "
+            "Загрузка остановлена до создания записи."
+        ),
+    }
+
+
 def get_documents_for_stage(stage_id: str) -> list[dict]:
     """Read-only: все зарегистрированные документы для этапа."""
     from business_core.sheets import read_business_sheet
