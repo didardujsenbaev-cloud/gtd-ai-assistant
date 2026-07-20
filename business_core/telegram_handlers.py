@@ -51,6 +51,8 @@ NB_NAME, NB_CITIES, NB_PRIORITY, NB_CONFIRM = range(20, 24)
 # Phase 13A
 EC_FIELD, EC_VALUE, EC_CONFIRM = range(30, 33)
 EO_FIELD, EO_VALUE, EO_CONFIRM = range(40, 43)
+# Phase 15A
+RD_CONFIRM = 60
 
 
 # ─────────────────────────────────────────────────────────────
@@ -3038,6 +3040,347 @@ async def unblockstage_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 # ─────────────────────────────────────────────────────────────
+# Document Registry Foundation (Phase 15A)
+# ─────────────────────────────────────────────────────────────
+#
+# Scope: register ONE already-existing Drive file against optional
+# Client/Object/Roadmap/Stage/Document Template links. No upload-from-
+# Telegram, no review workflow (/approvedoc, /rejectdoc), no versioning
+# UX, no bulk operations, no automatic Drive file moves — see
+# DOCUMENT_REGISTRY_ARCHITECTURE.md and the Phase 15A review gate for
+# what is deliberately deferred to 15B.
+#
+# Architecture: same immutable-snapshot pattern as /editclient,
+# /editobject and the Stage Management commands — single command line
+# with all fields, referential validation happens BEFORE any card is
+# shown (a validation failure never reaches confirmation), snapshot
+# taken once, confirm re-validates nothing further and writes exactly
+# one row, re-reads after, replies with the new Document ID.
+
+DOCUMENT_REGISTRY_REQUIRED_ARGS = ("business", "name", "drive")
+
+
+async def registerdoc_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """
+    /registerdoc business=BIZ-001 name="Технический паспорт" drive=<file_id_or_url>
+                  [client=PRS-001] [object=OBJ-001] [roadmap=RM-001] [stage=STAGE-001]
+                  [template=DOC-001] [notes="..."]
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg())
+        return ConversationHandler.END
+
+    raw = " ".join(context.args or [])
+    kv = _parse_kv_args(raw)
+
+    business_id = kv.get("business", "").strip()
+    name = kv.get("name", "").strip()
+    drive_input = kv.get("drive", "").strip()
+    client_id = kv.get("client", "").strip()
+    object_id = kv.get("object", "").strip()
+    roadmap_id = kv.get("roadmap", "").strip()
+    stage_id = kv.get("stage", "").strip()
+    template_id = kv.get("template", "").strip()
+    notes = kv.get("notes", "").strip()
+
+    missing = [a for a in DOCUMENT_REGISTRY_REQUIRED_ARGS if not kv.get(a, "").strip()]
+    if missing:
+        await update.message.reply_text(
+            "❌ Использование:\n"
+            '/registerdoc business=BIZ-001 name="Технический паспорт" drive=<file_id_или_URL>\n\n'
+            "Опционально: client=, object=, roadmap=, stage=, template=, notes=\n\n"
+            f"Отсутствуют обязательные поля: {', '.join(missing)}"
+        )
+        return ConversationHandler.END
+
+    try:
+        from business_core.document_registry_manager import resolve_and_validate_links
+
+        validation = resolve_and_validate_links(
+            business_id=business_id, client_id=client_id, object_id=object_id,
+            roadmap_id=roadmap_id, stage_id=stage_id, document_template_id=template_id,
+        )
+        if not validation["ok"]:
+            await update.message.reply_text(f"❌ {validation['error']}")
+            return ConversationHandler.END
+
+        from integrations.google_drive_adapter import (
+            get_drive_service, get_file_id_from_input, get_file_metadata,
+        )
+
+        file_id = get_file_id_from_input(drive_input)
+        service = get_drive_service()
+        meta = get_file_metadata(service, file_id)
+        if not meta["ok"]:
+            await update.message.reply_text(
+                f"❌ Не удалось прочитать Drive-файл {file_id}: {meta['error']}"
+            )
+            return ConversationHandler.END
+        if meta.get("trashed"):
+            await update.message.reply_text(f"❌ Файл {file_id} находится в Trash — регистрация невозможна.")
+            return ConversationHandler.END
+
+    except Exception as e:
+        log.error(f"registerdoc_start error: {e}")
+        await update.message.reply_text(f"❌ Ошибка: {e}")
+        return ConversationHandler.END
+
+    resolved = validation["resolved"]
+    snapshot = {
+        "business_id": resolved["business_id"],
+        "client_id": resolved["client_id"],
+        "object_id": resolved["object_id"],
+        "roadmap_id": resolved["roadmap_id"],
+        "stage_id": resolved["stage_id"],
+        "document_template_id": resolved["document_template_id"],
+        "document_name": name,
+        "drive_file_id": file_id,
+        "file_name": meta["name"],
+        "mime_type": meta["mime_type"],
+        # Phase 15A safety refinement: store the Drive API's own
+        # webViewLink verbatim — never construct a URL manually. Empty
+        # if Drive didn't return one; that alone never blocks registration.
+        "web_view_link": meta.get("web_view_link", ""),
+        "notes": notes,
+    }
+    context.user_data["regdoc_confirmed_snapshot"] = snapshot
+
+    # Phase 15A safety refinement: show the FINAL NORMALIZED links (all
+    # six, "—" when empty) — not just what the user typed — so the
+    # confirmation is over exactly what will be written, including any
+    # auto-derived values (e.g. stage= alone deriving roadmap/object/client).
+    lines = [
+        "📋 Подтверди регистрацию документа:",
+        "",
+        f"Название: {name}",
+        f"Business ID: {resolved['business_id'] or '—'}",
+        f"Client ID: {resolved['client_id'] or '—'}",
+        f"Object ID: {resolved['object_id'] or '—'}",
+        f"Roadmap ID: {resolved['roadmap_id'] or '—'}",
+        f"Stage ID: {resolved['stage_id'] or '—'}",
+        f"Document Template ID: {resolved['document_template_id'] or '—'}",
+        f"Файл: {meta['name']} ({meta['mime_type']})",
+    ]
+    if notes:
+        lines.append(f"Notes: {notes}")
+
+    await update.message.reply_text(
+        "\n".join(lines),
+        reply_markup=ReplyKeyboardMarkup(
+            [["✅ Подтвердить"], ["❌ Отмена"]],
+            resize_keyboard=True, one_time_keyboard=True,
+        ),
+    )
+    return RD_CONFIRM
+
+
+async def registerdoc_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text.strip()
+
+    if "Отмена" in text:
+        context.user_data.pop("regdoc_confirmed_snapshot", None)
+        await update.message.reply_text("Отменено.", reply_markup=ReplyKeyboardRemove())
+        return ConversationHandler.END
+
+    snap = context.user_data.get("regdoc_confirmed_snapshot")
+    if snap is None:
+        # Либо ничего не было начато, либо это повторное нажатие
+        # "✅ Подтвердить" после того, как первое уже создало строку и
+        # очистило snapshot — не создаём вторую строку молча.
+        await update.message.reply_text(
+            "❌ Нет подтверждённых данных для регистрации (возможно, уже зарегистрировано). "
+            "Начни заново: /registerdoc",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return ConversationHandler.END
+
+    try:
+        from business_core.sheets import (
+            append_business_row, find_row_by_id,
+            get_business_sheet, row_from_header_map,
+        )
+        from business_core.document_registry_manager import compute_next_document_and_family_ids
+
+        # Phase 15A safety refinement: ONE read of the sheet, both IDs
+        # (DREG + DFAM) computed from that single snapshot, immediately
+        # before the one append — no separate reads per prefix that
+        # could observe different sheet states between them.
+        sheet = get_business_sheet("document_registry")
+        all_values = sheet.get_all_values()
+        headers = all_values[0] if all_values else []
+        document_id, family_id = compute_next_document_and_family_ids(all_values)
+
+        now = _now_utc_str()
+        row = row_from_header_map(headers, {
+            "Document ID": document_id,
+            "Document Family ID": family_id,
+            "Version": "1",
+            "Business ID": snap["business_id"],
+            "Client ID": snap["client_id"],
+            "Object ID": snap["object_id"],
+            "Roadmap ID": snap["roadmap_id"],
+            "Stage ID": snap["stage_id"],
+            "Document Template ID": snap["document_template_id"],
+            "Document Name": snap["document_name"],
+            "Status": "uploaded",
+            "Drive File ID": snap["drive_file_id"],
+            "Drive File URL": snap.get("web_view_link", ""),
+            "File Name": snap["file_name"],
+            "Mime Type": snap["mime_type"],
+            "Uploaded At": now,
+            "Uploaded By": _telegram_username(update),
+            "Notes": snap["notes"],
+            "Created At": now,
+            "Updated At": now,
+        })
+        # Единственная запись — либо строка полностью появляется, либо
+        # (при исключении) не появляется вовсе; нет промежуточного
+        # состояния с частично записанной строкой.
+        append_business_row("document_registry", row)
+
+        found = find_row_by_id("document_registry", document_id)
+        if not found:
+            await update.message.reply_text(
+                "⚠️ Строка записана, но не удалось перечитать её для подтверждения.",
+                reply_markup=ReplyKeyboardRemove(),
+            )
+        else:
+            _, saved_row = found
+            await update.message.reply_text(
+                f"✅ Документ зарегистрирован\n\n"
+                f"Document ID: {saved_row.get('Document ID')}\n"
+                f"Document Family ID: {saved_row.get('Document Family ID')}\n"
+                f"Название: {saved_row.get('Document Name')}\n"
+                f"Статус: {saved_row.get('Status')}\n"
+                f"Файл: {saved_row.get('File Name')}",
+                reply_markup=ReplyKeyboardRemove(),
+            )
+
+    except Exception as e:
+        log.error(f"registerdoc_confirm error: {e}")
+        await update.message.reply_text(f"❌ Ошибка сохранения: {e}", reply_markup=ReplyKeyboardRemove())
+
+    context.user_data.pop("regdoc_confirmed_snapshot", None)
+    return ConversationHandler.END
+
+
+async def registerdoc_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data.pop("regdoc_confirmed_snapshot", None)
+    await update.message.reply_text("Отменено.", reply_markup=ReplyKeyboardRemove())
+    return ConversationHandler.END
+
+
+def _now_utc_str() -> str:
+    """Phase 15A: единый UTC timestamp текущей операции — вызывается
+    ОДИН раз в registerdoc_confirm() и переиспользуется для Uploaded At/
+    Created At/Updated At, а не пересчитывается отдельно для каждого поля."""
+    from datetime import timezone
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+def _telegram_username(update: Update) -> str:
+    user = getattr(update, "effective_user", None)
+    if user is None:
+        return ""
+    return getattr(user, "username", "") or str(getattr(user, "id", ""))
+
+
+async def doc_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/doc document_id=DREG-001 — read-only полная карточка документа."""
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg())
+        return
+
+    raw = " ".join(context.args or [])
+    kv = _parse_kv_args(raw)
+    document_id = kv.get("document_id") or kv.get("_pos0", "")
+
+    if not document_id:
+        await _reply(update, "❌ Укажи document_id.\n\nПример: /doc document_id=DREG-001")
+        return
+
+    try:
+        from business_core.sheets import find_row_by_id
+        found = find_row_by_id("document_registry", document_id)
+        if not found:
+            await _reply(update, f"❌ Документ {document_id} не найден.")
+            return
+        _, row = found
+        lines = [
+            f"📄 Документ {row.get('Document ID', '')}",
+            "",
+            f"Family: {row.get('Document Family ID', '')} (v{row.get('Version', '')})",
+            f"Название: {row.get('Document Name', '')}",
+            f"Статус: {row.get('Status', '')}",
+            f"Business: {row.get('Business ID', '') or '—'}",
+            f"Client: {row.get('Client ID', '') or '—'}",
+            f"Object: {row.get('Object ID', '') or '—'}",
+            f"Roadmap: {row.get('Roadmap ID', '') or '—'}",
+            f"Stage: {row.get('Stage ID', '') or '—'}",
+            f"Document Template: {row.get('Document Template ID', '') or '—'}",
+            f"Файл: {row.get('File Name', '')} ({row.get('Mime Type', '')})",
+            f"Drive: {row.get('Drive File URL', '')}",
+            f"Загружен: {row.get('Uploaded At', '')} ({row.get('Uploaded By', '')})",
+            f"Notes: {row.get('Notes', '') or '—'}",
+        ]
+        await _reply(update, "\n".join(lines))
+    except Exception as e:
+        log.error(f"doc_cmd error: {e}")
+        await _reply(update, f"❌ Ошибка: {e}")
+
+
+async def docs4stage_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /docs4stage stage_id=STAGE-001 — read-only: требования из шаблона
+    (Document Template IDs), зарегистрированные документы, вычисляемые
+    missing requirements. Без keyword-угадывания — если у этапа нет ни
+    одного Document Template ID, явно показывает "не сопоставлено".
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg())
+        return
+
+    raw = " ".join(context.args or [])
+    kv = _parse_kv_args(raw)
+    stage_id = kv.get("stage_id") or kv.get("_pos0", "")
+
+    if not stage_id:
+        await _reply(update, "❌ Укажи stage_id.\n\nПример: /docs4stage stage_id=STAGE-001")
+        return
+
+    try:
+        from business_core.document_registry_manager import (
+            compute_stage_document_status, get_documents_for_stage,
+        )
+
+        status = compute_stage_document_status(stage_id)
+        documents = get_documents_for_stage(stage_id)
+
+        lines = [f"📄 Документы этапа {stage_id}", ""]
+
+        if not status["matchable"]:
+            lines.append("⚠️ Требования не сопоставлены — у этапа нет Document Template ID.")
+            lines.append("(намеренно не угадываем по ключевым словам)")
+        else:
+            lines.append(f"Требуется шаблонов: {len(status['template_ids_required'])}")
+            lines.append(f"Закрыто: {len(status['matched'])}")
+            if status["missing"]:
+                lines.append(f"Отсутствует: {', '.join(status['missing'])}")
+            else:
+                lines.append("Отсутствующих требований нет.")
+
+        lines.append("")
+        lines.append(f"Зарегистрировано документов: {len(documents)}")
+        for d in documents:
+            lines.append(f"  {d.get('Document ID')} — {d.get('Document Name')} ({d.get('Status')})")
+
+        await _reply(update, "\n".join(lines))
+    except Exception as e:
+        log.error(f"docs4stage_cmd error: {e}")
+        await _reply(update, f"❌ Ошибка: {e}")
+
+
+# ─────────────────────────────────────────────────────────────
 # /recalcprogress — ручной пересчёт Progress % (Phase 9D)
 # ─────────────────────────────────────────────────────────────
 
@@ -4339,6 +4682,16 @@ def register_business_handlers(app: Application) -> None:
         allow_reentry=True,
     ))
     app.add_handler(CommandHandler("stage", stage_cmd))
+
+    # Phase 15A: Document Registry Foundation
+    app.add_handler(ConversationHandler(
+        entry_points=[CommandHandler("registerdoc", registerdoc_start)],
+        states={RD_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, registerdoc_confirm)]},
+        fallbacks=[CommandHandler("cancel", registerdoc_cancel)],
+        allow_reentry=True,
+    ))
+    app.add_handler(CommandHandler("doc", doc_cmd))
+    app.add_handler(CommandHandler("docs4stage", docs4stage_cmd))
 
     # Простые команды
     app.add_handler(CommandHandler("bc",        bc_dashboard))

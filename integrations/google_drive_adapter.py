@@ -317,6 +317,33 @@ def get_file_url(file_id: str) -> str:
     return f"https://drive.google.com/file/d/{file_id}/view"
 
 
+def get_file_metadata(service, file_id: str) -> dict:
+    """
+    Phase 15A: read-only метаданные существующего Drive-файла для
+    /registerdoc — НЕ перемещает и не изменяет файл, только читает.
+
+    Returns:
+        {"ok": True, "name": str, "mime_type": str, "trashed": bool,
+         "web_view_link": str}
+        или
+        {"ok": False, "error": str}
+    """
+    try:
+        meta = service.files().get(
+            fileId=file_id,
+            fields="id,name,mimeType,webViewLink,trashed",
+        ).execute()
+        return {
+            "ok": True,
+            "name": meta.get("name", ""),
+            "mime_type": meta.get("mimeType", ""),
+            "trashed": meta.get("trashed", False),
+            "web_view_link": meta.get("webViewLink", ""),
+        }
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
 # ─────────────────────────────────────────────────────────────
 # Создание структуры бизнеса
 # ─────────────────────────────────────────────────────────────
@@ -937,6 +964,27 @@ def list_folder_contents(
     ).execute()
 
     return result.get("files", [])
+
+
+def get_file_id_from_input(value: str) -> str:
+    """
+    Phase 15A: извлечь Drive file ID из URL или вернуть значение как есть,
+    если это уже голый ID (без '/').
+
+    Поддерживает:
+    - https://drive.google.com/file/d/FILE_ID/view
+    - https://drive.google.com/open?id=FILE_ID
+    - голый FILE_ID
+    """
+    import re
+    value = value.strip()
+    m = re.search(r"/file/d/([a-zA-Z0-9_-]+)", value)
+    if m:
+        return m.group(1)
+    m = re.search(r"[?&]id=([a-zA-Z0-9_-]+)", value)
+    if m:
+        return m.group(1)
+    return value
 
 
 def get_folder_id_from_url(url: str) -> Optional[str]:

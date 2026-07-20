@@ -49,6 +49,8 @@ BUSINESS_SHEET_NAMES: dict[str, str] = {
     "checklist_registry":         "CHECKLIST_REGISTRY",
     "document_template_registry": "DOCUMENT_TEMPLATE_REGISTRY",
     "faq_registry":               "FAQ_REGISTRY",
+    # Phase 15A: Document Registry Foundation
+    "document_registry":          "DOCUMENT_REGISTRY",
 }
 
 BUSINESS_HEADERS: dict[str, list[str]] = {
@@ -236,6 +238,24 @@ BUSINESS_HEADERS: dict[str, list[str]] = {
         "Question", "Answer", "Category", "Status", "Notes",
         "Created At", "Last Updated",
     ],
+    # Phase 15A: Document Registry Foundation.
+    # Document ID prefix is "DREG" (not "DOC") — "DOC" is already used live
+    # by document_template_registry (Document Template ID, e.g. DOC-001,
+    # DOC-IZH-KP-001); reusing it here would make two conceptually
+    # different entities share one ID namespace. Document Family ID uses
+    # its own "DFAM" prefix and its own column-aware generator (see
+    # business_core/document_registry_manager.py) since generate_next_id()
+    # only scans column 1.
+    "document_registry": [
+        "Document ID", "Document Family ID", "Version",
+        "Business ID", "Client ID", "Object ID", "Roadmap ID", "Stage ID",
+        "Document Template ID",
+        "Document Name", "Status",
+        "Drive File ID", "Drive File URL", "File Name", "Mime Type",
+        "Uploaded At", "Uploaded By",
+        "Reviewed At", "Reviewed By", "Rejection Reason",
+        "Notes", "Created At", "Updated At",
+    ],
 }
 
 # ID-префиксы для generate_next_id
@@ -257,6 +277,9 @@ _ID_PREFIXES: dict[str, str] = {
     "checklist_registry":         "CHK",
     "document_template_registry": "DOC",
     "faq_registry":               "FAQ",
+    # Phase 15A: "DOC" already taken by document_template_registry above —
+    # deliberately different prefix, see schema comment in BUSINESS_HEADERS.
+    "document_registry":          "DREG",
 }
 
 
