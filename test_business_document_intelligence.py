@@ -1357,6 +1357,428 @@ class TestUploaddocEnqueueIntegration(unittest.TestCase):
 
 
 # ────────────────────────────────────────────────────────────
+# Phase 16C: business_core/document_query.py — read-only query layer
+# ────────────────────────────────────────────────────────────
+
+def _fresh_dq():
+    for key in list(sys.modules.keys()):
+        if "business_core" in key:
+            del sys.modules[key]
+    import business_core.document_query as dq
+    return dq
+
+
+class TestDocumentQueryJsonParsing(unittest.TestCase):
+    def test_parse_fields_json_valid(self):
+        dq = _fresh_dq()
+        data, valid = dq._parse_fields_json(json.dumps({"a": "1"}))
+        self.assertTrue(valid)
+        self.assertEqual(data, {"a": "1"})
+
+    def test_parse_fields_json_empty_is_valid_empty(self):
+        dq = _fresh_dq()
+        data, valid = dq._parse_fields_json("")
+        self.assertTrue(valid)
+        self.assertEqual(data, {})
+
+    def test_parse_fields_json_invalid_json(self):
+        dq = _fresh_dq()
+        data, valid = dq._parse_fields_json("{not valid")
+        self.assertFalse(valid)
+        self.assertEqual(data, {})
+
+    def test_parse_fields_json_array_is_invalid(self):
+        dq = _fresh_dq()
+        data, valid = dq._parse_fields_json("[1, 2, 3]")
+        self.assertFalse(valid)
+
+    def test_parse_keywords_json_valid(self):
+        dq = _fresh_dq()
+        self.assertEqual(dq._parse_keywords_json(json.dumps(["a", "b"])), ("a", "b"))
+
+    def test_parse_keywords_json_empty(self):
+        dq = _fresh_dq()
+        self.assertEqual(dq._parse_keywords_json(""), ())
+        self.assertEqual(dq._parse_keywords_json("[]"), ())
+
+    def test_parse_keywords_json_invalid_returns_empty_tuple(self):
+        dq = _fresh_dq()
+        self.assertEqual(dq._parse_keywords_json("not json"), ())
+        self.assertEqual(dq._parse_keywords_json(json.dumps({"a": 1})), ())
+
+
+class TestGetDocumentAnalysis(unittest.TestCase):
+    def _run(self, document_id="DREG-002", doc_row="__unset__", content_row="__unset__"):
+        dq = _fresh_dq()
+        doc_row = _doc_registry_row(**{"Document ID": document_id}) if doc_row == "__unset__" else doc_row
+        content_row = _content_row(**{"Document ID": document_id}) if content_row == "__unset__" else content_row
+
+        with patch("business_core.sheets.find_row_by_id",
+                   return_value=(2, doc_row) if doc_row is not None else None), \
+             patch("business_core.document_intelligence.get_content_status", return_value=content_row):
+            return dq.get_document_analysis(document_id)
+
+    def test_not_found(self):
+        result = self._run(doc_row=None)
+        self.assertEqual(result.status, "not_found")
+        self.assertEqual(result.document_id, "DREG-002")
+
+    def test_no_content_row(self):
+        doc_row = _doc_registry_row(**{
+            "Document ID": "DREG-002", "Document Name": "My Doc",
+            "File Name": "my.pdf", "Mime Type": "application/pdf",
+        })
+        result = self._run(doc_row=doc_row, content_row=None)
+        self.assertEqual(result.status, "no_content")
+        self.assertEqual(result.document_name, "My Doc")
+        self.assertEqual(result.file_name, "my.pdf")
+        self.assertEqual(result.mime_type, "application/pdf")
+
+    def test_completed_maps_all_fields(self):
+        result = self._run()
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(result.detected_document_type, "technical_passport")
+        self.assertEqual(result.summary, "Test summary.")
+        self.assertEqual(result.fields, {"owner": "TEST PERSON"})
+        self.assertTrue(result.fields_valid)
+        self.assertEqual(result.keywords, ("technical passport", "test"))
+        self.assertEqual(result.language, "en")
+        self.assertEqual(result.page_count, "1")
+        self.assertEqual(result.completed_at, "2026-01-01 00:00:10 UTC")
+
+    def test_invalid_extracted_fields_json_sets_fields_valid_false(self):
+        result = self._run(content_row=_content_row(**{"Extracted Fields JSON": "{broken"}))
+        self.assertFalse(result.fields_valid)
+        self.assertEqual(result.fields, {})
+
+    def test_blank_content_status_defaults_to_pending(self):
+        result = self._run(content_row=_content_row(**{"Content Status": ""}))
+        self.assertEqual(result.status, "pending")
+
+    def test_result_is_immutable(self):
+        result = self._run()
+        from dataclasses import FrozenInstanceError
+        with self.assertRaises(FrozenInstanceError):
+            result.status = "tampered"
+
+    def test_get_document_status_narrow_accessor(self):
+        dq = _fresh_dq()
+        doc_row = _doc_registry_row(**{"Document ID": "DREG-002"})
+        with patch("business_core.sheets.find_row_by_id", return_value=(2, doc_row)), \
+             patch("business_core.document_intelligence.get_content_status",
+                   return_value=_content_row(**{"Content Status": "processing"})):
+            self.assertEqual(dq.get_document_status("DREG-002"), "processing")
+
+    def test_get_document_summary_narrow_accessor(self):
+        dq = _fresh_dq()
+        doc_row = _doc_registry_row(**{"Document ID": "DREG-002"})
+        with patch("business_core.sheets.find_row_by_id", return_value=(2, doc_row)), \
+             patch("business_core.document_intelligence.get_content_status",
+                   return_value=_content_row(**{"AI Summary": "A specific summary."})):
+            self.assertEqual(dq.get_document_summary("DREG-002"), "A specific summary.")
+
+    def test_read_only_no_writes(self):
+        with patch("business_core.sheets.append_business_row") as mock_append, \
+             patch("business_core.sheets.update_business_row") as mock_update_row, \
+             patch("business_core.sheets.update_business_cell") as mock_update_cell:
+            self._run()
+            mock_append.assert_not_called()
+            mock_update_row.assert_not_called()
+            mock_update_cell.assert_not_called()
+
+
+# ────────────────────────────────────────────────────────────
+# Phase 16C: /docanalysis — read-only cached-analysis viewer
+# (Telegram handler now only renders a DocumentAnalysisResult — see
+# business_core/document_query.py for the actual lookup logic)
+# ────────────────────────────────────────────────────────────
+
+class TestRenderFieldsDict(unittest.TestCase):
+    def test_valid_dict_renders_readable_lines(self):
+        th = _fresh_th()
+        block = th._render_fields_dict({"cadastral_number": "00-000-000-000", "owner": "TEST PERSON"})
+        self.assertIn("cadastral number: 00-000-000-000", block)
+        self.assertIn("owner: TEST PERSON", block)
+
+    def test_underscore_replaced_with_space_in_keys_only(self):
+        th = _fresh_th()
+        block = th._render_fields_dict({"object_address": "TEST_VALUE_123"})
+        self.assertIn("object address:", block)
+        # The VALUE's own underscores must survive verbatim — never rewritten.
+        self.assertIn("TEST_VALUE_123", block)
+
+    def test_empty_dict_returns_empty(self):
+        th = _fresh_th()
+        self.assertEqual(th._render_fields_dict({}), "")
+
+    def test_array_value_rendered_comma_joined(self):
+        th = _fresh_th()
+        block = th._render_fields_dict({"rooms": ["kitchen", "hall", "bedroom"]})
+        self.assertIn("rooms: kitchen, hall, bedroom", block)
+
+    def test_shallow_nested_object_rendered_inline(self):
+        th = _fresh_th()
+        block = th._render_fields_dict({"owner_info": {"first_name": "Test", "last_name": "Person"}})
+        self.assertIn("owner info:", block)
+        self.assertIn("first name: Test", block)
+        self.assertIn("last name: Person", block)
+
+    def test_deeply_nested_object_falls_back_to_compact_json_not_recursion_error(self):
+        th = _fresh_th()
+        block = th._render_fields_dict({"a": {"b": {"c": {"d": "deep"}}}})  # must not raise
+        self.assertIn("a:", block)
+
+    def test_does_not_invent_translations(self):
+        """Values are shown verbatim — no renaming/translation of semantic meaning."""
+        th = _fresh_th()
+        block = th._render_fields_dict({"city": "г. Алматы"})
+        self.assertIn("г. Алматы", block)
+
+
+class TestSplitMessageByLines(unittest.TestCase):
+    def test_short_text_single_part(self):
+        th = _fresh_th()
+        parts = th._split_message_by_lines("line1\nline2\nline3", max_len=1000)
+        self.assertEqual(len(parts), 1)
+
+    def test_never_cuts_a_line_in_half(self):
+        th = _fresh_th()
+        lines = [f"field_{i}: value_{i}" for i in range(500)]
+        text = "\n".join(lines)
+        parts = th._split_message_by_lines(text, max_len=200)
+        self.assertGreater(len(parts), 1)
+        # Every original line must appear whole in exactly one part.
+        rejoined_lines = "\n".join(parts).split("\n")
+        self.assertEqual(rejoined_lines, lines)
+
+    def test_never_cuts_a_unicode_character(self):
+        th = _fresh_th()
+        lines = [f"поле {i}: значение кириллицей номер {i}" for i in range(200)]
+        text = "\n".join(lines)
+        parts = th._split_message_by_lines(text, max_len=150)
+        for part in parts:
+            part.encode("utf-8")  # would not raise anyway in Python str, but
+            self.assertNotIn("�", part)  # no replacement-character corruption
+
+    def test_empty_text_returns_one_empty_part(self):
+        th = _fresh_th()
+        self.assertEqual(th._split_message_by_lines(""), [""])
+
+
+CONTENT_ROW_TEMPLATE = {
+    "Document ID": "DREG-002", "Drive File ID": "FILE2", "Content Status": "completed",
+    "Detected Document Type": "technical_passport", "Suggested Document Template ID": "",
+    "Template Match Confidence": "0.00", "AI Summary": "Test summary.",
+    "Extracted Fields JSON": '{"owner": "TEST PERSON"}', "Text Preview": "preview text",
+    "Language": "en", "Page Count": "1", "Keywords JSON": '["technical passport", "test"]',
+    "Model": "claude-sonnet-4-5", "Prompt Version": "v1", "Content Hash": "abc123",
+    "Analysis Started At": "2026-01-01 00:00:00 UTC", "Analysis Completed At": "2026-01-01 00:00:10 UTC",
+    "Analysis Error": "", "Created At": "2026-01-01 00:00:00 UTC", "Updated At": "2026-01-01 00:00:10 UTC",
+}
+
+
+def _content_row(**overrides):
+    row = dict(CONTENT_ROW_TEMPLATE)
+    row.update(overrides)
+    return row
+
+
+def _result(**overrides):
+    """Builds a business_core.document_query.DocumentAnalysisResult for
+    a "completed" scenario by default, using a freshly-imported dq
+    module (consistent with this file's module-reload convention)."""
+    dq = _fresh_dq()
+    defaults = dict(
+        status="completed", document_id="DREG-002",
+        document_name="PHASE 16B Supported PDF Smoke Test",
+        file_name="PHASE_16B_TEST_DOCUMENT.pdf", mime_type="application/pdf",
+        detected_document_type="technical_passport", summary="Test summary.",
+        fields={"owner": "TEST PERSON"}, fields_valid=True,
+        keywords=("technical passport", "test"), language="en", page_count="1",
+        suggested_template_id="", template_match_confidence="0.00",
+        completed_at="2026-01-01 00:00:10 UTC", updated_at="2026-01-01 00:00:10 UTC",
+        error="",
+    )
+    defaults.update(overrides)
+    return dq.DocumentAnalysisResult(**defaults)
+
+
+class TestDocAnalysisCmd(unittest.TestCase):
+    """
+    docanalysis_cmd() now only calls
+    business_core.document_query.get_document_analysis() and renders
+    the result — these tests mock that single call, exactly matching
+    "lookup then render, nothing else".
+    """
+
+    def _run(self, cmdline="/docanalysis document_id=DREG-002", result="__unset__"):
+        th = _fresh_th()
+        update, context = _cmd(cmdline)
+        result = _result() if result == "__unset__" else result
+
+        async def run():
+            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
+                 patch("business_core.document_query.get_document_analysis", return_value=result):
+                await th.docanalysis_cmd(update, context)
+
+        asyncio.run(run())
+        return update, context
+
+    def test_missing_document_id(self):
+        th = _fresh_th()
+        update, context = _cmd("/docanalysis")
+
+        async def run():
+            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+                await th.docanalysis_cmd(update, context)
+
+        asyncio.run(run())
+        reply = update.message.reply_text.call_args[0][0]
+        self.assertIn("document_id", reply)
+        self.assertIsNone(update.message.reply_text.call_args.kwargs.get("parse_mode"))
+
+    def test_document_not_found_in_registry(self):
+        update, context = self._run(result=_result(status="not_found", document_id="DREG-002",
+                                                     document_name="", file_name="", mime_type="",
+                                                     fields={}))
+        reply = update.message.reply_text.call_args[0][0]
+        self.assertIn("❌", reply)
+        self.assertIn("DREG-002", reply)
+        self.assertIn("не найден в DOCUMENT_REGISTRY", reply)
+
+    def test_no_content_row_yet(self):
+        update, context = self._run(result=_result(status="no_content", fields={}))
+        reply = update.message.reply_text.call_args[0][0]
+        self.assertIn("ещё не запускался", reply)
+        self.assertIn("/analyzedoc document_id=DREG-002", reply)
+
+    def test_pending_status(self):
+        update, context = self._run(result=_result(status="pending"))
+        reply = update.message.reply_text.call_args[0][0]
+        self.assertIn("ожидает запуска", reply)
+
+    def test_processing_status(self):
+        update, context = self._run(result=_result(status="processing"))
+        reply = update.message.reply_text.call_args[0][0]
+        self.assertIn("сейчас анализируется", reply)
+
+    def test_failed_status_shows_details_and_retry_hint(self):
+        update, context = self._run(result=_result(
+            status="failed", error="AI call error: timeout", updated_at="2026-01-02 00:00:00 UTC",
+        ))
+        reply = update.message.reply_text.call_args[0][0]
+        self.assertIn("Анализ завершился с ошибкой", reply)
+        self.assertIn("AI call error: timeout", reply)
+        self.assertIn("2026-01-02 00:00:00 UTC", reply)
+        self.assertIn("/analyzedoc document_id=DREG-002 force=true", reply)
+
+    def test_unsupported_status_shows_file_and_mime_no_force_suggestion(self):
+        update, context = self._run(result=_result(
+            status="unsupported", file_name="notes.rtf", mime_type="text/rtf",
+            error="Unsupported MIME type: text/rtf",
+        ))
+        reply = update.message.reply_text.call_args[0][0]
+        self.assertIn("не поддерживается", reply)
+        self.assertIn("notes.rtf", reply)
+        self.assertIn("text/rtf", reply)
+        self.assertIn("Unsupported MIME type: text/rtf", reply)
+        self.assertNotIn("force=true", reply)  # never suggested as a fix for unsupported format
+
+    def test_completed_status_shows_full_card(self):
+        update, context = self._run()
+        reply = update.message.reply_text.call_args[0][0]
+        self.assertIn("DREG-002", reply)
+        self.assertIn("PHASE 16B Supported PDF Smoke Test", reply)
+        self.assertIn("PHASE_16B_TEST_DOCUMENT.pdf", reply)
+        self.assertIn("technical_passport", reply)
+        self.assertIn("Test summary.", reply)
+        self.assertIn("owner: TEST PERSON", reply)  # extracted fields block rendered
+        self.assertIn("technical passport, test", reply)  # keywords rendered
+
+    def test_completed_with_empty_keywords_omits_keywords_line(self):
+        update, context = self._run(result=_result(keywords=()))
+        reply = update.message.reply_text.call_args[0][0]
+        self.assertNotIn("Keywords:", reply)
+
+    def test_completed_with_invalid_extracted_fields_shows_warning_not_crash(self):
+        update, context = self._run(result=_result(fields={}, fields_valid=False))
+        reply = update.message.reply_text.call_args[0][0]
+        self.assertIn("некорректном формате", reply)
+
+    def test_unrecognized_status_does_not_crash(self):
+        update, context = self._run(result=_result(status="weird_future_status"))
+        reply = update.message.reply_text.call_args[0][0]
+        self.assertIn("weird_future_status", reply)
+
+    def test_all_replies_use_parse_mode_none(self):
+        for result in (
+            _result(status="not_found", fields={}),
+            _result(status="no_content", fields={}),
+            _result(status="pending"),
+            _result(status="processing"),
+            _result(status="failed"),
+            _result(status="unsupported"),
+            _result(),
+        ):
+            update, context = self._run(result=result)
+            call = update.message.reply_text.call_args
+            self.assertIsNone(call.kwargs.get("parse_mode"), f"failed for status: {result.status}")
+
+    def test_underscores_survive_verbatim_in_completed_card(self):
+        update, context = self._run(result=_result(
+            document_name="test_document_name", fields={"cadastral_number": "20:313:051:052:2:4"},
+        ))
+        reply = update.message.reply_text.call_args[0][0]
+        self.assertIn("test_document_name", reply)
+        self.assertIn("20:313:051:052:2:4", reply)
+
+    def test_long_output_splits_into_multiple_replies(self):
+        many_fields = {f"field_{i}": f"value number {i} with some extra padding text" for i in range(200)}
+        update, context = self._run(result=_result(fields=many_fields))
+        self.assertGreater(update.message.reply_text.call_count, 1)
+        for call in update.message.reply_text.call_args_list:
+            self.assertIsNone(call.kwargs.get("parse_mode"))
+
+    def test_no_anthropic_call(self):
+        with patch.dict("sys.modules", {"anthropic": MagicMock()}) as mods:
+            update, context = self._run()
+            anthropic_mock = mods.get("anthropic")
+            if anthropic_mock is not None:
+                anthropic_mock.Anthropic.assert_not_called()
+
+    def test_no_drive_download_or_service_call(self):
+        with patch("integrations.google_drive_adapter.get_drive_service") as mock_service:
+            update, context = self._run()
+            mock_service.assert_not_called()
+
+    def test_no_sheets_write_of_any_kind(self):
+        with patch("business_core.sheets.append_business_row") as mock_append, \
+             patch("business_core.sheets.update_business_row") as mock_update_row, \
+             patch("business_core.sheets.update_business_cell") as mock_update_cell:
+            update, context = self._run()
+            mock_append.assert_not_called()
+            mock_update_row.assert_not_called()
+            mock_update_cell.assert_not_called()
+
+    def test_no_mutation_and_no_sheets_column_names_in_handler_source(self):
+        """A stronger structural guarantee: docanalysis_cmd's own source
+        must never reference any write primitive, and must never
+        reference a Sheets column name (it must only touch result
+        object attributes)."""
+        th = _fresh_th()
+        import inspect
+        source = inspect.getsource(th.docanalysis_cmd)
+        for forbidden in (
+            "append_business_row", "update_business_row", "update_business_cell",
+            "analyze_document(", "get_drive_service(", "_download_drive_file_bytes(",
+            "find_row_by_id", "get_content_status",
+            '"Content Status"', '"Document Name"', '"File Name"', '"Mime Type"',
+            '"AI Summary"', '"Extracted Fields JSON"', '"Keywords JSON"',
+        ):
+            self.assertNotIn(forbidden, source)
+
+
+# ────────────────────────────────────────────────────────────
 # Regression / boundaries
 # ────────────────────────────────────────────────────────────
 
@@ -1382,6 +1804,10 @@ class TestRegressionAndBoundaries(unittest.TestCase):
     def test_analyzedoc_registered_as_plain_command(self):
         th = _fresh_th()
         self.assertTrue(hasattr(th, "analyzedoc_cmd"))
+
+    def test_docanalysis_registered_as_plain_command(self):
+        th = _fresh_th()
+        self.assertTrue(hasattr(th, "docanalysis_cmd"))
 
     def test_gtd_core_files_not_referenced_in_new_module(self):
         """No actual import of telegram_bot.py or reuse of its global

@@ -24,6 +24,7 @@ Business Core — Telegram handlers.
 from __future__ import annotations
 
 import io
+import json
 import logging
 import os
 import tempfile
@@ -4029,6 +4030,7 @@ async def analyzedoc_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 f"Detected Document Type: {existing.get('Detected Document Type') or '—'}\n"
                 f"Summary: {existing.get('AI Summary') or '—'}\n"
                 f"Suggested Document Template ID: {existing.get('Suggested Document Template ID') or '—'}\n\n"
+                f"Полная карточка: /docanalysis document_id={document_id}\n"
                 "Используй force=true для повторного анализа.",
                 parse_mode=None,
             )
@@ -4064,6 +4066,191 @@ async def analyzedoc_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     except Exception as e:
         log.error(f"analyzedoc_cmd error: {e}")
+        await _reply(update, f"❌ Ошибка: {e}", parse_mode=None)
+
+
+# ─────────────────────────────────────────────────────────────
+# Document Analysis Read Interface (Phase 16C)
+# ─────────────────────────────────────────────────────────────
+#
+# /docanalysis is strictly read-only: it never calls Anthropic, never
+# downloads from Drive, never writes to DOCUMENT_CONTENT or
+# DOCUMENT_REGISTRY, and never triggers analysis. All lookup logic
+# (Sheets reads, column names, JSON parsing) lives in
+# business_core/document_query.py — this handler only calls
+# get_document_analysis() and renders the returned
+# DocumentAnalysisResult. It never reads a Sheets column name directly.
+
+_DOCANALYSIS_MESSAGE_MAX_CHARS = 4000
+
+
+def _render_value(value, depth: int = 0) -> str:
+    """Scalars pass through as str(); arrays are comma-joined; a single
+    level of nested dict is flattened inline ('key: v; key2: v2') —
+    deeper nesting falls back to a compact JSON string rather than
+    recursing further ("shallow nested objects" only, per spec)."""
+    if isinstance(value, dict):
+        if depth >= 1:
+            return json.dumps(value, ensure_ascii=False, sort_keys=True)
+        parts = [f"{str(k).replace('_', ' ')}: {_render_value(v, depth + 1)}" for k, v in value.items()]
+        return "; ".join(parts) if parts else "{}"
+    if isinstance(value, list):
+        return ", ".join(_render_value(v, depth + 1) for v in value) if value else "[]"
+    return str(value)
+
+
+def _render_fields_dict(fields: dict) -> str:
+    """
+    Pure rendering: turns an ALREADY-PARSED dict (JSON parsing itself
+    happens in document_query.py, not here) into a readable multi-line
+    block ("field name: value" per line, underscores replaced with
+    spaces in KEYS only — values shown verbatim, no invented
+    translations/renames). "" if there's nothing to show.
+    """
+    if not fields:
+        return ""
+    lines = [f"{str(key).replace('_', ' ')}: {_render_value(value)}" for key, value in fields.items()]
+    return "\n".join(lines)
+
+
+def _split_message_by_lines(text: str, max_len: int = _DOCANALYSIS_MESSAGE_MAX_CHARS) -> list[str]:
+    """Line-aware splitter: never cuts a line in half, so it can never
+    cut a Unicode character or a "field: value" line's content midway —
+    unlike a naive text[:max_len] slice. Splits between lines only."""
+    lines = text.split("\n")
+    parts: list[str] = []
+    current: list[str] = []
+    current_len = 0
+    for line in lines:
+        line_len = len(line) + 1  # +1 for the joining newline
+        if current and current_len + line_len > max_len:
+            parts.append("\n".join(current))
+            current = []
+            current_len = 0
+        current.append(line)
+        current_len += line_len
+    if current:
+        parts.append("\n".join(current))
+    return parts or [""]
+
+
+def _render_document_analysis(result) -> str:
+    """
+    Pure rendering of a business_core.document_query.DocumentAnalysisResult
+    — this function (and docanalysis_cmd below) never references a
+    Google Sheets column name, only the result object's own attributes.
+    """
+    if result.status == "not_found":
+        return f"❌ Документ {result.document_id} не найден в DOCUMENT_REGISTRY."
+
+    if result.status == "no_content":
+        return (
+            f"ℹ️ Анализ для документа {result.document_id} ещё не запускался.\n\n"
+            f"Для запуска:\n/analyzedoc document_id={result.document_id}"
+        )
+
+    if result.status == "pending":
+        return "⏳ Анализ документа ожидает запуска."
+
+    if result.status == "processing":
+        return "⏳ Документ сейчас анализируется."
+
+    if result.status == "failed":
+        lines = [
+            "❌ Анализ завершился с ошибкой",
+            "",
+            f"Document ID: {result.document_id}",
+            f"Название документа: {result.document_name or '—'}",
+            f"Ошибка: {result.error or '—'}",
+            f"Updated At: {result.updated_at or '—'}",
+            "",
+            f"/analyzedoc document_id={result.document_id} force=true",
+        ]
+        return "\n".join(lines)
+
+    if result.status == "unsupported":
+        # Deliberately no force=true suggestion here — an unsupported
+        # format is not something a retry can fix.
+        lines = [
+            "⚠️ Формат документа пока не поддерживается",
+            "",
+            f"Document ID: {result.document_id}",
+            f"File Name: {result.file_name or '—'}",
+            f"MIME Type: {result.mime_type or '—'}",
+            f"Reason: {result.error or '—'}",
+        ]
+        return "\n".join(lines)
+
+    if result.status != "completed":
+        return f"ℹ️ Статус анализа: {result.status or 'неизвестен'}."
+
+    keywords_line = ", ".join(result.keywords)
+    card_lines = [
+        "📄 Результат анализа документа",
+        "",
+        f"Document ID: {result.document_id}",
+        f"Document Name: {result.document_name or '—'}",
+        f"File Name: {result.file_name or '—'}",
+        f"Detected Document Type: {result.detected_document_type or '—'}",
+        f"AI Summary: {result.summary or '—'}",
+        f"Language: {result.language or '—'}",
+        f"Page Count: {result.page_count or '—'}",
+        f"Suggested Document Template ID: {result.suggested_template_id or '—'}",
+        f"Template Match Confidence: {result.template_match_confidence or '—'}",
+    ]
+    if keywords_line:
+        card_lines.append(f"Keywords: {keywords_line}")
+    card_lines.append(f"Analysis Completed At: {result.completed_at or '—'}")
+
+    if not result.fields_valid:
+        card_lines.append("")
+        card_lines.append("Извлечённые поля:")
+        card_lines.append("⚠️ Структурированные поля сохранены в некорректном формате.")
+    else:
+        fields_block = _render_fields_dict(result.fields)
+        if fields_block:
+            card_lines.append("")
+            card_lines.append("Извлечённые поля:")
+            card_lines.append(fields_block)
+
+    return "\n".join(card_lines)
+
+
+async def docanalysis_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /docanalysis document_id=DREG-001
+
+    Read-only view of cached DOCUMENT_CONTENT analysis: lookup (via
+    business_core.document_query.get_document_analysis()) then render
+    — nothing else. Never calls Anthropic, never downloads from Drive,
+    never writes to any sheet, never triggers or re-triggers analysis.
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg(), parse_mode=None)
+        return
+
+    raw = " ".join(context.args or [])
+    kv = _parse_kv_args(raw)
+    document_id = kv.get("document_id") or kv.get("_pos0", "")
+
+    if not document_id:
+        await _reply(
+            update,
+            "❌ Укажи document_id.\n\nПример: /docanalysis document_id=DREG-001",
+            parse_mode=None,
+        )
+        return
+
+    try:
+        from business_core.document_query import get_document_analysis
+
+        result = get_document_analysis(document_id)
+        text = _render_document_analysis(result)
+        for part in _split_message_by_lines(text):
+            await update.message.reply_text(part, parse_mode=None)
+
+    except Exception as e:
+        log.error(f"docanalysis_cmd error: {e}")
         await _reply(update, f"❌ Ошибка: {e}", parse_mode=None)
 
 
@@ -5394,6 +5581,7 @@ def register_business_handlers(app: Application) -> None:
 
     # Phase 16A: Document Intelligence Foundation
     app.add_handler(CommandHandler("analyzedoc", analyzedoc_cmd))
+    app.add_handler(CommandHandler("docanalysis", docanalysis_cmd))
 
     # Простые команды
     app.add_handler(CommandHandler("bc",        bc_dashboard))
