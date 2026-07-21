@@ -51,6 +51,8 @@ BUSINESS_SHEET_NAMES: dict[str, str] = {
     "faq_registry":               "FAQ_REGISTRY",
     # Phase 15A: Document Registry Foundation
     "document_registry":          "DOCUMENT_REGISTRY",
+    # Phase 16A: Document Intelligence Foundation
+    "document_content":           "DOCUMENT_CONTENT",
 }
 
 BUSINESS_HEADERS: dict[str, list[str]] = {
@@ -255,6 +257,25 @@ BUSINESS_HEADERS: dict[str, list[str]] = {
         "Uploaded At", "Uploaded By",
         "Reviewed At", "Reviewed By", "Rejection Reason",
         "Notes", "Created At", "Updated At",
+    ],
+    # Phase 16A: Document Intelligence Foundation.
+    # Purely additive — DOCUMENT_REGISTRY's schema/headers are NOT touched.
+    # "Document ID" (= DREG-xxx) is the 1:1 key, reused as-is from
+    # document_registry — no separate ID prefix/generator needed here,
+    # find_row_by_id() already assumes the key sits in column 1.
+    # Extracted text is intentionally NOT stored unbounded here (Google
+    # Sheets has a 50k-char/cell limit) — only a bounded "Text Preview".
+    # A future DOCUMENT_CHUNKS sheet can be added later for full text
+    # without requiring any change to this schema or to DOCUMENT_REGISTRY.
+    "document_content": [
+        "Document ID", "Drive File ID", "Content Status",
+        "Detected Document Type", "Suggested Document Template ID",
+        "Template Match Confidence",
+        "AI Summary", "Extracted Fields JSON", "Text Preview",
+        "Language", "Page Count", "Keywords JSON",
+        "Model", "Prompt Version", "Content Hash",
+        "Analysis Started At", "Analysis Completed At", "Analysis Error",
+        "Created At", "Updated At",
     ],
 }
 
@@ -760,6 +781,50 @@ def update_business_cell(sheet_key: str, row: int, col: int, value) -> None:
     """
     sheet = get_business_sheet(sheet_key)
     sheet.update_cell(row, col, value)
+
+
+def update_business_row(sheet_key: str, row: int, values: dict) -> None:
+    """
+    Phase 16A: обновить НЕСКОЛЬКО ячеек одной строки ОДНИМ batched-запросом
+    (через Worksheet.batch_update) вместо N отдельных update_cell() — нужно
+    для DOCUMENT_CONTENT, где один переход статуса пишет сразу много полей.
+
+    Адресация — по ИМЕНИ заголовка (header-safe), как row_from_header_map():
+    никогда не пишет в колонку по позиции вслепую.
+
+    Args:
+        sheet_key: ключ листа
+        row: номер строки (1-based)
+        values: {"Имя колонки": значение, ...}
+
+    Raises:
+        ValueError: если среди ключей values есть имя, отсутствующее среди
+            фактических заголовков листа.
+    """
+    if not values:
+        return
+
+    sheet = get_business_sheet(sheet_key)
+    headers = sheet.row_values(1)
+    idx = get_header_index_map(headers)
+
+    missing = sorted(k for k in values if k not in idx)
+    if missing:
+        raise ValueError(
+            f"update_business_row('{sheet_key}'): колонки не найдены в заголовках "
+            f"листа: {missing}"
+        )
+
+    if row < 2:
+        raise ValueError(f"update_business_row('{sheet_key}'): некорректный номер строки: {row}")
+    if not sheet.row_values(row):
+        raise ValueError(f"update_business_row('{sheet_key}'): строка {row} не существует")
+
+    data = [
+        {"range": f"{_col_letter(idx[key] + 1)}{row}", "values": [[value]]}
+        for key, value in values.items()
+    ]
+    sheet.batch_update(data, value_input_option="USER_ENTERED")
 
 
 def find_row_by_id(sheet_key: str, record_id: str) -> tuple[int, dict] | None:

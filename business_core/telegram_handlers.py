@@ -3890,6 +3890,13 @@ async def uploaddoc_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             reply_markup=ReplyKeyboardRemove(),
         )
 
+        # Phase 16A: enqueue enrichment analysis ONLY after the upload has
+        # fully succeeded (uploaded, authoritative metadata, registry
+        # write, post-write verification, success reply already sent).
+        # This is a background job — its failure can never roll back the
+        # upload above, which has already completed by this point.
+        _enqueue_document_analysis(context, document_id, drive_file_id)
+
     except Exception as e:
         log.error(f"uploaddoc_confirm error: {e}")
         await update.message.reply_text(f"❌ Ошибка: {e}", reply_markup=ReplyKeyboardRemove())
@@ -3910,6 +3917,138 @@ async def uploaddoc_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     context.user_data.pop("ud_confirmed_snapshot", None)
     await update.message.reply_text("Отменено.", reply_markup=ReplyKeyboardRemove())
     return ConversationHandler.END
+
+
+# ─────────────────────────────────────────────────────────────
+# Document Intelligence Foundation (Phase 16A)
+# ─────────────────────────────────────────────────────────────
+#
+# Analysis is enrichment ONLY, run asynchronously via the existing
+# Telegram job_queue (already installed/used elsewhere — no new
+# dependency), and ONLY ever enqueued after /uploaddoc's own transaction
+# (upload -> Drive metadata -> DOCUMENT_REGISTRY write -> post-write
+# verification -> success reply) has fully completed. An analysis
+# failure can never roll back that already-completed upload — see
+# business_core/document_intelligence.py's module docstring for the
+# full design rationale.
+
+def _enqueue_document_analysis(
+    context: ContextTypes.DEFAULT_TYPE, document_id: str, drive_file_id: str,
+    force: bool = False,
+) -> bool:
+    """Best-effort enqueue — never raises, never blocks the caller."""
+    job_queue = getattr(context, "job_queue", None)
+    if job_queue is None:
+        log.warning(
+            f"_enqueue_document_analysis({document_id}): job_queue недоступен — "
+            "анализ не запланирован (загрузка документа уже успешно завершена)."
+        )
+        return False
+    try:
+        job_queue.run_once(
+            _analyze_document_job,
+            when=0,
+            data={"document_id": document_id, "drive_file_id": drive_file_id, "force": force},
+            name=f"analyze_document_{document_id}",
+        )
+        return True
+    except Exception as e:
+        log.error(f"_enqueue_document_analysis({document_id}): не удалось поставить задачу: {e}")
+        return False
+
+
+async def _analyze_document_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    payload = context.job.data or {}
+    document_id = payload.get("document_id", "")
+    drive_file_id = payload.get("drive_file_id", "")
+    force = bool(payload.get("force", False))
+    try:
+        from business_core.document_intelligence import analyze_document
+        result = analyze_document(document_id=document_id, drive_file_id=drive_file_id, force=force)
+        log.info(f"_analyze_document_job({document_id}): {result}")
+    except Exception as e:
+        # Defensive — analyze_document() already catches everything
+        # internally and always leaves a terminal Content Status, but a
+        # job callback must never let an exception escape regardless.
+        log.error(f"_analyze_document_job({document_id}): unexpected error: {e}")
+
+
+async def analyzedoc_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /analyzedoc document_id=DREG-001 [force=true]
+
+    Read-triggering only — no confirmation flow needed (idempotent,
+    non-destructive). Enqueues at most one new background analysis
+    attempt; never writes DOCUMENT_CONTENT directly from this handler
+    (analyze_document() itself is the single source of truth for the
+    idempotency claim, so this command can never create a duplicate row
+    even if called twice in quick succession).
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg())
+        return
+
+    raw = " ".join(context.args or [])
+    kv = _parse_kv_args(raw)
+    document_id = kv.get("document_id") or kv.get("_pos0", "")
+    force = kv.get("force", "").strip().lower() == "true"
+
+    if not document_id:
+        await _reply(update, "❌ Укажи document_id.\n\nПример: /analyzedoc document_id=DREG-001 [force=true]")
+        return
+
+    try:
+        from business_core.sheets import find_row_by_id
+        from business_core.document_intelligence import get_content_status, decide_action
+
+        doc_found = find_row_by_id("document_registry", document_id)
+        if not doc_found:
+            await _reply(update, f"❌ Документ {document_id} не найден в DOCUMENT_REGISTRY.")
+            return
+        _, doc_row = doc_found
+        drive_file_id = doc_row.get("Drive File ID", "")
+
+        existing = get_content_status(document_id)
+        action = decide_action(existing, force=force)
+
+        if action == "skip_completed":
+            await _reply(
+                update,
+                f"✅ Уже проанализировано.\n\n"
+                f"Document ID: {document_id}\n"
+                f"Detected Document Type: {existing.get('Detected Document Type') or '—'}\n"
+                f"Summary: {existing.get('AI Summary') or '—'}\n"
+                f"Suggested Document Template ID: {existing.get('Suggested Document Template ID') or '—'}\n\n"
+                "Используй force=true для повторного анализа.",
+            )
+            return
+        if action == "skip_processing":
+            await _reply(update, f"⏳ Документ {document_id} уже анализируется — подожди результата.")
+            return
+        if action in ("skip_failed", "skip_unsupported"):
+            status_ru = "не поддерживается" if action == "skip_unsupported" else "завершился ошибкой"
+            await _reply(
+                update,
+                f"⚠️ Предыдущий анализ {document_id} {status_ru}.\n"
+                f"Ошибка: {existing.get('Analysis Error') or '—'}\n\n"
+                "Для повторной попытки укажи force=true.",
+            )
+            return
+
+        # action == "proceed"
+        enqueued = _enqueue_document_analysis(context, document_id, drive_file_id, force=force)
+        if enqueued:
+            await _reply(update, f"🧠 Анализ документа {document_id} поставлен в очередь.")
+        else:
+            await _reply(
+                update,
+                f"⚠️ Не удалось поставить анализ {document_id} в очередь "
+                "(job_queue недоступен). Документ остаётся зарегистрированным без изменений.",
+            )
+
+    except Exception as e:
+        log.error(f"analyzedoc_cmd error: {e}")
+        await _reply(update, f"❌ Ошибка: {e}")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -5236,6 +5375,9 @@ def register_business_handlers(app: Application) -> None:
         fallbacks=[CommandHandler("cancel", uploaddoc_cancel)],
         allow_reentry=True,
     ))
+
+    # Phase 16A: Document Intelligence Foundation
+    app.add_handler(CommandHandler("analyzedoc", analyzedoc_cmd))
 
     # Простые команды
     app.add_handler(CommandHandler("bc",        bc_dashboard))
