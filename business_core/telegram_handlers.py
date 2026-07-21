@@ -3984,8 +3984,14 @@ async def analyzedoc_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     idempotency claim, so this command can never create a duplicate row
     even if called twice in quick succession).
     """
+    # Phase 16A fix (post-deploy smoke test): every reply here uses
+    # parse_mode=None. _reply()'s default "Markdown" silently swallows
+    # underscores when their count happens to be even (Telegram parses
+    # them as paired italic delimiters rather than raising an error), so
+    # "document_id" was rendered as "documentid" — the same class of bug
+    # already fixed for /uploaddoc's and /registerdoc's messages.
     if not _is_bc_enabled():
-        await _reply(update, _bc_disabled_msg())
+        await _reply(update, _bc_disabled_msg(), parse_mode=None)
         return
 
     raw = " ".join(context.args or [])
@@ -3994,7 +4000,11 @@ async def analyzedoc_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     force = kv.get("force", "").strip().lower() == "true"
 
     if not document_id:
-        await _reply(update, "❌ Укажи document_id.\n\nПример: /analyzedoc document_id=DREG-001 [force=true]")
+        await _reply(
+            update,
+            "❌ Укажи document_id.\n\nПример: /analyzedoc document_id=DREG-001 [force=true]",
+            parse_mode=None,
+        )
         return
 
     try:
@@ -4003,7 +4013,7 @@ async def analyzedoc_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
         doc_found = find_row_by_id("document_registry", document_id)
         if not doc_found:
-            await _reply(update, f"❌ Документ {document_id} не найден в DOCUMENT_REGISTRY.")
+            await _reply(update, f"❌ Документ {document_id} не найден в DOCUMENT_REGISTRY.", parse_mode=None)
             return
         _, doc_row = doc_found
         drive_file_id = doc_row.get("Drive File ID", "")
@@ -4020,10 +4030,14 @@ async def analyzedoc_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 f"Summary: {existing.get('AI Summary') or '—'}\n"
                 f"Suggested Document Template ID: {existing.get('Suggested Document Template ID') or '—'}\n\n"
                 "Используй force=true для повторного анализа.",
+                parse_mode=None,
             )
             return
         if action == "skip_processing":
-            await _reply(update, f"⏳ Документ {document_id} уже анализируется — подожди результата.")
+            await _reply(
+                update, f"⏳ Документ {document_id} уже анализируется — подожди результата.",
+                parse_mode=None,
+            )
             return
         if action in ("skip_failed", "skip_unsupported"):
             status_ru = "не поддерживается" if action == "skip_unsupported" else "завершился ошибкой"
@@ -4032,23 +4046,25 @@ async def analyzedoc_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 f"⚠️ Предыдущий анализ {document_id} {status_ru}.\n"
                 f"Ошибка: {existing.get('Analysis Error') or '—'}\n\n"
                 "Для повторной попытки укажи force=true.",
+                parse_mode=None,
             )
             return
 
         # action == "proceed"
         enqueued = _enqueue_document_analysis(context, document_id, drive_file_id, force=force)
         if enqueued:
-            await _reply(update, f"🧠 Анализ документа {document_id} поставлен в очередь.")
+            await _reply(update, f"🧠 Анализ документа {document_id} поставлен в очередь.", parse_mode=None)
         else:
             await _reply(
                 update,
                 f"⚠️ Не удалось поставить анализ {document_id} в очередь "
                 "(job_queue недоступен). Документ остаётся зарегистрированным без изменений.",
+                parse_mode=None,
             )
 
     except Exception as e:
         log.error(f"analyzedoc_cmd error: {e}")
-        await _reply(update, f"❌ Ошибка: {e}")
+        await _reply(update, f"❌ Ошибка: {e}", parse_mode=None)
 
 
 # ─────────────────────────────────────────────────────────────

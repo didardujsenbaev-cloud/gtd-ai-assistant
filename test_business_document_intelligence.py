@@ -1040,6 +1040,118 @@ class TestAnalyzeDocCommand(unittest.TestCase):
         asyncio.run(run())
 
 
+class TestAnalyzeDocMarkdownSafety(unittest.TestCase):
+    """Regression test for the production smoke-test finding: /analyzedoc's
+    usage-hint text contains raw underscores (document_id) which, under
+    _reply()'s default parse_mode="Markdown", Telegram silently parses as
+    paired italic delimiters and strips — turning "document_id" into
+    "documentid" — instead of raising an error that would trigger
+    _reply()'s plain-text fallback. Every analyzedoc_cmd() reply must
+    explicitly pass parse_mode=None, exactly like /uploaddoc's and
+    /registerdoc's messages already do."""
+
+    def _assert_parse_mode_none(self, update):
+        call = update.message.reply_text.call_args
+        self.assertIsNone(call.kwargs.get("parse_mode"), call)
+
+    def test_missing_document_id_uses_no_parse_mode(self):
+        th = _fresh_th()
+        update, context = _cmd("/analyzedoc")
+
+        async def run():
+            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+                await th.analyzedoc_cmd(update, context)
+
+        asyncio.run(run())
+        self._assert_parse_mode_none(update)
+        reply = update.message.reply_text.call_args[0][0]
+        self.assertIn("document_id", reply)  # underscore must survive verbatim
+
+    def test_document_not_found_uses_no_parse_mode(self):
+        th = _fresh_th()
+        update, context = _cmd("/analyzedoc document_id=DREG-999")
+
+        async def run():
+            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
+                 patch("business_core.sheets.find_row_by_id", return_value=None):
+                await th.analyzedoc_cmd(update, context)
+
+        asyncio.run(run())
+        self._assert_parse_mode_none(update)
+
+    def test_completed_cached_result_uses_no_parse_mode(self):
+        th = _fresh_th()
+        update, context = _cmd("/analyzedoc document_id=DREG-001")
+        cached = {"Content Status": "completed", "Detected Document Type": "technical_passport",
+                  "AI Summary": "Резюме", "Suggested Document Template ID": "DOC-IZH-KP-001"}
+
+        async def run():
+            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
+                 patch("business_core.sheets.find_row_by_id", return_value=(2, _doc_registry_row())), \
+                 patch("business_core.document_intelligence.get_content_status", return_value=cached):
+                await th.analyzedoc_cmd(update, context)
+
+        asyncio.run(run())
+        self._assert_parse_mode_none(update)
+
+    def test_processing_uses_no_parse_mode(self):
+        th = _fresh_th()
+        update, context = _cmd("/analyzedoc document_id=DREG-001")
+        cached = {"Content Status": "processing"}
+
+        async def run():
+            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
+                 patch("business_core.sheets.find_row_by_id", return_value=(2, _doc_registry_row())), \
+                 patch("business_core.document_intelligence.get_content_status", return_value=cached):
+                await th.analyzedoc_cmd(update, context)
+
+        asyncio.run(run())
+        self._assert_parse_mode_none(update)
+
+    def test_failed_without_force_uses_no_parse_mode(self):
+        th = _fresh_th()
+        update, context = _cmd("/analyzedoc document_id=DREG-001")
+        cached = {"Content Status": "failed", "Analysis Error": "boom"}
+
+        async def run():
+            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
+                 patch("business_core.sheets.find_row_by_id", return_value=(2, _doc_registry_row())), \
+                 patch("business_core.document_intelligence.get_content_status", return_value=cached):
+                await th.analyzedoc_cmd(update, context)
+
+        asyncio.run(run())
+        self._assert_parse_mode_none(update)
+        reply = update.message.reply_text.call_args[0][0]
+        self.assertIn("force=true", reply)  # underscore-free, but = must survive too
+
+    def test_enqueued_uses_no_parse_mode(self):
+        th = _fresh_th()
+        update, context = _cmd("/analyzedoc document_id=DREG-001 force=true")
+        cached = {"Content Status": "failed", "Analysis Error": "boom"}
+
+        async def run():
+            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
+                 patch("business_core.sheets.find_row_by_id", return_value=(2, _doc_registry_row())), \
+                 patch("business_core.document_intelligence.get_content_status", return_value=cached), \
+                 patch("business_core.telegram_handlers._enqueue_document_analysis", return_value=True):
+                await th.analyzedoc_cmd(update, context)
+
+        asyncio.run(run())
+        self._assert_parse_mode_none(update)
+
+    def test_unhandled_exception_uses_no_parse_mode(self):
+        th = _fresh_th()
+        update, context = _cmd("/analyzedoc document_id=DREG-001")
+
+        async def run():
+            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
+                 patch("business_core.sheets.find_row_by_id", side_effect=RuntimeError("boom")):
+                await th.analyzedoc_cmd(update, context)
+
+        asyncio.run(run())
+        self._assert_parse_mode_none(update)
+
+
 # ────────────────────────────────────────────────────────────
 # Enqueue helper + job callback
 # ────────────────────────────────────────────────────────────
