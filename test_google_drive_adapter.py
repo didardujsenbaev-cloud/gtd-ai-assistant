@@ -149,6 +149,11 @@ try:
         _append_to_env,
         _read_service_account_email,
         _is_shared_drive,
+        # Phase 15A/15B/15C
+        get_file_metadata,
+        upload_file,
+        trash_file,
+        list_folder_contents,
     )
     test("import google_drive_adapter — все функции", True)
 except Exception as e:
@@ -737,6 +742,126 @@ print(f"     client_url: {client_result.get('client_folder_url')}")
 # Очищаем env
 if "GDRIVE_BIZ_ROOT_FOLDER_ID" in os.environ:
     del os.environ["GDRIVE_BIZ_ROOT_FOLDER_ID"]
+
+
+# ─────────────────────────────────────────────────────────────
+# Тест 18: Shared Drive compatibility — supportsAllDrives (Phase 15C)
+# ─────────────────────────────────────────────────────────────
+#
+# get_file_metadata()/upload_file()/list_folder_contents()/trash_file()
+# must pass supportsAllDrives=True (list_folder_contents() also
+# includeItemsFromAllDrives/corpora) ONLY when GDRIVE_IS_SHARED_DRIVE=true
+# — mirroring the existing find_folder()/create_folder() pattern — and
+# must NOT pass them when GDRIVE_IS_SHARED_DRIVE=false, so plain My Drive
+# behavior is unaffected.
+
+section("18. Shared Drive compatibility — supportsAllDrives (Phase 15C)")
+
+original_shared_18 = os.environ.get("GDRIVE_IS_SHARED_DRIVE", "")
+
+
+def _mock_get_service(captured):
+    service = MagicMock()
+
+    def _get(**kwargs):
+        captured["get_kwargs"] = kwargs
+        m = MagicMock()
+        m.execute.return_value = {
+            "id": "FILE1", "name": "f.pdf", "mimeType": "application/pdf",
+            "webViewLink": "https://drive.google.com/file/d/FILE1/view", "trashed": False,
+        }
+        return m
+
+    def _list(**kwargs):
+        captured["list_kwargs"] = kwargs
+        m = MagicMock()
+        m.execute.return_value = {"files": []}
+        return m
+
+    def _create(**kwargs):
+        captured["create_kwargs"] = kwargs
+        m = MagicMock()
+        m.execute.return_value = {"id": "FILE1"}
+        return m
+
+    def _update(**kwargs):
+        captured["update_kwargs"] = kwargs
+        m = MagicMock()
+        m.execute.return_value = {}
+        return m
+
+    service.files.return_value.get.side_effect = _get
+    service.files.return_value.list.side_effect = _list
+    service.files.return_value.create.side_effect = _create
+    service.files.return_value.update.side_effect = _update
+    return service
+
+
+# ── GDRIVE_IS_SHARED_DRIVE=true → supportsAllDrives passed everywhere ──
+os.environ["GDRIVE_IS_SHARED_DRIVE"] = "true"
+
+cap = {}
+svc = _mock_get_service(cap)
+get_file_metadata(svc, "FILE1")
+test("get_file_metadata(): supportsAllDrives=True when shared drive",
+     cap["get_kwargs"].get("supportsAllDrives") is True)
+
+cap = {}
+svc = _mock_get_service(cap)
+list_folder_contents(svc, "FOLDER1")
+test("list_folder_contents(): supportsAllDrives=True when shared drive",
+     cap["list_kwargs"].get("supportsAllDrives") is True)
+test("list_folder_contents(): includeItemsFromAllDrives=True when shared drive",
+     cap["list_kwargs"].get("includeItemsFromAllDrives") is True)
+test("list_folder_contents(): corpora=allDrives when shared drive",
+     cap["list_kwargs"].get("corpora") == "allDrives")
+
+cap = {}
+svc = _mock_get_service(cap)
+with patch("integrations.google_drive_adapter.os.path.exists", return_value=True), \
+     patch("googleapiclient.http.MediaFileUpload", return_value=MagicMock()):
+    upload_file(svc, "/tmp/does_not_matter.pdf", "FOLDER1", filename="f.pdf", mime_type="application/pdf")
+test("upload_file(): supportsAllDrives=True when shared drive",
+     cap["create_kwargs"].get("supportsAllDrives") is True)
+
+cap = {}
+svc = _mock_get_service(cap)
+trash_file(svc, "FILE1")
+test("trash_file(): supportsAllDrives=True when shared drive",
+     cap["update_kwargs"].get("supportsAllDrives") is True)
+
+# ── GDRIVE_IS_SHARED_DRIVE=false → supportsAllDrives NOT passed (unchanged My Drive behavior) ──
+os.environ["GDRIVE_IS_SHARED_DRIVE"] = "false"
+
+cap = {}
+svc = _mock_get_service(cap)
+get_file_metadata(svc, "FILE1")
+test("get_file_metadata(): supportsAllDrives absent when not shared drive",
+     "supportsAllDrives" not in cap["get_kwargs"])
+
+cap = {}
+svc = _mock_get_service(cap)
+list_folder_contents(svc, "FOLDER1")
+test("list_folder_contents(): supportsAllDrives absent when not shared drive",
+     "supportsAllDrives" not in cap["list_kwargs"])
+test("list_folder_contents(): corpora absent when not shared drive",
+     "corpora" not in cap["list_kwargs"])
+
+cap = {}
+svc = _mock_get_service(cap)
+with patch("integrations.google_drive_adapter.os.path.exists", return_value=True), \
+     patch("googleapiclient.http.MediaFileUpload", return_value=MagicMock()):
+    upload_file(svc, "/tmp/does_not_matter.pdf", "FOLDER1", filename="f.pdf", mime_type="application/pdf")
+test("upload_file(): supportsAllDrives absent when not shared drive",
+     "supportsAllDrives" not in cap["create_kwargs"])
+
+cap = {}
+svc = _mock_get_service(cap)
+trash_file(svc, "FILE1")
+test("trash_file(): supportsAllDrives absent when not shared drive",
+     "supportsAllDrives" not in cap["update_kwargs"])
+
+os.environ["GDRIVE_IS_SHARED_DRIVE"] = original_shared_18 or "false"
 
 
 # ─────────────────────────────────────────────────────────────

@@ -329,10 +329,13 @@ def get_file_metadata(service, file_id: str) -> dict:
         {"ok": False, "error": str}
     """
     try:
-        meta = service.files().get(
-            fileId=file_id,
-            fields="id,name,mimeType,webViewLink,trashed",
-        ).execute()
+        get_kwargs: dict = {
+            "fileId": file_id,
+            "fields": "id,name,mimeType,webViewLink,trashed",
+        }
+        if _is_shared_drive():
+            get_kwargs["supportsAllDrives"] = True
+        meta = service.files().get(**get_kwargs).execute()
         return {
             "ok": True,
             "name": meta.get("name", ""),
@@ -552,11 +555,10 @@ def upload_file(
             "parents": [folder_id],
         }
         media = MediaFileUpload(local_path, mimetype=mime_type, resumable=True)
-        result = service.files().create(
-            body=metadata,
-            media_body=media,
-            fields="id",
-        ).execute()
+        create_kwargs: dict = {"body": metadata, "media_body": media, "fields": "id"}
+        if _is_shared_drive():
+            create_kwargs["supportsAllDrives"] = True
+        result = service.files().create(**create_kwargs).execute()
 
         file_id = result["id"]
         log.info(f"Файл загружен: '{fname}' → {file_id}")
@@ -956,12 +958,18 @@ def list_folder_contents(
     if not include_files:
         query += f" and mimeType='{DRIVE_FOLDER_MIME}'"
 
-    result = service.files().list(
-        q=query,
-        fields="files(id, name, mimeType, webViewLink, size)",
-        pageSize=100,
-        orderBy="name",
-    ).execute()
+    list_kwargs: dict = {
+        "q": query,
+        "fields": "files(id, name, mimeType, webViewLink, size)",
+        "pageSize": 100,
+        "orderBy": "name",
+    }
+    if _is_shared_drive():
+        list_kwargs["supportsAllDrives"]         = True
+        list_kwargs["includeItemsFromAllDrives"] = True
+        list_kwargs["corpora"]                   = "allDrives"
+
+    result = service.files().list(**list_kwargs).execute()
 
     return result.get("files", [])
 
@@ -977,7 +985,10 @@ def trash_file(service, file_id: str) -> dict:
         {"ok": True} или {"ok": False, "error": str}
     """
     try:
-        service.files().update(fileId=file_id, body={"trashed": True}).execute()
+        update_kwargs: dict = {"fileId": file_id, "body": {"trashed": True}}
+        if _is_shared_drive():
+            update_kwargs["supportsAllDrives"] = True
+        service.files().update(**update_kwargs).execute()
         return {"ok": True, "error": ""}
     except Exception as exc:
         return {"ok": False, "error": str(exc)}
