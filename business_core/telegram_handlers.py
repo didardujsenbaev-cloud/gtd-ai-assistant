@@ -4116,21 +4116,40 @@ def _render_fields_dict(fields: dict) -> str:
 def _split_message_by_lines(text: str, max_len: int = _DOCANALYSIS_MESSAGE_MAX_CHARS) -> list[str]:
     """Line-aware splitter: never cuts a line in half, so it can never
     cut a Unicode character or a "field: value" line's content midway —
-    unlike a naive text[:max_len] slice. Splits between lines only."""
+    unlike a naive text[:max_len] slice. Splits between lines only.
+
+    A single line that is itself longer than max_len (e.g. an unusually
+    long matched-document-ID list) cannot be preserved whole without
+    risking an outgoing message exceeding Telegram's size limit, so as a
+    last-resort fallback such a line is deterministically chunked into
+    max_len-sized pieces — a plain character-level slice, which is always
+    safe here since Python str indexing operates on whole Unicode code
+    points, never splitting one in half. Normal-sized lines are never
+    touched by this fallback and remain intact."""
     lines = text.split("\n")
     parts: list[str] = []
     current: list[str] = []
     current_len = 0
-    for line in lines:
-        line_len = len(line) + 1  # +1 for the joining newline
-        if current and current_len + line_len > max_len:
+
+    def _flush():
+        nonlocal current, current_len
+        if current:
             parts.append("\n".join(current))
             current = []
             current_len = 0
+
+    for line in lines:
+        if len(line) > max_len:
+            _flush()
+            for i in range(0, len(line), max_len):
+                parts.append(line[i:i + max_len])
+            continue
+        line_len = len(line) + 1  # +1 for the joining newline
+        if current and current_len + line_len > max_len:
+            _flush()
         current.append(line)
         current_len += line_len
-    if current:
-        parts.append("\n".join(current))
+    _flush()
     return parts or [""]
 
 
@@ -4251,6 +4270,231 @@ async def docanalysis_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     except Exception as e:
         log.error(f"docanalysis_cmd error: {e}")
+        await _reply(update, f"❌ Ошибка: {e}", parse_mode=None)
+
+
+# ─────────────────────────────────────────────────────────────
+# Telegram Document Requirements Interface (Phase 17B)
+# ─────────────────────────────────────────────────────────────
+#
+# /missingdocs and /docsrequired are strictly read-only: validate input
+# → validate scope existence → call business_core.document_requirements'
+# public API (via the business_core.document_requirements_query bridge)
+# → render. Neither handler reads DOCUMENT_REGISTRY or any other Sheets
+# row directly — only business_core.document_requirements_query's
+# scope_exists()/evaluate_scope() and the returned result objects'
+# attributes. No AI calls, no Drive calls, no Sheets writes, no mutation
+# of the requirements engine's own rules (business_core/
+# document_requirements.py is untouched by this phase).
+
+_SCOPE_ARG_NAMES = ("stage_id", "roadmap_id", "object_id")
+_SCOPE_LABEL_RU = {"stage": "Этап", "roadmap": "Дорожная карта", "object": "Объект"}
+_SCOPE_ID_LABEL = {"stage": "Stage ID", "roadmap": "Roadmap ID", "object": "Object ID"}
+
+_STATUS_LABELS_RU = {
+    "present": "присутствует",
+    "missing": "отсутствует",
+    "partial": "частично",
+    "optional_missing": "необязательный отсутствует",
+    "not_applicable": "не применяется",
+}
+
+
+def _parse_scope_args(raw: str) -> tuple:
+    """
+    Returns (scope_type, scope_id, error_message). Exactly one of
+    stage_id=/roadmap_id=/object_id= must be given, non-blank; anything
+    else (none given, more than one given, unknown argument name, blank
+    value, stray positional token) is rejected with a clear message —
+    never silently guessed.
+    """
+    kv = _parse_kv_args(raw)
+
+    unknown = [k for k in kv if k not in _SCOPE_ARG_NAMES and not k.startswith("_pos")]
+    positional = [k for k in kv if k.startswith("_pos")]
+    if unknown or positional:
+        bad = unknown + [kv[k] for k in positional]
+        return None, None, (
+            f"❌ Неизвестный аргумент: {', '.join(str(b) for b in bad)}.\n\n"
+            "Укажи ровно один из: stage_id=, roadmap_id=, object_id="
+        )
+
+    blank_keys = [k for k in _SCOPE_ARG_NAMES if k in kv and not kv.get(k, "").strip()]
+    if blank_keys:
+        return None, None, f"❌ Пустое значение параметра: {', '.join(blank_keys)}."
+
+    present = [(k, kv[k].strip()) for k in _SCOPE_ARG_NAMES if k in kv and kv.get(k, "").strip()]
+    if len(present) == 0:
+        return None, None, "❌ Укажи ровно один параметр: stage_id=, roadmap_id= или object_id=."
+    if len(present) > 1:
+        names = ", ".join(k for k, _ in present)
+        return None, None, f"❌ Укажи только ОДИН параметр области (получено: {names})."
+
+    key, value = present[0]
+    scope_type = key[: -len("_id")]  # "stage_id" -> "stage", etc.
+    return scope_type, value, None
+
+
+_NOT_FOUND_RU = {
+    "stage": "Этап {id} не найден.",
+    "roadmap": "Дорожная карта {id} не найдена.",
+    "object": "Объект {id} не найден.",
+}
+
+_ZERO_CONFIGURED_RU = {
+    "stage": "ℹ️ Для этого этапа ещё не настроены структурированные требования к документам.",
+    "roadmap": "ℹ️ В этапах этой дорожной карты ещё не настроены структурированные требования к документам.",
+    "object": "ℹ️ В дорожных картах этого объекта ещё не настроены структурированные требования к документам.",
+}
+
+
+def _requirement_display_name(requirement) -> str:
+    """
+    Unknown/dangling template IDs must remain visible, never hidden.
+    business_core.document_requirements already falls back to using the
+    template ID itself as the name when no catalog entry exists (it
+    never leaves name empty) — this is the only reliable signal
+    available from the existing result model without modifying the
+    Phase 17A engine, so a name that equals the template ID itself is
+    rendered as an explicit "unknown template" label instead of a bare
+    ID that could be mistaken for a real title.
+    """
+    if requirement.name == requirement.document_template_id:
+        return f"[неизвестный шаблон: {requirement.document_template_id}]"
+    return requirement.name
+
+
+def _scope_header_lines(result) -> list:
+    label = _SCOPE_ID_LABEL.get(result.scope_type, "Scope ID")
+    return [f"{label}: {result.scope_id}"]
+
+
+async def missingdocs_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/missingdocs stage_id=... | roadmap_id=... | object_id=... — read-only."""
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg(), parse_mode=None)
+        return
+
+    raw = " ".join(context.args or [])
+    scope_type, scope_id, error = _parse_scope_args(raw)
+    if error:
+        await _reply(update, error, parse_mode=None)
+        return
+
+    try:
+        from business_core.document_requirements_query import evaluate_scope
+
+        result = evaluate_scope(scope_type, scope_id)
+
+        if not result.exists:
+            await _reply(update, "❌ " + _NOT_FOUND_RU[scope_type].format(id=scope_id), parse_mode=None)
+            return
+
+        summary = result.summary
+        if not summary.items:
+            await _reply(update, _ZERO_CONFIGURED_RU[scope_type], parse_mode=None)
+            return
+
+        unsatisfied = [
+            item for item in summary.items
+            if item.status in (
+                "missing",
+                "partial",
+                "optional_missing",
+            )
+        ]
+
+        lines = []
+        if not unsatisfied:
+            lines.append("✅ Все обязательные документы собраны.")
+            lines.append("")
+            lines.extend(_scope_header_lines(result))
+            lines.append(f"Required total: {summary.total_required}")
+            lines.append(f"Satisfied: {summary.satisfied_required}")
+            lines.append(f"Completion percentage: {summary.completion_percentage}")
+        else:
+            lines.append("❌ Не хватает обязательных документов")
+            lines.append("")
+            lines.extend(_scope_header_lines(result))
+            lines.append(f"Required total: {summary.total_required}")
+            lines.append(f"Satisfied: {summary.satisfied_required}")
+            lines.append(f"Missing: {summary.missing_required}")
+            lines.append(f"Blocking missing: {summary.blocking_missing}")
+            lines.append(f"Completion percentage: {summary.completion_percentage}")
+            lines.append("")
+            for item in unsatisfied:
+                req = item.requirement
+                lines.append(f"- Document Template ID: {req.document_template_id}")
+                lines.append(f"  Name: {_requirement_display_name(req)}")
+                lines.append(f"  Stage ID: {req.stage_id or '—'}")
+                lines.append(f"  Matched count / Minimum count: {item.matched_count}/{req.minimum_count}")
+                lines.append(f"  Status: {_STATUS_LABELS_RU.get(item.status, item.status)}")
+                lines.append(f"  Blocking: {'yes' if item.is_blocking else 'no'}")
+
+        text = "\n".join(lines)
+        for part in _split_message_by_lines(text):
+            await update.message.reply_text(part, parse_mode=None)
+
+    except Exception as e:
+        log.error(f"missingdocs_cmd error: {e}")
+        await _reply(update, f"❌ Ошибка: {e}", parse_mode=None)
+
+
+async def docsrequired_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/docsrequired stage_id=... | roadmap_id=... | object_id=... — read-only."""
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg(), parse_mode=None)
+        return
+
+    raw = " ".join(context.args or [])
+    scope_type, scope_id, error = _parse_scope_args(raw)
+    if error:
+        await _reply(update, error, parse_mode=None)
+        return
+
+    try:
+        from business_core.document_requirements_query import evaluate_scope
+
+        result = evaluate_scope(scope_type, scope_id)
+
+        if not result.exists:
+            await _reply(update, "❌ " + _NOT_FOUND_RU[scope_type].format(id=scope_id), parse_mode=None)
+            return
+
+        summary = result.summary
+        if not summary.items:
+            await _reply(update, _ZERO_CONFIGURED_RU[scope_type], parse_mode=None)
+            return
+
+        lines = ["📋 Требования к документам", ""]
+        lines.extend(_scope_header_lines(result))
+        lines.append(f"Required total: {summary.total_required}")
+        lines.append(f"Satisfied: {summary.satisfied_required}")
+        lines.append(f"Missing: {summary.missing_required}")
+        lines.append(f"Blocking missing: {summary.blocking_missing}")
+        lines.append(f"Optional missing: {summary.optional_missing}")
+        lines.append(f"Completion percentage: {summary.completion_percentage}")
+        lines.append(f"Complete: {'yes' if summary.is_complete else 'no'}")
+        lines.append("")
+
+        for item in summary.items:
+            req = item.requirement
+            matched_ids = ", ".join(item.matched_document_ids) if item.matched_document_ids else "—"
+            lines.append(f"- Document Template ID: {req.document_template_id}")
+            lines.append(f"  Name: {_requirement_display_name(req)}")
+            lines.append(f"  Stage ID: {req.stage_id or '—'}")
+            lines.append(f"  Status: {_STATUS_LABELS_RU.get(item.status, item.status)}")
+            lines.append(f"  Matched Document IDs: {matched_ids}")
+            lines.append(f"  Matched count / Minimum count: {item.matched_count}/{req.minimum_count}")
+            lines.append(f"  Required: {'yes' if req.required else 'no'}")
+            lines.append(f"  Blocking: {'yes' if req.blocking else 'no'}")
+
+        text = "\n".join(lines)
+        for part in _split_message_by_lines(text):
+            await update.message.reply_text(part, parse_mode=None)
+
+    except Exception as e:
+        log.error(f"docsrequired_cmd error: {e}")
         await _reply(update, f"❌ Ошибка: {e}", parse_mode=None)
 
 
@@ -5582,6 +5826,10 @@ def register_business_handlers(app: Application) -> None:
     # Phase 16A: Document Intelligence Foundation
     app.add_handler(CommandHandler("analyzedoc", analyzedoc_cmd))
     app.add_handler(CommandHandler("docanalysis", docanalysis_cmd))
+
+    # Phase 17B: Telegram Document Requirements Interface
+    app.add_handler(CommandHandler("missingdocs", missingdocs_cmd))
+    app.add_handler(CommandHandler("docsrequired", docsrequired_cmd))
 
     # Простые команды
     app.add_handler(CommandHandler("bc",        bc_dashboard))

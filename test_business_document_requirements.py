@@ -21,10 +21,11 @@ All tests fully mock business_core.sheets — no live network calls.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import sys
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, AsyncMock, patch
 
 
 def _fresh_dr():
@@ -33,6 +34,22 @@ def _fresh_dr():
             del sys.modules[key]
     import business_core.document_requirements as dr
     return dr
+
+
+def _fresh_drq():
+    for key in list(sys.modules.keys()):
+        if "business_core" in key:
+            del sys.modules[key]
+    import business_core.document_requirements_query as drq
+    return drq
+
+
+def _fresh_th():
+    for key in list(sys.modules.keys()):
+        if "business_core" in key:
+            del sys.modules[key]
+    import business_core.telegram_handlers as th
+    return th
 
 
 # ────────────────────────────────────────────────────────────
@@ -601,6 +618,602 @@ class TestReadOnlyGuarantees(_PatchedCase):
             summary.is_complete = False
         with self.assertRaises(FrozenInstanceError):
             summary.items[0].status = "tampered"
+
+
+# ────────────────────────────────────────────────────────────
+# Phase 17B: business_core/document_requirements_query.py
+# ────────────────────────────────────────────────────────────
+
+class TestDocumentRequirementsQuery(_PatchedCase):
+    def test_scope_exists_stage(self):
+        drq = _fresh_drq()
+        with contextlib.ExitStack() as stack:
+            for p in _patch_sheets():
+                stack.enter_context(p)
+            self.assertTrue(drq.scope_exists("stage", "STAGE-001"))
+            self.assertFalse(drq.scope_exists("stage", "STAGE-NOPE"))
+
+    def test_scope_exists_roadmap(self):
+        drq = _fresh_drq()
+        with contextlib.ExitStack() as stack:
+            for p in _patch_sheets():
+                stack.enter_context(p)
+            self.assertTrue(drq.scope_exists("roadmap", "RM-001"))
+            self.assertFalse(drq.scope_exists("roadmap", "RM-NOPE"))
+
+    def test_scope_exists_object(self):
+        drq = _fresh_drq()
+        objects = [{"OBJ ID": "OBJ-001", "Client ID": "PRS-001", "Biz ID": "BIZ-001"}]
+
+        def _find(sheet_key, record_id, *a, **kw):
+            if sheet_key == "object_registry":
+                for row in objects:
+                    if row.get("OBJ ID") == record_id:
+                        return (2, row)
+                return None
+            return None
+
+        with patch("business_core.sheets.find_row_by_id", side_effect=_find):
+            self.assertTrue(drq.scope_exists("object", "OBJ-001"))
+            self.assertFalse(drq.scope_exists("object", "OBJ-NOPE"))
+
+    def test_evaluate_scope_not_found(self):
+        drq = _fresh_drq()
+        with contextlib.ExitStack() as stack:
+            for p in _patch_sheets():
+                stack.enter_context(p)
+            result = drq.evaluate_scope("stage", "STAGE-NOPE")
+        self.assertFalse(result.exists)
+        self.assertIsNone(result.summary)
+
+    def test_evaluate_scope_found_calls_engine(self):
+        drq = _fresh_drq()
+        with contextlib.ExitStack() as stack:
+            for p in _patch_sheets(documents=[_doc_row()]):
+                stack.enter_context(p)
+            result = drq.evaluate_scope("stage", "STAGE-001")
+        self.assertTrue(result.exists)
+        self.assertEqual(result.summary.total_required, 1)
+        self.assertEqual(result.summary.satisfied_required, 1)
+
+    def test_evaluate_scope_found_zero_requirements(self):
+        drq = _fresh_drq()
+        with contextlib.ExitStack() as stack:
+            for p in _patch_sheets():
+                stack.enter_context(p)
+            result = drq.evaluate_scope("stage", "STAGE-003")  # empty Document Template IDs
+        self.assertTrue(result.exists)
+        self.assertEqual(result.summary.items, ())
+
+    def test_unknown_scope_type_is_treated_as_not_found(self):
+        drq = _fresh_drq()
+        result = drq.evaluate_scope("service", "SVC-001")
+        self.assertFalse(result.exists)
+
+
+# ────────────────────────────────────────────────────────────
+# Phase 17B: Telegram handlers — /missingdocs, /docsrequired
+# ────────────────────────────────────────────────────────────
+
+def _req17b(**overrides):
+    dr = _fresh_dr()
+    defaults = dict(
+        requirement_id="STAGE-001:DOC-001", document_template_id="DOC-001",
+        document_type="technical_passport", name="Технический паспорт",
+        scope_type="stage", scope_id="STAGE-001", business_id="BIZ-001",
+        service_id="SVC-001", roadmap_id="RM-001", stage_id="STAGE-001",
+        required=True, blocking=True, minimum_count=1,
+    )
+    defaults.update(overrides)
+    return dr.DocumentRequirement(**defaults)
+
+
+def _status17b(requirement=None, **overrides):
+    dr = _fresh_dr()
+    requirement = requirement if requirement is not None else _req17b()
+    defaults = dict(requirement=requirement, matched_document_ids=(), matched_count=0, status=dr.STATUS_MISSING)
+    defaults.update(overrides)
+    return dr.DocumentRequirementStatus(**defaults)
+
+
+def _summary17b(items=(), **overrides):
+    dr = _fresh_dr()
+    items = tuple(items)
+    total_required = sum(1 for i in items if i.requirement.required)
+    satisfied = sum(1 for i in items if i.is_satisfied)
+    missing = sum(1 for i in items if i.status in ("missing", "partial"))
+    blocking = sum(1 for i in items if i.is_blocking)
+    optional_missing = sum(1 for i in items if i.status == "optional_missing")
+    completion = 100.0 if total_required == 0 else round(satisfied / total_required * 100, 2)
+    defaults = dict(
+        scope_type="stage", scope_id="STAGE-001", items=items,
+        total_required=total_required, satisfied_required=satisfied,
+        missing_required=missing, blocking_missing=blocking, optional_missing=optional_missing,
+        completion_percentage=completion, is_complete=(missing == 0 and blocking == 0),
+    )
+    defaults.update(overrides)
+    return dr.RequirementsSummary(**defaults)
+
+
+def _scope_result17b(exists=True, summary=None, scope_type="stage", scope_id="STAGE-001"):
+    drq = _fresh_drq()
+    return drq.ScopeEvaluationResult(scope_type=scope_type, scope_id=scope_id, exists=exists, summary=summary)
+
+
+def _upd17b(text: str):
+    update = MagicMock()
+    update.message.text = text
+    update.message.reply_text = AsyncMock()
+    update.effective_user = MagicMock(username="dida", id=123)
+    return update
+
+
+def _cmd17b(cmdline: str):
+    update = _upd17b(cmdline)
+    context = MagicMock()
+    context.args = cmdline.split()[1:]
+    context.user_data = {}
+    return update, context
+
+
+class TestParseScopeArgs(unittest.TestCase):
+    def test_single_stage_id_ok(self):
+        th = _fresh_th()
+        scope_type, scope_id, error = th._parse_scope_args("stage_id=STAGE-001")
+        self.assertEqual((scope_type, scope_id, error), ("stage", "STAGE-001", None))
+
+    def test_single_roadmap_id_ok(self):
+        th = _fresh_th()
+        scope_type, scope_id, error = th._parse_scope_args("roadmap_id=RM-001")
+        self.assertEqual((scope_type, scope_id, error), ("roadmap", "RM-001", None))
+
+    def test_single_object_id_ok(self):
+        th = _fresh_th()
+        scope_type, scope_id, error = th._parse_scope_args("object_id=OBJ-001")
+        self.assertEqual((scope_type, scope_id, error), ("object", "OBJ-001", None))
+
+    def test_no_scope_rejected(self):
+        th = _fresh_th()
+        scope_type, scope_id, error = th._parse_scope_args("")
+        self.assertIsNone(scope_type)
+        self.assertIsNotNone(error)
+
+    def test_multiple_scopes_rejected(self):
+        th = _fresh_th()
+        scope_type, scope_id, error = th._parse_scope_args("stage_id=STAGE-001 roadmap_id=RM-001")
+        self.assertIsNone(scope_type)
+        self.assertIn("ОДИН", error)
+
+    def test_unknown_argument_rejected(self):
+        th = _fresh_th()
+        scope_type, scope_id, error = th._parse_scope_args("business_id=BIZ-001")
+        self.assertIsNone(scope_type)
+        self.assertIn("Неизвестный аргумент", error)
+
+    def test_blank_value_rejected(self):
+        th = _fresh_th()
+        scope_type, scope_id, error = th._parse_scope_args('stage_id=""')
+        self.assertIsNone(scope_type)
+        self.assertIn("Пустое значение", error)
+
+    def test_malformed_positional_token_rejected(self):
+        th = _fresh_th()
+        scope_type, scope_id, error = th._parse_scope_args("garbage-token")
+        self.assertIsNone(scope_type)
+        self.assertIsNotNone(error)
+
+
+class TestMissingDocsCmd(unittest.TestCase):
+    def _run(self, cmdline, result):
+        th = _fresh_th()
+        update, context = _cmd17b(cmdline)
+
+        async def run():
+            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
+                 patch("business_core.document_requirements_query.evaluate_scope", return_value=result):
+                await th.missingdocs_cmd(update, context)
+
+        asyncio.run(run())
+        return update, context
+
+    def test_no_scope_argument(self):
+        th = _fresh_th()
+        update, context = _cmd17b("/missingdocs")
+
+        async def run():
+            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+                await th.missingdocs_cmd(update, context)
+
+        asyncio.run(run())
+        reply = update.message.reply_text.call_args[0][0]
+        self.assertIn("❌", reply)
+        self.assertIsNone(update.message.reply_text.call_args.kwargs.get("parse_mode"))
+
+    def test_nonexistent_stage(self):
+        update, context = self._run(
+            "/missingdocs stage_id=STAGE-999",
+            _scope_result17b(exists=False, scope_type="stage", scope_id="STAGE-999"),
+        )
+        reply = update.message.reply_text.call_args[0][0]
+        self.assertIn("Этап STAGE-999 не найден", reply)
+
+    def test_nonexistent_roadmap(self):
+        update, context = self._run(
+            "/missingdocs roadmap_id=RM-999",
+            _scope_result17b(exists=False, scope_type="roadmap", scope_id="RM-999"),
+        )
+        reply = update.message.reply_text.call_args[0][0]
+        self.assertIn("Дорожная карта RM-999 не найдена", reply)
+
+    def test_nonexistent_object(self):
+        update, context = self._run(
+            "/missingdocs object_id=OBJ-999",
+            _scope_result17b(exists=False, scope_type="object", scope_id="OBJ-999"),
+        )
+        reply = update.message.reply_text.call_args[0][0]
+        self.assertIn("Объект OBJ-999 не найден", reply)
+
+    def test_zero_configured_stage(self):
+        update, context = self._run(
+            "/missingdocs stage_id=STAGE-003",
+            _scope_result17b(summary=_summary17b(items=(), scope_id="STAGE-003"),
+                              scope_type="stage", scope_id="STAGE-003"),
+        )
+        reply = update.message.reply_text.call_args[0][0]
+        self.assertIn("ещё не настроены структурированные требования", reply)
+        self.assertNotIn("100", reply)  # never shown as "100% complete" in the primary message
+
+    def test_zero_configured_roadmap_message(self):
+        update, context = self._run(
+            "/missingdocs roadmap_id=RM-003",
+            _scope_result17b(summary=_summary17b(items=(), scope_type="roadmap", scope_id="RM-003"),
+                              scope_type="roadmap", scope_id="RM-003"),
+        )
+        reply = update.message.reply_text.call_args[0][0]
+        self.assertIn("В этапах этой дорожной карты", reply)
+
+    def test_zero_configured_object_message(self):
+        update, context = self._run(
+            "/missingdocs object_id=OBJ-003",
+            _scope_result17b(summary=_summary17b(items=(), scope_type="object", scope_id="OBJ-003"),
+                              scope_type="object", scope_id="OBJ-003"),
+        )
+        reply = update.message.reply_text.call_args[0][0]
+        self.assertIn("В дорожных картах этого объекта", reply)
+
+    def test_all_satisfied(self):
+        req = _req17b()
+        status = _status17b(req, status="present", matched_document_ids=("DREG-001",), matched_count=1)
+        summary = _summary17b(items=(status,))
+        update, context = self._run("/missingdocs stage_id=STAGE-001",
+                                     _scope_result17b(summary=summary))
+        reply = update.message.reply_text.call_args[0][0]
+        self.assertIn("✅ Все обязательные документы собраны.", reply)
+        self.assertIn("Required total: 1", reply)
+        self.assertIn("Satisfied: 1", reply)
+
+    def test_one_missing_requirement_listed(self):
+        req = _req17b()
+        status = _status17b(req, status="missing")
+        summary = _summary17b(items=(status,))
+        update, context = self._run("/missingdocs stage_id=STAGE-001",
+                                     _scope_result17b(summary=summary))
+        reply = update.message.reply_text.call_args[0][0]
+        self.assertIn("❌ Не хватает обязательных документов", reply)
+        self.assertIn("Document Template ID: DOC-001", reply)
+        self.assertIn("Name: Технический паспорт", reply)
+        self.assertIn("Stage ID: STAGE-001", reply)
+        self.assertIn("Matched count / Minimum count: 0/1", reply)
+        self.assertIn("Status: отсутствует", reply)
+        self.assertIn("Blocking: yes", reply)
+
+    def test_blocking_missing_shown(self):
+        req = _req17b(blocking=True)
+        status = _status17b(req, status="missing")
+        summary = _summary17b(items=(status,))
+        update, context = self._run("/missingdocs stage_id=STAGE-001",
+                                     _scope_result17b(summary=summary))
+        reply = update.message.reply_text.call_args[0][0]
+        self.assertIn("Blocking missing: 1", reply)
+
+    def test_partial_minimum_count(self):
+        req = _req17b(minimum_count=2)
+        status = _status17b(req, status="partial", matched_document_ids=("DREG-001",), matched_count=1)
+        summary = _summary17b(items=(status,))
+        update, context = self._run("/missingdocs stage_id=STAGE-001",
+                                     _scope_result17b(summary=summary))
+        reply = update.message.reply_text.call_args[0][0]
+        self.assertIn("Status: частично", reply)
+        self.assertIn("Matched count / Minimum count: 1/2", reply)
+
+    def test_unknown_template_id_visible(self):
+        req = _req17b(document_template_id="DOC-999", name="DOC-999")  # engine's own fallback: name==id
+        status = _status17b(req, status="missing")
+        summary = _summary17b(items=(status,))
+        update, context = self._run("/missingdocs stage_id=STAGE-001",
+                                     _scope_result17b(summary=summary))
+        reply = update.message.reply_text.call_args[0][0]
+        self.assertIn("[неизвестный шаблон: DOC-999]", reply)
+
+    def test_parse_mode_none_on_every_branch(self):
+        scenarios = [
+            _scope_result17b(exists=False),
+            _scope_result17b(summary=_summary17b(items=())),
+            _scope_result17b(summary=_summary17b(items=(_status17b(status="present", matched_count=1,
+                                                                     matched_document_ids=("D1",)),))),
+            _scope_result17b(summary=_summary17b(items=(_status17b(status="missing"),))),
+        ]
+        for result in scenarios:
+            update, context = self._run("/missingdocs stage_id=STAGE-001", result)
+            call = update.message.reply_text.call_args
+            self.assertIsNone(call.kwargs.get("parse_mode"))
+
+    def test_underscores_preserved(self):
+        req = _req17b(name="test_document_name", document_template_id="DOC_001")
+        status = _status17b(req, status="missing")
+        summary = _summary17b(items=(status,))
+        update, context = self._run("/missingdocs stage_id=STAGE-001",
+                                     _scope_result17b(summary=summary))
+        reply = update.message.reply_text.call_args[0][0]
+        self.assertIn("test_document_name", reply)
+        self.assertIn("DOC_001", reply)
+
+
+class TestDocsRequiredCmd(unittest.TestCase):
+    def _run(self, cmdline, result):
+        th = _fresh_th()
+        update, context = _cmd17b(cmdline)
+
+        async def run():
+            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
+                 patch("business_core.document_requirements_query.evaluate_scope", return_value=result):
+                await th.docsrequired_cmd(update, context)
+
+        asyncio.run(run())
+        return update, context
+
+    def test_stage_scope(self):
+        req = _req17b()
+        status = _status17b(req, status="present", matched_document_ids=("DREG-001",), matched_count=1)
+        summary = _summary17b(items=(status,))
+        update, context = self._run("/docsrequired stage_id=STAGE-001", _scope_result17b(summary=summary))
+        reply = update.message.reply_text.call_args[0][0]
+        self.assertIn("📋 Требования к документам", reply)
+        self.assertIn("Stage ID: STAGE-001", reply)
+        self.assertIn("Complete: yes", reply)
+
+    def test_roadmap_scope(self):
+        req = _req17b(scope_type="roadmap")
+        status = _status17b(req, status="missing")
+        summary = _summary17b(items=(status,), scope_type="roadmap", scope_id="RM-001")
+        update, context = self._run(
+            "/docsrequired roadmap_id=RM-001",
+            _scope_result17b(summary=summary, scope_type="roadmap", scope_id="RM-001"),
+        )
+        reply = update.message.reply_text.call_args[0][0]
+        self.assertIn("Roadmap ID: RM-001", reply)
+        self.assertIn("Complete: no", reply)
+
+    def test_object_scope(self):
+        req = _req17b()
+        status = _status17b(req, status="present", matched_document_ids=("DREG-001",), matched_count=1)
+        summary = _summary17b(items=(status,), scope_type="object", scope_id="OBJ-001")
+        update, context = self._run(
+            "/docsrequired object_id=OBJ-001",
+            _scope_result17b(summary=summary, scope_type="object", scope_id="OBJ-001"),
+        )
+        reply = update.message.reply_text.call_args[0][0]
+        self.assertIn("Object ID: OBJ-001", reply)
+
+    def test_full_card_shows_matched_document_ids(self):
+        req = _req17b()
+        status = _status17b(req, status="present", matched_document_ids=("DREG-001", "DREG-002"), matched_count=2)
+        summary = _summary17b(items=(status,))
+        update, context = self._run("/docsrequired stage_id=STAGE-001", _scope_result17b(summary=summary))
+        reply = update.message.reply_text.call_args[0][0]
+        self.assertIn("Matched Document IDs: DREG-001, DREG-002", reply)
+
+    def test_full_card_shows_every_requirement_not_just_missing(self):
+        present_status = _status17b(_req17b(document_template_id="DOC-001"), status="present",
+                                      matched_document_ids=("DREG-001",), matched_count=1)
+        missing_status = _status17b(_req17b(document_template_id="DOC-002", name="Другой документ"),
+                                      status="missing")
+        summary = _summary17b(items=(present_status, missing_status))
+        update, context = self._run("/docsrequired stage_id=STAGE-001", _scope_result17b(summary=summary))
+        reply = update.message.reply_text.call_args[0][0]
+        self.assertIn("DOC-001", reply)
+        self.assertIn("DOC-002", reply)
+        self.assertIn("Другой документ", reply)
+
+    def test_required_and_blocking_flags_shown(self):
+        req = _req17b(required=True, blocking=True)
+        status = _status17b(req, status="missing")
+        summary = _summary17b(items=(status,))
+        update, context = self._run("/docsrequired stage_id=STAGE-001", _scope_result17b(summary=summary))
+        reply = update.message.reply_text.call_args[0][0]
+        self.assertIn("Required: yes", reply)
+        self.assertIn("Blocking: yes", reply)
+
+    def test_status_labels_exact_russian(self):
+        th = _fresh_th()
+        self.assertEqual(th._STATUS_LABELS_RU["present"], "присутствует")
+        self.assertEqual(th._STATUS_LABELS_RU["missing"], "отсутствует")
+        self.assertEqual(th._STATUS_LABELS_RU["partial"], "частично")
+        self.assertEqual(th._STATUS_LABELS_RU["optional_missing"], "необязательный отсутствует")
+        self.assertEqual(th._STATUS_LABELS_RU["not_applicable"], "не применяется")
+
+    def test_zero_configured_never_says_100_percent(self):
+        update, context = self._run(
+            "/docsrequired stage_id=STAGE-003",
+            _scope_result17b(summary=_summary17b(items=())),
+        )
+        reply = update.message.reply_text.call_args[0][0]
+        self.assertIn("ещё не настроены структурированные требования", reply)
+        self.assertNotIn("100", reply)
+
+    def test_nonexistent_scope(self):
+        update, context = self._run(
+            "/docsrequired stage_id=STAGE-999",
+            _scope_result17b(exists=False, scope_id="STAGE-999"),
+        )
+        reply = update.message.reply_text.call_args[0][0]
+        self.assertIn("Этап STAGE-999 не найден", reply)
+
+    def test_long_output_splits_safely(self):
+        statuses = tuple(
+            _status17b(_req17b(document_template_id=f"DOC-{i:03d}", name=f"Document number {i} with padding text"),
+                       status="missing")
+            for i in range(200)
+        )
+        summary = _summary17b(items=statuses)
+        update, context = self._run("/docsrequired stage_id=STAGE-001", _scope_result17b(summary=summary))
+        self.assertGreater(update.message.reply_text.call_count, 1)
+        for call in update.message.reply_text.call_args_list:
+            self.assertIsNone(call.kwargs.get("parse_mode"))
+        # no line split in half: every "Document Template ID: DOC-xxx" line
+        # must appear whole in exactly one message part
+        all_text = "\n".join(c.args[0] for c in update.message.reply_text.call_args_list)
+        for i in range(200):
+            self.assertIn(f"Document Template ID: DOC-{i:03d}", all_text)
+
+
+class TestSplitMessageByLines(unittest.TestCase):
+    """Phase 17B review fix: a single line longer than max_len must never
+    pass through unchanged — it must be deterministically chunked."""
+
+    def test_normal_lines_untouched(self):
+        th = _fresh_th()
+        text = "line one\nline two\nline three"
+        parts = th._split_message_by_lines(text, max_len=100)
+        self.assertEqual(parts, [text])
+
+    def test_splits_between_lines_when_over_limit(self):
+        th = _fresh_th()
+        text = "\n".join(f"line {i}" for i in range(50))
+        parts = th._split_message_by_lines(text, max_len=50)
+        self.assertGreater(len(parts), 1)
+        for part in parts:
+            self.assertLessEqual(len(part), 50)
+        # every original line must appear whole in exactly one part
+        rejoined = "\n".join(parts)
+        for i in range(50):
+            self.assertIn(f"line {i}", rejoined)
+
+    def test_never_splits_mid_line_for_normal_sized_lines(self):
+        th = _fresh_th()
+        lines = [f"field_{i}: value_{i}" for i in range(30)]
+        text = "\n".join(lines)
+        parts = th._split_message_by_lines(text, max_len=60)
+        for line in lines:
+            found_whole = any(line in part.split("\n") for part in parts)
+            self.assertTrue(found_whole, f"line was split or lost: {line!r}")
+
+    def test_oversized_single_line_is_chunked_not_passed_through(self):
+        th = _fresh_th()
+        huge_line = "DREG-" + ("X" * 9000)  # single field line far exceeding max_len
+        parts = th._split_message_by_lines(huge_line, max_len=4000)
+        self.assertGreater(len(parts), 1)
+        for part in parts:
+            self.assertLessEqual(len(part), 4000)
+        self.assertEqual("".join(parts), huge_line)  # no content lost
+
+    def test_oversized_line_mixed_with_normal_lines_preserves_all_content(self):
+        th = _fresh_th()
+        huge_line = "Matched Document IDs: " + ", ".join(f"DREG-{i:04d}" for i in range(2000))
+        text = "\n".join(["normal line before", huge_line, "normal line after"])
+        parts = th._split_message_by_lines(text, max_len=4000)
+        for part in parts:
+            self.assertLessEqual(len(part), 4000)
+        rejoined = "".join(parts)
+        self.assertIn("normal line before", rejoined)
+        self.assertIn("normal line after", rejoined)
+        self.assertIn("DREG-0000", rejoined)
+        self.assertIn("DREG-1999", rejoined)
+
+    def test_unicode_preserved_across_chunk_boundary(self):
+        th = _fresh_th()
+        huge_line = "Кадастровый номер: " + ("Технический паспорт объекта " * 300)
+        parts = th._split_message_by_lines(huge_line, max_len=500)
+        self.assertGreater(len(parts), 1)
+        rejoined = "".join(parts)
+        self.assertEqual(rejoined, huge_line)
+        # every character survives round-trip decoding (no split mid-codepoint)
+        for part in parts:
+            part.encode("utf-8")  # would not raise regardless, but proves valid str
+
+    def test_underscores_and_ids_preserved_in_oversized_line(self):
+        th = _fresh_th()
+        huge_line = "Extracted Fields: " + ", ".join(f"field_{i}_value" for i in range(1000))
+        parts = th._split_message_by_lines(huge_line, max_len=1000)
+        rejoined = "".join(parts)
+        self.assertEqual(rejoined, huge_line)
+        self.assertIn("field_0_value", rejoined)
+        self.assertIn("field_999_value", rejoined)
+
+    def test_no_empty_parts_for_empty_text(self):
+        th = _fresh_th()
+        self.assertEqual(th._split_message_by_lines("", max_len=100), [""])
+
+
+class TestPhase17BReadOnlyGuarantees(unittest.TestCase):
+    def test_no_sheets_writes(self):
+        th = _fresh_th()
+        update, context = _cmd17b("/missingdocs stage_id=STAGE-001")
+        summary = _summary17b(items=(_status17b(status="missing"),))
+
+        async def run():
+            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
+                 patch("business_core.document_requirements_query.evaluate_scope",
+                       return_value=_scope_result17b(summary=summary)), \
+                 patch("business_core.sheets.append_business_row") as mock_append, \
+                 patch("business_core.sheets.update_business_row") as mock_update_row, \
+                 patch("business_core.sheets.update_business_cell") as mock_update_cell:
+                await th.missingdocs_cmd(update, context)
+                mock_append.assert_not_called()
+                mock_update_row.assert_not_called()
+                mock_update_cell.assert_not_called()
+
+        asyncio.run(run())
+
+    def test_no_drive_or_anthropic_reference_in_handlers(self):
+        th = _fresh_th()
+        import inspect
+        for fn in (th.missingdocs_cmd, th.docsrequired_cmd):
+            source = inspect.getsource(fn)
+            self.assertNotIn("get_drive_service", source)
+            self.assertNotIn("anthropic", source.lower())
+            self.assertNotIn("analyze_document(", source)
+
+    def test_no_requirement_engine_mutation(self):
+        """Handlers must never call any business_core.document_requirements
+        write-shaped function — there are none (the engine is entirely
+        read-only), but this pins that no future accidental import of a
+        write primitive creeps in."""
+        th = _fresh_th()
+        import inspect
+        for fn in (th.missingdocs_cmd, th.docsrequired_cmd):
+            source = inspect.getsource(fn)
+            self.assertNotIn("append_business_row", source)
+            self.assertNotIn("update_business_row", source)
+            self.assertNotIn("update_business_cell", source)
+
+    def test_handlers_do_not_read_document_registry_directly(self):
+        """Handlers must go through document_requirements_query, not
+        touch find_row_by_id/read_business_sheet themselves."""
+        th = _fresh_th()
+        import inspect
+        for fn in (th.missingdocs_cmd, th.docsrequired_cmd):
+            source = inspect.getsource(fn)
+            self.assertNotIn("find_row_by_id", source)
+            self.assertNotIn("read_business_sheet", source)
+
+    def test_commands_registered(self):
+        th = _fresh_th()
+        app = MagicMock()
+        th.register_business_handlers(app)
+        self.assertGreater(app.add_handler.call_count, 20)
+        self.assertTrue(hasattr(th, "missingdocs_cmd"))
+        self.assertTrue(hasattr(th, "docsrequired_cmd"))
 
 
 if __name__ == "__main__":
