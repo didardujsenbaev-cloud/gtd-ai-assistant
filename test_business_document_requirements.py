@@ -103,12 +103,13 @@ def _content_row(**overrides):
     return row
 
 
-def _patch_sheets(stages=None, roadmaps=None, templates=None, documents=None, contents=None):
+def _patch_sheets(stages=None, roadmaps=None, templates=None, documents=None, contents=None, relations=None):
     stages = STAGES if stages is None else stages
     roadmaps = ROADMAPS if roadmaps is None else roadmaps
     templates = TEMPLATES if templates is None else templates
     documents = documents or []
     contents = contents or []
+    relations = relations or []
 
     def _read_business_sheet(sheet_key, *a, **kw):
         return {
@@ -117,6 +118,7 @@ def _patch_sheets(stages=None, roadmaps=None, templates=None, documents=None, co
             "document_template_registry": templates,
             "document_registry": documents,
             "document_content": contents,
+            "stage_entity_relations": relations,
         }.get(sheet_key, [])
 
     def _find_row_by_id(sheet_key, record_id, *a, **kw):
@@ -125,6 +127,7 @@ def _patch_sheets(stages=None, roadmaps=None, templates=None, documents=None, co
             "roadmaps": (roadmaps, "Roadmap ID"),
             "document_template_registry": (templates, "Document Template ID"),
             "document_registry": (documents, "Document ID"),
+            "stage_entity_relations": (relations, "Relation ID"),
         }.get(sheet_key)
         if table is None:
             return None
@@ -141,10 +144,10 @@ def _patch_sheets(stages=None, roadmaps=None, templates=None, documents=None, co
 
 
 class _PatchedCase(unittest.TestCase):
-    def _dr(self, stages=None, roadmaps=None, templates=None, documents=None, contents=None):
+    def _dr(self, stages=None, roadmaps=None, templates=None, documents=None, contents=None, relations=None):
         dr = _fresh_dr()
         patches = _patch_sheets(stages=stages, roadmaps=roadmaps, templates=templates,
-                                 documents=documents, contents=contents)
+                                 documents=documents, contents=contents, relations=relations)
         stack = contextlib.ExitStack()
         for p in patches:
             stack.enter_context(p)
@@ -1287,6 +1290,172 @@ class TestPhase17BReadOnlyGuarantees(unittest.TestCase):
         self.assertGreater(app.add_handler.call_count, 20)
         self.assertTrue(hasattr(th, "missingdocs_cmd"))
         self.assertTrue(hasattr(th, "docsrequired_cmd"))
+
+
+# ────────────────────────────────────────────────────────────
+# Phase 18C-4: dual-source get_requirements_for_stage()
+# ────────────────────────────────────────────────────────────
+
+def _instance_rel(**overrides):
+    row = {
+        "Relation ID": "REL-100", "Template Stage ID": "", "Stage ID": "STAGE-001",
+        "Entity Type": "document_template", "Entity ID": "DOC-001",
+        "Required": "true", "Blocking": "true", "Minimum Count": "1",
+        "Status": "active", "Created At": "2026-07-22", "Updated At": "2026-07-22",
+    }
+    row.update(overrides)
+    return row
+
+
+class TestDualSourceRequirements(_PatchedCase):
+    def test_instance_relation_source_takes_precedence_over_legacy(self):
+        # STAGE-001's legacy Document Template IDs (from the shared STAGES
+        # fixture) is "DOC-001"; give it a DIFFERENT instance relation too.
+        dr = self._dr(relations=[_instance_rel(**{"Entity ID": "DOC-002"})])
+        reqs = dr.get_requirements_for_stage("STAGE-001")
+        self.assertEqual(len(reqs), 1)
+        self.assertEqual(reqs[0].document_template_id, "DOC-002")
+
+    def test_instance_and_legacy_differ_instance_wins(self):
+        dr = self._dr(relations=[_instance_rel(**{"Entity ID": "DOC-003"})])
+        reqs = dr.get_requirements_for_stage("STAGE-001")
+        ids = [r.document_template_id for r in reqs]
+        self.assertEqual(ids, ["DOC-003"])
+        self.assertNotIn("DOC-001", ids)  # legacy value never merged in
+
+    def test_no_instance_relations_legacy_fallback(self):
+        dr = self._dr(relations=[])
+        reqs = dr.get_requirements_for_stage("STAGE-001")
+        self.assertEqual([r.document_template_id for r in reqs], ["DOC-001"])  # legacy value
+
+    def test_rm001_shaped_legacy_only_stage_unchanged(self):
+        """No relations at all anywhere (RM-001's real shape today) —
+        behavior must be byte-identical to pre-Phase-18C-4."""
+        dr = self._dr()  # relations defaults to []
+        reqs = dr.get_requirements_for_stage("STAGE-001")
+        self.assertEqual(len(reqs), 1)
+        self.assertEqual(reqs[0].document_template_id, "DOC-001")
+        self.assertTrue(reqs[0].required)
+        self.assertTrue(reqs[0].blocking)
+        self.assertEqual(reqs[0].minimum_count, 1)
+
+    def test_required_copied_from_relation_row(self):
+        dr = self._dr(relations=[_instance_rel(**{"Required": "false"})])
+        reqs = dr.get_requirements_for_stage("STAGE-001")
+        self.assertFalse(reqs[0].required)
+
+    def test_blocking_copied_from_relation_row(self):
+        dr = self._dr(relations=[_instance_rel(**{"Blocking": "false"})])
+        reqs = dr.get_requirements_for_stage("STAGE-001")
+        self.assertFalse(reqs[0].blocking)
+
+    def test_minimum_count_copied_from_relation_row(self):
+        dr = self._dr(relations=[_instance_rel(**{"Minimum Count": "3"})])
+        reqs = dr.get_requirements_for_stage("STAGE-001")
+        self.assertEqual(reqs[0].minimum_count, 3)
+
+    def test_relation_order_preserved(self):
+        dr = self._dr(relations=[
+            _instance_rel(**{"Relation ID": "REL-100", "Entity ID": "DOC-003"}),
+            _instance_rel(**{"Relation ID": "REL-101", "Entity ID": "DOC-002"}),
+        ])
+        reqs = dr.get_requirements_for_stage("STAGE-001")
+        self.assertEqual([r.document_template_id for r in reqs], ["DOC-003", "DOC-002"])
+
+    def test_inactive_instance_relations_ignored(self):
+        dr = self._dr(relations=[_instance_rel(**{"Status": "inactive", "Entity ID": "DOC-002"})])
+        reqs = dr.get_requirements_for_stage("STAGE-001")
+        self.assertEqual([r.document_template_id for r in reqs], ["DOC-001"])  # legacy fallback
+
+    def test_all_instance_relations_inactive_legacy_fallback(self):
+        dr = self._dr(relations=[
+            _instance_rel(**{"Relation ID": "REL-100", "Entity ID": "DOC-002", "Status": "inactive"}),
+            _instance_rel(**{"Relation ID": "REL-101", "Entity ID": "DOC-003", "Status": "inactive"}),
+        ])
+        reqs = dr.get_requirements_for_stage("STAGE-001")
+        self.assertEqual([r.document_template_id for r in reqs], ["DOC-001"])
+
+    def test_invalid_active_relation_does_not_silently_fall_back(self):
+        dr = self._dr(relations=[_instance_rel(**{"Required": "yes"})])  # structurally invalid
+        reqs = dr.get_requirements_for_stage("STAGE-001")
+        # source stays instance_relations (not legacy) -> the invalid
+        # relation produces NO requirement, but legacy's DOC-001 must
+        # NOT silently appear either.
+        self.assertEqual(reqs, ())
+
+    def test_dangling_entity_id_visible_in_source_result(self):
+        from business_core.stage_entity_relations import get_document_requirements_source_for_stage
+        dr = self._dr(relations=[_instance_rel(**{"Entity ID": "DOC-999"})])
+        with contextlib.ExitStack() as stack:
+            for p in _patch_sheets(relations=[_instance_rel(**{"Entity ID": "DOC-999"})]):
+                stack.enter_context(p)
+            source = get_document_requirements_source_for_stage("STAGE-001")
+        self.assertEqual(source.source, "instance_relations")
+        self.assertTrue(any("DOC-999" in str(e) for _, errs in source.validation_errors for e in errs))
+        self.assertEqual(source.requirements, ())  # dangling relation excluded from actual requirements
+
+    def test_duplicate_active_instance_relation_visible(self):
+        from business_core.stage_entity_relations import get_document_requirements_source_for_stage
+        relations = [
+            _instance_rel(**{"Relation ID": "REL-100", "Entity ID": "DOC-002"}),
+            _instance_rel(**{"Relation ID": "REL-101", "Entity ID": "DOC-002"}),
+        ]
+        with contextlib.ExitStack() as stack:
+            for p in _patch_sheets(relations=relations):
+                stack.enter_context(p)
+            source = get_document_requirements_source_for_stage("STAGE-001")
+        self.assertEqual(len(source.requirements), 1)  # only the first counts as a real requirement
+        self.assertEqual(len(source.duplicate_errors), 1)
+        self.assertEqual(source.duplicate_errors[0][0], "DOC-002")
+
+    def test_unsupported_entity_type_excluded_but_reported(self):
+        from business_core.stage_entity_relations import get_document_requirements_source_for_stage
+        relations = [
+            _instance_rel(**{"Relation ID": "REL-100", "Entity ID": "DOC-002"}),
+            _instance_rel(**{"Relation ID": "REL-200", "Entity Type": "sop", "Entity ID": "SOP-001"}),
+        ]
+        with contextlib.ExitStack() as stack:
+            for p in _patch_sheets(relations=relations):
+                stack.enter_context(p)
+            source = get_document_requirements_source_for_stage("STAGE-001")
+        self.assertEqual(len(source.requirements), 1)
+        self.assertEqual(source.unsupported_entity_type_relation_ids, ("REL-200",))
+
+    def test_template_scoped_relation_not_used_for_instantiated_read(self):
+        """A relation scoped ONLY to a Template Stage ID (Stage ID
+        blank) must never be picked up as a runtime source for a real
+        instantiated stage, even if it references document templates."""
+        dr = self._dr(relations=[_instance_rel(**{
+            "Relation ID": "REL-100", "Template Stage ID": "TSTG-999", "Stage ID": "", "Entity ID": "DOC-002",
+        })])
+        reqs = dr.get_requirements_for_stage("STAGE-001")
+        self.assertEqual([r.document_template_id for r in reqs], ["DOC-001"])  # legacy fallback, not DOC-002
+
+    def test_empty_instance_and_empty_legacy_returns_no_requirements(self):
+        dr = self._dr(stages=[{"Stage ID": "STAGE-003", "Roadmap ID": "RM-001", "Document Template IDs": ""}],
+                       relations=[])
+        reqs = dr.get_requirements_for_stage("STAGE-003")
+        self.assertEqual(reqs, ())
+
+    def test_existing_document_satisfaction_matching_unchanged(self):
+        """Full evaluate_stage_requirements() still correctly matches
+        DOCUMENT_REGISTRY evidence when the source is instance_relations
+        — Phase 17D roadmap-level matching is untouched."""
+        dr = self._dr(
+            relations=[_instance_rel(**{"Entity ID": "DOC-002"})],
+            documents=[_doc_row(**{"Document Template ID": "DOC-002", "Stage ID": "STAGE-002"})],  # different stage, same roadmap
+        )
+        summary = dr.evaluate_stage_requirements("STAGE-001")
+        self.assertEqual(summary.items[0].status, dr.STATUS_PRESENT)  # roadmap-level reuse still works
+
+    def test_no_writes_in_source_precedence_functions(self):
+        import inspect
+        from business_core import stage_entity_relations as ser
+        for fn in (ser.get_document_requirements_source_for_stage,):
+            source = inspect.getsource(fn)
+            for forbidden in ("append_business_row", "update_business_row", "update_business_cell",
+                              "batch_append_business_rows", "generate_next_id"):
+                self.assertNotIn(forbidden, source)
 
 
 if __name__ == "__main__":

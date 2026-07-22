@@ -31,6 +31,18 @@ requested/uploaded/produced/registered) and is never a precondition
 for satisfying a requirement. See _current_valid_documents_for()'s
 docstring for the exact matching rule.
 
+Phase 18C-4: requirement SOURCE, for an instantiated stage, is now
+dual: if that stage has one or more active, instance-scoped
+STAGE_ENTITY_RELATIONS rows (Entity Type "document_template"), those
+rows are the sole source (never merged with the legacy column, not
+even partially); otherwise the original Phase 17A legacy source
+(ROADMAP_STAGES."Document Template IDs") is used, exactly as before.
+See business_core.stage_entity_relations.
+get_document_requirements_source_for_stage() for the exact precedence
+rule and get_requirements_for_stage() below for where it's consulted.
+Document matching/satisfaction (Phase 17D, above) is completely
+unaffected by which source produced the requirement.
+
 This module is strictly read-only: it makes no AI calls, no Drive
 calls, no Sheets writes, never modifies DOCUMENT_REGISTRY or any
 roadmap/stage row, and never enqueues a job. It only reads via
@@ -256,14 +268,16 @@ def _current_valid_documents_for(roadmap_id: str, document_template_id: str, obj
     )
 
 
-def _build_requirement(stage_id: str, document_template_id: str, chain: dict) -> DocumentRequirement:
+def _lookup_template_catalog(document_template_id: str) -> tuple[str, str]:
     """
     An unknown/dangling document_template_id (not present in
-    document_template_registry) is NEVER silently discarded — it is
-    preserved as a normal requirement with a safe fallback name (the ID
-    itself, always visible) rather than an empty string. Silently
-    dropping it would falsely inflate completeness for a stage with a
-    broken/typo'd template reference.
+    document_template_registry) is NEVER silently discarded — the
+    caller always gets a safe fallback name (the ID itself, always
+    visible) rather than an empty string. Silently dropping it would
+    falsely inflate completeness for a stage with a broken/typo'd
+    template reference. Shared by both the legacy comma-list path
+    (_build_requirement) and the Phase 18C-4 relation-row path
+    (_build_requirement_from_relation).
     """
     from business_core.sheets import find_row_by_id
 
@@ -274,6 +288,15 @@ def _build_requirement(stage_id: str, document_template_id: str, chain: dict) ->
         tmpl = template_found[1]
         document_type = tmpl.get("Document Type", "")
         name = tmpl.get("Title", "") or document_template_id
+    return document_type, name
+
+
+def _build_requirement(stage_id: str, document_template_id: str, chain: dict) -> DocumentRequirement:
+    """Legacy path: builds a requirement from one ROADMAP_STAGES.
+    "Document Template IDs" comma-list entry — required/blocking/
+    minimum_count are always the hardcoded engine defaults, since the
+    legacy column has no per-item way to express anything else."""
+    document_type, name = _lookup_template_catalog(document_template_id)
 
     return DocumentRequirement(
         requirement_id=f"{stage_id}:{document_template_id}",
@@ -287,6 +310,45 @@ def _build_requirement(stage_id: str, document_template_id: str, chain: dict) ->
         roadmap_id=chain.get("roadmap_id", ""),
         object_id=chain.get("object_id", ""),
         stage_id=stage_id,
+    )
+
+
+def _build_requirement_from_relation(stage_id: str, relation: dict, chain: dict) -> DocumentRequirement:
+    """
+    Phase 18C-4: builds a requirement from one validated, active,
+    instance-scoped STAGE_ENTITY_RELATIONS row — required/blocking/
+    minimum_count are read from the relation row itself, not the
+    engine's hardcoded defaults. Only ever called with a relation that
+    business_core.stage_entity_relations.get_document_requirements_source_for_stage()
+    has already validated (validate_relation_record +
+    validate_relation_references) and de-duplicated — this function
+    does no validation of its own.
+    """
+    document_template_id = relation.get("Entity ID", "")
+    document_type, name = _lookup_template_catalog(document_template_id)
+
+    required = (relation.get("Required", "") or "").strip().lower() == "true"
+    blocking = (relation.get("Blocking", "") or "").strip().lower() == "true"
+    try:
+        minimum_count = int(str(relation.get("Minimum Count", "1")).strip())
+    except (TypeError, ValueError):
+        minimum_count = 1
+
+    return DocumentRequirement(
+        requirement_id=f"{stage_id}:{document_template_id}",
+        document_template_id=document_template_id,
+        document_type=document_type,
+        name=name,
+        scope_type="stage",
+        scope_id=stage_id,
+        business_id=chain.get("business_id", ""),
+        service_id=chain.get("service_id", ""),
+        roadmap_id=chain.get("roadmap_id", ""),
+        object_id=chain.get("object_id", ""),
+        stage_id=stage_id,
+        required=required,
+        blocking=blocking,
+        minimum_count=minimum_count,
     )
 
 
@@ -328,22 +390,40 @@ def _evaluate_requirement(requirement: DocumentRequirement) -> DocumentRequireme
 
 
 def get_requirements_for_stage(stage_id: str) -> tuple:
-    """Read-only: the DocumentRequirement tuple for one stage, exploded
-    from its "Document Template IDs" list. Empty tuple if the stage
-    doesn't exist or has no requirements — these are treated the same
-    (nothing to evaluate), never an exception."""
+    """
+    Read-only: the DocumentRequirement tuple for one stage. Empty tuple
+    if the stage doesn't exist or has no requirements — these are
+    treated the same (nothing to evaluate), never an exception.
+
+    Phase 18C-4 source precedence (see
+    business_core.stage_entity_relations.get_document_requirements_source_for_stage()
+    for the exact rule): if this stage has one or more active,
+    instance-scoped STAGE_ENTITY_RELATIONS rows of Entity Type
+    "document_template", those rows are the SOLE source — never merged
+    with the legacy comma-list, even partially. Only when zero such
+    relations exist does this fall back to the original Phase 17A
+    source, ROADMAP_STAGES."Document Template IDs" — this is exactly
+    what keeps every existing roadmap (e.g. RM-001) producing identical
+    requirements to before this phase, since none has any instance
+    relations yet.
+    """
     from business_core.sheets import find_row_by_id
+    from business_core.stage_entity_relations import get_document_requirements_source_for_stage
 
     found = find_row_by_id("roadmap_stages", stage_id)
     if not found:
         return ()
     stage_row = found[1]
 
+    chain = _resolve_scope_chain(stage_id=stage_id, roadmap_id=stage_row.get("Roadmap ID", ""))
+
+    source = get_document_requirements_source_for_stage(stage_id)
+    if source.source == "instance_relations":
+        return tuple(_build_requirement_from_relation(stage_id, rel, chain) for rel in source.requirements)
+
     template_ids = _parse_id_list(stage_row.get("Document Template IDs", ""))
     if not template_ids:
         return ()
-
-    chain = _resolve_scope_chain(stage_id=stage_id, roadmap_id=stage_row.get("Roadmap ID", ""))
     return tuple(_build_requirement(stage_id, tid, chain) for tid in template_ids)
 
 

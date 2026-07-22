@@ -17,9 +17,15 @@ Most of this module is read-only and additive. The one exception is
 copy_template_relations_to_stage() (Phase 18C-3), which creates new
 INSTANCE-scoped relation rows (never touches template-scoped rows,
 never migrates the existing "Document Template IDs" comma-list
-columns). Nothing in this module is yet consulted by
-business_core.document_requirements.py or any Telegram command for
-requirement evaluation.
+columns).
+
+Phase 18C-4: get_document_requirements_source_for_stage() is now
+consulted by business_core.document_requirements.get_requirements_for_stage()
+to decide, per instantiated stage, whether to read active instance
+relations or fall back to the legacy comma-list — see that function's
+docstring for the exact precedence rule. This module still never
+reads DOCUMENT_REGISTRY or evaluates document SATISFACTION itself —
+that remains entirely business_core.document_requirements.py's job.
 
 Entity Type support is deliberately extensible without a schema
 change: adding a new type is one new entry in ENTITY_TYPE_DISPATCH,
@@ -541,4 +547,115 @@ def copy_template_relations_to_stage(
         template_stage_id=template_stage_id, stage_id=stage_id,
         created=tuple(created_records),
         skipped_duplicates=tuple(skipped_duplicates),
+    )
+
+
+# ─────────────────────────────────────────────────────────────
+# Phase 18C-4: document-requirements source precedence for an
+# instantiated (real) Stage ID — consumed by
+# business_core.document_requirements.get_requirements_for_stage()
+# ─────────────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class DocumentRequirementsSource:
+    """
+    Read-only result of get_document_requirements_source_for_stage().
+
+    `source == "instance_relations"` means one or more active,
+    instance-scoped relations exist for this stage — `requirements`
+    (already validated + de-duplicated, in sheet order) is then the
+    SOLE authoritative source; the legacy comma-list is never
+    consulted, not even partially, and never used as a fallback just
+    because some of the instance relations were invalid.
+
+    `source == "legacy"` means zero active document_template instance
+    relations exist for this stage (including "all inactive") — the
+    caller (business_core.document_requirements.get_requirements_for_stage())
+    falls back to ROADMAP_STAGES."Document Template IDs", exactly as
+    before Phase 18C-4.
+
+    `validation_errors`/`duplicate_errors`/
+    `unsupported_entity_type_relation_ids` make invalid, duplicate, and
+    non-document_template relations visible even though they don't
+    participate in the returned `requirements` — never silently
+    dropped from the audit trail.
+    """
+    stage_id: str
+    source: str = "legacy"  # "instance_relations" | "legacy"
+    requirements: tuple = ()                          # valid, de-duplicated relation rows, sheet order
+    validation_errors: tuple = ()                      # (relation_id, (error strings...))
+    duplicate_errors: tuple = ()                        # (entity_id, (relation_ids sharing it...))
+    unsupported_entity_type_relation_ids: tuple = ()    # active relations at this stage, non-document_template
+
+
+def get_document_requirements_source_for_stage(stage_id: str) -> DocumentRequirementsSource:
+    """
+    Strictly read-only. Implements the Phase 18C-4 precedence rule:
+
+      1. Read active STAGE_ENTITY_RELATIONS rows for this Stage ID
+         (Template Stage ID is never consulted here — a template-scoped
+         relation is only ever an inheritance INPUT at /startroadmap
+         time, never a runtime source for an already-instantiated
+         stage).
+      2. If zero active document_template relations exist (including
+         "all inactive"), source = "legacy".
+      3. Otherwise source = "instance_relations". Each relation is
+         validated (validate_relation_record + validate_relation_references);
+         an invalid one is excluded from `requirements` and reported in
+         `validation_errors` — it never causes a fallback to legacy.
+         A relation whose Entity ID repeats an earlier (sheet-order)
+         active relation's Entity ID is excluded from `requirements`
+         and reported in `duplicate_errors` (first occurrence wins,
+         mirroring the same de-dup-preserving-order convention already
+         used for the legacy comma-list in _parse_id_list()) — this
+         never causes a fallback either.
+      4. A non-document_template active relation at this stage is
+         excluded from document-requirements consideration entirely
+         but is still visible via `unsupported_entity_type_relation_ids`.
+    """
+    if not stage_id:
+        return DocumentRequirementsSource(stage_id=stage_id, source="legacy")
+
+    all_active = get_relations_for_stage(stage_id)  # active only, all entity types, sheet order
+    doc_relations = tuple(r for r in all_active if r.get("Entity Type", "") == "document_template")
+    unsupported_ids = tuple(
+        r.get("Relation ID", "") for r in all_active if r.get("Entity Type", "") != "document_template"
+    )
+
+    if not doc_relations:
+        return DocumentRequirementsSource(
+            stage_id=stage_id, source="legacy",
+            unsupported_entity_type_relation_ids=unsupported_ids,
+        )
+
+    validation_errors: list[tuple] = []
+    duplicate_map: dict[str, list[str]] = {}
+    seen_entity_ids: dict[str, str] = {}
+    valid_requirements: list[dict] = []
+
+    for rel in doc_relations:
+        relation_id = rel.get("Relation ID", "")
+        entity_id = rel.get("Entity ID", "")
+
+        rel_errors = tuple(validate_relation_record(rel)) + tuple(validate_relation_references(rel))
+        if rel_errors:
+            validation_errors.append((relation_id, rel_errors))
+            continue
+
+        if entity_id in seen_entity_ids:
+            duplicate_map.setdefault(entity_id, [seen_entity_ids[entity_id]]).append(relation_id)
+            continue
+
+        seen_entity_ids[entity_id] = relation_id
+        valid_requirements.append(rel)
+
+    duplicate_errors = tuple((eid, tuple(ids)) for eid, ids in duplicate_map.items())
+
+    return DocumentRequirementsSource(
+        stage_id=stage_id,
+        source="instance_relations",
+        requirements=tuple(valid_requirements),
+        validation_errors=tuple(validation_errors),
+        duplicate_errors=duplicate_errors,
+        unsupported_entity_type_relation_ids=unsupported_ids,
     )
