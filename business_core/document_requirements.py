@@ -13,13 +13,23 @@ SERVICE_CATALOG's "Документы от клиента" / "Документы
 — not safely matchable — and are deliberately NOT used here. This
 module does not invent a second, competing source of truth.
 
-Every requirement in the current data model is therefore stage-scoped.
+Every requirement's SOURCE is stage-scoped (each stage's own
+"Document Template IDs" list is where a requirement comes from).
 Roadmap- and object-level results are AGGREGATIONS over their
 constituent stages' requirements, not independent requirement sources.
 Service-level evaluation is intentionally not implemented in this
 phase — there is no structured, ID-referenceable service-level
 requirement source to aggregate (see the audit report, section K, for
 the smallest proposed additive schema if that's wanted later).
+
+Phase 17D: requirement SATISFACTION, however, is ROADMAP-scoped, not
+stage-scoped — a document uploaded once for a Roadmap (regardless of
+which stage it was registered against) satisfies matching requirements
+on every stage of that same Roadmap. Stage ID on a DOCUMENT_REGISTRY
+row is preserved purely as provenance (where the document was
+requested/uploaded/produced/registered) and is never a precondition
+for satisfying a requirement. See _current_valid_documents_for()'s
+docstring for the exact matching rule.
 
 This module is strictly read-only: it makes no AI calls, no Drive
 calls, no Sheets writes, never modifies DOCUMENT_REGISTRY or any
@@ -73,6 +83,7 @@ class DocumentRequirement:
     service_id: str = ""
     roadmap_template_id: str = ""
     roadmap_id: str = ""
+    object_id: str = ""
     stage_template_id: str = ""
     stage_id: str = ""
     required: bool = True
@@ -176,14 +187,27 @@ def _resolve_scope_chain(stage_id: str = "", roadmap_id: str = "", object_id: st
     }
 
 
-def _current_valid_documents_for(stage_id: str, document_template_id: str) -> tuple:
+def _current_valid_documents_for(roadmap_id: str, document_template_id: str, object_id: str = "") -> tuple:
     """
-    Read-only match of one (stage_id, document_template_id) requirement
-    against DOCUMENT_REGISTRY, following the exact same "Stage ID must
-    match exactly" rule already established by
-    document_registry_manager.get_documents_for_stage() — a document
-    registered under a different stage (or with no stage at all) never
-    counts, even if its Document Template ID matches.
+    Phase 17D: read-only match of one (roadmap_id, document_template_id)
+    requirement against DOCUMENT_REGISTRY, ROADMAP-scoped rather than
+    stage-scoped. A document registered against ANY stage of the same
+    roadmap (or with no stage recorded at all) now counts — Stage ID is
+    preserved on the DOCUMENT_REGISTRY row purely as provenance (where
+    the document was requested/uploaded/produced/registered), never as
+    a precondition for requirement satisfaction. This replaces the
+    Phase 17A "Stage ID must match exactly" rule (formerly matching
+    document_registry_manager.get_documents_for_stage()'s behavior —
+    that older, separate function is unrelated to this engine and is
+    intentionally left unchanged).
+
+    Roadmap ID is the decisive scope key: a document registered under a
+    different roadmap never counts, even if it happens to share the
+    same Object ID (two different roadmaps for the same object are
+    still two independent cases). Object ID, when the requirement has
+    one resolved AND the candidate row also has one recorded, must
+    additionally agree — a defense-in-depth consistency check, never a
+    fallback that alone can satisfy a Roadmap ID mismatch.
 
     Within one Document Family ID, the CURRENT version is always the
     highest Version number among ALL matching rows in that family —
@@ -204,13 +228,18 @@ def _current_valid_documents_for(stage_id: str, document_template_id: str) -> tu
     """
     from business_core.sheets import read_business_sheet
 
-    if not stage_id or not document_template_id:
+    if not roadmap_id or not document_template_id:
         return ()
 
     candidates = [
         row for row in read_business_sheet("document_registry")
-        if row.get("Stage ID", "") == stage_id
+        if row.get("Roadmap ID", "") == roadmap_id
         and row.get("Document Template ID", "") == document_template_id
+        and (
+            not object_id
+            or not row.get("Object ID", "")
+            or row.get("Object ID", "") == object_id
+        )
     ]
 
     families: dict[str, dict] = {}
@@ -256,6 +285,7 @@ def _build_requirement(stage_id: str, document_template_id: str, chain: dict) ->
         business_id=chain.get("business_id", ""),
         service_id=chain.get("service_id", ""),
         roadmap_id=chain.get("roadmap_id", ""),
+        object_id=chain.get("object_id", ""),
         stage_id=stage_id,
     )
 
@@ -268,8 +298,18 @@ def _evaluate_requirement(requirement: DocumentRequirement) -> DocumentRequireme
     a precondition for matching. An unknown template ID is therefore
     evaluated exactly like any other requirement (missing/partial/
     present), never short-circuited to not_applicable.
+
+    Phase 17D: matching is scoped by the requirement's ROADMAP (plus
+    Object ID as a secondary consistency check), not by the stage the
+    requirement happens to be configured on — see
+    _current_valid_documents_for()'s own docstring for the full
+    rationale. requirement.stage_id is still carried on the requirement
+    (and still recorded on the DOCUMENT_REGISTRY row it matched, if
+    any) purely as provenance.
     """
-    matched_ids = _current_valid_documents_for(requirement.stage_id, requirement.document_template_id)
+    matched_ids = _current_valid_documents_for(
+        requirement.roadmap_id, requirement.document_template_id, requirement.object_id
+    )
     matched_count = len(matched_ids)
 
     if not requirement.required:

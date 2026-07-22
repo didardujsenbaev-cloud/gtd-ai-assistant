@@ -327,7 +327,7 @@ class TestOptionalAndMinimumCount(_PatchedCase):
         dr = self._dr(documents=[_doc_row()])
         req = dr.DocumentRequirement(
             requirement_id="STAGE-001:DOC-001", document_template_id="DOC-001",
-            stage_id="STAGE-001", required=False,
+            stage_id="STAGE-001", roadmap_id="RM-001", required=False,
         )
         result = dr._evaluate_requirement(req)
         self.assertEqual(result.status, dr.STATUS_PRESENT)
@@ -351,7 +351,7 @@ class TestOptionalAndMinimumCount(_PatchedCase):
         dr = self._dr(documents=[_doc_row()])
         req = dr.DocumentRequirement(
             requirement_id="STAGE-001:DOC-001", document_template_id="DOC-001",
-            stage_id="STAGE-001", minimum_count=2,
+            stage_id="STAGE-001", roadmap_id="RM-001", minimum_count=2,
         )
         result = dr._evaluate_requirement(req)
         self.assertEqual(result.matched_count, 1)
@@ -365,7 +365,7 @@ class TestOptionalAndMinimumCount(_PatchedCase):
         ])
         req = dr.DocumentRequirement(
             requirement_id="STAGE-001:DOC-001", document_template_id="DOC-001",
-            stage_id="STAGE-001", minimum_count=2,
+            stage_id="STAGE-001", roadmap_id="RM-001", minimum_count=2,
         )
         result = dr._evaluate_requirement(req)
         self.assertEqual(result.matched_count, 2)
@@ -400,23 +400,49 @@ class TestMatchingRules(_PatchedCase):
         self.assertNotIn("document_intelligence", source)
         self.assertNotIn("document_query", source)
 
-    def test_wrong_stage_document_does_not_count(self):
-        dr = self._dr(documents=[_doc_row(**{"Stage ID": "STAGE-002"})])  # right template, wrong stage
+    def test_same_roadmap_different_stage_document_now_counts(self):
+        """Phase 17D: STAGE-001 and STAGE-002 both belong to RM-001. A
+        document registered against STAGE-002 must now satisfy a
+        requirement configured on STAGE-001 — satisfaction is scoped by
+        Roadmap, not by the exact stage the document was registered
+        against. Stage ID is retained on the document purely as
+        provenance (formerly this was STATUS_MISSING under the Phase
+        17A stage-exclusive matcher)."""
+        dr = self._dr(documents=[_doc_row(**{"Stage ID": "STAGE-002"})])
         summary = dr.evaluate_stage_requirements("STAGE-001")
-        self.assertEqual(summary.items[0].status, dr.STATUS_MISSING)
+        self.assertEqual(summary.items[0].status, dr.STATUS_PRESENT)
+        self.assertEqual(summary.items[0].matched_document_ids, ("DREG-001",))
 
     def test_wrong_roadmap_document_does_not_count(self):
-        # STAGE-999 belongs to RM-002; a document registered against
-        # STAGE-001 (RM-001) must not satisfy STAGE-999's requirement,
-        # even though both reference DOC-001.
+        # STAGE-999 belongs to RM-002; a document registered under
+        # RM-001 (regardless of which of RM-001's stages it names) must
+        # not satisfy STAGE-999's requirement, even though both
+        # reference DOC-001 — Roadmap ID is still the decisive key.
         dr = self._dr(documents=[_doc_row(**{"Stage ID": "STAGE-001"})])
         summary = dr.evaluate_stage_requirements("STAGE-999")
         self.assertEqual(summary.items[0].status, dr.STATUS_MISSING)
 
-    def test_document_with_no_stage_id_does_not_count(self):
+    def test_same_object_but_different_roadmap_document_does_not_count(self):
+        """Roadmap ID is decisive even when Object ID happens to match
+        — a document mistakenly tagged with the same Object ID as the
+        requirement's roadmap, but a different Roadmap ID, must not
+        satisfy the requirement. Guards against Object ID ever acting
+        as a fallback that alone can satisfy a Roadmap ID mismatch."""
+        dr = self._dr(documents=[_doc_row(**{
+            "Roadmap ID": "RM-002", "Stage ID": "STAGE-999", "Object ID": "OBJ-001",
+        })])
+        summary = dr.evaluate_stage_requirements("STAGE-001")  # STAGE-001 -> RM-001, Object OBJ-001
+        self.assertEqual(summary.items[0].status, dr.STATUS_MISSING)
+
+    def test_document_with_no_stage_id_now_counts(self):
+        """Phase 17D: a document registered with a blank Stage ID (but
+        the correct Roadmap ID) must still satisfy the requirement —
+        Stage ID is provenance only, never a precondition (formerly
+        this was STATUS_MISSING under the Phase 17A stage-exclusive
+        matcher)."""
         dr = self._dr(documents=[_doc_row(**{"Stage ID": ""})])
         summary = dr.evaluate_stage_requirements("STAGE-001")
-        self.assertEqual(summary.items[0].status, dr.STATUS_MISSING)
+        self.assertEqual(summary.items[0].status, dr.STATUS_PRESENT)
 
     def test_uploaded_status_counts(self):
         dr = self._dr(documents=[_doc_row(**{"Status": "uploaded"})])
@@ -437,6 +463,53 @@ class TestMatchingRules(_PatchedCase):
         dr = self._dr(documents=[_doc_row(**{"Status": ""})])
         summary = dr.evaluate_stage_requirements("STAGE-001")
         self.assertEqual(summary.items[0].status, dr.STATUS_MISSING)
+
+    def test_different_template_id_does_not_count(self):
+        """Same roadmap, same stage, but a different Document Template
+        ID — must never satisfy STAGE-001's requirement for DOC-001."""
+        dr = self._dr(documents=[_doc_row(**{"Document Template ID": "DOC-999"})])
+        summary = dr.evaluate_stage_requirements("STAGE-001")
+        self.assertEqual(summary.items[0].status, dr.STATUS_MISSING)
+
+    def test_stage_id_still_recorded_as_provenance_not_used_for_matching(self):
+        """Phase 17D: the requirement's own stage_id/scope_id are still
+        populated (provenance/display), and the matched document's
+        Stage ID is preserved on the DOCUMENT_REGISTRY row — but neither
+        is read by the matcher itself. Confirms 'existing Stage-specific
+        behavior remains compatible': stage-level requirement lookup,
+        rendering, and result-object shape are all unchanged."""
+        dr = self._dr(documents=[_doc_row(**{"Stage ID": "STAGE-002"})])
+        summary = dr.evaluate_stage_requirements("STAGE-001")
+        item = summary.items[0]
+        self.assertEqual(item.requirement.stage_id, "STAGE-001")
+        self.assertEqual(item.requirement.scope_id, "STAGE-001")
+        self.assertEqual(item.requirement.roadmap_id, "RM-001")
+        self.assertEqual(item.status, dr.STATUS_PRESENT)  # matched despite differing Stage ID
+
+    def test_no_duplicate_requirement_output_when_same_template_shared_across_stages(self):
+        """Two different stages of the same roadmap both requiring
+        DOC-001 must remain two distinct DocumentRequirement instances
+        (one per stage, each independently rendered) — roadmap-level
+        matching must not collapse or duplicate them, and both must
+        correctly show as satisfied by the single shared document,
+        without inflating matched_count or satisfied_required beyond
+        what's structurally expected."""
+        dr = self._dr(
+            stages=[
+                {"Stage ID": "STAGE-001", "Roadmap ID": "RM-001", "Document Template IDs": "DOC-001"},
+                {"Stage ID": "STAGE-002", "Roadmap ID": "RM-001", "Document Template IDs": "DOC-001"},
+            ],
+            documents=[_doc_row(**{"Stage ID": "STAGE-001"})],
+        )
+        summary = dr.evaluate_roadmap_requirements("RM-001")
+        self.assertEqual(len(summary.items), 2)
+        self.assertEqual(summary.total_required, 2)
+        self.assertEqual(summary.satisfied_required, 2)
+        req_ids = {item.requirement.requirement_id for item in summary.items}
+        self.assertEqual(req_ids, {"STAGE-001:DOC-001", "STAGE-002:DOC-001"})
+        for item in summary.items:
+            self.assertEqual(item.status, dr.STATUS_PRESENT)
+            self.assertEqual(item.matched_document_ids, ("DREG-001",))
 
 
 # ────────────────────────────────────────────────────────────
