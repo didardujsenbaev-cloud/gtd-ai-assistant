@@ -127,7 +127,21 @@ class DocumentRequirementStatus:
 
 @dataclass(frozen=True)
 class RequirementsSummary:
-    """Immutable aggregate result for a stage, roadmap, or object."""
+    """
+    Immutable aggregate result for a stage, roadmap, or object.
+
+    Phase 18C-4A: `configuration_errors` carries deterministic,
+    human-readable (stage_id, relation_id, reason) tuples for any
+    active document-instance-relation row that was invalid, dangling,
+    or a duplicate — never a raw exception. `has_configuration_errors`
+    is the fail-closed signal: whenever it's True, `is_complete` is
+    forced False regardless of how complete the *valid* requirements
+    happen to be, so a broken relation can never be reported as a
+    safely complete stage. Both fields default to their empty/False
+    state, so any summary built without configuration errors (which is
+    every summary today, since no live stage has instance relations
+    yet) is byte-for-byte identical to before this phase.
+    """
     scope_type: str
     scope_id: str
     items: tuple = ()
@@ -138,6 +152,8 @@ class RequirementsSummary:
     optional_missing: int = 0
     completion_percentage: float = 100.0
     is_complete: bool = True
+    configuration_errors: tuple = ()
+    has_configuration_errors: bool = False
 
 
 def _parse_id_list(raw: str) -> list[str]:
@@ -389,45 +405,107 @@ def _evaluate_requirement(requirement: DocumentRequirement) -> DocumentRequireme
     )
 
 
-def get_requirements_for_stage(stage_id: str) -> tuple:
+def _resolve_stage_requirements_and_errors(stage_id: str) -> tuple:
     """
-    Read-only: the DocumentRequirement tuple for one stage. Empty tuple
-    if the stage doesn't exist or has no requirements — these are
-    treated the same (nothing to evaluate), never an exception.
+    Read-only. Single point of truth for one stage's (requirements,
+    configuration_errors) pair — calls
+    business_core.stage_entity_relations.get_document_requirements_source_for_stage()
+    exactly ONCE (a real Sheets read), so callers that need both the
+    requirements and the configuration errors (evaluate_stage_requirements()
+    and its roadmap/object aggregates) never fetch the same relation
+    data twice. get_requirements_for_stage() and
+    _configuration_errors_for_stage() below are thin single-purpose
+    wrappers over this for callers that only need one side.
 
     Phase 18C-4 source precedence (see
-    business_core.stage_entity_relations.get_document_requirements_source_for_stage()
-    for the exact rule): if this stage has one or more active,
+    get_document_requirements_source_for_stage()'s own docstring for
+    the exact rule): if this stage has one or more active,
     instance-scoped STAGE_ENTITY_RELATIONS rows of Entity Type
     "document_template", those rows are the SOLE source — never merged
     with the legacy comma-list, even partially. Only when zero such
     relations exist does this fall back to the original Phase 17A
     source, ROADMAP_STAGES."Document Template IDs" — this is exactly
     what keeps every existing roadmap (e.g. RM-001) producing identical
-    requirements to before this phase, since none has any instance
+    requirements to before Phase 18C-4, since none has any instance
     relations yet.
+
+    Phase 18C-4A: configuration_errors is a deterministic, displayable
+    tuple of (stage_id, relation_id, reason) — never a raw exception.
+    Deliberately excludes source.unsupported_entity_type_relation_ids —
+    a non-document_template active relation (e.g. a future sop/checklist
+    relation) is normal, expected data, not a document-engine
+    configuration failure.
     """
     from business_core.sheets import find_row_by_id
     from business_core.stage_entity_relations import get_document_requirements_source_for_stage
 
     found = find_row_by_id("roadmap_stages", stage_id)
     if not found:
-        return ()
+        return (), ()
     stage_row = found[1]
+
+    source = get_document_requirements_source_for_stage(stage_id)
+
+    configuration_errors = []
+    for relation_id, reasons in source.validation_errors:
+        for reason in reasons:
+            configuration_errors.append((stage_id, relation_id, reason))
+    for entity_id, relation_ids in source.duplicate_errors:
+        for relation_id in relation_ids:
+            configuration_errors.append(
+                (stage_id, relation_id, f"Duplicate active relation for Entity ID {entity_id!r}.")
+            )
+    configuration_errors = tuple(configuration_errors)
 
     chain = _resolve_scope_chain(stage_id=stage_id, roadmap_id=stage_row.get("Roadmap ID", ""))
 
-    source = get_document_requirements_source_for_stage(stage_id)
     if source.source == "instance_relations":
-        return tuple(_build_requirement_from_relation(stage_id, rel, chain) for rel in source.requirements)
+        requirements = tuple(_build_requirement_from_relation(stage_id, rel, chain) for rel in source.requirements)
+        return requirements, configuration_errors
 
     template_ids = _parse_id_list(stage_row.get("Document Template IDs", ""))
     if not template_ids:
-        return ()
-    return tuple(_build_requirement(stage_id, tid, chain) for tid in template_ids)
+        return (), configuration_errors
+    return tuple(_build_requirement(stage_id, tid, chain) for tid in template_ids), configuration_errors
 
 
-def _summarize(scope_type: str, scope_id: str, statuses: tuple) -> RequirementsSummary:
+def get_requirements_for_stage(stage_id: str) -> tuple:
+    """Read-only: the DocumentRequirement tuple for one stage. Empty
+    tuple if the stage doesn't exist or has no requirements — these
+    are treated the same (nothing to evaluate), never an exception."""
+    requirements, _ = _resolve_stage_requirements_and_errors(stage_id)
+    return requirements
+
+
+def _configuration_errors_for_stage(stage_id: str) -> tuple:
+    """Read-only: just the configuration-errors half of
+    _resolve_stage_requirements_and_errors() — kept as its own function
+    since it's still a meaningful, independently-testable unit, even
+    though evaluate_stage_requirements() below calls the combined
+    resolver directly to avoid a redundant second Sheets read."""
+    _, configuration_errors = _resolve_stage_requirements_and_errors(stage_id)
+    return configuration_errors
+
+
+def _stage_ids_for_roadmap(roadmap_id: str) -> tuple:
+    from business_core.sheets import read_business_sheet
+
+    return tuple(
+        row.get("Stage ID", "") for row in read_business_sheet("roadmap_stages")
+        if row.get("Roadmap ID", "") == roadmap_id
+    )
+
+
+def _roadmap_ids_for_object(object_id: str) -> tuple:
+    from business_core.sheets import read_business_sheet
+
+    return tuple(
+        row.get("Roadmap ID", "") for row in read_business_sheet("roadmaps")
+        if row.get("Object ID", "") == object_id
+    )
+
+
+def _summarize(scope_type: str, scope_id: str, statuses: tuple, configuration_errors: tuple = ()) -> RequirementsSummary:
     countable = [s for s in statuses if s.status != STATUS_NOT_APPLICABLE and s.requirement.required]
     total_required = len(countable)
     satisfied_required = sum(1 for s in countable if s.is_satisfied)
@@ -438,7 +516,11 @@ def _summarize(scope_type: str, scope_id: str, statuses: tuple) -> RequirementsS
     completion_percentage = 100.0 if total_required == 0 else round(
         (satisfied_required / total_required) * 100, 2
     )
-    is_complete = missing_required == 0 and blocking_missing == 0
+    has_configuration_errors = bool(configuration_errors)
+    # Fail closed: a configuration error means the stage can never be
+    # reported as safely complete, regardless of how complete the
+    # *valid* requirements happen to be.
+    is_complete = missing_required == 0 and blocking_missing == 0 and not has_configuration_errors
 
     return RequirementsSummary(
         scope_type=scope_type,
@@ -451,37 +533,47 @@ def _summarize(scope_type: str, scope_id: str, statuses: tuple) -> RequirementsS
         optional_missing=optional_missing,
         completion_percentage=completion_percentage,
         is_complete=is_complete,
+        configuration_errors=configuration_errors,
+        has_configuration_errors=has_configuration_errors,
     )
 
 
 def evaluate_stage_requirements(stage_id: str) -> RequirementsSummary:
-    """Read-only. Evaluates every requirement for one stage."""
-    requirements = get_requirements_for_stage(stage_id)
+    """Read-only. Evaluates every requirement for one stage. Calls the
+    combined resolver once (not get_requirements_for_stage() +
+    _configuration_errors_for_stage() separately) to avoid a redundant
+    second STAGE_ENTITY_RELATIONS read."""
+    requirements, configuration_errors = _resolve_stage_requirements_and_errors(stage_id)
     statuses = tuple(_evaluate_requirement(r) for r in requirements)
-    return _summarize("stage", stage_id, statuses)
+    return _summarize("stage", stage_id, statuses, configuration_errors=configuration_errors)
 
 
 def get_requirements_for_roadmap(roadmap_id: str) -> tuple:
     """Read-only: concatenation of get_requirements_for_stage() over
     every stage belonging to this roadmap — a roadmap has no
     independent requirement source of its own (see module docstring)."""
-    from business_core.sheets import read_business_sheet
-
-    stage_ids = [
-        row.get("Stage ID", "") for row in read_business_sheet("roadmap_stages")
-        if row.get("Roadmap ID", "") == roadmap_id
-    ]
     requirements: list = []
-    for stage_id in stage_ids:
+    for stage_id in _stage_ids_for_roadmap(roadmap_id):
         requirements.extend(get_requirements_for_stage(stage_id))
     return tuple(requirements)
 
 
 def evaluate_roadmap_requirements(roadmap_id: str) -> RequirementsSummary:
-    """Read-only aggregate over every stage of this roadmap."""
-    requirements = get_requirements_for_roadmap(roadmap_id)
-    statuses = tuple(_evaluate_requirement(r) for r in requirements)
-    return _summarize("roadmap", roadmap_id, statuses)
+    """Read-only aggregate over every stage of this roadmap. A
+    configuration error on ANY constituent stage propagates upward —
+    the roadmap can never be reported safely complete while a child
+    stage has broken relation data, in deterministic stage order. Calls
+    the combined per-stage resolver once per stage (not
+    get_requirements_for_roadmap() + a separate error-collection pass)
+    to avoid a redundant second STAGE_ENTITY_RELATIONS read per stage."""
+    all_requirements: list = []
+    all_errors: list = []
+    for stage_id in _stage_ids_for_roadmap(roadmap_id):
+        reqs, errs = _resolve_stage_requirements_and_errors(stage_id)
+        all_requirements.extend(reqs)
+        all_errors.extend(errs)
+    statuses = tuple(_evaluate_requirement(r) for r in all_requirements)
+    return _summarize("roadmap", roadmap_id, statuses, configuration_errors=tuple(all_errors))
 
 
 def get_requirements_for_object(object_id: str) -> tuple:
@@ -489,20 +581,24 @@ def get_requirements_for_object(object_id: str) -> tuple:
     every roadmap whose Object ID matches — an object has no
     independent requirement source of its own either (see module
     docstring); it is reached only through its roadmap(s)."""
-    from business_core.sheets import read_business_sheet
-
-    roadmap_ids = [
-        row.get("Roadmap ID", "") for row in read_business_sheet("roadmaps")
-        if row.get("Object ID", "") == object_id
-    ]
     requirements: list = []
-    for roadmap_id in roadmap_ids:
+    for roadmap_id in _roadmap_ids_for_object(object_id):
         requirements.extend(get_requirements_for_roadmap(roadmap_id))
     return tuple(requirements)
 
 
 def evaluate_object_requirements(object_id: str) -> RequirementsSummary:
-    """Read-only aggregate over every roadmap tied to this object."""
-    requirements = get_requirements_for_object(object_id)
-    statuses = tuple(_evaluate_requirement(r) for r in requirements)
-    return _summarize("object", object_id, statuses)
+    """Read-only aggregate over every roadmap tied to this object. A
+    configuration error on any descendant stage propagates all the way
+    up, in deterministic roadmap-then-stage order. Calls the combined
+    per-stage resolver once per stage, same reasoning as
+    evaluate_roadmap_requirements()."""
+    all_requirements: list = []
+    all_errors: list = []
+    for roadmap_id in _roadmap_ids_for_object(object_id):
+        for stage_id in _stage_ids_for_roadmap(roadmap_id):
+            reqs, errs = _resolve_stage_requirements_and_errors(stage_id)
+            all_requirements.extend(reqs)
+            all_errors.extend(errs)
+    statuses = tuple(_evaluate_requirement(r) for r in all_requirements)
+    return _summarize("object", object_id, statuses, configuration_errors=tuple(all_errors))

@@ -1034,6 +1034,25 @@ class TestMissingDocsCmd(unittest.TestCase):
         self.assertIn("test_document_name", reply)
         self.assertIn("DOC_001", reply)
 
+    def test_configuration_error_warning_surfaced(self):
+        """Phase 18C-4A: all valid requirements satisfied, but an active
+        configuration error must still produce a visible warning and
+        must NEVER print the plain '✅ Все обязательные документы
+        собраны.' headline."""
+        req = _req17b()
+        status = _status17b(req, status="present", matched_document_ids=("DREG-001",), matched_count=1)
+        summary = _summary17b(
+            items=(status,),
+            configuration_errors=(("STAGE-001", "REL-100", "Minimum Count must be >= 1, got '0'."),),
+            has_configuration_errors=True,
+        )
+        update, context = self._run("/missingdocs stage_id=STAGE-001", _scope_result17b(summary=summary))
+        reply = update.message.reply_text.call_args[0][0]
+        self.assertNotIn("✅ Все обязательные документы собраны.", reply)
+        self.assertIn("⚠️ Ошибка настройки требований к документам.", reply)
+        self.assertIn("REL-100", reply)
+        self.assertIn("Minimum Count must be >= 1", reply)
+
 
 class TestDocsRequiredCmd(unittest.TestCase):
     def _run(self, cmdline, result):
@@ -1151,6 +1170,22 @@ class TestDocsRequiredCmd(unittest.TestCase):
         all_text = "\n".join(c.args[0] for c in update.message.reply_text.call_args_list)
         for i in range(200):
             self.assertIn(f"Document Template ID: DOC-{i:03d}", all_text)
+
+    def test_configuration_error_warning_surfaced(self):
+        req = _req17b()
+        status = _status17b(req, status="present", matched_document_ids=("DREG-001",), matched_count=1)
+        summary = _summary17b(
+            items=(status,),
+            configuration_errors=(("STAGE-001", "REL-100", "Entity ID 'DOC-999' not found in document_template_registry."),),
+            has_configuration_errors=True,
+            is_complete=False,
+        )
+        update, context = self._run("/docsrequired stage_id=STAGE-001", _scope_result17b(summary=summary))
+        reply = update.message.reply_text.call_args[0][0]
+        self.assertIn("Complete: no", reply)
+        self.assertIn("⚠️ Ошибка настройки требований к документам.", reply)
+        self.assertIn("REL-100", reply)
+        self.assertIn("DOC-999", reply)
 
 
 class TestSplitMessageByLines(unittest.TestCase):
@@ -1456,6 +1491,171 @@ class TestDualSourceRequirements(_PatchedCase):
             for forbidden in ("append_business_row", "update_business_row", "update_business_cell",
                               "batch_append_business_rows", "generate_next_id"):
                 self.assertNotIn(forbidden, source)
+
+
+# ────────────────────────────────────────────────────────────
+# Phase 18C-4A: invalid-relation fail-closed configuration-error surfacing
+# ────────────────────────────────────────────────────────────
+
+class TestConfigurationErrorSurfacing(_PatchedCase):
+    def test_invalid_active_relation_produces_configuration_error(self):
+        dr = self._dr(relations=[_instance_rel(**{"Required": "yes"})])
+        summary = dr.evaluate_stage_requirements("STAGE-001")
+        self.assertTrue(summary.has_configuration_errors)
+        self.assertEqual(len(summary.configuration_errors), 1)
+        stage_id, relation_id, reason = summary.configuration_errors[0]
+        self.assertEqual(stage_id, "STAGE-001")
+        self.assertEqual(relation_id, "REL-100")
+        self.assertIn("Required must be", reason)
+
+    def test_invalid_relation_not_silently_replaced_by_legacy(self):
+        """STAGE-001's legacy Document Template IDs is 'DOC-001' — an
+        invalid active instance relation must NOT cause DOC-001 to
+        silently appear as a requirement."""
+        dr = self._dr(relations=[_instance_rel(**{"Required": "yes", "Entity ID": "DOC-002"})])
+        summary = dr.evaluate_stage_requirements("STAGE-001")
+        self.assertEqual(summary.items, ())  # nothing valid to evaluate
+        self.assertTrue(summary.has_configuration_errors)
+
+    def test_valid_relations_still_appear_alongside_warning(self):
+        dr = self._dr(relations=[
+            _instance_rel(**{"Relation ID": "REL-100", "Entity ID": "DOC-002"}),
+            _instance_rel(**{"Relation ID": "REL-101", "Entity ID": "DOC-999"}),  # dangling
+        ])
+        summary = dr.evaluate_stage_requirements("STAGE-001")
+        self.assertEqual(len(summary.items), 1)
+        self.assertEqual(summary.items[0].requirement.document_template_id, "DOC-002")
+        self.assertTrue(summary.has_configuration_errors)
+
+    def test_stage_with_config_error_cannot_be_safely_complete(self):
+        dr = self._dr(
+            relations=[
+                _instance_rel(**{"Relation ID": "REL-100", "Entity ID": "DOC-002"}),
+                _instance_rel(**{"Relation ID": "REL-101", "Entity ID": "DOC-999"}),  # dangling
+            ],
+            documents=[_doc_row(**{"Document Template ID": "DOC-002"})],
+        )
+        summary = dr.evaluate_stage_requirements("STAGE-001")
+        # the one VALID requirement is fully satisfied...
+        self.assertEqual(summary.missing_required, 0)
+        self.assertEqual(summary.blocking_missing, 0)
+        # ...but the stage must still never be reported safely complete
+        self.assertFalse(summary.is_complete)
+
+    def test_duplicate_active_relation_produces_warning(self):
+        dr = self._dr(relations=[
+            _instance_rel(**{"Relation ID": "REL-100", "Entity ID": "DOC-002"}),
+            _instance_rel(**{"Relation ID": "REL-101", "Entity ID": "DOC-002"}),
+        ])
+        summary = dr.evaluate_stage_requirements("STAGE-001")
+        self.assertTrue(summary.has_configuration_errors)
+        self.assertTrue(any("Duplicate active relation" in reason for _, _, reason in summary.configuration_errors))
+
+    def test_dangling_entity_id_produces_warning(self):
+        dr = self._dr(relations=[_instance_rel(**{"Entity ID": "DOC-999"})])
+        summary = dr.evaluate_stage_requirements("STAGE-001")
+        self.assertTrue(summary.has_configuration_errors)
+        self.assertTrue(any("DOC-999" in reason for _, _, reason in summary.configuration_errors))
+
+    def test_multiple_errors_preserve_deterministic_order(self):
+        relations = [
+            _instance_rel(**{"Relation ID": "REL-100", "Entity ID": "DOC-999"}),   # dangling
+            _instance_rel(**{"Relation ID": "REL-101", "Entity ID": "DOC-002"}),
+            _instance_rel(**{"Relation ID": "REL-102", "Entity ID": "DOC-002"}),   # duplicate of REL-101
+        ]
+        dr = self._dr(relations=relations)
+        summary1 = dr.evaluate_stage_requirements("STAGE-001")
+        summary2 = dr.evaluate_stage_requirements("STAGE-001")
+        self.assertEqual(summary1.configuration_errors, summary2.configuration_errors)
+        relation_ids_in_order = [rid for _, rid, _ in summary1.configuration_errors]
+        # REL-100: dangling (validation error). REL-101/REL-102: both
+        # sides of the duplicate are reported, in sheet order.
+        self.assertEqual(relation_ids_in_order, ["REL-100", "REL-101", "REL-102"])
+
+    def test_roadmap_aggregate_propagates_stage_configuration_error(self):
+        dr = self._dr(relations=[_instance_rel(**{
+            "Relation ID": "REL-100", "Stage ID": "STAGE-002", "Entity ID": "DOC-999",
+        })])
+        roadmap_summary = dr.evaluate_roadmap_requirements("RM-001")
+        self.assertTrue(roadmap_summary.has_configuration_errors)
+        self.assertFalse(roadmap_summary.is_complete)
+        self.assertEqual(roadmap_summary.configuration_errors[0][0], "STAGE-002")
+
+    def test_object_aggregate_propagates_configuration_error(self):
+        dr = self._dr(relations=[_instance_rel(**{
+            "Relation ID": "REL-100", "Stage ID": "STAGE-002", "Entity ID": "DOC-999",
+        })])
+        object_summary = dr.evaluate_object_requirements("OBJ-001")
+        self.assertTrue(object_summary.has_configuration_errors)
+        self.assertFalse(object_summary.is_complete)
+
+    def test_legacy_only_rm001_shaped_stage_byte_for_byte_unchanged(self):
+        """No relations at all (RM-001's real shape today): configuration
+        fields are at their empty/False defaults, and is_complete is
+        driven purely by the pre-existing legacy math (no documents
+        registered -> DOC-001 missing -> not complete), exactly as
+        before this phase — never forced False by a configuration error."""
+        dr = self._dr(relations=[])
+        summary = dr.evaluate_stage_requirements("STAGE-001")
+        self.assertFalse(summary.has_configuration_errors)
+        self.assertEqual(summary.configuration_errors, ())
+        self.assertEqual(len(summary.items), 1)
+        self.assertEqual(summary.items[0].requirement.document_template_id, "DOC-001")
+        self.assertFalse(summary.is_complete)  # DOC-001 missing (no documents registered) — unrelated to this phase
+        self.assertEqual(summary.missing_required, 1)
+
+    def test_valid_instance_relation_stage_unchanged_by_this_phase(self):
+        dr = self._dr(relations=[_instance_rel(**{"Entity ID": "DOC-002"})])
+        summary = dr.evaluate_stage_requirements("STAGE-001")
+        self.assertFalse(summary.has_configuration_errors)
+        self.assertEqual(len(summary.items), 1)
+
+    def test_inactive_invalid_relation_does_not_create_warning(self):
+        dr = self._dr(relations=[_instance_rel(**{"Required": "yes", "Status": "inactive"})])
+        summary = dr.evaluate_stage_requirements("STAGE-001")
+        self.assertFalse(summary.has_configuration_errors)
+        self.assertEqual(summary.items[0].requirement.document_template_id, "DOC-001")  # legacy fallback
+
+    def test_template_scoped_invalid_relation_does_not_affect_instantiated_read(self):
+        dr = self._dr(relations=[_instance_rel(**{
+            "Relation ID": "REL-100", "Template Stage ID": "TSTG-999", "Stage ID": "",
+            "Required": "yes",  # invalid, but template-scoped only
+        })])
+        summary = dr.evaluate_stage_requirements("STAGE-001")
+        self.assertFalse(summary.has_configuration_errors)
+        self.assertEqual(summary.items[0].requirement.document_template_id, "DOC-001")  # legacy fallback
+
+    def test_unrelated_future_non_document_relation_does_not_break_completion(self):
+        dr = self._dr(relations=[_instance_rel(**{
+            "Relation ID": "REL-200", "Entity Type": "sop", "Entity ID": "SOP-001",
+        })])
+        summary = dr.evaluate_stage_requirements("STAGE-001")
+        self.assertFalse(summary.has_configuration_errors)
+        self.assertEqual(summary.items[0].requirement.document_template_id, "DOC-001")  # legacy fallback, sop ignored
+
+    def test_no_writes_in_configuration_error_helpers(self):
+        import inspect
+        dr = self._dr()
+        for fn in (dr._configuration_errors_for_stage,):
+            source = inspect.getsource(fn)
+            for forbidden in ("append_business_row", "update_business_row", "update_business_cell",
+                              "batch_append_business_rows", "generate_next_id"):
+                self.assertNotIn(forbidden, source)
+
+    def test_existing_document_matching_unchanged(self):
+        """Full satisfaction matching (Phase 17D roadmap-level reuse)
+        still works correctly for a stage that also happens to have a
+        configuration error elsewhere on it."""
+        dr = self._dr(
+            relations=[
+                _instance_rel(**{"Relation ID": "REL-100", "Entity ID": "DOC-002"}),
+                _instance_rel(**{"Relation ID": "REL-101", "Entity ID": "DOC-999"}),  # dangling, unrelated
+            ],
+            documents=[_doc_row(**{"Document Template ID": "DOC-002", "Stage ID": "STAGE-002"})],
+        )
+        summary = dr.evaluate_stage_requirements("STAGE-001")
+        satisfied_item = next(i for i in summary.items if i.requirement.document_template_id == "DOC-002")
+        self.assertEqual(satisfied_item.status, dr.STATUS_PRESENT)
 
 
 if __name__ == "__main__":

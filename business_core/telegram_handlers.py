@@ -4379,6 +4379,28 @@ def _scope_header_lines(result) -> list:
     return [f"{label}: {result.scope_id}"]
 
 
+def _configuration_error_warning_lines(summary) -> list:
+    """
+    Phase 18C-4A: rendered only when summary.has_configuration_errors
+    is True (never for any summary produced before this phase, since
+    the field defaults to False) — never a stack trace, only the
+    existing human-readable validation-error strings already produced
+    by business_core.stage_entity_relations.
+    """
+    if not getattr(summary, "has_configuration_errors", False):
+        return []
+    lines = [
+        "⚠️ Ошибка настройки требований к документам.",
+        "Некоторые связи этапа повреждены или дублируются.",
+        "Требуется проверка администратора.",
+        "",
+    ]
+    for stage_id, relation_id, reason in summary.configuration_errors:
+        lines.append(f"- Stage ID: {stage_id or '—'}, Relation ID: {relation_id or '—'}")
+        lines.append(f"  Причина: {reason}")
+    return lines
+
+
 async def missingdocs_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/missingdocs stage_id=... | roadmap_id=... | object_id=... — read-only."""
     if not _is_bc_enabled():
@@ -4401,7 +4423,7 @@ async def missingdocs_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             return
 
         summary = result.summary
-        if not summary.items:
+        if not summary.items and not summary.has_configuration_errors:
             await _reply(update, _ZERO_CONFIGURED_RU[scope_type], parse_mode=None)
             return
 
@@ -4415,7 +4437,7 @@ async def missingdocs_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         ]
 
         lines = []
-        if not unsatisfied:
+        if not unsatisfied and not summary.has_configuration_errors:
             lines.append("✅ Все обязательные документы собраны.")
             lines.append("")
             lines.extend(_scope_header_lines(result))
@@ -4423,7 +4445,10 @@ async def missingdocs_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             lines.append(f"Satisfied: {summary.satisfied_required}")
             lines.append(f"Completion percentage: {summary.completion_percentage}")
         else:
-            lines.append("❌ Не хватает обязательных документов")
+            if unsatisfied:
+                lines.append("❌ Не хватает обязательных документов")
+            else:
+                lines.append("❌ Настройка требований содержит ошибки")
             lines.append("")
             lines.extend(_scope_header_lines(result))
             lines.append(f"Required total: {summary.total_required}")
@@ -4440,6 +4465,10 @@ async def missingdocs_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 lines.append(f"  Matched count / Minimum count: {item.matched_count}/{req.minimum_count}")
                 lines.append(f"  Status: {_STATUS_LABELS_RU.get(item.status, item.status)}")
                 lines.append(f"  Blocking: {'yes' if item.is_blocking else 'no'}")
+
+        if summary.has_configuration_errors:
+            lines.append("")
+            lines.extend(_configuration_error_warning_lines(summary))
 
         text = "\n".join(lines)
         for part in _split_message_by_lines(text):
@@ -4472,7 +4501,7 @@ async def docsrequired_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             return
 
         summary = result.summary
-        if not summary.items:
+        if not summary.items and not summary.has_configuration_errors:
             await _reply(update, _ZERO_CONFIGURED_RU[scope_type], parse_mode=None)
             return
 
@@ -4498,6 +4527,10 @@ async def docsrequired_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             lines.append(f"  Matched count / Minimum count: {item.matched_count}/{req.minimum_count}")
             lines.append(f"  Required: {'yes' if req.required else 'no'}")
             lines.append(f"  Blocking: {'yes' if req.blocking else 'no'}")
+
+        if summary.has_configuration_errors:
+            lines.append("")
+            lines.extend(_configuration_error_warning_lines(summary))
 
         text = "\n".join(lines)
         for part in _split_message_by_lines(text):
