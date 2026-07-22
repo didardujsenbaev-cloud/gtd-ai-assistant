@@ -53,6 +53,8 @@ BUSINESS_SHEET_NAMES: dict[str, str] = {
     "document_registry":          "DOCUMENT_REGISTRY",
     # Phase 16A: Document Intelligence Foundation
     "document_content":           "DOCUMENT_CONTENT",
+    # Phase 18C-1: Stage-to-Entity Relation Foundation
+    "stage_entity_relations":     "STAGE_ENTITY_RELATIONS",
 }
 
 BUSINESS_HEADERS: dict[str, list[str]] = {
@@ -277,6 +279,21 @@ BUSINESS_HEADERS: dict[str, list[str]] = {
         "Analysis Started At", "Analysis Completed At", "Analysis Error",
         "Created At", "Updated At",
     ],
+    # Phase 18C-1: Stage-to-Entity Relation Foundation.
+    # One row = one stage<->entity relationship. Exactly one of
+    # "Template Stage ID"/"Stage ID" is populated per row (see
+    # business_core/stage_entity_relations.py for the validation rule
+    # and the read-only helpers). Deliberately NOT a generic graph:
+    # only "Entity Type"/"Entity ID" vary; the relation direction is
+    # always stage -> entity. No Role/Allowed Statuses/Display
+    # Order/Conditional Rule/Metadata JSON/Inherited From Relation ID
+    # columns yet — none has a current consumer (see Phase 18B audit).
+    "stage_entity_relations": [
+        "Relation ID", "Template Stage ID", "Stage ID",
+        "Entity Type", "Entity ID",
+        "Required", "Blocking", "Minimum Count", "Status",
+        "Created At", "Updated At",
+    ],
 }
 
 # ID-префиксы для generate_next_id
@@ -301,6 +318,8 @@ _ID_PREFIXES: dict[str, str] = {
     # Phase 15A: "DOC" already taken by document_template_registry above —
     # deliberately different prefix, see schema comment in BUSINESS_HEADERS.
     "document_registry":          "DREG",
+    # Phase 18C-1
+    "stage_entity_relations":     "REL",
 }
 
 
