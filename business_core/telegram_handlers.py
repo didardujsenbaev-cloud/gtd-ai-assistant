@@ -2418,6 +2418,16 @@ async def startroadmap_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
         lines.append(f"\nПросмотр этапов: `/stages roadmap_id={roadmap_id}`")
 
+        # Phase 18C-3: этапы уже созданы независимо от этого — ошибка
+        # копирования relation-строк не меняет ничего выше, только
+        # добавляет отдельное предупреждение, если она произошла.
+        if stages_result.get("relation_copy_errors"):
+            lines.append(
+                f"\n⚠️ Часть связей документов не скопирована для "
+                f"{len(stages_result['relation_copy_errors'])} этап(ов). "
+                f"Этапы созданы корректно; связи можно досоздать позже."
+            )
+
         await _reply(update, "\n".join(lines))
 
     except Exception as e:

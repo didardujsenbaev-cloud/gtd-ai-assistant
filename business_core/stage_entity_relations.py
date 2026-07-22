@@ -13,12 +13,13 @@ relation from an instantiated-roadmap-level relation (mirroring the
 same stage_template_id/stage_id pair already reserved, but unused, on
 business_core.document_requirements.DocumentRequirement).
 
-This module is strictly read-only and additive: it does not write any
-relation row, does not migrate the existing "Document Template IDs"
-comma-list columns, and is not yet consulted by
-business_core.document_requirements.py or any Telegram command. It
-only reads via business_core.sheets' existing
-read_business_sheet()/find_row_by_id().
+Most of this module is read-only and additive. The one exception is
+copy_template_relations_to_stage() (Phase 18C-3), which creates new
+INSTANCE-scoped relation rows (never touches template-scoped rows,
+never migrates the existing "Document Template IDs" comma-list
+columns). Nothing in this module is yet consulted by
+business_core.document_requirements.py or any Telegram command for
+requirement evaluation.
 
 Entity Type support is deliberately extensible without a schema
 change: adding a new type is one new entry in ENTITY_TYPE_DISPATCH,
@@ -380,4 +381,164 @@ def compare_legacy_document_relations() -> DocumentRelationAudit:
         total_legacy_configured_stages=total_legacy_configured,
         total_new_configured_stages=total_new_configured,
         is_globally_consistent=is_globally_consistent,
+    )
+
+
+# ─────────────────────────────────────────────────────────────
+# Phase 18C-3: template -> instance relation inheritance
+# ─────────────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class CopyRelationsResult:
+    """
+    Result of copy_template_relations_to_stage(). `ok=False` means
+    nothing was written this call (either a precondition failed or a
+    source relation was structurally/referentially invalid) — creation
+    is all-or-nothing per call, never a partial copy of only the valid
+    subset, so a retry after fixing the underlying data cannot leave
+    stray duplicate-of-half rows behind.
+
+    `skipped_duplicates` (source Relation ID -> already-existing
+    destination Relation ID) is NOT an error — it is exactly what makes
+    a retry after a partial multi-stage failure idempotent: relations
+    already copied for this stage are recognized and left alone,
+    the remaining ones are created.
+    """
+    template_stage_id: str
+    stage_id: str
+    created: tuple = ()             # tuple of the new relation row dicts, in source order
+    skipped_duplicates: tuple = ()  # tuple of (source_relation_id, existing_destination_relation_id)
+    errors: tuple = ()              # tuple of (source_relation_id_or_marker, (error strings...))
+    ok: bool = True
+
+
+def copy_template_relations_to_stage(
+    template_stage_id: str, stage_id: str, timestamp: str | None = None
+) -> CopyRelationsResult:
+    """
+    Copy every ACTIVE template-scoped relation of `template_stage_id`
+    into new instance-scoped (Stage ID = `stage_id`) relation rows.
+
+    Deliberately generic over Entity Type — it copies whatever active
+    relations exist on the source template stage (today always
+    document_template, since that is the only ENTITY_TYPE_DISPATCH
+    entry), never hardcoding a document-only branch. A future Entity
+    Type is copied automatically the moment it has a dispatch entry
+    and a source relation row — no change needed here.
+
+    Preconditions enforced BEFORE any write:
+      - the destination ROADMAP_STAGE must already exist (never create
+        a relation before its stage exists);
+      - every source relation must pass both validate_relation_record()
+        and validate_relation_references() — an invalid/dangling
+        source relation aborts the whole call with a clear error,
+        rather than being silently skipped or partially copied.
+
+    Idempotent: a relation whose (Stage ID, Entity Type, Entity ID)
+    already exists as an ACTIVE destination relation is recognized via
+    find_active_duplicate_relation() and skipped, not recreated — a
+    retry after a partial multi-stage failure therefore never produces
+    duplicate active instance relations.
+
+    Performs no legacy "Document Template IDs" column changes — that
+    inheritance path is untouched and unrelated to this function.
+    """
+    from business_core.sheets import (
+        find_row_by_id, generate_next_ids, batch_append_business_rows,
+        get_business_sheet, row_from_header_map,
+    )
+    from datetime import datetime
+
+    if not template_stage_id or not stage_id:
+        return CopyRelationsResult(
+            template_stage_id=template_stage_id, stage_id=stage_id,
+            errors=(("__precondition__", ("template_stage_id and stage_id are both required.",)),),
+            ok=False,
+        )
+
+    if find_row_by_id("roadmap_stages", stage_id) is None:
+        return CopyRelationsResult(
+            template_stage_id=template_stage_id, stage_id=stage_id,
+            errors=((
+                "__precondition__",
+                (f"Destination Stage ID {stage_id!r} does not exist yet in ROADMAP_STAGES — "
+                 f"refusing to create relations before its row exists.",),
+            ),),
+            ok=False,
+        )
+
+    source_relations = get_relations_for_template_stage(template_stage_id)  # active only, sheet order
+
+    if not source_relations:
+        return CopyRelationsResult(template_stage_id=template_stage_id, stage_id=stage_id)
+
+    validation_errors = []
+    for rel in source_relations:
+        rel_errors = tuple(validate_relation_record(rel)) + tuple(validate_relation_references(rel))
+        if rel_errors:
+            validation_errors.append((rel.get("Relation ID", ""), rel_errors))
+
+    if validation_errors:
+        return CopyRelationsResult(
+            template_stage_id=template_stage_id, stage_id=stage_id,
+            errors=tuple(validation_errors), ok=False,
+        )
+
+    to_create = []
+    skipped_duplicates = []
+    for rel in source_relations:
+        candidate = {
+            "Template Stage ID": "", "Stage ID": stage_id,
+            "Entity Type": rel.get("Entity Type", ""), "Entity ID": rel.get("Entity ID", ""),
+        }
+        existing = find_active_duplicate_relation(candidate)
+        if existing is not None:
+            skipped_duplicates.append((rel.get("Relation ID", ""), existing.get("Relation ID", "")))
+        else:
+            to_create.append(rel)
+
+    if not to_create:
+        return CopyRelationsResult(
+            template_stage_id=template_stage_id, stage_id=stage_id,
+            skipped_duplicates=tuple(skipped_duplicates),
+        )
+
+    ts = timestamp or datetime.now().strftime("%Y-%m-%d")
+    sheet = get_business_sheet("stage_entity_relations")
+    headers = sheet.row_values(1)
+    new_relation_ids = generate_next_ids("stage_entity_relations", len(to_create))
+
+    rows = []
+    created_records = []
+    for rel, new_id in zip(to_create, new_relation_ids):
+        values = {
+            "Relation ID": new_id,
+            "Template Stage ID": "",
+            "Stage ID": stage_id,
+            "Entity Type": rel.get("Entity Type", ""),
+            "Entity ID": rel.get("Entity ID", ""),
+            "Required": rel.get("Required", ""),
+            "Blocking": rel.get("Blocking", ""),
+            "Minimum Count": rel.get("Minimum Count", ""),
+            "Status": "active",
+            "Created At": ts,
+            "Updated At": ts,
+        }
+        rows.append(row_from_header_map(headers, values))
+        created_records.append(values)
+
+    try:
+        batch_append_business_rows("stage_entity_relations", rows)
+    except Exception as exc:
+        return CopyRelationsResult(
+            template_stage_id=template_stage_id, stage_id=stage_id,
+            skipped_duplicates=tuple(skipped_duplicates),
+            errors=(("__write_failure__", (str(exc),)),),
+            ok=False,
+        )
+
+    return CopyRelationsResult(
+        template_stage_id=template_stage_id, stage_id=stage_id,
+        created=tuple(created_records),
+        skipped_duplicates=tuple(skipped_duplicates),
     )

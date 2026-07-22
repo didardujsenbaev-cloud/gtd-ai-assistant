@@ -409,6 +409,124 @@ class TestCreateStagesFromTemplateRecord(unittest.TestCase):
 
 
 # ────────────────────────────────────────────────────────────
+# Phase 18C-3: create_stages_from_template_record — relation-copy hookup
+# ────────────────────────────────────────────────────────────
+
+class TestCreateStagesFromTemplateRecordRelationCopy(unittest.TestCase):
+    def _template_stages(self, n=2):
+        return [
+            {"stage_id": f"TSTG-{i:03d}", "template_id": "RTMPL-001", "order": str(i),
+             "stage_name": f"Этап {i}", "description": "", "required_docs": "",
+             "responsible": "", "estimated_days": "", "notes": ""}
+            for i in range(1, n + 1)
+        ]
+
+    def _run(self, copy_side_effect, n=2, generated_ids=None):
+        m = _fresh()
+        generated_ids = generated_ids or [f"STAGE-{i:03d}" for i in range(1, n + 1)]
+        with patch.object(m, "find_template_stages", return_value=self._template_stages(n)), \
+             patch("business_core.sheets.get_business_sheet", return_value=_rmstage_sheet()), \
+             patch("business_core.sheets.batch_append_business_rows"), \
+             patch("business_core.knowledge_manager.find_knowledge_by_template_stage", return_value={}), \
+             patch("business_core.sheets.generate_next_ids", return_value=generated_ids), \
+             patch("business_core.stage_entity_relations.copy_template_relations_to_stage",
+                   side_effect=copy_side_effect) as mock_copy:
+            result = m.create_stages_from_template_record("RM-001", "RTMPL-001")
+        return result, mock_copy
+
+    def test_copy_called_once_per_stage_in_order_with_correct_args(self):
+        from business_core.stage_entity_relations import CopyRelationsResult
+
+        def _copy(template_stage_id, stage_id):
+            return CopyRelationsResult(template_stage_id=template_stage_id, stage_id=stage_id, created=())
+
+        result, mock_copy = self._run(_copy)
+        self.assertEqual(mock_copy.call_count, 2)
+        self.assertEqual(
+            [c.args for c in mock_copy.call_args_list],
+            [("TSTG-001", "STAGE-001"), ("TSTG-002", "STAGE-002")],
+        )
+
+    def test_relation_copy_errors_aggregated(self):
+        from business_core.stage_entity_relations import CopyRelationsResult
+
+        def _copy(template_stage_id, stage_id):
+            if template_stage_id == "TSTG-001":
+                return CopyRelationsResult(
+                    template_stage_id=template_stage_id, stage_id=stage_id,
+                    errors=(("REL-X", ("boom",)),), ok=False,
+                )
+            return CopyRelationsResult(template_stage_id=template_stage_id, stage_id=stage_id)
+
+        result, _ = self._run(_copy)
+        self.assertTrue(result["ok"])  # stage creation itself still succeeded
+        self.assertEqual(result["stages_count"], 2)
+        self.assertEqual(len(result["relation_copy_errors"]), 1)
+        self.assertEqual(result["relation_copy_errors"][0][0], "STAGE-001")
+        self.assertEqual(result["relation_copy_errors"][0][1], "TSTG-001")
+
+    def test_relation_copy_created_count_aggregated(self):
+        from business_core.stage_entity_relations import CopyRelationsResult
+
+        def _copy(template_stage_id, stage_id):
+            return CopyRelationsResult(
+                template_stage_id=template_stage_id, stage_id=stage_id,
+                created=({"Entity ID": "DOC-002"},),
+            )
+
+        result, _ = self._run(_copy)
+        self.assertEqual(result["relation_copy_created_count"], 2)  # 2 stages x 1 created each
+
+    def test_zero_relations_case_still_succeeds(self):
+        from business_core.stage_entity_relations import CopyRelationsResult
+
+        def _copy(template_stage_id, stage_id):
+            return CopyRelationsResult(template_stage_id=template_stage_id, stage_id=stage_id, created=())
+
+        result, _ = self._run(_copy)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["relation_copy_errors"], ())
+        self.assertEqual(result["relation_copy_created_count"], 0)
+
+    def test_legacy_knowledge_inheritance_unaffected_by_relation_copy_outcome(self):
+        """Document Template IDs / SOP / Checklist / FAQ comma-list
+        inheritance must be identical whether relation-copy succeeds,
+        fails, or is never called at all."""
+        from business_core.stage_entity_relations import CopyRelationsResult
+
+        m = _fresh()
+        appended = []
+
+        def capture(key, rows):
+            appended.extend(rows)
+
+        def _copy(template_stage_id, stage_id):
+            return CopyRelationsResult(
+                template_stage_id=template_stage_id, stage_id=stage_id,
+                errors=(("X", ("simulated failure",)),), ok=False,
+            )
+
+        with patch.object(m, "find_template_stages", return_value=self._template_stages(1)), \
+             patch("business_core.sheets.get_business_sheet", return_value=_rmstage_sheet()), \
+             patch("business_core.sheets.batch_append_business_rows", side_effect=capture), \
+             patch("business_core.knowledge_manager.find_knowledge_by_template_stage",
+                   return_value={
+                       "sop_ids": ["SOP-001"], "checklist_ids": [], "material_ids": [],
+                       "document_template_ids": ["DOC-002"], "faq_ids": [],
+                   }), \
+             patch("business_core.sheets.generate_next_ids", return_value=["STAGE-001"]), \
+             patch("business_core.stage_entity_relations.copy_template_relations_to_stage", side_effect=_copy):
+            result = m.create_stages_from_template_record("RM-001", "RTMPL-001")
+
+        self.assertTrue(result["ok"])
+        idx = {h: i for i, h in enumerate(RM_STAGE_HEADERS)}
+        row = appended[0]
+        self.assertEqual(row[idx["Document Template IDs"]], "DOC-002")
+        self.assertEqual(row[idx["SOP IDs"]], "SOP-001")
+        self.assertEqual(len(result["relation_copy_errors"]), 1)
+
+
+# ────────────────────────────────────────────────────────────
 # Phase 10.2B.1: create_stages_from_template_record — header-safety
 # ────────────────────────────────────────────────────────────
 

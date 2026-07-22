@@ -411,6 +411,10 @@ def create_stages_from_template_record(roadmap_id: str, template_id: str) -> dic
             "stages_count": int,
             "warning":      str | None,
             "stage_ids":    list[str],
+            # Phase 18C-3: additive, only present once at least one
+            # stage row was actually created this call.
+            "relation_copy_errors":        tuple,  # (stage_id, template_stage_id, errors) per failed stage
+            "relation_copy_created_count": int,
         }
     """
     if not roadmap_id or not template_id:
@@ -489,11 +493,33 @@ def create_stages_from_template_record(roadmap_id: str, template_id: str) -> dic
         if rows:
             batch_append_business_rows("roadmap_stages", rows)
 
+        # Phase 18C-3: копируем активные STAGE_ENTITY_RELATIONS шаблонного
+        # этапа в новые instance-relations — ТОЛЬКО после того, как все
+        # ROADMAP_STAGES строки этого batch уже записаны выше (никогда не
+        # раньше, чем существует целевая строка). Ошибка копирования
+        # relation-строк НЕ считается провалом создания самих этапов
+        # (они уже реально созданы) — она видна отдельно через
+        # "relation_copy_errors", не через "ok"/"warning" этой функции.
+        relation_copy_errors: list[tuple] = []
+        relation_copy_created_count = 0
+        if rows:
+            from business_core.stage_entity_relations import copy_template_relations_to_stage
+            for ts, stage_id in zip(template_stages, new_stage_ids):
+                template_stage_id = ts.get("stage_id", "")
+                if not template_stage_id:
+                    continue
+                result = copy_template_relations_to_stage(template_stage_id, stage_id)
+                relation_copy_created_count += len(result.created)
+                if not result.ok:
+                    relation_copy_errors.append((stage_id, template_stage_id, result.errors))
+
         return {
             "ok": True,
             "stages_count": len(stage_ids),
             "warning": None,
             "stage_ids": stage_ids,
+            "relation_copy_errors": tuple(relation_copy_errors),
+            "relation_copy_created_count": relation_copy_created_count,
         }
 
     except Exception as exc:

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import sys
 import unittest
+import unittest.mock
 from unittest.mock import patch
 
 
@@ -388,13 +389,24 @@ class TestEntityTypeDispatcher(unittest.TestCase):
 # ────────────────────────────────────────────────────────────
 
 class TestReadOnlyGuarantees(unittest.TestCase):
-    def test_module_has_no_write_calls(self):
+    def test_read_and_validation_functions_have_no_write_calls(self):
+        """The read/validation/comparison surface (everything except
+        the Phase 18C-3 copy_template_relations_to_stage(), which
+        legitimately writes new instance relations) must remain
+        strictly read-only."""
         import inspect
         ser = _fresh_ser()
-        source = inspect.getsource(ser)
-        for forbidden in ("append_business_row", "update_business_row", "update_business_cell",
-                          "batch_append_business_rows", "generate_next_id"):
-            self.assertNotIn(forbidden, source)
+        read_only_functions = (
+            ser.list_relations, ser.get_relation_by_id,
+            ser.get_relations_for_template_stage, ser.get_relations_for_stage,
+            ser.validate_relation_record, ser.validate_relation_references,
+            ser.find_active_duplicate_relation, ser.compare_legacy_document_relations,
+        )
+        for fn in read_only_functions:
+            source = inspect.getsource(fn)
+            for forbidden in ("append_business_row", "update_business_row", "update_business_cell",
+                              "batch_append_business_rows", "generate_next_id"):
+                self.assertNotIn(forbidden, source, f"{fn.__name__} unexpectedly contains {forbidden!r}")
 
     def test_module_makes_no_ai_or_drive_calls(self):
         import inspect
@@ -645,6 +657,227 @@ class TestCompareLegacyDocumentRelationsNoWrites(unittest.TestCase):
         for forbidden in ("append_business_row", "update_business_row", "update_business_cell",
                           "batch_append_business_rows"):
             self.assertNotIn(forbidden, source)
+
+
+# ────────────────────────────────────────────────────────────
+# Phase 18C-3: copy_template_relations_to_stage()
+# ────────────────────────────────────────────────────────────
+
+COPY_TEMPLATE_STAGES = [{"Stage ID": "TSTG-017", "Template ID": "RMT-IZH-ALM-STANDARD-001"}]
+COPY_REAL_STAGES = [{"Stage ID": "STAGE-100", "Roadmap ID": "RM-100"}]
+COPY_TEMPLATES = [
+    {"Document Template ID": "DOC-002", "Title": "Test A", "Status": "active"},
+    {"Document Template ID": "DOC-003", "Title": "Test B", "Status": "active"},
+]
+
+
+class _CopyCase(unittest.TestCase):
+    def _run(self, template_stage_id="TSTG-017", stage_id="STAGE-100",
+              template_stages=None, real_stages=None, templates=None, relations=None,
+              destination_exists=True, next_ids=None, batch_side_effect=None,
+              timestamp="2026-07-22"):
+        ser = _fresh_ser()
+        template_stages = COPY_TEMPLATE_STAGES if template_stages is None else template_stages
+        real_stages = (COPY_REAL_STAGES if destination_exists else []) if real_stages is None else real_stages
+        templates = COPY_TEMPLATES if templates is None else templates
+        relations = relations or []
+
+        appended = []
+
+        def _batch_append(sheet_key, rows):
+            if batch_side_effect is not None:
+                batch_side_effect()
+            appended.extend(rows)
+
+        def _read_business_sheet(sheet_key, *a, **kw):
+            return {
+                "roadmap_template_stages": template_stages,
+                "roadmap_stages": real_stages,
+                "document_template_registry": templates,
+                "stage_entity_relations": relations,
+            }.get(sheet_key, [])
+
+        def _find_row_by_id(sheet_key, record_id, *a, **kw):
+            table = {
+                "roadmap_template_stages": (template_stages, "Stage ID"),
+                "roadmap_stages": (real_stages, "Stage ID"),
+                "document_template_registry": (templates, "Document Template ID"),
+                "stage_entity_relations": (relations, "Relation ID"),
+            }.get(sheet_key)
+            if table is None:
+                return None
+            rows, key_field = table
+            for i, row in enumerate(rows, start=2):
+                if row.get(key_field, "") == record_id:
+                    return (i, row)
+            return None
+
+        mock_sheet = unittest.mock.MagicMock()
+        mock_sheet.row_values.return_value = [
+            "Relation ID", "Template Stage ID", "Stage ID", "Entity Type", "Entity ID",
+            "Required", "Blocking", "Minimum Count", "Status", "Created At", "Updated At",
+        ]
+
+        with patch("business_core.sheets.read_business_sheet", side_effect=_read_business_sheet), \
+             patch("business_core.sheets.find_row_by_id", side_effect=_find_row_by_id), \
+             patch("business_core.sheets.get_business_sheet", return_value=mock_sheet), \
+             patch("business_core.sheets.generate_next_ids",
+                   return_value=(next_ids if next_ids is not None else ["REL-100", "REL-101", "REL-102"])), \
+             patch("business_core.sheets.batch_append_business_rows", side_effect=_batch_append):
+            result = ser.copy_template_relations_to_stage(template_stage_id, stage_id, timestamp=timestamp)
+        return result, appended
+
+
+class TestCopyTemplateRelationsToStage(_CopyCase):
+    def test_one_relation_creates_one_instance(self):
+        result, appended = self._run(relations=[_rel_row(**{"Relation ID": "REL-001", "Entity ID": "DOC-002"})])
+        self.assertTrue(result.ok)
+        self.assertEqual(len(result.created), 1)
+        self.assertEqual(result.created[0]["Entity ID"], "DOC-002")
+
+    def test_multiple_relations_preserve_source_order(self):
+        relations = [
+            _rel_row(**{"Relation ID": "REL-001", "Entity ID": "DOC-002"}),
+            _rel_row(**{"Relation ID": "REL-002", "Entity ID": "DOC-003"}),
+        ]
+        result, appended = self._run(relations=relations, next_ids=["REL-100", "REL-101"])
+        self.assertEqual([c["Entity ID"] for c in result.created], ["DOC-002", "DOC-003"])
+
+    def test_no_source_relations_creates_none(self):
+        result, appended = self._run(relations=[])
+        self.assertTrue(result.ok)
+        self.assertEqual(result.created, ())
+        self.assertEqual(appended, [])
+
+    def test_instance_copy_has_blank_template_stage_id(self):
+        result, _ = self._run(relations=[_rel_row(**{"Relation ID": "REL-001", "Entity ID": "DOC-002"})])
+        self.assertEqual(result.created[0]["Template Stage ID"], "")
+
+    def test_instance_copy_has_correct_stage_id(self):
+        result, _ = self._run(
+            stage_id="STAGE-100", relations=[_rel_row(**{"Relation ID": "REL-001", "Entity ID": "DOC-002"})],
+        )
+        self.assertEqual(result.created[0]["Stage ID"], "STAGE-100")
+
+    def test_required_blocking_minimum_count_copied_exactly(self):
+        result, _ = self._run(relations=[_rel_row(**{
+            "Relation ID": "REL-001", "Entity ID": "DOC-002",
+            "Required": "false", "Blocking": "false", "Minimum Count": "2",
+        })])
+        created = result.created[0]
+        self.assertEqual(created["Required"], "false")
+        self.assertEqual(created["Blocking"], "false")
+        self.assertEqual(created["Minimum Count"], "2")
+
+    def test_inactive_template_relation_ignored(self):
+        result, appended = self._run(relations=[
+            _rel_row(**{"Relation ID": "REL-001", "Entity ID": "DOC-002", "Status": "inactive"}),
+        ])
+        self.assertTrue(result.ok)
+        self.assertEqual(result.created, ())
+        self.assertEqual(appended, [])
+
+    def test_duplicate_destination_relation_not_recreated(self):
+        relations = [
+            _rel_row(**{"Relation ID": "REL-001", "Entity ID": "DOC-002"}),  # source (template-scoped)
+            _rel_row(**{  # already-copied destination (instance-scoped)
+                "Relation ID": "REL-050", "Template Stage ID": "", "Stage ID": "STAGE-100", "Entity ID": "DOC-002",
+            }),
+        ]
+        result, appended = self._run(relations=relations)
+        self.assertTrue(result.ok)
+        self.assertEqual(result.created, ())
+        self.assertEqual(len(result.skipped_duplicates), 1)
+        self.assertEqual(result.skipped_duplicates[0], ("REL-001", "REL-050"))
+        self.assertEqual(appended, [])
+
+    def test_retry_is_idempotent(self):
+        relations = [_rel_row(**{"Relation ID": "REL-001", "Entity ID": "DOC-002"})]
+        first, appended1 = self._run(relations=relations, next_ids=["REL-100"])
+        self.assertEqual(len(first.created), 1)
+        # simulate the retry: the destination relation now already exists
+        relations_after = relations + [{
+            **_rel_row(**{"Relation ID": "REL-100", "Template Stage ID": "", "Stage ID": "STAGE-100", "Entity ID": "DOC-002"}),
+        }]
+        second, appended2 = self._run(relations=relations_after)
+        self.assertEqual(second.created, ())
+        self.assertEqual(len(second.skipped_duplicates), 1)
+        self.assertEqual(appended2, [])  # no duplicate write on retry
+
+    def test_same_entity_id_allowed_for_two_different_stage_ids(self):
+        relations = [
+            _rel_row(**{"Relation ID": "REL-001", "Entity ID": "DOC-002"}),
+            _rel_row(**{  # existing relation for a DIFFERENT destination stage
+                "Relation ID": "REL-050", "Template Stage ID": "", "Stage ID": "STAGE-999", "Entity ID": "DOC-002",
+            }),
+        ]
+        result, appended = self._run(stage_id="STAGE-100", relations=relations)
+        self.assertEqual(len(result.created), 1)  # not blocked by the other stage's relation
+
+    def test_invalid_source_relation_visible_not_silently_skipped(self):
+        result, appended = self._run(relations=[_rel_row(**{
+            "Relation ID": "REL-001", "Entity ID": "DOC-002", "Required": "yes",  # invalid
+        })])
+        self.assertFalse(result.ok)
+        self.assertEqual(len(result.errors), 1)
+        self.assertEqual(result.errors[0][0], "REL-001")
+        self.assertEqual(appended, [])  # nothing created when a source relation is invalid
+
+    def test_dangling_source_entity_id_visible(self):
+        result, appended = self._run(relations=[_rel_row(**{
+            "Relation ID": "REL-001", "Entity ID": "DOC-999",
+        })])
+        self.assertFalse(result.ok)
+        self.assertTrue(any("DOC-999" in str(e) for _, errs in result.errors for e in errs))
+        self.assertEqual(appended, [])
+
+    def test_dangling_template_stage_id_visible(self):
+        result, appended = self._run(
+            template_stage_id="TSTG-999",
+            relations=[_rel_row(**{"Relation ID": "REL-001", "Template Stage ID": "TSTG-999", "Entity ID": "DOC-002"})],
+        )
+        self.assertFalse(result.ok)
+        self.assertTrue(any("TSTG-999" in str(e) for _, errs in result.errors for e in errs))
+        self.assertEqual(appended, [])
+
+    def test_unsupported_entity_type_visible(self):
+        result, appended = self._run(relations=[_rel_row(**{
+            "Relation ID": "REL-001", "Entity Type": "sop", "Entity ID": "SOP-001",
+        })])
+        self.assertFalse(result.ok)
+        self.assertTrue(any("Unsupported Entity Type" in str(e) for _, errs in result.errors for e in errs))
+        self.assertEqual(appended, [])
+
+    def test_relation_id_generation_is_deterministic(self):
+        result, _ = self._run(
+            relations=[_rel_row(**{"Relation ID": "REL-001", "Entity ID": "DOC-002"})],
+            next_ids=["REL-777"],
+        )
+        self.assertEqual(result.created[0]["Relation ID"], "REL-777")
+
+    def test_no_writes_before_destination_stage_exists(self):
+        result, appended = self._run(destination_exists=False, relations=[
+            _rel_row(**{"Relation ID": "REL-001", "Entity ID": "DOC-002"}),
+        ])
+        self.assertFalse(result.ok)
+        self.assertEqual(appended, [])
+        self.assertTrue(any("does not exist yet" in str(e) for _, errs in result.errors for e in errs))
+
+    def test_partial_failure_produces_explicit_structured_error(self):
+        def _boom():
+            raise RuntimeError("simulated write failure")
+
+        result, appended = self._run(
+            relations=[_rel_row(**{"Relation ID": "REL-001", "Entity ID": "DOC-002"})],
+            batch_side_effect=_boom,
+        )
+        self.assertFalse(result.ok)
+        self.assertTrue(any("simulated write failure" in str(e) for _, errs in result.errors for e in errs))
+
+    def test_blank_args_return_precondition_error(self):
+        ser = _fresh_ser()
+        result = ser.copy_template_relations_to_stage("", "STAGE-100")
+        self.assertFalse(result.ok)
 
 
 if __name__ == "__main__":
