@@ -525,6 +525,50 @@ class TestCreateStagesFromTemplateRecordRelationCopy(unittest.TestCase):
         self.assertEqual(row[idx["SOP IDs"]], "SOP-001")
         self.assertEqual(len(result["relation_copy_errors"]), 1)
 
+    def test_unexpected_exception_during_relation_copy_does_not_wipe_stage_results(self):
+        """Phase 18D production defect regression test: an unexpected
+        exception raised BY copy_template_relations_to_stage() itself
+        (e.g. a transient Google Sheets API error — not a structured
+        CopyRelationsResult(ok=False)) must never propagate up and
+        cause this function to report ok=False/stages_count=0/empty
+        stage_ids — the ROADMAP_STAGES rows are already committed by
+        the time relation-copy runs, so that would silently misreport
+        a real partial success as a total failure."""
+        def _copy(template_stage_id, stage_id):
+            raise RuntimeError("simulated transient API quota error")
+
+        result, mock_copy = self._run(_copy)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["stages_count"], 2)
+        self.assertEqual(result["stage_ids"], ["STAGE-001", "STAGE-002"])
+        self.assertTrue(result["partial_success"])
+        self.assertEqual(len(result["relation_copy_errors"]), 2)  # both stages hit the exception
+        for stage_id, template_stage_id, errors in result["relation_copy_errors"]:
+            self.assertIn("simulated transient API quota error", str(errors))
+
+    def test_partial_success_false_when_no_relation_errors(self):
+        from business_core.stage_entity_relations import CopyRelationsResult
+
+        def _copy(template_stage_id, stage_id):
+            return CopyRelationsResult(template_stage_id=template_stage_id, stage_id=stage_id, created=())
+
+        result, _ = self._run(_copy)
+        self.assertFalse(result["partial_success"])
+
+    def test_partial_success_true_when_relation_result_reports_error(self):
+        from business_core.stage_entity_relations import CopyRelationsResult
+
+        def _copy(template_stage_id, stage_id):
+            return CopyRelationsResult(
+                template_stage_id=template_stage_id, stage_id=stage_id,
+                errors=(("X", ("bad data",)),), ok=False,
+            )
+
+        result, _ = self._run(_copy)
+        self.assertTrue(result["partial_success"])
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["stages_count"], 2)
+
 
 # ────────────────────────────────────────────────────────────
 # Phase 10.2B.1: create_stages_from_template_record — header-safety

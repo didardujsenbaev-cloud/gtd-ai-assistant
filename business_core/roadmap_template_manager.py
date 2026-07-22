@@ -411,8 +411,16 @@ def create_stages_from_template_record(roadmap_id: str, template_id: str) -> dic
             "stages_count": int,
             "warning":      str | None,
             "stage_ids":    list[str],
-            # Phase 18C-3: additive, only present once at least one
-            # stage row was actually created this call.
+            # Phase 18C-3 (hardened in Phase 18D after a real production
+            # defect): additive, only present once at least one stage
+            # row was actually created this call. "ok"/"stages_count"
+            # always reflect the STAGE rows alone — a relation-copy
+            # failure (expected or unexpected, including a transient API
+            # error) NEVER flips "ok" to False or "stages_count" to 0,
+            # since the stages themselves are already committed by that
+            # point. "partial_success" is the single boolean signal that
+            # stages succeeded but at least one relation copy did not.
+            "partial_success":             bool,
             "relation_copy_errors":        tuple,  # (stage_id, template_stage_id, errors) per failed stage
             "relation_copy_created_count": int,
         }
@@ -499,7 +507,17 @@ def create_stages_from_template_record(roadmap_id: str, template_id: str) -> dic
         # раньше, чем существует целевая строка). Ошибка копирования
         # relation-строк НЕ считается провалом создания самих этапов
         # (они уже реально созданы) — она видна отдельно через
-        # "relation_copy_errors", не через "ok"/"warning" этой функции.
+        # "relation_copy_errors"/"partial_success", не через "ok".
+        #
+        # Phase 18D production defect fix: each iteration is wrapped in
+        # its OWN try/except. Before this fix, an unexpected exception
+        # from copy_template_relations_to_stage() (e.g. a transient
+        # Google Sheets API quota error, observed live in Phase 18D)
+        # propagated all the way to this function's outer except block,
+        # which then returned ok=False/stages_count=0 — even though the
+        # 8 ROADMAP_STAGES rows had already been committed successfully
+        # moments earlier. That silently misreported a real, partial
+        # success as a total failure, risking a duplicate-stage retry.
         relation_copy_errors: list[tuple] = []
         relation_copy_created_count = 0
         if rows:
@@ -508,15 +526,19 @@ def create_stages_from_template_record(roadmap_id: str, template_id: str) -> dic
                 template_stage_id = ts.get("stage_id", "")
                 if not template_stage_id:
                     continue
-                result = copy_template_relations_to_stage(template_stage_id, stage_id)
-                relation_copy_created_count += len(result.created)
-                if not result.ok:
-                    relation_copy_errors.append((stage_id, template_stage_id, result.errors))
+                try:
+                    result = copy_template_relations_to_stage(template_stage_id, stage_id)
+                    relation_copy_created_count += len(result.created)
+                    if not result.ok:
+                        relation_copy_errors.append((stage_id, template_stage_id, result.errors))
+                except Exception as exc:
+                    relation_copy_errors.append((stage_id, template_stage_id, (str(exc),)))
 
         return {
             "ok": True,
             "stages_count": len(stage_ids),
             "warning": None,
+            "partial_success": bool(relation_copy_errors),
             "stage_ids": stage_ids,
             "relation_copy_errors": tuple(relation_copy_errors),
             "relation_copy_created_count": relation_copy_created_count,
