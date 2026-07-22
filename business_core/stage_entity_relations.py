@@ -27,6 +27,8 @@ never a new column.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 VALID_BOOL_STRINGS = ("true", "false")
 VALID_STATUSES = ("active", "inactive")
 
@@ -231,3 +233,151 @@ def find_active_duplicate_relation(record: dict) -> dict | None:
                 return row
 
     return None
+
+
+# ─────────────────────────────────────────────────────────────
+# Phase 18C-2: dual-read comparison against the legacy
+# ROADMAP_TEMPLATE_STAGES."Document Template IDs" comma-list
+# ─────────────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class StageComparisonResult:
+    """Per-Template-Stage-ID comparison between the legacy comma-list
+    and the new (document_template, active, template-scoped) relation
+    rows. `ordered_match` is the single pass/fail signal; every other
+    field explains exactly why, when it's False."""
+    template_stage_id: str
+    legacy_ids: tuple = ()
+    new_ids: tuple = ()
+    missing: tuple = ()                          # in legacy, absent from new
+    extra: tuple = ()                             # in new, absent from legacy
+    legacy_duplicate_ids: tuple = ()              # same ID repeated in the raw legacy comma-list
+    duplicate_active_relations: tuple = ()        # same Entity ID has >1 active relation row for this stage
+    invalid_relation_ids: tuple = ()              # Relation IDs failing validate_relation_record()
+    dangling_entity_ids: tuple = ()               # Entity IDs absent from document_template_registry
+    unsupported_entity_type_relation_ids: tuple = ()  # non-document_template relations at this stage
+    ordered_match: bool = True
+
+
+@dataclass(frozen=True)
+class DocumentRelationAudit:
+    """Whole-template dual-read result — covers every
+    ROADMAP_TEMPLATE_STAGES row, not only the currently-populated
+    pilot stages."""
+    per_stage: tuple = ()
+    orphan_relations: tuple = ()                  # relations whose Template Stage ID matches no real stage
+    invalid_scope_relation_ids: tuple = ()         # relations with BOTH Template Stage ID and Stage ID populated
+    total_legacy_configured_stages: int = 0
+    total_new_configured_stages: int = 0
+    is_globally_consistent: bool = True
+
+
+def compare_legacy_document_relations() -> DocumentRelationAudit:
+    """
+    Strictly read-only. Compares, for EVERY row of
+    ROADMAP_TEMPLATE_STAGES (not just the pilot subset), the legacy
+    "Document Template IDs" comma-list against active, template-scoped
+    STAGE_ENTITY_RELATIONS rows of Entity Type "document_template".
+
+    Never raises on a dangling/invalid/orphan relation — every such
+    case is surfaced in the returned result, never silently dropped
+    or skipped, matching the same "never silently discard" discipline
+    already established for the legacy engine (document_requirements.py).
+    """
+    from business_core.sheets import read_business_sheet
+    from business_core.document_requirements import _parse_id_list
+
+    template_stage_rows = read_business_sheet("roadmap_template_stages")
+    known_stage_ids = {r.get("Stage ID", "") for r in template_stage_rows if r.get("Stage ID", "")}
+
+    all_relations = list_relations(include_inactive=True)
+    doc_template_ids = {
+        t.get("Document Template ID", "") for t in read_business_sheet("document_template_registry")
+    }
+
+    orphan_relations = tuple(
+        r for r in all_relations
+        if not _is_blank(r.get("Template Stage ID", ""))
+        and r.get("Template Stage ID", "") not in known_stage_ids
+    )
+    invalid_scope_relation_ids = tuple(
+        r.get("Relation ID", "") for r in all_relations
+        if not _is_blank(r.get("Template Stage ID", "")) and not _is_blank(r.get("Stage ID", ""))
+    )
+
+    per_stage: list[StageComparisonResult] = []
+    total_legacy_configured = 0
+    total_new_configured = 0
+
+    for row in template_stage_rows:
+        tstg_id = row.get("Stage ID", "")
+        raw_legacy = row.get("Document Template IDs", "") or ""
+        legacy_ids = tuple(_parse_id_list(raw_legacy))
+        raw_tokens = [t.strip() for t in raw_legacy.split(",") if t.strip()]
+        legacy_duplicate_ids = tuple(sorted({t for t in raw_tokens if raw_tokens.count(t) > 1}))
+
+        stage_relations = tuple(r for r in all_relations if r.get("Template Stage ID", "") == tstg_id)
+        doc_relations = tuple(r for r in stage_relations if r.get("Entity Type", "") == "document_template")
+        unsupported_relation_ids = tuple(
+            r.get("Relation ID", "") for r in stage_relations if r.get("Entity Type", "") != "document_template"
+        )
+
+        active_doc_relations = tuple(r for r in doc_relations if (r.get("Status", "") or "") == "active")
+        new_ids = tuple(r.get("Entity ID", "") for r in active_doc_relations)
+
+        seen_counts: dict[str, int] = {}
+        for eid in new_ids:
+            seen_counts[eid] = seen_counts.get(eid, 0) + 1
+        duplicate_active_relations = tuple(sorted(e for e, c in seen_counts.items() if c > 1))
+
+        invalid_relation_ids = tuple(
+            r.get("Relation ID", "") for r in doc_relations if validate_relation_record(r)
+        )
+        dangling_entity_ids = tuple(sorted({
+            r.get("Entity ID", "") for r in doc_relations
+            if r.get("Entity ID", "") not in doc_template_ids
+        }))
+
+        new_ids_deduped_ordered = tuple(dict.fromkeys(new_ids))
+        missing = tuple(e for e in legacy_ids if e not in new_ids_deduped_ordered)
+        extra = tuple(e for e in new_ids_deduped_ordered if e not in legacy_ids)
+
+        ordered_match = (
+            not missing and not extra
+            and not legacy_duplicate_ids and not duplicate_active_relations
+            and not invalid_relation_ids and not dangling_entity_ids
+            and legacy_ids == new_ids_deduped_ordered
+        )
+
+        if legacy_ids:
+            total_legacy_configured += 1
+        if new_ids_deduped_ordered:
+            total_new_configured += 1
+
+        per_stage.append(StageComparisonResult(
+            template_stage_id=tstg_id,
+            legacy_ids=legacy_ids,
+            new_ids=new_ids_deduped_ordered,
+            missing=missing,
+            extra=extra,
+            legacy_duplicate_ids=legacy_duplicate_ids,
+            duplicate_active_relations=duplicate_active_relations,
+            invalid_relation_ids=invalid_relation_ids,
+            dangling_entity_ids=dangling_entity_ids,
+            unsupported_entity_type_relation_ids=unsupported_relation_ids,
+            ordered_match=ordered_match,
+        ))
+
+    is_globally_consistent = (
+        not orphan_relations and not invalid_scope_relation_ids
+        and all(s.ordered_match for s in per_stage)
+    )
+
+    return DocumentRelationAudit(
+        per_stage=tuple(per_stage),
+        orphan_relations=orphan_relations,
+        invalid_scope_relation_ids=invalid_scope_relation_ids,
+        total_legacy_configured_stages=total_legacy_configured,
+        total_new_configured_stages=total_new_configured,
+        is_globally_consistent=is_globally_consistent,
+    )
