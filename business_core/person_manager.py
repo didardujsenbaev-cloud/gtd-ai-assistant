@@ -693,3 +693,166 @@ def archive_person(person_id: str) -> dict:
 
     result = update_person(person_id, {"Статус отношений": "archived"})
     return {"ok": result["ok"], "changed": result["changed"], "error": result["error"]}
+
+
+def append_person_biz_id(person_id: str, biz_id: str) -> dict:
+    """
+    Добавить biz_id в колонку "Biz IDs" — append-без-дублей, а не
+    overwrite. Primary Biz ID заполняется только если он пуст (никогда
+    не перезаписывается). Phase 23D-3B1: relocated from
+    business_core.business_builder.add_biz_id_to_person(), which
+    becomes a thin delegator in Phase 23D-3B2.
+
+    This is deliberately NOT expressed through update_person() —
+    read-modify-write append+dedup semantics belong here, not in a
+    flat field-setter.
+
+    Returns:
+        {"ok": bool, "changed": bool, "updated_fields": tuple, "error": str | None}
+
+    "changed": False (with "ok": True) means the biz_id was already
+    present — a legitimate no-op, not an error. Duplicate detection is
+    a case-sensitive exact string match against the parsed Biz IDs list.
+
+    Not atomic: up to two sequential update_cell() calls (Biz IDs, then
+    conditionally Primary Biz ID). If the second call raises after the
+    first already succeeded, the except branch below still returns
+    "ok": False / "changed": False / "updated_fields": () — it cannot
+    prove how many cells actually landed. Same disclosed limitation as
+    update_person() (Phase 23D-2 technical debt) — not solved here.
+    """
+    if not person_id or not biz_id:
+        return {"ok": False, "changed": False, "updated_fields": (), "error": "person_id и biz_id обязательны"}
+
+    try:
+        from business_core.sheets import get_business_sheet
+
+        sheet = get_business_sheet("people_registry")
+        all_values = sheet.get_all_values()
+        if len(all_values) < 2:
+            return {"ok": False, "changed": False, "updated_fields": (), "error": f"Person '{person_id}' не найден"}
+
+        headers = all_values[0]
+
+        def _col(h):
+            return headers.index(h) if h in headers else None
+
+        biz_ids_col = _col("Biz IDs")
+        prim_col    = _col("Primary Biz ID")
+
+        for i, row in enumerate(all_values[1:], start=2):
+            if not row or row[0] != person_id:
+                continue
+
+            current_ids = _normalize_biz_ids(
+                row[biz_ids_col] if biz_ids_col is not None and biz_ids_col < len(row) else ""
+            )
+
+            if biz_id in current_ids:
+                log.debug(f"append_person_biz_id: {biz_id} уже есть у {person_id}")
+                return {"ok": True, "changed": False, "updated_fields": (), "error": None}
+
+            current_ids.append(biz_id)
+            new_biz_ids_str = ",".join(current_ids)
+            updated_fields = []
+
+            if biz_ids_col is not None:
+                sheet.update_cell(i, biz_ids_col + 1, new_biz_ids_str)
+                updated_fields.append("Biz IDs")
+                log.info(f"append_person_biz_id: {person_id} → Biz IDs = {new_biz_ids_str}")
+
+            if prim_col is not None:
+                current_prim = row[prim_col].strip() if prim_col < len(row) else ""
+                if not current_prim:
+                    sheet.update_cell(i, prim_col + 1, biz_id)
+                    updated_fields.append("Primary Biz ID")
+                    log.info(f"append_person_biz_id: {person_id} → Primary Biz ID = {biz_id}")
+
+            return {"ok": True, "changed": True, "updated_fields": tuple(updated_fields), "error": None}
+
+        return {"ok": False, "changed": False, "updated_fields": (), "error": f"Person '{person_id}' не найден"}
+
+    except Exception as exc:
+        log.warning(f"append_person_biz_id({person_id}, {biz_id}) error: {exc}")
+        return {"ok": False, "changed": False, "updated_fields": (), "error": str(exc)}
+
+
+def update_person_drive_info(person_id: str, folder_id: str = "", folder_url: str = "") -> dict:
+    """
+    Дозаполнить Drive-информацию Person'а — обновляет "Google Drive"
+    (URL) и "Drive Folder ID" НЕЗАВИСИМО друг от друга, только если
+    текущее значение поля пусто; никогда не перезаписывает уже
+    заполненное значение. Phase 23D-3B1: relocated from
+    business_core.business_builder.update_person_drive_info(), which
+    becomes a thin delegator in Phase 23D-3B2.
+
+    Deliberately self-contained rather than routed through
+    update_person() — per Phase 23D-3B architectural decision, Drive
+    fields are NOT added to _PERSON_EDITABLE_FIELDS; this function owns
+    its own specialized fill-if-empty read-modify-write, exactly as the
+    relocated logic did before.
+
+    Known, documented asymmetry preserved as-is (not fixed in this
+    phase): a falsy `folder_id` short-circuits the whole call before
+    `folder_url` is even considered, so a call with only `folder_url`
+    set and `folder_id=""` returns without attempting to fill the URL
+    alone. This mirrors the pre-existing business_builder behavior
+    exactly — treated as technical debt, not addressed here.
+
+    Not atomic: up to two independent update_cell() calls (Google
+    Drive, Drive Folder ID). If the second call raises after the first
+    already succeeded, the except branch below still returns
+    "ok": False / "changed": False / "updated_fields": () — it cannot
+    prove how many cells actually landed. Same disclosed limitation as
+    update_person() (Phase 23D-2 technical debt) — not solved here.
+
+    Returns:
+        {"ok": bool, "changed": bool, "updated_fields": tuple, "error": str | None}
+    """
+    if not person_id or not folder_id:
+        return {"ok": False, "changed": False, "updated_fields": (), "error": "person_id и folder_id обязательны"}
+
+    try:
+        from business_core.sheets import get_business_sheet
+
+        sheet = get_business_sheet("people_registry")
+        all_values = sheet.get_all_values()
+        if len(all_values) < 2:
+            return {"ok": False, "changed": False, "updated_fields": (), "error": f"Person '{person_id}' не найден"}
+
+        headers = all_values[0]
+
+        def _col(h):
+            return headers.index(h) if h in headers else None
+
+        drive_col    = _col("Google Drive")
+        drive_id_col = _col("Drive Folder ID")
+
+        for i, row in enumerate(all_values[1:], start=2):
+            if not row or row[0] != person_id:
+                continue
+
+            updated_fields = []
+
+            if drive_col is not None:
+                current = row[drive_col].strip() if drive_col < len(row) else ""
+                if not current and folder_url:
+                    sheet.update_cell(i, drive_col + 1, folder_url)
+                    updated_fields.append("Google Drive")
+
+            if drive_id_col is not None:
+                current = row[drive_id_col].strip() if drive_id_col < len(row) else ""
+                if not current and folder_id:
+                    sheet.update_cell(i, drive_id_col + 1, folder_id)
+                    updated_fields.append("Drive Folder ID")
+
+            if updated_fields:
+                log.info(f"update_person_drive_info: {person_id} → Drive дозаполнен ({', '.join(updated_fields)})")
+
+            return {"ok": True, "changed": bool(updated_fields), "updated_fields": tuple(updated_fields), "error": None}
+
+        return {"ok": False, "changed": False, "updated_fields": (), "error": f"Person '{person_id}' не найден"}
+
+    except Exception as exc:
+        log.warning(f"update_person_drive_info({person_id}) error: {exc}")
+        return {"ok": False, "changed": False, "updated_fields": (), "error": str(exc)}

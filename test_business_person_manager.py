@@ -633,5 +633,164 @@ class TestArchitectureGuards(unittest.TestCase):
         self.assertEqual(mtime_before, mtime_after)
 
 
+# ─────────────────────────────────────────────────────────────
+# Phase 23D-3B1 — append_person_biz_id() / update_person_drive_info()
+# ─────────────────────────────────────────────────────────────
+
+class TestAppendPersonBizId(unittest.TestCase):
+
+    def test_adds_new_biz_id(self):
+        pm = _fresh_pm()
+        row = list(PERSON_ROW)
+        row[PEOPLE_HEADERS.index("Biz IDs")] = "BIZ-001"
+        sheet = _make_sheet(row=row)
+        with patch("business_core.sheets.get_business_sheet", return_value=sheet):
+            result = pm.append_person_biz_id("PRS-001", "BIZ-002")
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["changed"])
+        self.assertIn("Biz IDs", result["updated_fields"])
+        biz_ids_col = PEOPLE_HEADERS.index("Biz IDs") + 1
+        sheet.update_cell.assert_any_call(2, biz_ids_col, "BIZ-001,BIZ-002")
+
+    def test_duplicate_biz_id_no_change(self):
+        pm = _fresh_pm()
+        row = list(PERSON_ROW)
+        row[PEOPLE_HEADERS.index("Biz IDs")] = "BIZ-001,BIZ-002"
+        sheet = _make_sheet(row=row)
+        with patch("business_core.sheets.get_business_sheet", return_value=sheet):
+            result = pm.append_person_biz_id("PRS-001", "BIZ-001")
+
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["changed"])
+        self.assertEqual(result["updated_fields"], ())
+        sheet.update_cell.assert_not_called()
+
+    def test_does_not_overwrite_existing_primary_biz_id(self):
+        pm = _fresh_pm()
+        row = list(PERSON_ROW)
+        row[PEOPLE_HEADERS.index("Biz IDs")] = "BIZ-001"
+        row[PEOPLE_HEADERS.index("Primary Biz ID")] = "BIZ-001"
+        sheet = _make_sheet(row=row)
+        with patch("business_core.sheets.get_business_sheet", return_value=sheet):
+            result = pm.append_person_biz_id("PRS-001", "BIZ-002")
+
+        self.assertNotIn("Primary Biz ID", result["updated_fields"])
+        primary_col = PEOPLE_HEADERS.index("Primary Biz ID") + 1
+        for c in sheet.update_cell.call_args_list:
+            self.assertFalse(c.args[1] == primary_col and c.args[2] == "BIZ-002")
+
+    def test_sets_primary_biz_id_if_empty(self):
+        pm = _fresh_pm()
+        row = list(PERSON_ROW)
+        row[PEOPLE_HEADERS.index("Biz IDs")] = "BIZ-001"
+        row[PEOPLE_HEADERS.index("Primary Biz ID")] = ""
+        sheet = _make_sheet(row=row)
+        with patch("business_core.sheets.get_business_sheet", return_value=sheet):
+            result = pm.append_person_biz_id("PRS-001", "BIZ-002")
+
+        self.assertIn("Primary Biz ID", result["updated_fields"])
+        primary_col = PEOPLE_HEADERS.index("Primary Biz ID") + 1
+        sheet.update_cell.assert_any_call(2, primary_col, "BIZ-002")
+
+    def test_person_not_found(self):
+        pm = _fresh_pm()
+        sheet = MagicMock()
+        sheet.get_all_values.return_value = [PEOPLE_HEADERS, list(PERSON_ROW)]
+        with patch("business_core.sheets.get_business_sheet", return_value=sheet):
+            result = pm.append_person_biz_id("PRS-999", "BIZ-002")
+
+        self.assertFalse(result["ok"])
+        self.assertIn("не найден", result["error"])
+        sheet.update_cell.assert_not_called()
+
+    def test_empty_person_id_or_biz_id_rejected(self):
+        pm = _fresh_pm()
+        self.assertFalse(pm.append_person_biz_id("", "BIZ-001")["ok"])
+        self.assertFalse(pm.append_person_biz_id("PRS-001", "")["ok"])
+
+    def test_sheets_error_returns_ok_false(self):
+        pm = _fresh_pm()
+        with patch("business_core.sheets.get_business_sheet", side_effect=Exception("timeout")):
+            result = pm.append_person_biz_id("PRS-001", "BIZ-002")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "timeout")
+
+
+class TestUpdatePersonDriveInfo(unittest.TestCase):
+
+    def test_fills_empty_drive_fields(self):
+        pm = _fresh_pm()
+        row = list(PERSON_ROW)
+        row[PEOPLE_HEADERS.index("Google Drive")] = ""
+        row[PEOPLE_HEADERS.index("Drive Folder ID")] = ""
+        sheet = _make_sheet(row=row)
+        with patch("business_core.sheets.get_business_sheet", return_value=sheet):
+            result = pm.update_person_drive_info("PRS-001", "folder-123", "https://drive.google.com/x")
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["changed"])
+        self.assertEqual(sheet.update_cell.call_count, 2)
+        self.assertEqual(set(result["updated_fields"]), {"Google Drive", "Drive Folder ID"})
+
+    def test_does_not_overwrite_existing_drive_fields(self):
+        pm = _fresh_pm()
+        row = list(PERSON_ROW)
+        row[PEOPLE_HEADERS.index("Google Drive")] = "https://existing.url"
+        row[PEOPLE_HEADERS.index("Drive Folder ID")] = "existing-id"
+        sheet = _make_sheet(row=row)
+        with patch("business_core.sheets.get_business_sheet", return_value=sheet):
+            result = pm.update_person_drive_info("PRS-001", "new-folder", "https://new.url")
+
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["changed"])
+        self.assertEqual(result["updated_fields"], ())
+        sheet.update_cell.assert_not_called()
+
+    def test_one_field_empty_one_already_set(self):
+        """One field already populated is preserved while the other,
+        empty one is independently filled."""
+        pm = _fresh_pm()
+        row = list(PERSON_ROW)
+        row[PEOPLE_HEADERS.index("Google Drive")] = "https://existing.url"
+        row[PEOPLE_HEADERS.index("Drive Folder ID")] = ""
+        sheet = _make_sheet(row=row)
+        with patch("business_core.sheets.get_business_sheet", return_value=sheet):
+            result = pm.update_person_drive_info("PRS-001", "new-folder-id", "https://new.url")
+
+        self.assertTrue(result["changed"])
+        self.assertEqual(result["updated_fields"], ("Drive Folder ID",))
+        sheet.update_cell.assert_called_once()
+
+    def test_person_not_found(self):
+        pm = _fresh_pm()
+        sheet = MagicMock()
+        sheet.get_all_values.return_value = [PEOPLE_HEADERS, list(PERSON_ROW)]
+        with patch("business_core.sheets.get_business_sheet", return_value=sheet):
+            result = pm.update_person_drive_info("PRS-999", "folder-x", "https://x")
+
+        self.assertFalse(result["ok"])
+        self.assertIn("не найден", result["error"])
+
+    def test_empty_folder_id_short_circuits_even_with_folder_url(self):
+        """Documented technical debt (Phase 23D-3B): a falsy folder_id
+        short-circuits the whole call before folder_url is even
+        considered — preserved exactly, not fixed in this phase."""
+        pm = _fresh_pm()
+        sheet = MagicMock()
+        with patch("business_core.sheets.get_business_sheet", return_value=sheet):
+            result = pm.update_person_drive_info("PRS-001", "", "https://drive.google.com/x")
+
+        self.assertFalse(result["ok"])
+        sheet.get_all_values.assert_not_called()
+
+    def test_sheets_error_returns_ok_false(self):
+        pm = _fresh_pm()
+        with patch("business_core.sheets.get_business_sheet", side_effect=Exception("boom")):
+            result = pm.update_person_drive_info("PRS-001", "x", "https://x")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "boom")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
