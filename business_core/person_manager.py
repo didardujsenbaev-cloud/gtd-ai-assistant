@@ -604,8 +604,9 @@ def create_person(
 _PERSON_EDITABLE_FIELDS = (
     "ФИО", "Имя", "Телефон", "Телефон 2", "WhatsApp", "Telegram", "Email",
     "Город", "Компания", "Должность", "Тип", "Подтип", "Уровень доверия",
-    "Статус отношений", "Теплота", "Комментарий", "Biz IDs", "Company ID",
-    "Citizenship", "Passport / ID", "Primary Biz ID", "Дата последнего контакта",
+    "Статус отношений", "Теплота", "Комментарий", "Бизнесы", "Biz IDs",
+    "Company ID", "Citizenship", "Passport / ID", "Primary Biz ID",
+    "Дата последнего контакта",
 )
 
 

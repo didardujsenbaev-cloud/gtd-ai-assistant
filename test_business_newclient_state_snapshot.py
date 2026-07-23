@@ -23,6 +23,15 @@ an already-valid Biz ID directly (e.g. "BIZ-001") used to leave
 Biz IDs/Primary Biz ID empty. newclient_confirm() now also checks the
 BIZ_REGISTRY "ID" column directly as a fallback.
 
+Phase 23D-2: newclient_confirm()'s STATUS_NEW branch now writes through
+business_core.person_manager.create_person() (core identity fields)
+followed by update_person() (Бизнесы/Уровень доверия/Теплота). The mock
+sheet is stateful (find/row_values/get_all_values/update/update_cell
+against one shared row list) so assertions can read the row's FINAL
+state after both calls, and business_core.sheets.get_business_sheet is
+routed per sheet key (people_registry vs. biz_registry) so
+create_person()'s Business ID FK check succeeds.
+
 All tests fully mock business_core.sheets / business_core.business_builder
 — no live Google Sheets/Drive API calls.
 """
@@ -49,12 +58,67 @@ STANDARD_HEADERS = [
 ]
 
 
-def _make_people_sheet(headers=STANDARD_HEADERS, existing_rows=None) -> MagicMock:
+class _StatefulSheet:
+    """Same pattern as test_business_newclient_headersafe.py — one
+    shared row list backing find/row_values/get_all_values/update/
+    update_cell, so create_person()'s append AND update_person()'s
+    per-field writes are both reflected afterwards."""
+
+    def __init__(self, headers: list, existing_rows: list | None = None):
+        self.headers = list(headers)
+        self.rows = [list(r) for r in (existing_rows or [])]
+
+    def get_all_values(self):
+        return [self.headers] + self.rows
+
+    def row_values(self, r):
+        if r == 1:
+            return self.headers
+        return self.rows[r - 2]
+
+    def find(self, value, in_column=1):
+        for i, row in enumerate(self.rows):
+            if row and row[0] == value:
+                cell = MagicMock()
+                cell.row = i + 2
+                return cell
+        return None
+
+    def update(self, range_name=None, values=None):
+        self.rows.append(list(values[0]))
+
+    def update_cell(self, row_num, col, value):
+        row = self.rows[row_num - 2]
+        while len(row) < col:
+            row.append("")
+        row[col - 1] = value
+
+
+def _make_people_sheet(headers=STANDARD_HEADERS, existing_rows=None):
+    state = _StatefulSheet(headers, existing_rows)
     sheet = MagicMock()
-    sheet.row_values.return_value = list(headers)
-    sheet.get_all_values.return_value = [list(headers)] + (existing_rows or [])
-    sheet.update.return_value = None
+    sheet.get_all_values.side_effect = state.get_all_values
+    sheet.row_values.side_effect = state.row_values
+    sheet.find.side_effect = state.find
+    sheet.update.side_effect = state.update
+    sheet.update_cell.side_effect = state.update_cell
+    sheet._state = state
     return sheet
+
+
+def _make_biz_registry_sheet():
+    sheet = MagicMock()
+    sheet.get_all_values.return_value = [["ID"], ["BIZ-001"]]
+    return sheet
+
+
+def _sheet_router(people_sheet):
+    biz_sheet = _make_biz_registry_sheet()
+
+    def fake_get(key):
+        return people_sheet if key == "people_registry" else biz_sheet
+
+    return fake_get
 
 
 def _fresh_import():
@@ -131,14 +195,9 @@ class TestSnapshotUsedForSave(unittest.TestCase):
     def _confirm_with_mocks(self, context, confirm_text="✅ Сохранить"):
         handlers = _fresh_import()
         sheet = _make_people_sheet()
-        captured = {}
-
-        def capture_update(**kwargs):
-            captured["row"] = kwargs.get("values", [[]])[0]
-        sheet.update.side_effect = capture_update
 
         async def run():
-            with patch("business_core.sheets.get_business_sheet", return_value=sheet), \
+            with patch("business_core.sheets.get_business_sheet", side_effect=_sheet_router(sheet)), \
                  patch("business_core.sheets.generate_next_id", return_value="PRS-999"), \
                  patch("business_core.business_builder.find_existing_person", return_value=None), \
                  patch("business_core.business_builder.provision_client_drive",
@@ -148,7 +207,7 @@ class TestSnapshotUsedForSave(unittest.TestCase):
                 await handlers["confirm"](_upd(confirm_text), context)
 
         asyncio.run(run())
-        return sheet, captured
+        return sheet
 
     def test_draft_mutation_after_card_does_not_affect_save(self):
         handlers = _fresh_import()
@@ -161,10 +220,10 @@ class TestSnapshotUsedForSave(unittest.TestCase):
         context.user_data["nc"]["full_name"] = "СОВЕРШЕННО ДРУГОЕ ИМЯ"
         context.user_data["nc"]["businesses"] = "Другой Бизнес"
 
-        sheet, captured = self._confirm_with_mocks(context)
+        sheet = self._confirm_with_mocks(context)
 
         idx = {h: i for i, h in enumerate(STANDARD_HEADERS)}
-        row = captured["row"]
+        row = sheet._state.rows[0]  # final state, after create_person + update_person
         self.assertEqual(row[idx["ФИО"]], "Иван Иванов")
         self.assertNotIn("СОВЕРШЕННО ДРУГОЕ ИМЯ", row[idx["ФИО"]])
         self.assertEqual(row[idx["Бизнесы"]], "Узаконение недвижимости")
@@ -174,10 +233,10 @@ class TestSnapshotUsedForSave(unittest.TestCase):
         context, _ = _walk_to_confirm(handlers, name="Петров Пётр", phone="+77009998877")
         snap = dict(context.user_data["nc_confirmed_snapshot"])
 
-        sheet, captured = self._confirm_with_mocks(context)
+        sheet = self._confirm_with_mocks(context)
 
         idx = {h: i for i, h in enumerate(STANDARD_HEADERS)}
-        row = captured["row"]
+        row = sheet._state.rows[0]
         self.assertEqual(row[idx["ФИО"]], snap["full_name"])
         self.assertEqual(row[idx["Телефон"]], snap["phone"])
 
@@ -190,11 +249,9 @@ class TestConfirmationTextNeverStored(unittest.TestCase):
         handlers = _fresh_import()
         context, _ = _walk_to_confirm(handlers, name="Тест Клиент")
         sheet = _make_people_sheet()
-        captured = {}
-        sheet.update.side_effect = lambda **kw: captured.update(row=kw["values"][0])
 
         async def run():
-            with patch("business_core.sheets.get_business_sheet", return_value=sheet), \
+            with patch("business_core.sheets.get_business_sheet", side_effect=_sheet_router(sheet)), \
                  patch("business_core.sheets.generate_next_id", return_value="PRS-999"), \
                  patch("business_core.business_builder.find_existing_person", return_value=None), \
                  patch("business_core.business_builder.provision_client_drive",
@@ -204,8 +261,9 @@ class TestConfirmationTextNeverStored(unittest.TestCase):
                 await handlers["confirm"](_upd("правильно"), context)
 
         asyncio.run(run())
-        self.assertNotIn("правильно", captured["row"])
-        self.assertNotIn("✅ Сохранить", captured["row"])
+        row = sheet._state.rows[0]
+        self.assertNotIn("правильно", row)
+        self.assertNotIn("✅ Сохранить", row)
 
 
 class TestFreshEntryNoStaleState(unittest.TestCase):
@@ -239,9 +297,9 @@ class TestMissingSnapshotIsSafe(unittest.TestCase):
         context = _ctx()
         context.user_data["nc"] = {"full_name": "Что-то"}  # snapshot отсутствует
 
-        with patch("business_core.sheets.append_business_row") as mock_append:
+        with patch("business_core.person_manager.create_person") as mock_create:
             asyncio.run(handlers["confirm"](_upd("✅ Сохранить"), context))
-        mock_append.assert_not_called()
+        mock_create.assert_not_called()
 
 
 class TestBizIdAcceptsDirectId(unittest.TestCase):
@@ -254,11 +312,9 @@ class TestBizIdAcceptsDirectId(unittest.TestCase):
         context, _ = _walk_to_confirm(handlers, biz_answer="BIZ-001")
 
         sheet = _make_people_sheet()
-        captured = {}
-        sheet.update.side_effect = lambda **kw: captured.update(row=kw["values"][0])
 
         async def run():
-            with patch("business_core.sheets.get_business_sheet", return_value=sheet), \
+            with patch("business_core.sheets.get_business_sheet", side_effect=_sheet_router(sheet)), \
                  patch("business_core.sheets.generate_next_id", return_value="PRS-999"), \
                  patch("business_core.sheets.read_business_sheet", return_value=BIZ_ROWS), \
                  patch("business_core.business_builder.find_existing_person", return_value=None), \
@@ -270,7 +326,7 @@ class TestBizIdAcceptsDirectId(unittest.TestCase):
 
         asyncio.run(run())
         idx = {h: i for i, h in enumerate(STANDARD_HEADERS)}
-        row = captured["row"]
+        row = sheet._state.rows[0]
         self.assertEqual(row[idx["Biz IDs"]], "BIZ-001")
         self.assertEqual(row[idx["Primary Biz ID"]], "BIZ-001")
 
@@ -284,11 +340,9 @@ class TestFullNameCharacterPreserved(unittest.TestCase):
         self.assertEqual(context.user_data["nc_confirmed_snapshot"]["full_name"], "Тест Иванов")
 
         sheet = _make_people_sheet()
-        captured = {}
-        sheet.update.side_effect = lambda **kw: captured.update(row=kw["values"][0])
 
         async def run():
-            with patch("business_core.sheets.get_business_sheet", return_value=sheet), \
+            with patch("business_core.sheets.get_business_sheet", side_effect=_sheet_router(sheet)), \
                  patch("business_core.sheets.generate_next_id", return_value="PRS-999"), \
                  patch("business_core.business_builder.find_existing_person", return_value=None), \
                  patch("business_core.business_builder.provision_client_drive",
@@ -299,7 +353,8 @@ class TestFullNameCharacterPreserved(unittest.TestCase):
 
         asyncio.run(run())
         idx = {h: i for i, h in enumerate(STANDARD_HEADERS)}
-        self.assertEqual(captured["row"][idx["ФИО"]], "Тест Иванов")
+        row = sheet._state.rows[0]
+        self.assertEqual(row[idx["ФИО"]], "Тест Иванов")
 
 
 class TestSuccessNotConfusedWithFormattingError(unittest.TestCase):
@@ -310,7 +365,6 @@ class TestSuccessNotConfusedWithFormattingError(unittest.TestCase):
         handlers = _fresh_import()
         context, _ = _walk_to_confirm(handlers, name="Клиент Успех")
         sheet = _make_people_sheet()
-        sheet.update.return_value = None
 
         update = _upd("✅ Сохранить")
         # Первый вызов reply_text (успешный ответ) — выбрасывает исключение,
@@ -318,20 +372,18 @@ class TestSuccessNotConfusedWithFormattingError(unittest.TestCase):
         update.message.reply_text = AsyncMock(side_effect=[Exception("boom"), None])
 
         async def run():
-            with patch("business_core.sheets.get_business_sheet", return_value=sheet), \
+            with patch("business_core.sheets.get_business_sheet", side_effect=_sheet_router(sheet)), \
                  patch("business_core.sheets.generate_next_id", return_value="PRS-999"), \
-                 patch("business_core.sheets.append_business_row") as mock_append, \
                  patch("business_core.business_builder.find_existing_person", return_value=None), \
                  patch("business_core.business_builder.provision_client_drive",
                        return_value={"ok": False, "error": "не задан"}), \
                  patch("business_core.business_builder._get_biz_id_by_name",
                        return_value="BIZ-001"):
                 await handlers["confirm"](update, context)
-                return mock_append
 
-        mock_append = asyncio.run(run())
+        asyncio.run(run())
         # Запись всё равно должна была уйти в Sheets ДО падения нотификации.
-        mock_append.assert_called_once()
+        self.assertEqual(len(sheet._state.rows), 1)
         # Второй вызов reply_text — сообщение об успехе, не "Ошибка сохранения".
         second_call_msg = update.message.reply_text.call_args_list[1][0][0]
         self.assertIn("✅", second_call_msg)
@@ -347,7 +399,7 @@ class TestSuccessNotConfusedWithFormattingError(unittest.TestCase):
         update = _upd("✅ Сохранить")
 
         async def run():
-            with patch("business_core.sheets.get_business_sheet", return_value=sheet), \
+            with patch("business_core.sheets.get_business_sheet", side_effect=_sheet_router(sheet)), \
                  patch("business_core.sheets.generate_next_id", return_value="PRS-999"), \
                  patch("business_core.business_builder.find_existing_person", return_value=None), \
                  patch("business_core.business_builder.provision_client_drive",
@@ -372,7 +424,7 @@ class TestUserDataCleanedAfterSuccess(unittest.TestCase):
         sheet = _make_people_sheet()
 
         async def run():
-            with patch("business_core.sheets.get_business_sheet", return_value=sheet), \
+            with patch("business_core.sheets.get_business_sheet", side_effect=_sheet_router(sheet)), \
                  patch("business_core.sheets.generate_next_id", return_value="PRS-999"), \
                  patch("business_core.business_builder.find_existing_person", return_value=None), \
                  patch("business_core.business_builder.provision_client_drive",

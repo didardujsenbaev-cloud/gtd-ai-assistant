@@ -854,12 +854,6 @@ async def newclient_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return ConversationHandler.END
 
     try:
-        from business_core.sheets import (
-            append_business_row,
-            generate_next_id,
-            get_business_sheet,
-            row_from_header_map,
-        )
         from business_core.business_builder import (
             find_existing_person,
             add_biz_id_to_person,
@@ -868,6 +862,7 @@ async def newclient_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             save_client_drive_to_sheets,
             normalize_biz_ids,
         )
+        from business_core.person_manager import create_person, update_person
 
         full_name = nc.get("full_name", "")
         phone     = nc.get("phone", "")
@@ -892,6 +887,12 @@ async def newclient_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         STATUS_SAME_BIZ      = "same_biz"
         STATUS_OTHER_BIZ     = "other_biz"
 
+        # Phase 23D-2: initialized unconditionally, before the branching,
+        # so STATUS_SAME_BIZ/STATUS_OTHER_BIZ (which never touch profile
+        # fields) can never hit an unbound variable when this flag is read
+        # later in the reply-construction step.
+        profile_fields_warning = False
+
         if existing is None:
             client_status = STATUS_NEW
             prs_id = None
@@ -902,52 +903,55 @@ async def newclient_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             client_status = STATUS_OTHER_BIZ
             prs_id = existing["prs_id"]
 
-        # ── Создание новой записи ─────────────────────────────────
+        # ── Создание новой записи (Phase 23D-2: через Person Manager) ──
         if client_status == STATUS_NEW:
-            prs_id     = generate_next_id("people_registry", "PRS")
-            parts      = full_name.split()
-            short_name = parts[0] if parts else full_name
-            now        = datetime.now().strftime("%Y-%m-%d")
+            # Core identity write — the ONLY step whose failure reproduces
+            # today's "❌ Ошибка сохранения" path (raising here lets the
+            # existing outer `except Exception as e` handle it exactly as
+            # before — no new error-handling shape introduced).
+            create_result = create_person(
+                full_name=full_name,
+                phone=phone,
+                person_type=nc.get("person_type", "клиент"),
+                business_id=biz_id_resolved,
+                status="active",
+            )
+            if not create_result["ok"]:
+                raise ValueError(create_result["error"])
 
-            biz_ids_val     = biz_id_resolved if biz_id_resolved else ""
-            primary_biz_val = biz_id_resolved if biz_id_resolved else ""
+            prs_id = create_result["person_id"]
 
-            # Phase 10.2B.4: строка формируется по ФАКТИЧЕСКИМ заголовкам
-            # листа PEOPLE_REGISTRY, а не по жёсткой позиции — не зависит
-            # от порядка колонок и не смещает значения в чужие колонки
-            # (см. Phase 10.2B.3: подтверждённое смещение "active"/"тёплый").
-            sheet   = get_business_sheet("people_registry")
-            headers = sheet.row_values(1)
-
-            required_headers = [
-                "ID", "ФИО", "Телефон",
-                "Статус отношений", "Теплота", "Комментарий",
-                "Biz IDs", "Primary Biz ID",
-                "Дата первого контакта", "Дата последнего контакта",
-            ]
-            missing_headers = [h for h in required_headers if h not in headers]
-            if missing_headers:
-                raise ValueError(
-                    f"PEOPLE_REGISTRY: отсутствуют обязательные колонки {missing_headers}. "
-                    f"Запись клиента остановлена, ничего не записано."
-                )
-
-            row_values = row_from_header_map(headers, {
-                "ID":     prs_id,
-                "ФИО":    full_name,
-                "Имя":    short_name,
-                "Телефон": phone,
-                "Тип":    nc.get("person_type", "клиент"),
+            # Profile-field write — Бизнесы (legacy display name),
+            # Уровень доверия, Теплота are /newclient-specific defaults,
+            # deliberately NOT part of create_person()'s universal API
+            # (Person Manager stays domain-neutral — see Phase 23D-2
+            # architecture decision). A failure here is a PARTIAL
+            # success: the Person itself is already confirmed created,
+            # so this must never be reported as a save failure, must
+            # never block Drive provisioning, and must never block
+            # cache invalidation.
+            update_result = update_person(prs_id, {
                 "Бизнесы": biz_name,
                 "Уровень доверия": "средний",
-                "Дата первого контакта":    now,
-                "Дата последнего контакта": now,
-                "Статус отношений": "active",
-                "Теплота":           "тёплый",
-                "Biz IDs":           biz_ids_val,
-                "Primary Biz ID":    primary_biz_val,
+                "Теплота": "тёплый",
             })
-            append_business_row("people_registry", row_values)
+            if not update_result["ok"]:
+                profile_fields_warning = True
+                log.warning(
+                    f"newclient_confirm: update_person partial failure "
+                    f"person_id={prs_id} operation=update_person "
+                    f"error={update_result['error']} "
+                    f"attempted_fields=['Бизнесы', 'Уровень доверия', 'Теплота']"
+                )
+            # update_person() currently issues one update_cell() call PER
+            # changed field (Бизнесы / Уровень доверия / Теплота), not a
+            # single batched write — so a failure partway through could
+            # leave some, but not necessarily all, of these three fields
+            # saved. The warning below deliberately says "часть" (some),
+            # never claims none were saved. Batching this into a single
+            # write is recorded as technical debt (Phase 23D-2), not
+            # addressed in this phase — see ENGINEERING_STANDARDS.md,
+            # Technical Debt Policy.
 
             try:
                 from business_core.inbox_bridge import invalidate_cache
@@ -1009,12 +1013,23 @@ async def newclient_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         else:
             header = "ℹ️ Контакт уже был в другом бизнесе, добавил связь с текущим бизнесом"
 
+        # Phase 23D-2: profile_fields_warning is only ever True for
+        # STATUS_NEW (the only branch that calls update_person() for
+        # profile fields) — appended AFTER the success header, never
+        # replacing it, and never implying the Person itself wasn't saved.
+        warning_line = (
+            "\n⚠️ Некоторые дополнительные поля профиля (бизнес/теплота) "
+            "могли сохраниться не полностью — проверьте карточку клиента."
+            if profile_fields_warning else ""
+        )
+
         try:
             await update.message.reply_text(
                 f"{header}\n\n"
                 f"🆔 ID: {prs_id}\n"
                 f"👤 {full_name}"
-                f"{drive_msg}\n\n"
+                f"{drive_msg}"
+                f"{warning_line}\n\n"
                 f"/clients — посмотреть всех клиентов",
                 reply_markup=ReplyKeyboardRemove(),
             )

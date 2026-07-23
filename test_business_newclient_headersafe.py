@@ -7,6 +7,17 @@ Phase 10.2B.4: Header-safe newclient_confirm() — mock tests.
 ("active" -> Теплота, "тёплый" -> Комментарий, Biz IDs -> Company ID,
 Primary Biz ID -> за пределы листа) больше не воспроизводится.
 
+Phase 23D-2: newclient_confirm()'s STATUS_NEW branch now writes through
+business_core.person_manager.create_person() (core identity fields)
+followed by update_person() (Бизнесы/Уровень доверия/Теплота — the
+"profile fields" split, see ARCHITECTURE.md / Person Layer). The mock
+sheet is now STATEFUL (supports find/row_values/get_all_values/update/
+update_cell against the same underlying row list) so assertions can
+read the final, post-both-calls state of PEOPLE_REGISTRY — a more
+robust check than parsing one specific low-level write call, and the
+only way to correctly verify fields that are now set via update_cell()
+rather than the initial row construction.
+
 Все тесты полностью мокают business_core.sheets.get_business_sheet —
 ни один тест не должен обращаться к live Google Sheets API.
 """
@@ -33,8 +44,14 @@ STANDARD_HEADERS = [
     "Biz IDs", "Company ID", "Citizenship", "Passport / ID", "Primary Biz ID",
 ]
 
-# Та же самая, но с перемешанным порядком (не совпадает по позиции)
+# Та же самая, но с перемешанным порядком (не совпадает по позиции) —
+# "ID" остаётся первой колонкой (реалистичный сценарий: в реальном
+# Google Sheets колонку A с ID практически никогда не переносят, даже
+# когда остальные колонки переставляют; это же допущение уже разделяют
+# find(..., in_column=1)-паттерны во всех менеджерах этого кодбейса —
+# organization_manager.py, roadmap_manager.py, теперь и person_manager.py).
 SHUFFLED_HEADERS = [
+    "ID",
     "Primary Biz ID", "Passport / ID", "Citizenship", "Company ID", "Biz IDs",
     "Drive Folder ID", "Google Drive",
     "Комментарий", "Теплота", "Статус отношений",
@@ -45,17 +62,68 @@ SHUFFLED_HEADERS = [
     "Теги", "Специализация", "Кого знает", "Чем я полезен", "Чем полезен",
     "Источник", "Уровень доверия", "Бизнесы", "Подтип", "Тип",
     "Должность", "Компания", "Город", "Email", "Telegram",
-    "WhatsApp", "Телефон 2", "Телефон", "Имя", "ФИО", "ID",
+    "WhatsApp", "Телефон 2", "Телефон", "Имя", "ФИО",
 ]
 
 
-def _make_people_sheet(headers: list, existing_rows: list | None = None) -> MagicMock:
-    """Мок листа PEOPLE_REGISTRY. Никаких реальных HTTP-вызовов."""
+class _StatefulSheet:
+    """A minimal, stateful stand-in for one Sheets tab — supports
+    find()/row_values()/get_all_values()/update()/update_cell() against
+    a single shared row list, so create_person()'s append and
+    update_person()'s per-field writes are both reflected in
+    get_all_values()/row_values() afterwards."""
+
+    def __init__(self, headers: list, existing_rows: list | None = None):
+        self.headers = list(headers)
+        self.rows = [list(r) for r in (existing_rows or [])]
+
+    def get_all_values(self):
+        return [self.headers] + self.rows
+
+    def row_values(self, r):
+        if r == 1:
+            return self.headers
+        return self.rows[r - 2]
+
+    def find(self, value, in_column=1):
+        for i, row in enumerate(self.rows):
+            if row and row[0] == value:
+                cell = MagicMock()
+                cell.row = i + 2
+                return cell
+        return None
+
+    def update(self, range_name=None, values=None):
+        self.rows.append(list(values[0]))
+
+    def update_cell(self, row_num, col, value):
+        row = self.rows[row_num - 2]
+        while len(row) < col:
+            row.append("")
+        row[col - 1] = value
+
+
+def _make_people_sheet(headers: list, existing_rows: list | None = None):
+    """Returns a MagicMock wired to a _StatefulSheet instance, so test
+    code can still use MagicMock call-tracking (call_count, call_args)
+    while the underlying data is genuinely stateful."""
+    state = _StatefulSheet(headers, existing_rows)
     sheet = MagicMock()
-    sheet.row_values.return_value = list(headers)
-    rows = existing_rows or []
-    sheet.get_all_values.return_value = [list(headers)] + rows
-    sheet.update.return_value = None
+    sheet.get_all_values.side_effect = state.get_all_values
+    sheet.row_values.side_effect = state.row_values
+    sheet.find.side_effect = state.find
+    sheet.update.side_effect = state.update
+    sheet.update_cell.side_effect = state.update_cell
+    sheet._state = state  # exposed for assertions reading final row state
+    return sheet
+
+
+def _make_biz_registry_sheet():
+    """Minimal BIZ_REGISTRY mock — just enough for create_person()'s
+    read-only find_row_by_id("biz_registry", ...) FK check to succeed
+    for BIZ-001/BIZ-002, exactly as they exist in production today."""
+    sheet = MagicMock()
+    sheet.get_all_values.return_value = [["ID"], ["BIZ-001"], ["BIZ-002"]]
     return sheet
 
 
@@ -99,11 +167,16 @@ def _run_newclient_confirm(sheet, find_existing_return=None, biz_id_resolved="BI
     Запустить newclient_confirm с полностью замоканными зависимостями.
     Возвращает (update, context, sheet) для дальнейших проверок.
     """
+    biz_sheet = _make_biz_registry_sheet()
+
+    def fake_get_business_sheet(key):
+        return sheet if key == "people_registry" else biz_sheet
+
     async def run():
         newclient_confirm = _fresh_import()
         update, context = _make_update_context(biz_id_resolved=biz_id_resolved)
 
-        with patch("business_core.sheets.get_business_sheet", return_value=sheet), \
+        with patch("business_core.sheets.get_business_sheet", side_effect=fake_get_business_sheet), \
              patch("business_core.sheets.generate_next_id", return_value="PRS-999"), \
              patch("business_core.business_builder.find_existing_person",
                    return_value=find_existing_return), \
@@ -133,54 +206,94 @@ class TestNewClientHeaderSafeStandardOrder(unittest.TestCase):
         self.assertIn("✅", msg)
         self.assertIn("PRS-999", msg)
 
-    def _written_row(self) -> dict:
+    def _created_row(self) -> dict:
+        """The row as it looked immediately after create_person()'s
+        append (the ONE sheet.update() call) — core identity fields only."""
         self.assertEqual(self.sheet.update.call_count, 1)
         kwargs = self.sheet.update.call_args.kwargs
         values = kwargs["values"][0]
         idx = {h: i for i, h in enumerate(STANDARD_HEADERS)}
         return {h: (values[i] if i < len(values) else "") for h, i in idx.items()}
 
+    def _final_row(self) -> dict:
+        """The row's FINAL state after create_person() AND
+        update_person() (profile fields) have both run."""
+        row = self.sheet._state.rows[0]
+        idx = {h: i for i, h in enumerate(STANDARD_HEADERS)}
+        return {h: (row[i] if i < len(row) else "") for h, i in idx.items()}
+
     def test_3_id_in_id_column(self):
-        row = self._written_row()
+        row = self._created_row()
         self.assertEqual(row["ID"], "PRS-999")
 
     def test_3_name_in_fio_column(self):
-        row = self._written_row()
+        row = self._created_row()
         self.assertEqual(row["ФИО"], "Иван Иванов")
 
     def test_4_relationship_status_active(self):
-        row = self._written_row()
+        row = self._created_row()
         self.assertEqual(row["Статус отношений"], "active")
 
     def test_5_warmth_value(self):
-        row = self._written_row()
+        """Теплота is now set via the follow-up update_person() call
+        (Phase 23D-2), not the initial create_person() row — check the
+        FINAL sheet state, not the create-time row."""
+        row = self._final_row()
         self.assertEqual(row["Теплота"], "тёплый")
 
     def test_6_comment_not_warmth(self):
-        row = self._written_row()
+        row = self._final_row()
         self.assertEqual(row["Комментарий"], "")
         self.assertNotEqual(row["Комментарий"], "тёплый")
 
     def test_7_biz_ids_value(self):
-        row = self._written_row()
+        row = self._created_row()
         self.assertEqual(row["Biz IDs"], "BIZ-001")
 
     def test_8_primary_biz_id_value(self):
-        row = self._written_row()
+        row = self._created_row()
         self.assertEqual(row["Primary Biz ID"], "BIZ-001")
 
     def test_9_unknown_extra_columns_untouched(self):
-        row = self._written_row()
+        row = self._final_row()
         # поля, которым не присвоено значение в newclient_confirm, должны остаться пустыми
         for h in ("Company ID", "Citizenship", "Passport / ID", "Телефон 2",
                   "WhatsApp", "Email", "Город"):
             self.assertEqual(row[h], "", f"{h} должно быть пустым")
 
-    def test_10_headers_read_once(self):
-        self.assertEqual(self.sheet.row_values.call_count, 1)
+    def test_10_headers_read_once_for_create(self):
+        # create_person()'s and update_person()'s header reads are counted
+        # SEPARATELY by splitting the sheet's chronological call log on
+        # the one sheet.update() call (create_person()'s row append) —
+        # every row_values(1) call before it belongs to create_person(),
+        # every one after it belongs to update_person()/_find_person_row().
+        calls = self.sheet.method_calls
+        append_index = next(
+            i for i, c in enumerate(calls) if c[0] == "update"
+        )
+        before, after = calls[:append_index], calls[append_index + 1:]
+
+        header_reads_for_create = [c for c in before if c[0] == "row_values" and c.args == (1,)]
+        header_reads_for_update = [c for c in after if c[0] == "row_values" and c.args == (1,)]
+
+        # create_person() reads headers exactly once before its append.
+        self.assertEqual(len(header_reads_for_create), 1)
+        # update_person() reads headers exactly twice after the append:
+        # once inside _find_person_row() (to map the existing row back to
+        # a dict) and once more inside update_person() itself (to resolve
+        # the column index for update_cell()) — both real, separate reads,
+        # not an artifact of the mock.
+        self.assertEqual(len(header_reads_for_update), 2)
 
     def test_11_append_called_once(self):
         self.assertEqual(self.sheet.update.call_count, 1)
+
+    def test_12_bizness_legacy_column_set_via_update_person(self):
+        """Phase 23D-2: 'Бизнесы' (legacy display name) is now written
+        by update_person(), not create_person() — verify it lands
+        correctly in the final state."""
+        row = self._final_row()
+        self.assertEqual(row["Бизнесы"], "ТестБизнес")
 
 
 class TestNewClientHeaderSafeShuffledOrder(unittest.TestCase):
@@ -192,11 +305,10 @@ class TestNewClientHeaderSafeShuffledOrder(unittest.TestCase):
             self.sheet, find_existing_return=None
         )
 
-    def _written_row(self) -> dict:
-        kwargs = self.sheet.update.call_args.kwargs
-        values = kwargs["values"][0]
+    def _final_row(self) -> dict:
+        row = self.sheet._state.rows[0]
         idx = {h: i for i, h in enumerate(SHUFFLED_HEADERS)}
-        return {h: (values[i] if i < len(values) else "") for h, i in idx.items()}
+        return {h: (row[i] if i < len(row) else "") for h, i in idx.items()}
 
     def test_2_created_with_shuffled_headers(self):
         self.update.message.reply_text.assert_called_once()
@@ -204,7 +316,7 @@ class TestNewClientHeaderSafeShuffledOrder(unittest.TestCase):
         self.assertIn("✅", msg)
 
     def test_values_correct_despite_shuffle(self):
-        row = self._written_row()
+        row = self._final_row()
         self.assertEqual(row["ID"], "PRS-999")
         self.assertEqual(row["ФИО"], "Иван Иванов")
         self.assertEqual(row["Статус отношений"], "active")
@@ -223,12 +335,6 @@ class TestNewClientNoShiftRegression(unittest.TestCase):
             self.sheet, find_existing_return=None
         )
 
-    def _written_row(self) -> dict:
-        kwargs = self.sheet.update.call_args.kwargs
-        values = kwargs["values"][0]
-        idx = {h: i for i, h in enumerate(STANDARD_HEADERS)}
-        return {h: (values[i] if i < len(values) else "") for h, i in idx.items()}
-
     def test_row_length_matches_headers(self):
         kwargs = self.sheet.update.call_args.kwargs
         values = kwargs["values"][0]
@@ -245,10 +351,14 @@ class TestNewClientSameBizNoNewRow(unittest.TestCase):
 
     def test_same_biz_skips_append(self):
         sheet = _make_people_sheet(STANDARD_HEADERS)
-        update, context, add_biz, upd_drive, save_drive = _run_newclient_confirm(
-            sheet,
-            find_existing_return={"prs_id": "PRS-001", "same_biz": True, "drive_url": ""},
-        )
+        with patch("business_core.person_manager.create_person") as mock_create, \
+             patch("business_core.person_manager.update_person") as mock_update:
+            update, context, add_biz, upd_drive, save_drive = _run_newclient_confirm(
+                sheet,
+                find_existing_return={"prs_id": "PRS-001", "same_biz": True, "drive_url": ""},
+            )
+            mock_create.assert_not_called()
+            mock_update.assert_not_called()
         self.assertEqual(sheet.update.call_count, 0)
         add_biz.assert_not_called()
         msg = update.message.reply_text.call_args[0][0]
@@ -260,11 +370,15 @@ class TestNewClientOtherBizNoNewRow(unittest.TestCase):
 
     def test_other_biz_updates_not_creates(self):
         sheet = _make_people_sheet(STANDARD_HEADERS)
-        update, context, add_biz, upd_drive, save_drive = _run_newclient_confirm(
-            sheet,
-            find_existing_return={"prs_id": "PRS-002", "same_biz": False, "drive_url": ""},
-            biz_id_resolved="BIZ-002",
-        )
+        with patch("business_core.person_manager.create_person") as mock_create, \
+             patch("business_core.person_manager.update_person") as mock_update:
+            update, context, add_biz, upd_drive, save_drive = _run_newclient_confirm(
+                sheet,
+                find_existing_return={"prs_id": "PRS-002", "same_biz": False, "drive_url": ""},
+                biz_id_resolved="BIZ-002",
+            )
+            mock_create.assert_not_called()
+            mock_update.assert_not_called()
         self.assertEqual(sheet.update.call_count, 0)
         add_biz.assert_called_once_with("PRS-002", "BIZ-002")
         msg = update.message.reply_text.call_args[0][0]
