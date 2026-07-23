@@ -5774,6 +5774,247 @@ async def version_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await _reply(update, f"❌ Ошибка получения версии: {e}")
 
 
+# ─────────────────────────────────────────────────────────────
+# Phase 21F: Organization Layer — /newdept /newrole /roles /roledetails
+# /assignrole. Additive only — no existing command touched.
+#
+# Thin wrappers over business_core.organization_manager: parse args,
+# call the manager, format the reply. No business logic beyond what the
+# manager already returns (ENGINEERING_STANDARDS.md, Module Standards —
+# telegram_handlers.py is not a source of truth for validation).
+# ─────────────────────────────────────────────────────────────
+
+async def newdept_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /newdept name="Operations" [business_id=BIZ-001] [parent_department_id=DEPT-001]
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg())
+        return
+
+    raw = " ".join(context.args or [])
+    args = _parse_kv_args(raw)
+    name = args.get("name") or args.get("_pos0", "")
+
+    if not name:
+        await _reply(update,
+            "❌ Укажи name.\n\nПример:\n"
+            '`/newdept name="Operations" parent_department_id=DEPT-001`'
+        )
+        return
+
+    try:
+        from business_core.organization_manager import create_department
+
+        result = create_department(
+            name,
+            business_id=args.get("business_id", ""),
+            parent_department_id=args.get("parent_department_id", ""),
+            notes=args.get("notes", ""),
+        )
+        if not result["ok"]:
+            await _reply(update, f"❌ Ошибка: {result['error']}")
+            return
+
+        lines = ["✅ Department создан", f"Department ID: `{result['department_id']}`", f"Название: {name}"]
+        if args.get("parent_department_id"):
+            lines.append(f"Parent: `{args['parent_department_id']}`")
+        await _reply(update, "\n".join(lines))
+    except Exception as e:
+        log.error(f"newdept_cmd error: {e}")
+        await _reply(update, f"❌ Ошибка: {e}")
+
+
+async def newrole_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /newrole name="Coordinator" department_id=DEPT-002 [reports_to_role_id=ROLE-001]
+             [status=planned] [purpose="..."] [main_result="..."]
+
+    status по умолчанию "planned" — новая роль обычно вакантна до найма
+    (см. ARCHITECTURE.md / Organization Layer).
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg())
+        return
+
+    raw = " ".join(context.args or [])
+    args = _parse_kv_args(raw)
+    name = args.get("name") or args.get("_pos0", "")
+    department_id = args.get("department_id", "")
+
+    if not name or not department_id:
+        from business_core.organization_manager import ROLE_STATUS
+        await _reply(update,
+            "❌ Укажи name и department_id.\n\n"
+            f"Допустимые статусы: `{', '.join(ROLE_STATUS)}`\n\n"
+            "Пример:\n"
+            '`/newrole name="Coordinator" department_id=DEPT-002 '
+            'reports_to_role_id=ROLE-001 status=planned`'
+        )
+        return
+
+    try:
+        from business_core.organization_manager import create_role
+
+        result = create_role(
+            name,
+            department_id=department_id,
+            reports_to_role_id=args.get("reports_to_role_id", ""),
+            status=args.get("status", "planned"),
+            purpose=args.get("purpose", ""),
+            main_result=args.get("main_result", ""),
+            notes=args.get("notes", ""),
+        )
+        if not result["ok"]:
+            await _reply(update, f"❌ Ошибка: {result['error']}")
+            return
+
+        lines = ["✅ Role создана", f"Role ID: `{result['role_id']}`", f"Название: {name}",
+                  f"Department: `{department_id}`"]
+        if args.get("reports_to_role_id"):
+            lines.append(f"Reports To: `{args['reports_to_role_id']}`")
+        lines.append(f"\nНазначить человека: `/assignrole person_id=PRS-001 role_id={result['role_id']}`")
+        await _reply(update, "\n".join(lines))
+    except Exception as e:
+        log.error(f"newrole_cmd error: {e}")
+        await _reply(update, f"❌ Ошибка: {e}")
+
+
+async def roles_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /roles [department_id=DEPT-002] [status=planned]
+
+    Read-only. Показывает вакантность (по is_role_vacant()) рядом с
+    каждой ролью.
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg())
+        return
+
+    raw = " ".join(context.args or [])
+    args = _parse_kv_args(raw)
+
+    try:
+        from business_core.organization_manager import list_roles, is_role_vacant
+
+        roles = list_roles(department_id=args.get("department_id", ""), status=args.get("status", ""))
+
+        if not roles:
+            await _reply(update, "📋 *Роли*\n\nПусто. Создай первую: /newrole")
+            return
+
+        lines = [f"📋 *Роли* ({len(roles)} шт.)\n"]
+        for r in roles[:30]:
+            vacancy_icon = "🟡 вакантна" if is_role_vacant(r["role_id"]) else "🟢 занята"
+            lines.append(f"`{r['role_id']}` {r['role_name']} — {r['status']} ({vacancy_icon})")
+        await _reply(update, "\n".join(lines))
+    except Exception as e:
+        log.error(f"roles_cmd error: {e}")
+        await _reply(update, f"❌ Ошибка: {e}")
+
+
+async def roledetails_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /roledetails role_id=ROLE-001
+
+    Read-only карточка роли: поля Role + вакантность + активные
+    назначения (person_id, start_date).
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg())
+        return
+
+    raw = " ".join(context.args or [])
+    args = _parse_kv_args(raw)
+    role_id = args.get("role_id") or args.get("_pos0", "")
+
+    if not role_id:
+        await _reply(update, "❌ Укажи role_id.\n\nПример: /roledetails role_id=ROLE-001")
+        return
+
+    try:
+        from business_core.organization_manager import find_role_by_id, is_role_vacant, get_active_roles_for_person
+
+        role = find_role_by_id(role_id)
+        if not role:
+            await _reply(update, f"❌ Role {role_id} не найдена.")
+            return
+
+        from business_core.organization_manager import list_assignments_for_role
+        active_assignments = list_assignments_for_role(role_id, status="active")
+
+        lines = [
+            f"📌 Role {role['role_id']}",
+            "",
+            f"Название: {role['role_name']}",
+            f"Department: {role['department_id']}",
+            f"Reports To: {role['reports_to_role_id'] or '—'}",
+            f"Статус: {role['status']}",
+            f"Purpose: {role['purpose'] or '—'}",
+            f"Main Result: {role['main_result'] or '—'}",
+        ]
+        if is_role_vacant(role_id):
+            lines.append("Вакантность: 🟡 вакантна")
+        else:
+            lines.append("Вакантность: 🟢 занята")
+            for a in active_assignments:
+                lines.append(f"  — {a['person_id']} (с {a['start_date']}, {a['assignment_type']})")
+
+        await _reply(update, "\n".join(lines))
+    except Exception as e:
+        log.error(f"roledetails_cmd error: {e}")
+        await _reply(update, f"❌ Ошибка: {e}")
+
+
+async def assignrole_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /assignrole person_id=PRS-001 role_id=ROLE-001 [start_date=2026-01-01]
+                [assignment_type=primary]
+
+    start_date по умолчанию — сегодня, если не передан. Множественные
+    одновременные активные назначения для одного человека разрешены
+    (multi-role, см. ARCHITECTURE.md §4) — эта команда не проверяет и не
+    запрещает такое дублирование.
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg())
+        return
+
+    raw = " ".join(context.args or [])
+    args = _parse_kv_args(raw)
+    person_id = args.get("person_id", "")
+    role_id = args.get("role_id", "")
+
+    if not person_id or not role_id:
+        await _reply(update,
+            "❌ Укажи person_id и role_id.\n\nПример:\n"
+            "`/assignrole person_id=PRS-001 role_id=ROLE-001`"
+        )
+        return
+
+    try:
+        from business_core.organization_manager import assign_person_to_role
+
+        start_date = args.get("start_date", "") or datetime.now().strftime("%Y-%m-%d")
+        result = assign_person_to_role(
+            person_id, role_id, start_date,
+            assignment_type=args.get("assignment_type", "primary"),
+        )
+        if not result["ok"]:
+            await _reply(update, f"❌ Ошибка: {result['error']}")
+            return
+
+        await _reply(update, "\n".join([
+            "✅ Назначение создано",
+            f"Assignment ID: `{result['assignment_id']}`",
+            f"{person_id} → {role_id}",
+            f"С {start_date}",
+        ]))
+    except Exception as e:
+        log.error(f"assignrole_cmd error: {e}")
+        await _reply(update, f"❌ Ошибка: {e}")
+
+
 def register_business_handlers(app: Application) -> None:
     """
     Зарегистрировать все Business Core handlers в приложении.
@@ -5958,6 +6199,12 @@ def register_business_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("report",           report_cmd))
     # Phase 12A
     app.add_handler(CommandHandler("version",          version_cmd))
+    # Phase 21F: Organization Layer
+    app.add_handler(CommandHandler("newdept",          newdept_cmd))
+    app.add_handler(CommandHandler("newrole",          newrole_cmd))
+    app.add_handler(CommandHandler("roles",            roles_cmd))
+    app.add_handler(CommandHandler("roledetails",      roledetails_cmd))
+    app.add_handler(CommandHandler("assignrole",       assignrole_cmd))
 
     # Callback handler для кнопок подтверждения бизнес-контекста (Фаза 5B)
     app.add_handler(CallbackQueryHandler(bc_ctx_callback, pattern=r"^bc_ctx:"))
@@ -5968,5 +6215,6 @@ def register_business_handlers(app: Application) -> None:
         "/newobject /objects /startroadmap /stages /updatestage /recalcprogress "
         "/newservice /services /service "
         "/milestones /report "
+        "/newdept /newrole /roles /roledetails /assignrole "
         "+ bc_ctx callback (Фаза 5B)"
     )
