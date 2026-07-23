@@ -6015,6 +6015,233 @@ async def assignrole_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await _reply(update, f"❌ Ошибка: {e}")
 
 
+# ─────────────────────────────────────────────────────────────
+# Phase 22D: Work Execution Layer — /assignstagerole /reassignstagerole
+# /stageresponsibility. Additive only — no existing command touched.
+#
+# Thin wrappers over business_core.work_assignment_manager: parse args,
+# call the manager, format the reply. No business logic beyond what the
+# manager already returns, no direct Sheets access from these handlers
+# (ENGINEERING_STANDARDS.md, Module Standards / Manager First).
+# ─────────────────────────────────────────────────────────────
+
+async def assignstagerole_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /assignstagerole stage_id=STAGE-001 role_id=ROLE-001
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg())
+        return
+
+    raw = " ".join(context.args or [])
+    args = _parse_kv_args(raw)
+    stage_id = args.get("stage_id", "")
+    role_id = args.get("role_id", "")
+
+    if not stage_id or not role_id:
+        await _reply(update,
+            "❌ Укажи stage_id и role_id.\n\nПример:\n"
+            "`/assignstagerole stage_id=STAGE-001 role_id=ROLE-001`"
+        )
+        return
+
+    try:
+        from business_core.work_assignment_manager import assign_role_to_stage
+
+        result = assign_role_to_stage(stage_id, role_id)
+        if not result["ok"]:
+            await _reply(update, f"❌ Ошибка: {result['error']}")
+            return
+
+        await _reply(update, "\n".join([
+            "✅ Role назначена на этап",
+            f"Stage: `{stage_id}`",
+            f"Role: `{role_id}`",
+            f"Relation ID: `{result['relation_id']}`",
+        ]))
+    except Exception as e:
+        log.error(f"assignstagerole_cmd error: {e}")
+        await _reply(update, f"❌ Ошибка: {e}")
+
+
+async def reassignstagerole_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /reassignstagerole stage_id=STAGE-001 role_id=ROLE-002
+
+    Различает четыре исхода:
+      - changed=True, ok=True  -> ✅ смена прошла успешно
+      - changed=False, ok=True -> ℹ️ этап уже назначен на эту роль (idempotent no-op)
+      - changed=True, ok=False -> ⚠️ старая relation уже деактивирована,
+        но новая не создалась — partial failure, требует повторной попытки
+      - changed=False, ok=False -> ❌ валидационная/manager-ошибка, ничего не изменено
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg())
+        return
+
+    raw = " ".join(context.args or [])
+    args = _parse_kv_args(raw)
+    stage_id = args.get("stage_id", "")
+    role_id = args.get("role_id", "")
+
+    if not stage_id or not role_id:
+        await _reply(update,
+            "❌ Укажи stage_id и role_id.\n\nПример:\n"
+            "`/reassignstagerole stage_id=STAGE-001 role_id=ROLE-002`"
+        )
+        return
+
+    try:
+        from business_core.work_assignment_manager import reassign_stage_role
+
+        result = reassign_stage_role(stage_id, role_id)
+
+        if result["ok"] and result["changed"]:
+            await _reply(update, "\n".join([
+                "✅ Role этапа изменена",
+                f"Stage: `{stage_id}`",
+                f"Была: `{result['old_relation_id'] or '—'}`",
+                f"Стала: `{result['new_relation_id']}` (role `{role_id}`)",
+            ]))
+            return
+
+        if result["ok"] and not result["changed"]:
+            await _reply(update,
+                f"ℹ️ Этап `{stage_id}` уже назначен на роль `{role_id}` "
+                "(изменений нет, повтор безопасен)."
+            )
+            return
+
+        if not result["ok"] and result["changed"]:
+            await _reply(update, "\n".join([
+                "⚠️ Смена роли выполнена частично",
+                f"Stage: `{stage_id}`",
+                f"Старая relation деактивирована: `{result['old_relation_id']}`",
+                f"Не удалось создать новую: {result['error']}",
+                "Повтор команды безопасен.",
+            ]))
+            return
+
+        await _reply(update, f"❌ Ошибка: {result['error']}")
+    except Exception as e:
+        log.error(f"reassignstagerole_cmd error: {e}")
+        await _reply(update, f"❌ Ошибка: {e}")
+
+
+async def stageresponsibility_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /stageresponsibility stage_id=STAGE-001
+
+    Read-only. Показывает все четыре структурных статуса resolve_
+    stage_responsibility(): assigned / vacant / unconfigured /
+    configuration_error. Никогда не показывает traceback/внутренние
+    детали исключений — только уже безопасные, человекочитаемые строки
+    из result['errors'].
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg())
+        return
+
+    raw = " ".join(context.args or [])
+    args = _parse_kv_args(raw)
+    stage_id = args.get("stage_id") or args.get("_pos0", "")
+
+    if not stage_id:
+        await _reply(update, "❌ Укажи stage_id.\n\nПример: /stageresponsibility stage_id=STAGE-001")
+        return
+
+    try:
+        from business_core.work_assignment_manager import resolve_stage_responsibility
+
+        result = resolve_stage_responsibility(stage_id)
+        status = result["status"]
+
+        if status == "assigned":
+            role_name = "—"
+            try:
+                from business_core.organization_manager import find_role_by_id
+                role = find_role_by_id(result["role_id"])
+                if role:
+                    role_name = role.get("role_name") or "—"
+            except Exception:
+                pass
+
+            person_name = "—"
+            assignment_type = ""
+            try:
+                from business_core.sheets import find_row_by_id
+                found = find_row_by_id("people_registry", result["person_id"])
+                if found:
+                    _, row = found
+                    person_name = row.get("ФИО") or row.get("Имя") or "—"
+            except Exception:
+                pass
+            try:
+                from business_core.organization_manager import list_assignments_for_role
+                active = list_assignments_for_role(result["role_id"], status="active")
+                match = next((a for a in active if a.get("person_id") == result["person_id"]), None)
+                if match:
+                    assignment_type = match.get("assignment_type", "")
+            except Exception:
+                pass
+
+            lines = [
+                "✅ Stage Responsibility: assigned",
+                f"Stage ID: `{stage_id}`",
+                f"Role ID: `{result['role_id']}`",
+                f"Role Name: {role_name}",
+                f"Person ID: `{result['person_id']}`",
+                f"Person Name: {person_name}",
+            ]
+            if assignment_type:
+                lines.append(f"Assignment Type: {assignment_type}")
+            await _reply(update, "\n".join(lines))
+            return
+
+        if status == "vacant":
+            role_name = "—"
+            try:
+                from business_core.organization_manager import find_role_by_id
+                role = find_role_by_id(result["role_id"])
+                if role:
+                    role_name = role.get("role_name") or "—"
+            except Exception:
+                pass
+
+            await _reply(update, "\n".join([
+                "🟡 Stage Responsibility: vacant",
+                f"Stage ID: `{stage_id}`",
+                f"Role ID: `{result['role_id']}`",
+                f"Role Name: {role_name}",
+                "У роли нет активного Person Assignment.",
+            ]))
+            return
+
+        if status == "unconfigured":
+            await _reply(update, "\n".join([
+                "ℹ️ Stage Responsibility: unconfigured",
+                f"Stage ID: `{stage_id}`",
+                "Для этого этапа не настроена ответственная роль.",
+            ]))
+            return
+
+        # configuration_error
+        lines = [
+            "❌ Stage Responsibility: configuration_error",
+            f"Stage ID: `{stage_id}`",
+        ]
+        if result.get("role_id"):
+            lines.append(f"Role ID: `{result['role_id']}`")
+        if result.get("relation_id"):
+            lines.append(f"Relation ID: `{result['relation_id']}`")
+        for err in result.get("errors", ()):
+            lines.append(f"— {err}")
+        await _reply(update, "\n".join(lines))
+    except Exception as e:
+        log.error(f"stageresponsibility_cmd error: {e}")
+        await _reply(update, "❌ Ошибка при получении статуса ответственности за этап.")
+
+
 def register_business_handlers(app: Application) -> None:
     """
     Зарегистрировать все Business Core handlers в приложении.
@@ -6205,6 +6432,10 @@ def register_business_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("roles",            roles_cmd))
     app.add_handler(CommandHandler("roledetails",      roledetails_cmd))
     app.add_handler(CommandHandler("assignrole",       assignrole_cmd))
+    # Phase 22D: Work Execution Layer
+    app.add_handler(CommandHandler("assignstagerole",   assignstagerole_cmd))
+    app.add_handler(CommandHandler("reassignstagerole", reassignstagerole_cmd))
+    app.add_handler(CommandHandler("stageresponsibility", stageresponsibility_cmd))
 
     # Callback handler для кнопок подтверждения бизнес-контекста (Фаза 5B)
     app.add_handler(CallbackQueryHandler(bc_ctx_callback, pattern=r"^bc_ctx:"))
@@ -6216,5 +6447,6 @@ def register_business_handlers(app: Application) -> None:
         "/newservice /services /service "
         "/milestones /report "
         "/newdept /newrole /roles /roledetails /assignrole "
+        "/assignstagerole /reassignstagerole /stageresponsibility "
         "+ bc_ctx callback (Фаза 5B)"
     )
