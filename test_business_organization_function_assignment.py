@@ -705,6 +705,8 @@ class TestFullApiSurfaceContract(unittest.TestCase):
         "find_assignment_by_id", "list_assignments_for_person", "list_assignments_for_role",
         "get_assignment_history", "is_role_vacant", "get_active_roles_for_person",
         "assign_person_to_role", "end_assignment", "update_assignment",
+        # Phase 21D
+        "seed_default_organization",
     )
 
     EXPECTED_ENUMS = (

@@ -1267,3 +1267,141 @@ def update_assignment(assignment_id: str, updates: dict) -> dict:
     except Exception as exc:
         log.error(f"update_assignment({assignment_id}) error: {exc}")
         return {"ok": False, "changed": False, "updated_fields": (), "error": str(exc)}
+
+
+# ═══════════════════════════════════════════════════════════════
+# Phase 21D: Seed Data
+# ═══════════════════════════════════════════════════════════════
+#
+# Reproduces exactly the example organization from ARCHITECTURE.md /
+# Phase 20A.5 §9: 2 Department (Executive, Operations), 5 Role (CEO
+# active+assigned to owner_person_id, 4 planned/vacant), 12 Role Function
+# on the Coordinator role, 1 active Assignment (CEO -> owner_person_id).
+#
+# NOT auto-run on import or bot startup — callable only, e.g. from a
+# one-off maintenance script or a test. owner_person_id is a required
+# parameter (never hardcoded — the "Дидар" hardcode is separately logged
+# technical debt, see ARCHITECTURE.md / ENGINEERING_STANDARDS.md Technical
+# Debt Policy, not repeated here).
+#
+# Not transactional: if an intermediate step fails, whatever succeeded so
+# far is left in place (purely additive creates, nothing to roll back) and
+# the returned dict reports exactly what was created and what failed —
+# same honesty-over-guessing philosophy as every other write contract in
+# this module.
+
+_COORDINATOR_FUNCTIONS = (
+    ("client_management",     "Обработка входящих обращений", "continuous", "high"),
+    ("client_management",     "Первичная квалификация клиентов", "continuous", "high"),
+    ("client_management",     "Follow-up по потенциальным клиентам", "daily", "medium"),
+    ("client_management",     "Создание и сопровождение клиентов, объектов, услуг, roadmap", "continuous", "high"),
+    ("stage_control",         "Контроль этапов и сроков", "continuous", "high"),
+    ("document_management",   "Работа с документами и Google Drive", "continuous", "medium"),
+    ("contractor_management", "Поиск и первичный отбор подрядчиков", "ad_hoc", "medium"),
+    ("contractor_management", "Передача заданий подрядчикам", "weekly", "medium"),
+    ("contractor_management", "Контроль результатов и сроков подрядчиков", "continuous", "high"),
+    ("communications",        "Запуск заранее утверждённых рассылок в SendPulse", "weekly", "low"),
+    ("communications",        "Обработка реакций после рассылок", "weekly", "low"),
+    ("reporting",             "Ежедневная операционная отчётность", "daily", "medium"),
+)
+
+
+def seed_default_organization(owner_person_id: str) -> dict:
+    """
+    Создать ровно ту оргструктуру, что описана в ARCHITECTURE.md /
+    Phase 20A.5 §9. Не вызывается автоматически — только явный вызов.
+
+    Args:
+        owner_person_id: PRS-xxx владельца бизнеса — назначается на роль
+                          CEO / Founder со Status=active.
+
+    Returns:
+        {
+            "ok": bool,              # True только если ВСЕ шаги успешны
+            "department_ids": dict,  # {"executive": ..., "operations": ...}
+            "role_ids": dict,        # {"ceo": ..., "operations_manager": ...,
+                                      #  "coordinator": ..., "inbound_manager": ...,
+                                      #  "document_controller": ...}
+            "function_ids": list[str],
+            "assignment_id": str,
+            "errors": list[str],
+        }
+    """
+    result = {
+        "ok": False,
+        "department_ids": {},
+        "role_ids": {},
+        "function_ids": [],
+        "assignment_id": "",
+        "errors": [],
+    }
+
+    if not owner_person_id:
+        result["errors"].append("owner_person_id обязателен")
+        return result
+
+    dept_exec = create_department("Executive")
+    if not dept_exec["ok"]:
+        result["errors"].append(f"Executive: {dept_exec['error']}")
+        return result
+    result["department_ids"]["executive"] = dept_exec["department_id"]
+
+    dept_ops = create_department("Operations", parent_department_id=dept_exec["department_id"])
+    if not dept_ops["ok"]:
+        result["errors"].append(f"Operations: {dept_ops['error']}")
+        return result
+    result["department_ids"]["operations"] = dept_ops["department_id"]
+
+    role_ceo = create_role("CEO / Founder", department_id=dept_exec["department_id"], status="active")
+    if not role_ceo["ok"]:
+        result["errors"].append(f"CEO / Founder: {role_ceo['error']}")
+        return result
+    result["role_ids"]["ceo"] = role_ceo["role_id"]
+
+    head_update = update_department(dept_exec["department_id"], {"Head Role ID": role_ceo["role_id"]})
+    if not head_update["ok"]:
+        result["errors"].append(f"Executive Head Role ID: {head_update['error']}")
+
+    role_specs = (
+        ("operations_manager", "Operations Manager", dept_ops["department_id"], role_ceo["role_id"]),
+        ("coordinator", "Coordinator (projects, clients, contractors)", dept_ops["department_id"], None),
+        ("inbound_manager", "Inbound Manager", dept_ops["department_id"], None),
+        ("document_controller", "Document Controller", dept_ops["department_id"], None),
+    )
+    for key, name, dept_id, reports_to in role_specs:
+        actual_reports_to = reports_to if reports_to is not None else result["role_ids"].get("operations_manager", "")
+        role_result = create_role(name, department_id=dept_id, reports_to_role_id=actual_reports_to, status="planned")
+        if not role_result["ok"]:
+            result["errors"].append(f"{name}: {role_result['error']}")
+            return result
+        result["role_ids"][key] = role_result["role_id"]
+
+    coordinator_id = result["role_ids"]["coordinator"]
+    for i, (category, name, frequency, criticality) in enumerate(_COORDINATOR_FUNCTIONS, start=1):
+        func_result = create_role_function(
+            name, role_id=coordinator_id, function_category=category,
+            frequency=frequency, criticality=criticality, sort_order=str(i),
+        )
+        if not func_result["ok"]:
+            result["errors"].append(f"Function '{name}': {func_result['error']}")
+            return result
+        result["function_ids"].append(func_result["function_id"])
+
+    from datetime import datetime
+    assignment_result = assign_person_to_role(
+        owner_person_id, role_ceo["role_id"],
+        start_date=datetime.now().strftime("%Y-%m-%d"),
+        assignment_type="primary", status="active",
+    )
+    if not assignment_result["ok"]:
+        result["errors"].append(f"CEO Assignment: {assignment_result['error']}")
+        return result
+    result["assignment_id"] = assignment_result["assignment_id"]
+
+    result["ok"] = True
+    log.info(
+        f"seed_default_organization: {len(result['department_ids'])} departments, "
+        f"{len(result['role_ids'])} roles, {len(result['function_ids'])} functions, "
+        f"1 assignment (owner={owner_person_id})"
+    )
+    return result
