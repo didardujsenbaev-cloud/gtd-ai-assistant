@@ -676,17 +676,20 @@ class TestPublicApiContract(unittest.TestCase):
             self.assertTrue(hasattr(om, name), f"missing public function: {name}")
             self.assertTrue(callable(getattr(om, name)))
 
-    def test_no_unexpected_public_functions(self):
-        """New public functions are fine to add later, but this phase's
-        surface is exactly these 10 — catches accidental premature exposure
-        of Phase 21C (Function/Assignment) helpers into this module."""
+    def test_department_role_functions_still_present(self):
+        """Phase 21C legitimately extends this module's public surface
+        (Role Function + Assignment CRUD, per the approved Phase 21 plan)
+        — this is now a subset check, not exact equality. The exact
+        current full surface is locked in by
+        test_business_organization_function_assignment.py's own contract
+        test (Phase 21C closeout)."""
         om = _fresh_om()
         public_callables = {
             name for name in vars(om)
             if not name.startswith("_") and callable(getattr(om, name))
             and getattr(getattr(om, name), "__module__", "") == om.__name__
         }
-        self.assertEqual(public_callables, set(self.EXPECTED_PUBLIC_FUNCTIONS))
+        self.assertTrue(set(self.EXPECTED_PUBLIC_FUNCTIONS).issubset(public_callables))
 
     def test_all_expected_enums_exist_and_are_tuples(self):
         om = _fresh_om()
