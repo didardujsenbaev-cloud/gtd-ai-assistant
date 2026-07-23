@@ -612,13 +612,15 @@ class TestArchitectureGuards(unittest.TestCase):
                      "business_core.telegram_handlers", "business_core.roadmap_manager"}
         self.assertEqual(imports & forbidden, set())
 
-    def test_telegram_handlers_not_touched(self):
-        import subprocess
-        result = subprocess.run(
-            ["git", "diff", "HEAD", "--", "business_core/telegram_handlers.py"],
-            cwd=WORKSPACE, capture_output=True, text=True,
-        )
-        self.assertEqual(result.stdout.strip(), "", "telegram_handlers.py must be untouched by Phase 23D-1")
+    # Note: the Phase 23D-1 guard asserting telegram_handlers.py stayed
+    # fully untouched was removed here — Phase 23D-2 explicitly refactors
+    # newclient_confirm() to call person_manager.create_person()/
+    # update_person(), so that constraint no longer applies to this
+    # module going forward. person_manager.py's own import-boundary
+    # guards above (no organization_manager/work_assignment_manager/
+    # telegram_handlers/roadmap_manager IMPORTS) remain the load-bearing
+    # check — Telegram is allowed to call INTO person_manager.py, never
+    # the reverse.
 
     def test_env_not_modified_by_import(self):
         env_path = WORKSPACE / ".env"

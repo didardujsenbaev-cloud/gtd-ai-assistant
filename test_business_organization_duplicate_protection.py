@@ -438,13 +438,13 @@ class TestRegressionAndGuards(unittest.TestCase):
             elif isinstance(node, ast.ImportFrom) and node.module:
                 self.assertNotIn(node.module.split(".")[0], GTD_FORBIDDEN)
 
-    def test_no_telegram_handlers_touched(self):
-        import subprocess
-        result = subprocess.run(
-            ["git", "diff", "HEAD", "--", "business_core/telegram_handlers.py"],
-            cwd=WORKSPACE, capture_output=True, text=True,
-        )
-        self.assertEqual(result.stdout.strip(), "", "telegram_handlers.py must be untouched by Phase 23C")
+    # Note: a git-diff-based guard asserting telegram_handlers.py stayed
+    # fully untouched by Phase 23C was removed here — that was a
+    # point-in-time closeout check for Phase 23C specifically (already
+    # satisfied and locked in by its commit), not a durable invariant.
+    # Later phases (23D-2) are explicitly authorized to modify
+    # telegram_handlers.py, so a generic "git diff HEAD" check would
+    # misfire against any later, unrelated phase's in-progress changes.
 
     def test_env_not_modified_by_import(self):
         env_path = WORKSPACE / ".env"

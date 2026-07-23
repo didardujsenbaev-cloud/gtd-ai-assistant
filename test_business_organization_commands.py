@@ -408,24 +408,17 @@ class TestAdditiveOnly(unittest.TestCase):
     behavior — a diff-scope check via git, not a re-test of every
     existing command (those are already covered by their own test files)."""
 
-    def test_git_diff_touches_only_additive_lines_in_telegram_handlers(self):
-        import subprocess
-        result = subprocess.run(
-            ["git", "diff", "HEAD", "--", "business_core/telegram_handlers.py"],
-            cwd=WORKSPACE, capture_output=True, text=True,
-        )
-        if result.returncode != 0 or not result.stdout.strip():
-            self.skipTest("no staged diff to inspect (already committed or no git available)")
-        removed_lines = [
-            line for line in result.stdout.splitlines()
-            if line.startswith("-") and not line.startswith("---")
-        ]
-        # Some removed lines are expected (e.g. the log.info() message
-        # extended with new command names) — but no line inside an
-        # existing *_cmd function body should be removed. We approximate
-        # this by asserting removed-line count stays small (the log
-        # message + registration block edits only).
-        self.assertLessEqual(len(removed_lines), 10, removed_lines)
+    # Note: this class previously included a git-diff-based guard
+    # ("test_git_diff_touches_only_additive_lines_in_telegram_handlers")
+    # asserting Phase 21F's OWN uncommitted diff to telegram_handlers.py
+    # stayed small/additive. That check was a point-in-time closeout
+    # verification for Phase 21F specifically (already satisfied and
+    # locked in by its commit) — not a durable invariant. Later phases
+    # (22D, 23D-2) are explicitly authorized to further modify
+    # telegram_handlers.py, including legitimate deletions, so a
+    # generic "git diff HEAD" check would misfire against any later,
+    # unrelated phase's in-progress changes. Removed rather than left
+    # to produce false failures.
 
 
 class TestNoGtdCoupling(unittest.TestCase):

@@ -509,24 +509,18 @@ class TestHandlersDelegateOnlyToApprovedApis(unittest.TestCase):
 
 
 # ─────────────────────────────────────────────────────────────
-# Additive-only regression guard + import guards
+# Import guards
 # ─────────────────────────────────────────────────────────────
-
-class TestAdditiveOnly(unittest.TestCase):
-
-    def test_git_diff_removed_lines_stay_minimal(self):
-        import subprocess
-        result = subprocess.run(
-            ["git", "diff", "HEAD", "--", "business_core/telegram_handlers.py"],
-            cwd=WORKSPACE, capture_output=True, text=True,
-        )
-        if result.returncode != 0 or not result.stdout.strip():
-            self.skipTest("no staged diff to inspect (already committed or no git available)")
-        removed_lines = [
-            line for line in result.stdout.splitlines()
-            if line.startswith("-") and not line.startswith("---")
-        ]
-        self.assertLessEqual(len(removed_lines), 15, removed_lines)
+#
+# Note: this module previously also had a TestAdditiveOnly class with a
+# git-diff-based guard asserting Phase 22D's OWN uncommitted diff to
+# telegram_handlers.py stayed small/additive. That was a point-in-time
+# closeout check for Phase 22D specifically (already satisfied and
+# locked in by its commit), not a durable invariant — later phases
+# (23D-2) are explicitly authorized to further modify
+# telegram_handlers.py, so a generic "git diff HEAD" check would
+# misfire against any later, unrelated phase's in-progress changes.
+# Removed rather than left to produce false failures.
 
 
 class TestExistingCommandsUntouched(unittest.TestCase):
