@@ -281,8 +281,10 @@ class TestReplyFormat(unittest.TestCase):
         reply = upd.message.reply_text.call_args[0][0]
         self.assertEqual(
             reply,
-            "✅ Этап `STAGE-001`: pending → done\n"
-            "Progress Roadmap `RM-001`: 33% → 67%",
+            "✅ Этап обновлён\n"
+            "Этап: `STAGE-001`\n"
+            "Статус: pending → done\n"
+            "Прогресс roadmap `RM-001`: 33% → 67%",
         )
 
     def test_progress_changed_false_format(self):
@@ -312,7 +314,7 @@ class TestReplyFormat(unittest.TestCase):
         self.assertEqual(
             reply,
             "ℹ️ Этап `STAGE-001` уже имел статус `done` (изменений нет, повтор безопасен).\n"
-            "Progress Roadmap `RM-001` уже 67%",
+            "Прогресс roadmap `RM-001` уже 67%",
         )
 
     def test_notes_plus_status_progress_all_present_notes_not_lost(self):
@@ -339,8 +341,10 @@ class TestReplyFormat(unittest.TestCase):
 
         _run(run())
         reply = upd.message.reply_text.call_args[0][0]
-        self.assertIn("✅ Этап `STAGE-001`: pending → blocked", reply)
-        self.assertIn("Progress Roadmap `RM-001` уже 0%", reply)
+        self.assertIn("✅ Этап обновлён", reply)
+        self.assertIn("Этап: `STAGE-001`", reply)
+        self.assertIn("Статус: pending → blocked", reply)
+        self.assertIn("Прогресс roadmap `RM-001` уже 0%", reply)
         self.assertIn("Notes обновлены: Ожидаем документы клиента", reply)
 
     def test_progress_line_skipped_when_roadmap_id_missing(self):

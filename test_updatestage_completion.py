@@ -104,8 +104,10 @@ class TestLastStageCompletesRoadmap(unittest.TestCase):
         reply = upd.message.reply_text.call_args[0][0]
         self.assertEqual(
             reply,
-            "✅ Этап `STAGE-001`: pending → done\n"
-            "Progress Roadmap `RM-001`: 67% → 100%\n"
+            "✅ Этап обновлён\n"
+            "Этап: `STAGE-001`\n"
+            "Статус: pending → done\n"
+            "Прогресс roadmap `RM-001`: 67% → 100%\n"
             "✅ Roadmap `RM-001` завершён: active → completed",
         )
 
@@ -160,7 +162,7 @@ class TestLastStageCompletesRoadmap(unittest.TestCase):
         reply = upd.message.reply_text.call_args[0][0]
         self.assertNotIn("завершён", reply)
         self.assertNotIn("Roadmap `RM-001` уже имеет статус", reply)
-        self.assertIn("Progress Roadmap `RM-001`: 33% → 67%", reply)
+        self.assertIn("Прогресс roadmap `RM-001`: 33% → 67%", reply)
 
 
 # ────────────────────────────────────────────────────────────

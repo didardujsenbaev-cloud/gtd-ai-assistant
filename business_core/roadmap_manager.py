@@ -1162,13 +1162,46 @@ def find_stage_by_id(stage_id: str) -> Optional[dict]:
         return None
 
 
+def _stage_update_result(
+    *, ok: bool, partial_success: bool, stage_id: str, roadmap_id: str,
+    previous_status: str, requested_status: str, final_status: str, changed: bool,
+    updated_fields: tuple = (), warnings: tuple = (), errors: tuple = (),
+) -> dict:
+    """
+    Phase 19B-1: shared result-builder for update_stage_status_in_sheet().
+    Keeps BOTH the new structured contract (ok/partial_success/previous_status/
+    requested_status/final_status/updated_fields/warnings/errors) AND the
+    original Phase 9B/14A keys (error/old_status/new_status) so every
+    pre-existing caller/test keeps working unchanged, while new callers can
+    read the richer, honest contract.
+    """
+    return {
+        "ok": ok,
+        "partial_success": partial_success,
+        "stage_id": stage_id,
+        "roadmap_id": roadmap_id,
+        "previous_status": previous_status,
+        "requested_status": requested_status,
+        "final_status": final_status,
+        "changed": changed,
+        "updated_fields": tuple(updated_fields),
+        "warnings": tuple(warnings),
+        "errors": tuple(errors),
+        # Backward-compatible aliases (Phase 9B/14A contract, unchanged shape):
+        "error": errors[0] if errors else None,
+        "old_status": previous_status,
+        "new_status": requested_status,
+    }
+
+
 def update_stage_status_in_sheet(
     stage_id: str,
     new_status: str,
     notes: Optional[str] = None,
 ) -> dict:
     """
-    Обновить статус этапа в листе ROADMAP_STAGES (Phase 9B — /updatestage).
+    Обновить статус этапа в листе ROADMAP_STAGES (Phase 9B — /updatestage;
+    hardened in Phase 19B-1 against partial writes).
 
     Пишет ТОЛЬКО колонку Status (и, если notes передан явно, колонку
     Notes) — по имени заголовка, точечно в найденную строку. Никакие
@@ -1176,6 +1209,17 @@ def update_stage_status_in_sheet(
     Received, знаниевые поля) и никакие другие строки не трогаются.
     Не пересчитывает Progress %, не меняет статус Roadmap, не пишет
     историю.
+
+    Phase 19B-1: каждая колонка теперь пишется и обрабатывается ИЗОЛИРОВАННО.
+    Если Status успешно записан, но последующая запись (Completed At /
+    Start Date / Notes) выбрасывает исключение — результат остаётся
+    ok=True (запрошенный статус подтверждённо зафиксирован), но
+    partial_success=True, и причина попадает в "warnings", а не молча
+    теряется и не превращается в ложный "ok=False". Если сама запись
+    Status выбрасывает исключение, делается контролируемое повторное
+    чтение строки, чтобы честно определить final_status (мог ли статус
+    всё же зафиксироваться, несмотря на исключение при отправке запроса) —
+    "final_status" никогда не угадывается.
 
     Args:
         stage_id:   ID этапа (STAGE-...)
@@ -1187,36 +1231,42 @@ def update_stage_status_in_sheet(
                     Если не передан — колонка Notes не трогается.
 
     Returns:
-        {
-            "ok":          bool,
-            "error":       str | None,
-            "stage_id":    str,
-            "roadmap_id":  str,   # '' если этап не найден/статус невалиден
-            "old_status":  str,
-            "new_status":  str,
-            "changed":     bool,  # False если статус совпал с уже стоявшим
-        }
+        См. _stage_update_result() — новые поля (partial_success,
+        previous_status, requested_status, final_status, updated_fields,
+        warnings, errors) плюс старые (ok, error, old_status, new_status,
+        changed) для обратной совместимости.
     """
     if not stage_id:
-        return {"ok": False, "error": "stage_id не указан",
-                "stage_id": "", "roadmap_id": "", "old_status": "", "new_status": new_status, "changed": False}
+        return _stage_update_result(
+            ok=False, partial_success=False, stage_id="", roadmap_id="",
+            previous_status="", requested_status=new_status, final_status="", changed=False,
+            errors=("stage_id не указан",),
+        )
 
     if new_status not in STAGE_STATUS_CANONICAL:
-        return {
-            "ok": False,
-            "error": (
+        return _stage_update_result(
+            ok=False, partial_success=False, stage_id=stage_id, roadmap_id="",
+            previous_status="", requested_status=new_status, final_status="", changed=False,
+            errors=(
                 f"Недопустимый статус '{new_status}'. "
-                f"Допустимые значения: {', '.join(STAGE_STATUS_CANONICAL)}"
+                f"Допустимые значения: {', '.join(STAGE_STATUS_CANONICAL)}",
             ),
-            "stage_id": stage_id, "roadmap_id": "", "old_status": "", "new_status": new_status, "changed": False,
-        }
+        )
 
     stage = find_stage_by_id(stage_id)
     if not stage:
-        return {"ok": False, "error": f"Этап '{stage_id}' не найден",
-                "stage_id": stage_id, "roadmap_id": "", "old_status": "", "new_status": new_status, "changed": False}
+        return _stage_update_result(
+            ok=False, partial_success=False, stage_id=stage_id, roadmap_id="",
+            previous_status="", requested_status=new_status, final_status="", changed=False,
+            errors=(f"Этап '{stage_id}' не найден",),
+        )
 
     roadmap_id = stage["roadmap_id"]
+    previous_status = stage["status"]
+
+    updated_fields: list[str] = []
+    warnings: list[str] = []
+    errors: list[str] = []
 
     try:
         from business_core.sheets import get_business_sheet, get_header_index_map
@@ -1226,54 +1276,113 @@ def update_stage_status_in_sheet(
         idx = get_header_index_map(headers)
 
         if "Status" not in idx:
-            return {"ok": False, "error": "В листе ROADMAP_STAGES отсутствует колонка 'Status'",
-                    "stage_id": stage_id, "roadmap_id": roadmap_id,
-                    "old_status": stage["status"], "new_status": new_status, "changed": False}
+            return _stage_update_result(
+                ok=False, partial_success=False, stage_id=stage_id, roadmap_id=roadmap_id,
+                previous_status=previous_status, requested_status=new_status,
+                final_status=previous_status, changed=False,
+                errors=("В листе ROADMAP_STAGES отсутствует колонка 'Status'",),
+            )
 
         row_num = stage["row_num"]
-        old_status = stage["status"]
 
-        sheet.update_cell(row_num, idx["Status"] + 1, new_status)
+        # ── 1. Status: the one write whose success this function must
+        #      determine HONESTLY, even if the write call itself raises. ──
+        final_status = previous_status
+        status_confirmed = False
+        try:
+            sheet.update_cell(row_num, idx["Status"] + 1, new_status)
+            status_confirmed = True
+            final_status = new_status
+            updated_fields.append("Status")
+        except Exception as exc:
+            log.error(f"update_stage_status_in_sheet({stage_id}) Status write error: {exc}")
+            # Controlled fresh read: did the write actually commit despite
+            # the exception (e.g. a timeout on an otherwise-successful
+            # request)? Never guess — only trust a successful re-read.
+            try:
+                fresh = find_stage_by_id(stage_id)
+            except Exception as verify_exc:
+                fresh = None
+                warnings.append(f"Не удалось перепроверить статус после ошибки записи: {verify_exc}")
 
-        # Phase 14A: автозаполнение дат жизненного цикла этапа.
-        # - Completed At заполняется КАЖДЫЙ раз при переходе в 'done' —
-        #   отражает время последнего завершения (переоткрытие и повторное
-        #   завершение обновляет дату, а не оставляет устаревшую).
-        # - Start Date заполняется ТОЛЬКО если ещё пусто при переходе в
-        #   'in_progress' — не затирает вручную выставленную дату начала
-        #   при повторных переходах туда-обратно.
-        # Ни то, ни другое не трогает следующий этап и не пересчитывает
-        # Progress % — это по-прежнему делает отдельный вызывающий код.
+            if fresh is not None and fresh.get("status") == new_status:
+                status_confirmed = True
+                final_status = new_status
+                updated_fields.append("Status")
+                warnings.append(
+                    f"Запись Status вызвала ошибку ({exc}), но повторное чтение "
+                    f"подтвердило, что статус зафиксирован."
+                )
+            elif fresh is not None:
+                final_status = fresh.get("status", previous_status)
+                errors.append(f"Не удалось записать Status: {exc}")
+            else:
+                final_status = previous_status
+                errors.append(f"Не удалось записать Status: {exc}")
+
+            if not status_confirmed:
+                return _stage_update_result(
+                    ok=False, partial_success=False, stage_id=stage_id, roadmap_id=roadmap_id,
+                    previous_status=previous_status, requested_status=new_status,
+                    final_status=final_status, changed=(final_status != previous_status),
+                    updated_fields=tuple(updated_fields), warnings=tuple(warnings), errors=tuple(errors),
+                )
+
+        # From here, the requested Status IS confirmed committed — every
+        # remaining write is a SEPARATE, isolated, best-effort secondary
+        # field. A failure here never erases the confirmed Status result.
+        changed = previous_status != new_status
+
+        # ── 2. Completed At / Start Date autofill (Phase 14A semantics
+        #      unchanged: Completed At refilled every 'done' transition;
+        #      Start Date filled only once, on first 'in_progress'). ──
         if new_status == "done" and "Completed At" in idx:
-            sheet.update_cell(row_num, idx["Completed At"] + 1, datetime.now().strftime("%Y-%m-%d"))
+            try:
+                sheet.update_cell(row_num, idx["Completed At"] + 1, datetime.now().strftime("%Y-%m-%d"))
+                updated_fields.append("Completed At")
+            except Exception as exc:
+                warnings.append(f"Не удалось обновить Completed At: {exc}")
 
         if new_status == "in_progress" and "Start Date" in idx:
-            current_row = sheet.row_values(row_num)
-            start_col = idx["Start Date"]
-            current_start = current_row[start_col].strip() if start_col < len(current_row) else ""
-            if not current_start:
-                sheet.update_cell(row_num, start_col + 1, datetime.now().strftime("%Y-%m-%d"))
+            try:
+                current_row = sheet.row_values(row_num)
+                start_col = idx["Start Date"]
+                current_start = current_row[start_col].strip() if start_col < len(current_row) else ""
+                if not current_start:
+                    sheet.update_cell(row_num, start_col + 1, datetime.now().strftime("%Y-%m-%d"))
+                    updated_fields.append("Start Date")
+            except Exception as exc:
+                warnings.append(f"Не удалось обновить Start Date: {exc}")
 
+        # ── 3. Notes, only if explicitly supplied. ──
         if notes is not None:
             if "Notes" not in idx:
-                return {"ok": False, "error": "В листе ROADMAP_STAGES отсутствует колонка 'Notes'",
-                        "stage_id": stage_id, "roadmap_id": roadmap_id,
-                        "old_status": old_status, "new_status": new_status, "changed": True}
-            sheet.update_cell(row_num, idx["Notes"] + 1, notes)
+                warnings.append("В листе ROADMAP_STAGES отсутствует колонка 'Notes' — заметка не сохранена.")
+            else:
+                try:
+                    sheet.update_cell(row_num, idx["Notes"] + 1, notes)
+                    updated_fields.append("Notes")
+                except Exception as exc:
+                    warnings.append(f"Не удалось обновить Notes: {exc}")
 
-        return {
-            "ok": True, "error": None,
-            "stage_id": stage_id,
-            "roadmap_id": roadmap_id,
-            "old_status": old_status,
-            "new_status": new_status,
-            "changed": old_status != new_status,
-        }
+        return _stage_update_result(
+            ok=True, partial_success=bool(warnings), stage_id=stage_id, roadmap_id=roadmap_id,
+            previous_status=previous_status, requested_status=new_status,
+            final_status=final_status, changed=changed,
+            updated_fields=tuple(updated_fields), warnings=tuple(warnings), errors=tuple(errors),
+        )
 
     except Exception as exc:
+        # Unexpected failure before we even reached the sheet/headers
+        # (e.g. get_business_sheet() itself raised) — nothing was written.
         log.error(f"update_stage_status_in_sheet({stage_id}) error: {exc}")
-        return {"ok": False, "error": str(exc),
-                "stage_id": stage_id, "roadmap_id": "", "old_status": "", "new_status": new_status, "changed": False}
+        errors.append(str(exc))
+        return _stage_update_result(
+            ok=False, partial_success=False, stage_id=stage_id, roadmap_id=roadmap_id,
+            previous_status=previous_status, requested_status=new_status,
+            final_status=previous_status, changed=False,
+            updated_fields=tuple(updated_fields), warnings=tuple(warnings), errors=tuple(errors),
+        )
 
 
 def calculate_progress(stages: list[dict]) -> int:

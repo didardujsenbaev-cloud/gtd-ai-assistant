@@ -2490,7 +2490,7 @@ async def stages_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             status_icons = {
                 "pending":     "⬜",
                 "in_progress": "🔄",
-                "completed":   "✅",
+                "done":        "✅",
                 "blocked":     "🔴",
                 "waiting":     "⏳",
                 "skipped":     "⏭",
@@ -2568,54 +2568,99 @@ async def updatestage_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
         result = update_stage_status_in_sheet(stage_id, status, notes=notes)
 
+        # Phase 19B-1: ok=False means the requested Status was NOT
+        # confirmed committed — this is the only case that gets the
+        # "total failure" response. final_status still reflects the
+        # best honestly-known current state (never a guess).
         if not result["ok"]:
-            await _reply(update, f"❌ {result['error']}")
+            await _reply(update, "\n".join([
+                "❌ Не удалось обновить этап",
+                f"Этап: `{stage_id}`",
+                f"Текущий подтверждённый статус: `{result.get('final_status') or '—'}`",
+                f"Причина: {result['error']}",
+            ]))
+            return
+
+        # Downstream (Progress %, roadmap auto-completion) failures are
+        # collected separately — they NEVER flip the already-confirmed
+        # Status result back to a failure (Part D: stage_update_ok,
+        # progress warning/error, and roadmap-completion warning/error
+        # are three independent signals, never conflated).
+        downstream_failures: list[str] = []
+
+        roadmap_id = result.get("roadmap_id", "")
+        progress_line = None
+        completion_line = None
+        if roadmap_id:
+            progress = recalculate_roadmap_progress(roadmap_id)
+            if progress["ok"]:
+                if progress["changed"]:
+                    progress_line = (
+                        f"Прогресс roadmap `{roadmap_id}`: "
+                        f"{progress['old_progress']}% → {progress['new_progress']}%"
+                    )
+                else:
+                    progress_line = f"Прогресс roadmap `{roadmap_id}` уже {progress['new_progress']}%"
+
+                # Phase 9E.2: автозавершение — только если Progress %
+                # реально пересчитан.
+                completion = maybe_complete_roadmap(roadmap_id, progress_pct=progress["new_progress"])
+                if completion["ok"]:
+                    if completion["changed"]:
+                        completion_line = (
+                            f"✅ Roadmap `{roadmap_id}` завершён: "
+                            f"{completion['old_status']} → {completion['new_status']}"
+                        )
+                    elif completion["old_status"] == "completed":
+                        completion_line = f"ℹ️ Roadmap `{roadmap_id}` уже имеет статус `completed`"
+                else:
+                    downstream_failures.append(f"Завершение roadmap: {completion['error']}")
+            else:
+                downstream_failures.append(f"Прогресс roadmap: {progress['error']}")
+                downstream_failures.append(
+                    "Прогресс roadmap может требовать пересчёта — повтори "
+                    f"`/updatestage stage_id={stage_id} status={status}` при необходимости."
+                )
+
+        stage_field_failures = [
+            w for w in result.get("warnings", ())
+        ]
+        is_partial = bool(result.get("partial_success")) or bool(downstream_failures)
+
+        if is_partial:
+            lines = [
+                "⚠️ Статус этапа обновлён частично",
+                f"Этап: `{stage_id}`",
+                f"Статус подтверждён: {result['old_status']} → {result['new_status']}"
+                if result["changed"] else
+                f"Статус подтверждён: `{result['new_status']}` (без изменений)",
+            ]
+            failed_items = stage_field_failures + downstream_failures
+            if failed_items:
+                lines.append("Не удалось обновить:")
+                for item in failed_items:
+                    lines.append(f"- {item}")
+            lines.append("Повтор команды безопасен.")
+            if progress_line:
+                lines.append(progress_line)
+            if completion_line:
+                lines.append(completion_line)
+            await _reply(update, "\n".join(lines))
             return
 
         if result["changed"]:
-            lines = [
-                f"✅ Этап `{stage_id}`: {result['old_status']} → {result['new_status']}",
-            ]
+            lines = ["✅ Этап обновлён", f"Этап: `{stage_id}`",
+                     f"Статус: {result['old_status']} → {result['new_status']}"]
         else:
             lines = [
                 f"ℹ️ Этап `{stage_id}` уже имел статус `{result['new_status']}` "
                 "(изменений нет, повтор безопасен).",
             ]
 
-        # Phase 9E.1: пересчёт Progress % только после валидного и
-        # существующего этапа (result["ok"] уже гарантирует это выше).
-        roadmap_id = result.get("roadmap_id", "")
-        if roadmap_id:
-            progress = recalculate_roadmap_progress(roadmap_id)
-            if progress["ok"]:
-                if progress["changed"]:
-                    lines.append(
-                        f"Progress Roadmap `{roadmap_id}`: "
-                        f"{progress['old_progress']}% → {progress['new_progress']}%"
-                    )
-                else:
-                    lines.append(
-                        f"Progress Roadmap `{roadmap_id}` уже {progress['new_progress']}%"
-                    )
-
-                # Phase 9E.2: автозавершение roadmap — только если Progress %
-                # реально пересчитан. progress_pct передаётся напрямую, чтобы
-                # не пересчитывать его повторно; список этапов
-                # maybe_complete_roadmap при необходимости читает сам.
-                completion = maybe_complete_roadmap(
-                    roadmap_id, progress_pct=progress["new_progress"],
-                )
-                if completion["ok"]:
-                    if completion["changed"]:
-                        lines.append(
-                            f"✅ Roadmap `{roadmap_id}` завершён: "
-                            f"{completion['old_status']} → {completion['new_status']}"
-                        )
-                    elif completion["old_status"] == "completed":
-                        lines.append(
-                            f"ℹ️ Roadmap `{roadmap_id}` уже имеет статус `completed`"
-                        )
-
+        if progress_line:
+            lines.append(progress_line)
+        if completion_line:
+            lines.append(completion_line)
         if notes is not None:
             lines.append(f"Notes обновлены: {notes}")
 
