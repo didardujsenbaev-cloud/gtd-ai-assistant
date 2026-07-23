@@ -16,6 +16,10 @@ from typing import Optional
 
 from business_core.models import BusinessArea
 from business_core.business_registry import create_business_record, validate_business_record
+from business_core.person_manager import (
+    append_person_biz_id as pm_append_person_biz_id,
+    update_person_drive_info as pm_update_person_drive_info,
+)
 
 log = logging.getLogger(__name__)
 
@@ -703,130 +707,38 @@ def add_biz_id_to_person(person_id: str, biz_id: str) -> bool:
     """
     Добавить biz_id в колонку "Biz IDs" существующего клиента.
 
-    Не дублирует, если biz_id уже есть.
-    Primary Biz ID не перезаписывает если уже заполнен.
-
-    Args:
-        person_id: PRS-ID
-        biz_id:    BIZ-ID для добавления
+    Phase 23D-3B2: logic relocated to
+    business_core.person_manager.append_person_biz_id() — this stays as
+    a thin backward-compatible delegator so every existing caller
+    (newclient_confirm's OTHER_BIZ branch, newobject_cmd) keeps working
+    unchanged. True only on an actual, error-free change — duplicate
+    Biz ID, missing person, empty input, and any manager-level error
+    all translate to False, exactly as before.
 
     Returns:
-        True если обновлено, False если уже было или ошибка
+        True если обновлено, False если уже было, не найдено или ошибка
     """
-    if not person_id or not biz_id:
-        return False
-
-    try:
-        from business_core.sheets import get_business_sheet
-        sheet = get_business_sheet("people_registry")
-        all_values = sheet.get_all_values()
-        if len(all_values) < 2:
-            return False
-
-        headers = all_values[0]
-
-        def _col(h):
-            return headers.index(h) if h in headers else None
-
-        biz_ids_col = _col("Biz IDs")
-        prim_col    = _col("Primary Biz ID")
-
-        for i, row in enumerate(all_values[1:], start=2):
-            if not row or row[0] != person_id:
-                continue
-
-            # Текущие Biz IDs
-            current_ids = normalize_biz_ids(
-                row[biz_ids_col] if biz_ids_col is not None and biz_ids_col < len(row) else ""
-            )
-
-            if biz_id in current_ids:
-                log.debug(f"add_biz_id_to_person: {biz_id} уже есть у {person_id}")
-                return False  # Уже есть — ничего не делаем
-
-            # Добавляем biz_id
-            current_ids.append(biz_id)
-            new_biz_ids_str = ",".join(current_ids)
-
-            # Колонка Biz IDs
-            if biz_ids_col is not None:
-                col_letter = _col_letter(biz_ids_col + 1)
-                sheet.update_cell(i, biz_ids_col + 1, new_biz_ids_str)
-                log.info(f"add_biz_id_to_person: {person_id} → Biz IDs = {new_biz_ids_str}")
-
-            # Primary Biz ID — только если пустой
-            if prim_col is not None:
-                current_prim = row[prim_col].strip() if prim_col < len(row) else ""
-                if not current_prim:
-                    sheet.update_cell(i, prim_col + 1, biz_id)
-                    log.info(f"add_biz_id_to_person: {person_id} → Primary Biz ID = {biz_id}")
-
-            return True
-
-    except Exception as exc:
-        log.warning(f"add_biz_id_to_person({person_id}, {biz_id}) error: {exc}")
-
-    return False
+    result = pm_append_person_biz_id(person_id, biz_id)
+    return bool(result.get("ok") and result.get("changed"))
 
 
 def update_person_drive_info(person_id: str, folder_id: str, folder_url: str) -> bool:
     """
     Обновить Drive-информацию существующего клиента (дозаполнение).
 
-    Обновляет только если текущие значения пустые — не перезаписывает.
-
-    Args:
-        person_id:  PRS-ID
-        folder_id:  Google Drive folder ID
-        folder_url: Google Drive URL
+    Phase 23D-3B2: logic relocated to
+    business_core.person_manager.update_person_drive_info() — this
+    stays as a thin backward-compatible delegator so every existing
+    caller (newclient_confirm's Drive branch, provision_object_drive)
+    keeps working unchanged. True only on an actual, error-free change —
+    both-fields-already-populated, missing person, empty input, and any
+    manager-level error all translate to False, exactly as before.
 
     Returns:
-        True если обновлено, False если уже было или ошибка
+        True если обновлено, False если уже было, не найдено или ошибка
     """
-    if not person_id or not folder_id:
-        return False
-
-    try:
-        from business_core.sheets import get_business_sheet
-        sheet = get_business_sheet("people_registry")
-        all_values = sheet.get_all_values()
-        if len(all_values) < 2:
-            return False
-
-        headers = all_values[0]
-
-        def _col(h):
-            return headers.index(h) if h in headers else None
-
-        drive_col    = _col("Google Drive")
-        drive_id_col = _col("Drive Folder ID")
-
-        for i, row in enumerate(all_values[1:], start=2):
-            if not row or row[0] != person_id:
-                continue
-
-            updated = False
-
-            if drive_col is not None:
-                current = row[drive_col].strip() if drive_col < len(row) else ""
-                if not current and folder_url:
-                    sheet.update_cell(i, drive_col + 1, folder_url)
-                    updated = True
-
-            if drive_id_col is not None:
-                current = row[drive_id_col].strip() if drive_id_col < len(row) else ""
-                if not current and folder_id:
-                    sheet.update_cell(i, drive_id_col + 1, folder_id)
-                    updated = True
-
-            if updated:
-                log.info(f"update_person_drive_info: {person_id} → Drive дозаполнен")
-            return updated
-
-    except Exception as exc:
-        log.warning(f"update_person_drive_info({person_id}) error: {exc}")
-
-    return False
+    result = pm_update_person_drive_info(person_id, folder_id=folder_id, folder_url=folder_url)
+    return bool(result.get("ok") and result.get("changed"))
 
 
 def _col_letter(col_index: int) -> str:

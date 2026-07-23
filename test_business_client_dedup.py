@@ -242,123 +242,100 @@ class TestFindExistingPerson(unittest.TestCase):
         self.assertIsNone(result)
 
 
-# ─── add_biz_id_to_person ───────────────────────────────────────────────────
+# ─── add_biz_id_to_person — Phase 23D-3B2: wrapper-delegation only ─────────
+#
+# The substantive spreadsheet-level semantics (append/dedup, Primary Biz
+# ID fill-if-empty, missing-person, error handling) moved to
+# business_core.person_manager.append_person_biz_id() and are covered by
+# test_business_person_manager.py::TestAppendPersonBizId (Phase 23D-3B1).
+# These tests verify ONLY the wrapper's delegation + bool-translation
+# contract — not spreadsheet logic, which no longer lives here.
 
 class TestAddBizIdToPerson(unittest.TestCase):
 
-    def _mock_sheet_with_person(self, biz_ids="", primary_biz=""):
-        row = _make_row("PRS-001", "Иван", biz_ids=biz_ids, primary_biz=primary_biz)
-        mock = _make_sheet(FULL_HEADERS, [row])
-        mock.update_cell = MagicMock()
-        return mock
+    @patch("business_core.business_builder.pm_append_person_biz_id")
+    def test_delegates_with_correct_arguments(self, mock_pm):
+        mock_pm.return_value = {"ok": True, "changed": True, "updated_fields": ("Biz IDs",), "error": None}
 
-    @patch("business_core.sheets.get_business_sheet")
-    def test_adds_new_biz_id(self, mock_get):
-        mock = self._mock_sheet_with_person(biz_ids="BIZ-001")
-        mock_get.return_value = mock
+        from business_core.business_builder import add_biz_id_to_person
+        add_biz_id_to_person("PRS-001", "BIZ-002")
+
+        mock_pm.assert_called_once_with("PRS-001", "BIZ-002")
+
+    @patch("business_core.business_builder.pm_append_person_biz_id")
+    def test_ok_true_changed_true_returns_true(self, mock_pm):
+        mock_pm.return_value = {"ok": True, "changed": True, "updated_fields": ("Biz IDs",), "error": None}
 
         from business_core.business_builder import add_biz_id_to_person
         result = add_biz_id_to_person("PRS-001", "BIZ-002")
 
         self.assertTrue(result)
-        # update_cell должен был быть вызван с новым значением
-        calls_args = [str(c) for c in mock.update_cell.call_args_list]
-        combined = " ".join(calls_args)
-        self.assertIn("BIZ-001", combined)
-        self.assertIn("BIZ-002", combined)
 
-    @patch("business_core.sheets.get_business_sheet")
-    def test_no_duplicate_biz_id(self, mock_get):
-        mock = self._mock_sheet_with_person(biz_ids="BIZ-001,BIZ-002")
-        mock_get.return_value = mock
-
-        from business_core.business_builder import add_biz_id_to_person
-        result = add_biz_id_to_person("PRS-001", "BIZ-001")
-
-        self.assertFalse(result)  # уже есть — не обновляем
-        mock.update_cell.assert_not_called()
-
-    @patch("business_core.sheets.get_business_sheet")
-    def test_does_not_overwrite_primary_biz_id(self, mock_get):
-        mock = self._mock_sheet_with_person(biz_ids="BIZ-001", primary_biz="BIZ-001")
-        mock_get.return_value = mock
-
-        from business_core.business_builder import add_biz_id_to_person
-        add_biz_id_to_person("PRS-001", "BIZ-002")
-
-        # Primary Biz ID не должен обновляться (уже заполнен)
-        for c in mock.update_cell.call_args_list:
-            args = c[0]
-            # primary_biz_id — последняя колонка в FULL_HEADERS
-            primary_col_idx = FULL_HEADERS.index("Primary Biz ID") + 1
-            self.assertFalse(
-                args[1] == primary_col_idx and args[2] == "BIZ-002",
-                "Primary Biz ID не должен перезаписываться"
-            )
-
-    @patch("business_core.sheets.get_business_sheet")
-    def test_sets_primary_biz_if_empty(self, mock_get):
-        mock = self._mock_sheet_with_person(biz_ids="BIZ-001", primary_biz="")
-        mock_get.return_value = mock
-
-        from business_core.business_builder import add_biz_id_to_person
-        add_biz_id_to_person("PRS-001", "BIZ-002")
-
-        primary_col_idx = FULL_HEADERS.index("Primary Biz ID") + 1
-        found = any(
-            c[0][1] == primary_col_idx
-            for c in mock.update_cell.call_args_list
-        )
-        self.assertTrue(found, "Primary Biz ID должен быть установлен если пустой")
-
-    @patch("business_core.sheets.get_business_sheet")
-    def test_sheets_error_returns_false(self, mock_get):
-        mock_get.side_effect = Exception("timeout")
+    @patch("business_core.business_builder.pm_append_person_biz_id")
+    def test_ok_true_changed_false_returns_false(self, mock_pm):
+        """Duplicate Biz ID — a legitimate no-op, not an error."""
+        mock_pm.return_value = {"ok": True, "changed": False, "updated_fields": (), "error": None}
 
         from business_core.business_builder import add_biz_id_to_person
         result = add_biz_id_to_person("PRS-001", "BIZ-001")
 
         self.assertFalse(result)
 
+    @patch("business_core.business_builder.pm_append_person_biz_id")
+    def test_ok_false_returns_false(self, mock_pm):
+        """Missing person / empty input / manager-level error — all False."""
+        mock_pm.return_value = {"ok": False, "changed": False, "updated_fields": (), "error": "Person 'PRS-999' не найден"}
 
-# ─── update_person_drive_info ───────────────────────────────────────────────
+        from business_core.business_builder import add_biz_id_to_person
+        result = add_biz_id_to_person("PRS-999", "BIZ-001")
+
+        self.assertFalse(result)
+
+
+# ─── update_person_drive_info — Phase 23D-3B2: wrapper-delegation only ─────
+#
+# Substantive semantics (fill-if-empty per field, missing-person, error
+# handling) moved to business_core.person_manager.update_person_drive_info()
+# and are covered by test_business_person_manager.py::TestUpdatePersonDriveInfo
+# (Phase 23D-3B1).
 
 class TestUpdatePersonDriveInfo(unittest.TestCase):
 
-    @patch("business_core.sheets.get_business_sheet")
-    def test_fills_empty_drive_fields(self, mock_get):
-        row = _make_row("PRS-001", "Иван", drive_url="", drive_folder_id="")
-        mock = _make_sheet(FULL_HEADERS, [row])
-        mock.update_cell = MagicMock()
-        mock_get.return_value = mock
+    @patch("business_core.business_builder.pm_update_person_drive_info")
+    def test_delegates_with_correct_arguments(self, mock_pm):
+        mock_pm.return_value = {"ok": True, "changed": True, "updated_fields": ("Google Drive", "Drive Folder ID"), "error": None}
+
+        from business_core.business_builder import update_person_drive_info
+        update_person_drive_info("PRS-001", "folder-123", "https://drive.google.com/x")
+
+        mock_pm.assert_called_once_with("PRS-001", folder_id="folder-123", folder_url="https://drive.google.com/x")
+
+    @patch("business_core.business_builder.pm_update_person_drive_info")
+    def test_ok_true_changed_true_returns_true(self, mock_pm):
+        mock_pm.return_value = {"ok": True, "changed": True, "updated_fields": ("Google Drive", "Drive Folder ID"), "error": None}
 
         from business_core.business_builder import update_person_drive_info
         result = update_person_drive_info("PRS-001", "folder-123", "https://drive.google.com/x")
 
         self.assertTrue(result)
-        self.assertEqual(mock.update_cell.call_count, 2)
 
-    @patch("business_core.sheets.get_business_sheet")
-    def test_does_not_overwrite_existing_drive(self, mock_get):
-        row = _make_row("PRS-001", "Иван",
-                        drive_url="https://existing.url",
-                        drive_folder_id="existing-id")
-        mock = _make_sheet(FULL_HEADERS, [row])
-        mock.update_cell = MagicMock()
-        mock_get.return_value = mock
+    @patch("business_core.business_builder.pm_update_person_drive_info")
+    def test_ok_true_changed_false_returns_false(self, mock_pm):
+        """Both fields already populated — a legitimate no-op, not an error."""
+        mock_pm.return_value = {"ok": True, "changed": False, "updated_fields": (), "error": None}
 
         from business_core.business_builder import update_person_drive_info
         result = update_person_drive_info("PRS-001", "new-folder", "https://new.url")
 
         self.assertFalse(result)
-        mock.update_cell.assert_not_called()
 
-    @patch("business_core.sheets.get_business_sheet")
-    def test_sheets_error_returns_false(self, mock_get):
-        mock_get.side_effect = Exception("boom")
+    @patch("business_core.business_builder.pm_update_person_drive_info")
+    def test_ok_false_returns_false(self, mock_pm):
+        """Missing person / empty input / manager-level error — all False."""
+        mock_pm.return_value = {"ok": False, "changed": False, "updated_fields": (), "error": "Person 'PRS-999' не найден"}
 
         from business_core.business_builder import update_person_drive_info
-        result = update_person_drive_info("PRS-001", "x", "https://x")
+        result = update_person_drive_info("PRS-999", "x", "https://x")
 
         self.assertFalse(result)
 
