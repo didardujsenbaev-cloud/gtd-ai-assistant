@@ -312,8 +312,12 @@ class TestGetPersonBizIds(unittest.TestCase):
         self.assertEqual(result, ["BIZ-001", "BIZ-002"])
 
     @patch("business_core.sheets.get_business_sheet")
-    @patch("business_core.business_builder._get_biz_id_by_name")
+    @patch("business_core.person_manager._get_biz_id_by_name")
     def test_fallback_to_old_field(self, mock_biz_id, mock_get):
+        """Phase 23D-1: get_person_biz_ids()'s implementation (including
+        _get_biz_id_by_name) was relocated to business_core.person_manager;
+        business_core.business_builder.get_person_biz_ids() is now a thin
+        delegator. Patch target updated accordingly — behavior unchanged."""
         headers = ["ID", "ФИО", "Бизнесы"]
         rows    = [["PRS-001", "Иван", "Узаконение"]]
         mock_get.return_value = self._make_mock(headers, rows)
