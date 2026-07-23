@@ -55,6 +55,11 @@ BUSINESS_SHEET_NAMES: dict[str, str] = {
     "document_content":           "DOCUMENT_CONTENT",
     # Phase 18C-1: Stage-to-Entity Relation Foundation
     "stage_entity_relations":     "STAGE_ENTITY_RELATIONS",
+    # Phase 21A: Organization Layer schema foundation
+    "department_registry":        "DEPARTMENT_REGISTRY",
+    "role_registry":               "ROLE_REGISTRY",
+    "role_functions":              "ROLE_FUNCTIONS",
+    "person_role_assignments":     "PERSON_ROLE_ASSIGNMENTS",
 }
 
 BUSINESS_HEADERS: dict[str, list[str]] = {
@@ -294,6 +299,31 @@ BUSINESS_HEADERS: dict[str, list[str]] = {
         "Required", "Blocking", "Minimum Count", "Status",
         "Created At", "Updated At",
     ],
+    # Phase 21A: Organization Layer schema foundation (Phase 20A -> 20A.6
+    # architecture, revised per Phase 20A critical feedback). Internal
+    # positions only — external contractors stay in PEOPLE_REGISTRY, never
+    # become Role rows (see ARCHITECTURE.md / Organization Layer). Role is
+    # deliberately global (no "Business ID" column) — see Phase 20A revised
+    # §4; a future ROLE_BUSINESS_SCOPE relation is the designed-but-not-built
+    # extension point if a role ever needs scoping to a subset of businesses.
+    "department_registry": [
+        "Department ID", "Business ID", "Department Name",
+        "Parent Department ID", "Head Role ID", "Status", "Notes",
+    ],
+    "role_registry": [
+        "Role ID", "Department ID", "Role Name", "Reports To Role ID",
+        "Role Type", "Employment Model", "Status",
+        "Purpose", "Main Result", "Notes",
+    ],
+    "role_functions": [
+        "Function ID", "Role ID", "Function Category", "Function Name",
+        "Description", "Frequency", "Criticality", "Can Delegate",
+        "Status", "Sort Order",
+    ],
+    "person_role_assignments": [
+        "Assignment ID", "Person ID", "Role ID",
+        "Start Date", "End Date", "Assignment Type", "Status", "Notes",
+    ],
 }
 
 # ID-префиксы для generate_next_id
@@ -320,6 +350,11 @@ _ID_PREFIXES: dict[str, str] = {
     "document_registry":          "DREG",
     # Phase 18C-1
     "stage_entity_relations":     "REL",
+    # Phase 21A
+    "department_registry":        "DEPT",
+    "role_registry":               "ROLE",
+    "role_functions":              "FUNC",
+    "person_role_assignments":     "PRA",
 }
 
 
