@@ -405,7 +405,7 @@ class TestSuccessNotConfusedWithFormattingError(unittest.TestCase):
                  patch("business_core.business_builder.provision_client_drive",
                        return_value={"ok": True, "folder_id": "fid_with_underscore",
                                      "folder_url": "https://drive.google.com/drive/folders/fid_with_underscore"}), \
-                 patch("business_core.business_builder.save_client_drive_to_sheets"), \
+                 patch("business_core.business_builder.update_person_drive_info"), \
                  patch("business_core.business_builder._get_biz_id_by_name",
                        return_value="BIZ-001"):
                 await handlers["confirm"](update, context)

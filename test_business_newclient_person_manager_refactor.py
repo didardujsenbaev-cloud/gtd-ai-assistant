@@ -372,5 +372,121 @@ class TestProfileFieldsWarningInitialization(unittest.TestCase):
         self.assertIn("другом бизнесе", msg)
 
 
+# ─────────────────────────────────────────────────────────────
+# Phase 23D-3C1 — save_client_drive_to_sheets() bypass eliminated;
+# STATUS_NEW Drive branch now unconditionally uses
+# update_person_drive_info() (Person Manager-backed), same as the
+# existing-person branch already did.
+# ─────────────────────────────────────────────────────────────
+
+class TestStatusNewDriveUsesPersonManager(unittest.TestCase):
+
+    def test_status_new_drive_calls_update_person_drive_info_with_correct_args(self):
+        th = _fresh_th()
+        update = _make_confirm_update()
+        context = _make_confirm_context()
+
+        with patch("business_core.business_builder.find_existing_person", return_value=None), \
+             patch("business_core.person_manager.create_person",
+                   return_value={"ok": True, "person_id": "PRS-105", "error": None}), \
+             patch("business_core.person_manager.update_person",
+                   return_value={"ok": True, "changed": True, "updated_fields": (), "error": None}), \
+             patch("business_core.business_builder.provision_client_drive",
+                   return_value={"ok": True, "folder_id": "fid-105", "folder_url": "https://drive.google.com/fid-105"}), \
+             patch("business_core.business_builder.update_person_drive_info") as mock_upd_drive:
+            _run(th.newclient_confirm(update, context))
+
+        mock_upd_drive.assert_called_once_with("PRS-105", "fid-105", "https://drive.google.com/fid-105")
+
+    def test_status_new_drive_never_calls_save_client_drive_to_sheets(self):
+        th = _fresh_th()
+        update = _make_confirm_update()
+        context = _make_confirm_context()
+
+        with patch("business_core.business_builder.find_existing_person", return_value=None), \
+             patch("business_core.person_manager.create_person",
+                   return_value={"ok": True, "person_id": "PRS-106", "error": None}), \
+             patch("business_core.person_manager.update_person",
+                   return_value={"ok": True, "changed": True, "updated_fields": (), "error": None}), \
+             patch("business_core.business_builder.provision_client_drive",
+                   return_value={"ok": True, "folder_id": "fid-106", "folder_url": "https://drive.google.com/fid-106"}), \
+             patch("business_core.business_builder.update_person_drive_info"), \
+             patch("business_core.business_builder.save_client_drive_to_sheets") as mock_save_drive:
+            _run(th.newclient_confirm(update, context))
+
+        mock_save_drive.assert_not_called()
+
+    def test_status_new_drive_success_reply_unchanged(self):
+        th = _fresh_th()
+        update = _make_confirm_update()
+        context = _make_confirm_context()
+
+        with patch("business_core.business_builder.find_existing_person", return_value=None), \
+             patch("business_core.person_manager.create_person",
+                   return_value={"ok": True, "person_id": "PRS-107", "error": None}), \
+             patch("business_core.person_manager.update_person",
+                   return_value={"ok": True, "changed": True, "updated_fields": (), "error": None}), \
+             patch("business_core.business_builder.provision_client_drive",
+                   return_value={"ok": True, "folder_id": "fid-107", "folder_url": "https://drive.google.com/fid-107"}), \
+             patch("business_core.business_builder.update_person_drive_info"):
+            _run(th.newclient_confirm(update, context))
+
+        msg = update.message.reply_text.call_args[0][0]
+        self.assertIn("✅ Клиент добавлен!", msg)
+        self.assertIn("PRS-107", msg)
+        self.assertIn("📁 Drive: https://drive.google.com/fid-107", msg)
+
+    def test_other_biz_drive_path_still_calls_update_person_drive_info(self):
+        """Existing-person (OTHER_BIZ) Drive path — unaffected by this
+        phase, still routes through the same wrapper as before."""
+        th = _fresh_th()
+        update = _make_confirm_update()
+        context = _make_confirm_context()
+
+        with patch("business_core.business_builder.find_existing_person",
+                   return_value={"prs_id": "PRS-002", "same_biz": False, "drive_url": ""}), \
+             patch("business_core.business_builder.add_biz_id_to_person"), \
+             patch("business_core.business_builder.provision_client_drive",
+                   return_value={"ok": True, "folder_id": "fid-existing", "folder_url": "https://drive.google.com/fid-existing"}), \
+             patch("business_core.business_builder.update_person_drive_info") as mock_upd_drive:
+            _run(th.newclient_confirm(update, context))
+
+        mock_upd_drive.assert_called_once_with("PRS-002", "fid-existing", "https://drive.google.com/fid-existing")
+
+
+class TestNewClientConfirmNoDirectRegistryWrite(unittest.TestCase):
+    """Architecture guard: newclient_confirm() must contain no raw
+    update_business_cell()/update_cell()/get_business_sheet()-for-write/
+    save_client_drive_to_sheets() call — only the Person Manager-backed
+    wrappers (create_person, update_person, add_biz_id_to_person,
+    update_person_drive_info)."""
+
+    def test_no_direct_registry_write_calls_remain(self):
+        import ast
+        import inspect
+        from business_core.telegram_handlers import newclient_confirm
+
+        source = inspect.getsource(newclient_confirm)
+        tree = ast.parse(source)
+
+        forbidden_calls = {"update_business_cell", "update_cell", "save_client_drive_to_sheets"}
+        found_calls = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                func = node.func
+                name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
+                if name in forbidden_calls:
+                    found_calls.add(name)
+
+        self.assertEqual(found_calls, set())
+
+    def test_save_client_drive_to_sheets_not_imported(self):
+        import inspect
+        from business_core.telegram_handlers import newclient_confirm
+
+        source = inspect.getsource(newclient_confirm)
+        self.assertNotIn("save_client_drive_to_sheets", source)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -859,7 +859,6 @@ async def newclient_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             add_biz_id_to_person,
             update_person_drive_info,
             provision_client_drive,
-            save_client_drive_to_sheets,
             normalize_biz_ids,
         )
         from business_core.person_manager import create_person, update_person
@@ -981,15 +980,16 @@ async def newclient_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                         biz_name=biz_name,
                     )
                     if drive_result["ok"]:
-                        # Сохраняем в таблицу (идемпотентно — только если пусто)
-                        if client_status == STATUS_NEW:
-                            save_client_drive_to_sheets(
-                                prs_id, drive_result["folder_id"], drive_result["folder_url"]
-                            )
-                        else:
-                            update_person_drive_info(
-                                prs_id, drive_result["folder_id"], drive_result["folder_url"]
-                            )
+                        # Phase 23D-3C1: unconditional for both STATUS_NEW
+                        # and existing-person flows — safe because
+                        # update_person_drive_info()'s fill-if-empty
+                        # semantics are observably identical to the old
+                        # STATUS_NEW-only unconditional overwrite here:
+                        # create_person() never sets Drive fields, so
+                        # they are guaranteed empty at this call site.
+                        update_person_drive_info(
+                            prs_id, drive_result["folder_id"], drive_result["folder_url"]
+                        )
                         drive_msg = f"\n📁 Drive: {drive_result['folder_url']}"
                     else:
                         err = drive_result.get("error", "")
