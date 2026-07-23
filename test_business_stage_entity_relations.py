@@ -379,9 +379,19 @@ class TestEntityTypeDispatcher(unittest.TestCase):
         self.assertEqual(entry["sheet_key"], "document_template_registry")
         self.assertEqual(entry["id_column"], "Document Template ID")
 
-    def test_only_document_template_supported_today(self):
+    def test_only_document_template_and_role_supported_today(self):
+        """Phase 22B added "role" (Work Execution Foundation) — the
+        dispatch table is still exactly two entries, both additive,
+        neither a schema change to STAGE_ENTITY_RELATIONS itself.
+        "contractor_person" remains explicitly deferred (Phase 22A/22B)."""
         ser = _fresh_ser()
-        self.assertEqual(set(ser.ENTITY_TYPE_DISPATCH.keys()), {"document_template"})
+        self.assertEqual(set(ser.ENTITY_TYPE_DISPATCH.keys()), {"document_template", "role"})
+
+    def test_role_entity_type_dispatch_target(self):
+        ser = _fresh_ser()
+        entry = ser.ENTITY_TYPE_DISPATCH["role"]
+        self.assertEqual(entry["sheet_key"], "role_registry")
+        self.assertEqual(entry["id_column"], "Role ID")
 
 
 # ────────────────────────────────────────────────────────────

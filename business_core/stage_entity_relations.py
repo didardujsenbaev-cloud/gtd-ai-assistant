@@ -47,6 +47,16 @@ ENTITY_TYPE_DISPATCH: dict[str, dict[str, str]] = {
         "sheet_key": "document_template_registry",
         "id_column": "Document Template ID",
     },
+    # Phase 22B: Work Execution Foundation. Links a stage to an
+    # Organization Layer Role (see business_core/work_assignment_manager.py
+    # for resolution/assignment logic). "contractor_person" (a direct
+    # PEOPLE_REGISTRY link, bypassing Role) is explicitly deferred per the
+    # Phase 22A architecture review — not added until a real business case
+    # exists.
+    "role": {
+        "sheet_key": "role_registry",
+        "id_column": "Role ID",
+    },
 }
 
 
