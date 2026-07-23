@@ -150,6 +150,56 @@ def list_departments(business_id: str = "", status: str = "") -> list[dict]:
 # Department: write operations
 # ─────────────────────────────────────────────────────────────
 
+def _normalize_org_name(value: str) -> str:
+    """
+    Trim + collapse internal whitespace + casefold — for duplicate
+    DETECTION only, never mutates a stored display value.
+
+    Same normalization recipe as business_builder.py's
+    normalize_person_name() (trim -> collapse whitespace -> lowercase),
+    reimplemented locally rather than imported, to preserve the Layer
+    Dependency Rule that this module depends only on business_core.sheets
+    and never on another domain's manager (see this module's own
+    TestModuleOnlyDependsOnSheets guard tests, Phase 21B/21C).
+    """
+    return re.sub(r"\s+", " ", (value or "").strip()).casefold()
+
+
+# Department has no "planned" status in the approved schema
+# (DEPARTMENT_STATUS = ("active", "archived")) — only "active" rows
+# count as duplicate-blocking. Archived Departments never block a new
+# create, matching this codebase's existing soft-delete convention
+# (an archived row is retired, not a live duplicate).
+_DEPARTMENT_DUPLICATE_BLOCKING_STATUSES = ("active",)
+
+
+def _find_duplicate_department(
+    department_name: str, business_id: str, parent_department_id: str,
+) -> Optional[dict]:
+    """
+    Read-only. A Department is a duplicate if an existing row with a
+    BLOCKING status (see above) has the same normalized name, the same
+    Business ID (blank matches blank — a global Department only
+    collides with another global Department, never with a
+    business-scoped one of the same name), and the same Parent
+    Department ID.
+    """
+    target_name = _normalize_org_name(department_name)
+    target_business_id = business_id or ""
+    target_parent = parent_department_id or ""
+
+    for dept in list_departments():
+        if dept["status"] not in _DEPARTMENT_DUPLICATE_BLOCKING_STATUSES:
+            continue
+        if (dept.get("business_id") or "") != target_business_id:
+            continue
+        if (dept.get("parent_department_id") or "") != target_parent:
+            continue
+        if _normalize_org_name(dept["department_name"]) == target_name:
+            return dept
+    return None
+
+
 def create_department(
     department_name: str,
     business_id: str = "",
@@ -166,6 +216,12 @@ def create_department(
     Parent Department ID — опционален; если указан — валидируется против
     DEPARTMENT_REGISTRY (self-FK). Head Role ID НЕ валидируется — вакантный
     Department без назначенной головы роли легитимен по дизайну.
+
+    Phase 23C: duplicate protection. Rejected BEFORE ID generation and
+    BEFORE any write if an "active" Department already exists with the
+    same normalized name + Business ID + Parent Department ID. No merge,
+    no automatic archival, no automatic reuse — the existing row is
+    returned in the error message only for the caller's information.
 
     Returns:
         {"ok": bool, "department_id": str, "error": str | None}
@@ -194,6 +250,21 @@ def create_department(
                 "ok": False, "department_id": "",
                 "error": f"Parent Department '{parent_department_id}' не найден",
             }
+
+    try:
+        duplicate = _find_duplicate_department(department_name, business_id, parent_department_id)
+    except Exception as exc:
+        log.error(f"create_department duplicate check error: {exc}")
+        return {"ok": False, "department_id": "", "error": str(exc)}
+
+    if duplicate is not None:
+        return {
+            "ok": False, "department_id": "",
+            "error": (
+                f"Активный Department с таким именем уже существует: "
+                f"{duplicate['department_id']} ({duplicate['department_name']})"
+            ),
+        }
 
     try:
         from business_core.sheets import generate_next_id, append_business_row
@@ -437,6 +508,44 @@ def list_roles(department_id: str = "", status: str = "") -> list[dict]:
 # Role: write operations
 # ─────────────────────────────────────────────────────────────
 
+# Reports To Role ID is an EDITABLE ORGANIZATIONAL ATTRIBUTE, not part
+# of Role identity — conclusion drawn from the existing, already-shipped
+# architecture, not guessed: "Reports To Role ID" is a member of
+# _ROLE_EDITABLE_FIELDS (see update_role() below) and has been freely
+# reassignable via update_role() since Phase 21B. A Role does not become
+# "a different role" when the org chart above it is restructured — the
+# same real-world Coordinator position stays the same Role row whether
+# it reports to a CEO or, after a reorg, an Operations Manager. Duplicate
+# identity therefore does NOT include Reports To Role ID.
+#
+# Role has no Business ID column of its own (Phase 20A revised §4 —
+# global by design). Its "effective business scope" is inherited
+# entirely from its Department's Business ID, and Department ID is
+# already part of the duplicate key below — so no separate Business ID
+# check is needed or possible without a schema change (explicitly out
+# of scope for this phase).
+
+# "planned" DOES exist for Role (unlike Department) — both "active" and
+# "planned" rows block a duplicate create; "paused"/"archived" do not.
+_ROLE_DUPLICATE_BLOCKING_STATUSES = ("active", "planned")
+
+
+def _find_duplicate_role(role_name: str, department_id: str) -> Optional[dict]:
+    """
+    Read-only. A Role is a duplicate if an existing row with a BLOCKING
+    status (see above) in the SAME Department has the same normalized
+    name. Reports To Role ID is deliberately excluded from this key —
+    see the comment above _ROLE_DUPLICATE_BLOCKING_STATUSES.
+    """
+    target_name = _normalize_org_name(role_name)
+    for role in list_roles(department_id=department_id):
+        if role["status"] not in _ROLE_DUPLICATE_BLOCKING_STATUSES:
+            continue
+        if _normalize_org_name(role["role_name"]) == target_name:
+            return role
+    return None
+
+
 def create_role(
     role_name: str,
     department_id: str,
@@ -457,6 +566,13 @@ def create_role(
     Role (см. Phase 20A revised §4). department_id обязателен и
     валидируется против DEPARTMENT_REGISTRY. reports_to_role_id, если
     указан, валидируется против ROLE_REGISTRY.
+
+    Phase 23C: duplicate protection. Rejected BEFORE ID generation and
+    BEFORE any write if an "active" or "planned" Role already exists in
+    the same Department with the same normalized name. Reports To Role
+    ID is NOT part of the duplicate key (see comment above
+    _find_duplicate_role) — it is an editable attribute, not identity.
+    No merge, no automatic archival, no automatic reuse.
 
     Returns:
         {"ok": bool, "role_id": str, "error": str | None}
@@ -487,6 +603,21 @@ def create_role(
 
     if reports_to_role_id and not find_role_by_id(reports_to_role_id):
         return {"ok": False, "role_id": "", "error": f"Reports To Role '{reports_to_role_id}' не найден"}
+
+    try:
+        duplicate = _find_duplicate_role(role_name, department_id)
+    except Exception as exc:
+        log.error(f"create_role duplicate check error: {exc}")
+        return {"ok": False, "role_id": "", "error": str(exc)}
+
+    if duplicate is not None:
+        return {
+            "ok": False, "role_id": "",
+            "error": (
+                f"Активная/planned Role с таким именем уже существует в этом Department: "
+                f"{duplicate['role_id']} ({duplicate['role_name']})"
+            ),
+        }
 
     try:
         from business_core.sheets import generate_next_id, append_business_row

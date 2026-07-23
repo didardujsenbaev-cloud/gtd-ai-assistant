@@ -560,17 +560,22 @@ class TestArchiveRole(unittest.TestCase):
 # Duplicate names allowed (no uniqueness constraint in approved schema)
 # ─────────────────────────────────────────────────────────────
 
-class TestDuplicatesAllowed(unittest.TestCase):
+class TestDuplicatesNowRejected(unittest.TestCase):
+    """Superseded by Phase 23C: exact-duplicate names are now rejected,
+    not allowed. See test_business_organization_duplicate_protection.py
+    for the full duplicate-detection test suite (normalization, scoping,
+    archived-row behavior, Reports-To exclusion, etc.) — this class only
+    re-confirms the two original Phase 21B scenarios flip outcome."""
 
-    def test_duplicate_department_name_allowed(self):
+    def test_duplicate_department_name_now_rejected(self):
         om = _fresh_om()
         sheet = MagicMock()
         sheet.get_all_values.return_value = [DEPARTMENT_HEADERS, DEPARTMENT_ROW]
         with patch("business_core.sheets.get_business_sheet", return_value=sheet):
             result = om.create_department("Executive")
-        self.assertTrue(result["ok"])
+        self.assertFalse(result["ok"])
 
-    def test_duplicate_role_name_allowed(self):
+    def test_duplicate_role_name_now_rejected(self):
         om = _fresh_om()
         dept_sheet = _make_sheet(DEPARTMENT_HEADERS, DEPARTMENT_ROW)
         role_sheet = MagicMock()
@@ -581,7 +586,7 @@ class TestDuplicatesAllowed(unittest.TestCase):
 
         with patch("business_core.sheets.get_business_sheet", side_effect=fake_get):
             result = om.create_role("CEO / Founder", department_id="DEPT-001")
-        self.assertTrue(result["ok"])
+        self.assertFalse(result["ok"])
 
 
 # ─────────────────────────────────────────────────────────────
