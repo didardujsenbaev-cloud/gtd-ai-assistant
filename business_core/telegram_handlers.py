@@ -1244,62 +1244,66 @@ async def editclient_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return ConversationHandler.END
 
     try:
-        from business_core.sheets import find_row_by_id, get_business_sheet
+        from business_core.person_manager import find_person_by_id, update_person
+        from business_core.inbox_bridge import invalidate_cache
 
         client_id = snap["client_id"]
         field_key = snap["field"]
 
-        # Перечитываем строку прямо перед записью — защита от staleness
-        # между показом карточки и подтверждением.
-        found = find_row_by_id("people_registry", client_id)
-        if not found:
+        # Phase 23D-3A: structural (not error-string-based) staleness
+        # guard — re-checks existence right before writing, exactly as
+        # the prior find_row_by_id() re-read did, just via Person
+        # Manager's own read API instead of a raw Sheets call.
+        if find_person_by_id(client_id) is None:
             await update.message.reply_text(
                 f"❌ Клиент {client_id} больше не найден — изменение не выполнено.",
                 reply_markup=ReplyKeyboardRemove(),
             )
         else:
-            row_number, _live_row = found
-            sheet = get_business_sheet("people_registry")
-            headers = sheet.row_values(1)
-
-            def _col(name):
-                return headers.index(name) + 1 if name in headers else None
-
             if field_key == "full_name":
-                fio_col   = _col("ФИО")
-                short_col = _col("Имя")
-                if fio_col:
-                    sheet.update_cell(row_number, fio_col, snap["new_value"])
-                if short_col:
-                    parts = snap["new_value"].split()
-                    sheet.update_cell(row_number, short_col, parts[0] if parts else snap["new_value"])
+                parts = snap["new_value"].split()
+                updates = {
+                    "ФИО": snap["new_value"],
+                    "Имя": parts[0] if parts else snap["new_value"],
+                }
             elif field_key == "phone":
-                col = _col("Телефон")
-                if col:
-                    sheet.update_cell(row_number, col, snap["new_value"])
+                updates = {"Телефон": snap["new_value"]}
             elif field_key == "business":
-                biz_ids_col     = _col("Biz IDs")
-                primary_col     = _col("Primary Biz ID")
-                biz_display_col = _col("Бизнесы")
-                if biz_ids_col:
-                    sheet.update_cell(row_number, biz_ids_col, snap["new_biz_id"])
-                if primary_col:
-                    sheet.update_cell(row_number, primary_col, snap["new_biz_id"])
-                if biz_display_col:
-                    sheet.update_cell(row_number, biz_display_col, snap["new_biz_name"])
+                updates = {
+                    "Бизнесы": snap["new_biz_name"],
+                    "Biz IDs": snap["new_biz_id"],
+                    "Primary Biz ID": snap["new_biz_id"],
+                }
             elif field_key == "notes":
-                col = _col("Комментарий")
-                if col:
-                    sheet.update_cell(row_number, col, snap["new_value"])
+                updates = {"Комментарий": snap["new_value"]}
 
-            field_labels = {v: k for k, v in EDITCLIENT_FIELDS.items()}
-            await update.message.reply_text(
-                f"✅ Клиент {client_id} обновлён\n\n"
-                f"Поле: {field_labels[field_key]}\n"
-                f"Было: {snap['old_value_display'] or '—'}\n"
-                f"Стало: {snap['new_value_display'] or '—'}",
-                reply_markup=ReplyKeyboardRemove(),
-            )
+            result = update_person(client_id, updates)
+            # A write attempt was just made — update_person() cannot
+            # prove how many cells landed if it failed partway through
+            # (see its own docstring / Phase 23D-2 technical debt note),
+            # so the cache is invalidated unconditionally here rather
+            # than only on result["ok"] — never inferred from parsing
+            # result["error"].
+            invalidate_cache()
+
+            if result["ok"]:
+                field_labels = {v: k for k, v in EDITCLIENT_FIELDS.items()}
+                await update.message.reply_text(
+                    f"✅ Клиент {client_id} обновлён\n\n"
+                    f"Поле: {field_labels[field_key]}\n"
+                    f"Было: {snap['old_value_display'] or '—'}\n"
+                    f"Стало: {snap['new_value_display'] or '—'}",
+                    reply_markup=ReplyKeyboardRemove(),
+                )
+            else:
+                log.warning(
+                    f"editclient_confirm: update_person failure "
+                    f"person_id={client_id} field={field_key} error={result['error']}"
+                )
+                await update.message.reply_text(
+                    f"❌ Ошибка сохранения: {result['error']}",
+                    reply_markup=ReplyKeyboardRemove(),
+                )
 
     except Exception as e:
         log.error(f"editclient_confirm error: {e}")

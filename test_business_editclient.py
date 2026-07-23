@@ -3,13 +3,21 @@ Phase 13A: /editclient — mock tests.
 
 Same immutable-snapshot architecture as /newclient (Phase 11J):
 choose field -> enter new value -> confirmation card (old/was ->
-new/станет) -> snapshot -> ONLY on explicit confirm does a single
-targeted cell write happen, against a freshly re-read row. ID, Drive
-Folder ID and Created At are never touched. Business edits resolve
-through business_core.business_builder.resolve_business() and store
-the Biz ID, never the raw display text.
+new/станет) -> snapshot -> ONLY on explicit confirm does a write
+happen. ID, Drive Folder ID and Created At are never touched.
+Business edits resolve through business_core.business_builder.resolve_business()
+and store the Biz ID, never the raw display text.
 
-All tests fully mock business_core.sheets — no live Google Sheets API.
+Phase 23D-3A: editclient_confirm() no longer writes PEOPLE_REGISTRY
+directly — it now calls business_core.person_manager.find_person_by_id()
+(structural staleness/existence guard) and
+business_core.person_manager.update_person() (the actual write), then
+unconditionally calls business_core.inbox_bridge.invalidate_cache()
+whenever a write was attempted (never inferred from parsing
+result["error"] — see the Phase 23D-3A implementation plan).
+
+All tests fully mock business_core.person_manager / business_core.inbox_bridge —
+no live Google Sheets API, no real cache access.
 """
 
 from __future__ import annotations
@@ -18,44 +26,6 @@ import asyncio
 import sys
 import unittest
 from unittest.mock import MagicMock, AsyncMock, patch
-
-PEOPLE_HEADERS = [
-    "ID", "ФИО", "Имя", "Телефон", "Тип", "Бизнесы",
-    "Комментарий", "Google Drive", "Drive Folder ID",
-    "Biz IDs", "Primary Biz ID", "Дата первого контакта",
-]
-
-
-def _make_people_sheet(rows: list[list]) -> MagicMock:
-    sheet = MagicMock()
-    values = [PEOPLE_HEADERS] + rows
-    sheet.get_all_values.return_value = values
-    sheet.row_values.side_effect = lambda r: values[r - 1] if 0 <= r - 1 < len(values) else []
-    updates = {}
-    def _update_cell(row, col, value):
-        updates[(row, col)] = value
-    sheet.update_cell.side_effect = _update_cell
-    sheet._updates = updates
-    return sheet
-
-
-def _existing_row(client_id="PRS-001", fio="Кайрат", phone="87087632894",
-                   biz_display="узаконение недвижимости", drive_id="DRIVE-ABC123",
-                   biz_ids="", primary_biz=""):
-    idx = {h: i for i, h in enumerate(PEOPLE_HEADERS)}
-    row = [""] * len(PEOPLE_HEADERS)
-    row[idx["ID"]] = client_id
-    row[idx["ФИО"]] = fio
-    row[idx["Имя"]] = fio.split()[0] if fio.split() else fio
-    row[idx["Телефон"]] = phone
-    row[idx["Тип"]] = "клиент"
-    row[idx["Бизнесы"]] = biz_display
-    row[idx["Комментарий"]] = ""
-    row[idx["Drive Folder ID"]] = drive_id
-    row[idx["Biz IDs"]] = biz_ids
-    row[idx["Primary Biz ID"]] = primary_biz
-    row[idx["Дата первого контакта"]] = "2026-07-18"
-    return row
 
 
 def _fresh_import():
@@ -69,7 +39,7 @@ def _fresh_import():
                 value=editclient_value, confirm=editclient_confirm)
 
 
-def _upd(text: str, args=None):
+def _upd(text: str):
     update = MagicMock()
     update.message.text = text
     update.message.reply_text = AsyncMock()
@@ -83,15 +53,34 @@ def _ctx(args=None):
     return context
 
 
+def _existing_person(client_id="PRS-001", fio="Кайрат", phone="87087632894",
+                      biz_display="узаконение недвижимости", drive_id="DRIVE-ABC123",
+                      biz_ids="", primary_biz=""):
+    """The dict shape find_row_by_id()/find_person_by_id() return for a
+    row — used both as editclient_start()'s pre-fetch result and as
+    person_manager.find_person_by_id()'s existence-check return value."""
+    return {
+        "ID": client_id,
+        "ФИО": fio,
+        "Имя": fio.split()[0] if fio.split() else fio,
+        "Телефон": phone,
+        "Тип": "клиент",
+        "Бизнесы": biz_display,
+        "Комментарий": "",
+        "Drive Folder ID": drive_id,
+        "Biz IDs": biz_ids,
+        "Primary Biz ID": primary_biz,
+    }
+
+
 class TestEditClientEntityNotFound(unittest.TestCase):
     def test_unknown_client_id_reports_not_found(self):
         handlers = _fresh_import()
         context = _ctx(args=["client_id=PRS-999"])
-        sheet = _make_people_sheet([])
 
         async def run():
             with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
-                 patch("business_core.sheets.get_business_sheet", return_value=sheet):
+                 patch("business_core.sheets.find_row_by_id", return_value=None):
                 return await handlers["start"](_upd("/editclient client_id=PRS-999"), context)
 
         result = asyncio.run(run())
@@ -103,95 +92,195 @@ class TestEditClientEntityNotFound(unittest.TestCase):
 def _walk_to_confirm(handlers, field_button="Телефон", new_value="87001112233",
                       existing_row=None, biz_rows=None):
     context = _ctx(args=["client_id=PRS-001"])
-    sheet = _make_people_sheet([existing_row or _existing_row()])
+    row = existing_row or _existing_person()
     biz_rows = biz_rows or [{"ID": "BIZ-001", "Название": "Узаконение недвижимости", "Статус": "active"}]
 
     async def run():
         with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
-             patch("business_core.sheets.get_business_sheet", return_value=sheet), \
+             patch("business_core.sheets.find_row_by_id", return_value=(2, row)), \
              patch("business_core.sheets.read_business_sheet", return_value=biz_rows):
             await handlers["start"](_upd("/editclient client_id=PRS-001"), context)
             await handlers["field"](_upd(field_button), context)
             await handlers["value"](_upd(new_value), context)
 
     asyncio.run(run())
-    return context, sheet
+    return context
 
 
-class TestEditClientOneFieldChanges(unittest.TestCase):
-    def test_phone_change_updates_only_phone_cell(self):
+def _confirm_with_mocks(handlers, context, *, person_found=True,
+                         update_result=None, text="✅ Сохранить"):
+    """Run editclient_confirm() with person_manager.find_person_by_id()
+    and update_person() mocked, plus inbox_bridge.invalidate_cache()
+    tracked. Returns (mock_find, mock_update, mock_invalidate)."""
+    update_result = update_result if update_result is not None else {
+        "ok": True, "changed": True, "updated_fields": (), "error": None,
+    }
+
+    async def run():
+        with patch("business_core.person_manager.find_person_by_id",
+                    return_value=(_existing_person() if person_found else None)) as mock_find, \
+             patch("business_core.person_manager.update_person",
+                   return_value=update_result) as mock_update, \
+             patch("business_core.inbox_bridge.invalidate_cache") as mock_invalidate:
+            await handlers["confirm"](_upd(text), context)
+            return mock_find, mock_update, mock_invalidate
+
+    return asyncio.run(run())
+
+
+class TestEditClientFieldMapping(unittest.TestCase):
+    """Phase 23D-3A: each of the 4 editable fields must map to the
+    exact update_person() field dict — full_name -> ФИО+Имя, phone ->
+    Телефон only, business -> Бизнесы+Biz IDs+Primary Biz ID, notes ->
+    Комментарий only. ID and Drive Folder ID must never appear."""
+
+    def test_full_name_maps_to_fio_and_imya(self):
         handlers = _fresh_import()
-        context, sheet = _walk_to_confirm(handlers, field_button="Телефон", new_value="87001112233")
+        context = _walk_to_confirm(handlers, field_button="Имя (ФИО)", new_value="Асхат Нурланов")
+        mock_find, mock_update, mock_invalidate = _confirm_with_mocks(handlers, context)
 
-        async def confirm():
-            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
-                 patch("business_core.sheets.get_business_sheet", return_value=sheet), \
-                 patch("business_core.sheets.find_row_by_id",
-                       return_value=(2, dict(zip(PEOPLE_HEADERS, _existing_row())))):
-                await handlers["confirm"](_upd("✅ Сохранить"), context)
+        mock_update.assert_called_once_with("PRS-001", {"ФИО": "Асхат Нурланов", "Имя": "Асхат"})
 
-        asyncio.run(confirm())
-        phone_col = PEOPLE_HEADERS.index("Телефон") + 1
-        self.assertEqual(sheet._updates.get((2, phone_col)), "87001112233")
-        # ни ID, ни Drive Folder ID не должны были обновиться
-        id_col = PEOPLE_HEADERS.index("ID") + 1
-        drive_col = PEOPLE_HEADERS.index("Drive Folder ID") + 1
-        self.assertNotIn((2, id_col), sheet._updates)
-        self.assertNotIn((2, drive_col), sheet._updates)
-
-
-class TestEditClientIdAndDriveUnchanged(unittest.TestCase):
-    def test_id_and_drive_folder_id_never_written(self):
+    def test_phone_maps_only_to_telefon(self):
         handlers = _fresh_import()
-        context, sheet = _walk_to_confirm(handlers, field_button="Комментарий", new_value="звонил дважды")
+        context = _walk_to_confirm(handlers, field_button="Телефон", new_value="87001112233")
+        mock_find, mock_update, mock_invalidate = _confirm_with_mocks(handlers, context)
 
-        async def confirm():
-            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
-                 patch("business_core.sheets.get_business_sheet", return_value=sheet), \
-                 patch("business_core.sheets.find_row_by_id",
-                       return_value=(2, dict(zip(PEOPLE_HEADERS, _existing_row())))):
-                await handlers["confirm"](_upd("✅ Сохранить"), context)
+        mock_update.assert_called_once_with("PRS-001", {"Телефон": "87001112233"})
 
-        asyncio.run(confirm())
-        written_cols = {col for (_row, col) in sheet._updates}
-        self.assertNotIn(PEOPLE_HEADERS.index("ID") + 1, written_cols)
-        self.assertNotIn(PEOPLE_HEADERS.index("Drive Folder ID") + 1, written_cols)
+    def test_business_maps_to_bizness_biz_ids_primary(self):
+        handlers = _fresh_import()
+        context = _walk_to_confirm(handlers, field_button="Бизнес", new_value="узаконение недвижимости")
+        mock_find, mock_update, mock_invalidate = _confirm_with_mocks(handlers, context)
+
+        mock_update.assert_called_once_with("PRS-001", {
+            "Бизнесы": "Узаконение недвижимости",
+            "Biz IDs": "BIZ-001",
+            "Primary Biz ID": "BIZ-001",
+        })
+
+    def test_notes_maps_only_to_kommentariy(self):
+        handlers = _fresh_import()
+        context = _walk_to_confirm(handlers, field_button="Комментарий", new_value="звонил дважды")
+        mock_find, mock_update, mock_invalidate = _confirm_with_mocks(handlers, context)
+
+        mock_update.assert_called_once_with("PRS-001", {"Комментарий": "звонил дважды"})
+
+    def test_update_person_called_exactly_once(self):
+        handlers = _fresh_import()
+        context = _walk_to_confirm(handlers, field_button="Телефон", new_value="87001112233")
+        mock_find, mock_update, mock_invalidate = _confirm_with_mocks(handlers, context)
+
+        mock_update.assert_called_once()
+
+    def test_id_and_drive_folder_id_never_in_updates(self):
+        for field_button, new_value in (
+            ("Имя (ФИО)", "Новое Имя"), ("Телефон", "87001112233"),
+            ("Бизнес", "узаконение недвижимости"), ("Комментарий", "заметка"),
+        ):
+            handlers = _fresh_import()
+            context = _walk_to_confirm(handlers, field_button=field_button, new_value=new_value)
+            mock_find, mock_update, mock_invalidate = _confirm_with_mocks(handlers, context)
+
+            updates_arg = mock_update.call_args.args[1]
+            self.assertNotIn("ID", updates_arg)
+            self.assertNotIn("Drive Folder ID", updates_arg)
 
 
 class TestEditClientSnapshotProtection(unittest.TestCase):
-    def test_draft_mutation_after_card_does_not_affect_save(self):
+    def test_confirmed_snapshot_used_not_mutated_draft(self):
         handlers = _fresh_import()
-        context, sheet = _walk_to_confirm(handlers, field_button="Телефон", new_value="87001112233")
+        context = _walk_to_confirm(handlers, field_button="Телефон", new_value="87001112233")
 
         # Мутация draft ПОСЛЕ показа карточки подтверждения не должна
         # повлиять на то, что реально сохранится.
         context.user_data["ec"]["new_value"] = "СОВСЕМ ДРУГОЕ ЗНАЧЕНИЕ"
 
-        async def confirm():
-            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
-                 patch("business_core.sheets.get_business_sheet", return_value=sheet), \
-                 patch("business_core.sheets.find_row_by_id",
-                       return_value=(2, dict(zip(PEOPLE_HEADERS, _existing_row())))):
-                await handlers["confirm"](_upd("✅ Сохранить"), context)
+        mock_find, mock_update, mock_invalidate = _confirm_with_mocks(handlers, context)
 
-        asyncio.run(confirm())
-        phone_col = PEOPLE_HEADERS.index("Телефон") + 1
-        self.assertEqual(sheet._updates.get((2, phone_col)), "87001112233")
-        self.assertNotIn("СОВСЕМ ДРУГОЕ ЗНАЧЕНИЕ", sheet._updates.values())
+        mock_update.assert_called_once_with("PRS-001", {"Телефон": "87001112233"})
 
 
 class TestEditClientCancel(unittest.TestCase):
-    def test_cancel_at_confirm_writes_nothing(self):
+    def test_cancel_calls_neither_find_person_by_id_nor_update_person(self):
         handlers = _fresh_import()
-        context, sheet = _walk_to_confirm(handlers, field_button="Телефон", new_value="87001112233")
+        context = _walk_to_confirm(handlers, field_button="Телефон", new_value="87001112233")
 
-        async def cancel():
-            await handlers["confirm"](_upd("❌ Отмена"), context)
+        mock_find, mock_update, mock_invalidate = _confirm_with_mocks(
+            handlers, context, text="❌ Отмена",
+        )
 
-        asyncio.run(cancel())
-        self.assertEqual(sheet._updates, {})
+        mock_find.assert_not_called()
+        mock_update.assert_not_called()
+        mock_invalidate.assert_not_called()
         self.assertNotIn("ec", context.user_data)
         self.assertNotIn("ec_confirmed_snapshot", context.user_data)
+
+
+class TestEditClientNotFound(unittest.TestCase):
+    def test_not_found_calls_neither_update_person_nor_invalidate_cache(self):
+        handlers = _fresh_import()
+        context = _walk_to_confirm(handlers, field_button="Телефон", new_value="87001112233")
+
+        async def run():
+            update = _upd("✅ Сохранить")
+            with patch("business_core.person_manager.find_person_by_id", return_value=None) as mock_find, \
+                 patch("business_core.person_manager.update_person") as mock_update, \
+                 patch("business_core.inbox_bridge.invalidate_cache") as mock_invalidate:
+                await handlers["confirm"](update, context)
+                return update, mock_find, mock_update, mock_invalidate
+
+        update, mock_find, mock_update, mock_invalidate = asyncio.run(run())
+
+        mock_find.assert_called_once_with("PRS-001")
+        mock_update.assert_not_called()
+        mock_invalidate.assert_not_called()
+        msg = update.message.reply_text.call_args[0][0]
+        self.assertEqual(msg, "❌ Клиент PRS-001 больше не найден — изменение не выполнено.")
+
+
+class TestEditClientCacheInvalidation(unittest.TestCase):
+    def test_success_calls_invalidate_cache_exactly_once(self):
+        handlers = _fresh_import()
+        context = _walk_to_confirm(handlers, field_button="Телефон", new_value="87001112233")
+
+        mock_find, mock_update, mock_invalidate = _confirm_with_mocks(
+            handlers, context,
+            update_result={"ok": True, "changed": True, "updated_fields": ("Телефон",), "error": None},
+        )
+
+        mock_invalidate.assert_called_once()
+
+    def test_update_person_failure_still_calls_invalidate_cache_exactly_once(self):
+        handlers = _fresh_import()
+        context = _walk_to_confirm(handlers, field_button="Телефон", new_value="87001112233")
+
+        mock_find, mock_update, mock_invalidate = _confirm_with_mocks(
+            handlers, context,
+            update_result={"ok": False, "changed": False, "updated_fields": (), "error": "boom"},
+        )
+
+        mock_invalidate.assert_called_once()
+
+
+class TestEditClientGenericFailureMessage(unittest.TestCase):
+    def test_generic_failure_message_is_exact(self):
+        handlers = _fresh_import()
+        context = _walk_to_confirm(handlers, field_button="Телефон", new_value="87001112233")
+
+        async def run():
+            update = _upd("✅ Сохранить")
+            with patch("business_core.person_manager.find_person_by_id",
+                        return_value=_existing_person()), \
+                 patch("business_core.person_manager.update_person",
+                       return_value={"ok": False, "changed": False, "updated_fields": (), "error": "boom"}), \
+                 patch("business_core.inbox_bridge.invalidate_cache"):
+                await handlers["confirm"](update, context)
+                return update
+
+        update = asyncio.run(run())
+        msg = update.message.reply_text.call_args[0][0]
+        self.assertEqual(msg, "❌ Ошибка сохранения: boom")
 
 
 class TestEditClientBusinessSavesId(unittest.TestCase):
@@ -199,32 +288,24 @@ class TestEditClientBusinessSavesId(unittest.TestCase):
         """Тот же production-баг, что чинил Phase 13A resolver:
         'узаконение недвижимости' в свободной форме -> BIZ-001."""
         handlers = _fresh_import()
-        context, sheet = _walk_to_confirm(
+        context = _walk_to_confirm(
             handlers, field_button="Бизнес", new_value="узаконение недвижимости",
         )
+        mock_find, mock_update, mock_invalidate = _confirm_with_mocks(handlers, context)
 
-        async def confirm():
-            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
-                 patch("business_core.sheets.get_business_sheet", return_value=sheet), \
-                 patch("business_core.sheets.find_row_by_id",
-                       return_value=(2, dict(zip(PEOPLE_HEADERS, _existing_row())))):
-                await handlers["confirm"](_upd("✅ Сохранить"), context)
-
-        asyncio.run(confirm())
-        biz_ids_col = PEOPLE_HEADERS.index("Biz IDs") + 1
-        primary_col = PEOPLE_HEADERS.index("Primary Biz ID") + 1
-        self.assertEqual(sheet._updates.get((2, biz_ids_col)), "BIZ-001")
-        self.assertEqual(sheet._updates.get((2, primary_col)), "BIZ-001")
+        updates_arg = mock_update.call_args.args[1]
+        self.assertEqual(updates_arg["Biz IDs"], "BIZ-001")
+        self.assertEqual(updates_arg["Primary Biz ID"], "BIZ-001")
 
     def test_unresolvable_business_reprompts_without_writing(self):
         handlers = _fresh_import()
         context = _ctx(args=["client_id=PRS-001"])
-        sheet = _make_people_sheet([_existing_row()])
+        row = _existing_person()
         biz_rows = [{"ID": "BIZ-001", "Название": "Узаконение недвижимости", "Статус": "active"}]
 
         async def run():
             with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
-                 patch("business_core.sheets.get_business_sheet", return_value=sheet), \
+                 patch("business_core.sheets.find_row_by_id", return_value=(2, row)), \
                  patch("business_core.sheets.read_business_sheet", return_value=biz_rows):
                 await handlers["start"](_upd("/editclient client_id=PRS-001"), context)
                 await handlers["field"](_upd("Бизнес"), context)
@@ -235,7 +316,48 @@ class TestEditClientBusinessSavesId(unittest.TestCase):
         result = asyncio.run(run())
         self.assertEqual(result, EC_VALUE)
         self.assertNotIn("ec_confirmed_snapshot", context.user_data)
-        self.assertEqual(sheet._updates, {})
+
+
+class TestEditClientNoDirectRegistryAccess(unittest.TestCase):
+    """Phase 23D-3A architecture guard: editclient_confirm() must call
+    no direct get_business_sheet()/update_cell()/row_values()/
+    header.index()/append_business_row() — only Person Manager's
+    find_person_by_id()/update_person()."""
+
+    def test_no_direct_registry_write_calls_remain(self):
+        import ast
+        import inspect
+        from business_core.telegram_handlers import editclient_confirm
+
+        source = inspect.getsource(editclient_confirm)
+        tree = ast.parse(source)
+
+        forbidden_calls = {
+            "get_business_sheet", "update_cell", "row_values", "append_business_row",
+        }
+        found_calls = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                func = node.func
+                name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
+                if name in forbidden_calls:
+                    found_calls.add(name)
+            if isinstance(node, ast.ImportFrom) and node.module == "business_core.sheets":
+                for alias in node.names:
+                    self.assertNotIn(
+                        alias.name, {"get_business_sheet", "find_row_by_id", "append_business_row"},
+                        f"editclient_confirm must not import {alias.name} from business_core.sheets",
+                    )
+
+        self.assertEqual(found_calls, set())
+
+    def test_no_header_index_pattern(self):
+        import inspect
+        from business_core.telegram_handlers import editclient_confirm
+
+        source = inspect.getsource(editclient_confirm)
+        self.assertNotIn("headers.index(", source)
+        self.assertNotIn(".row_values(1)", source)
 
 
 class TestEditClientNoLiveApi(unittest.TestCase):
