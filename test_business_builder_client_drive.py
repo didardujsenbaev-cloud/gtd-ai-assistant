@@ -1,5 +1,5 @@
 """
-Mock-тесты для provision_client_drive() и save_client_drive_to_sheets().
+Mock-тесты для provision_client_drive().
 
 Проверяют:
 1.  Клиент создаётся даже если Drive недоступен (нет GDRIVE_BIZ_ROOT_FOLDER_ID)
@@ -8,10 +8,8 @@ Mock-тесты для provision_client_drive() и save_client_drive_to_sheets()
 4.  Если biz_id не найден — используется biz_name как fallback
 5.  Если biz_id найден — используется правильный ID
 6.  Повторный вызов идемпотентен (setup_biz_client_folder вызывается снова)
-7.  Ссылка на папку сохраняется в people_registry
-8.  Если нет колонки Drive Folder ID — Google Drive всё равно сохраняется
-9.  GTD-файлы не импортируются
-10. telegram_bot.py не менялся
+7.  GTD-файлы не импортируются
+8.  telegram_bot.py не менялся
 """
 
 import unittest
@@ -31,7 +29,6 @@ class TestImport(unittest.TestCase):
     def test_import_business_builder(self):
         from business_core import business_builder
         self.assertTrue(hasattr(business_builder, "provision_client_drive"))
-        self.assertTrue(hasattr(business_builder, "save_client_drive_to_sheets"))
         self.assertTrue(hasattr(business_builder, "_get_biz_id_by_name"))
 
 
@@ -223,78 +220,6 @@ class TestProvisionClientDriveError(unittest.TestCase):
                         result = provision_client_drive("PRS-004", "Тест", "Бизнес")
                     except Exception as e:
                         self.fail(f"provision_client_drive бросил исключение: {e}")
-
-
-# ─────────────────────────────────────────────────────────────
-# 6. save_client_drive_to_sheets
-# ─────────────────────────────────────────────────────────────
-
-class TestSaveClientDriveToSheets(unittest.TestCase):
-    def _make_mock_sheet(self, headers):
-        mock_sheet = MagicMock()
-        mock_sheet.row_values.return_value = headers
-        return mock_sheet
-
-    def test_saves_both_columns(self):
-        headers = [
-            "ID", "ФИО", "Тип", "Бизнесы", "Комментарий",
-            "Google Drive", "Drive Folder ID",
-        ]
-        mock_sheet = self._make_mock_sheet(headers)
-        mock_update = MagicMock()
-
-        with patch("business_core.sheets.find_row_by_id", return_value=(3, {"ID": "PRS-001"})):
-            with patch("business_core.sheets.get_business_sheet", return_value=mock_sheet):
-                with patch("business_core.sheets.update_business_cell", mock_update):
-                    from business_core.business_builder import save_client_drive_to_sheets
-                    result = save_client_drive_to_sheets(
-                        "PRS-001", "folder_abc", "https://drive.google.com/folder_abc"
-                    )
-
-        self.assertTrue(result)
-        calls = mock_update.call_args_list
-        self.assertEqual(len(calls), 2)
-        # col of "Google Drive" = index 5 + 1 = 6
-        self.assertEqual(calls[0], call("people_registry", 3, 6, "https://drive.google.com/folder_abc"))
-        # col of "Drive Folder ID" = index 6 + 1 = 7
-        self.assertEqual(calls[1], call("people_registry", 3, 7, "folder_abc"))
-
-    def test_saves_only_google_drive_when_no_drive_folder_id_col(self):
-        headers = ["ID", "ФИО", "Тип", "Google Drive"]
-        mock_sheet = self._make_mock_sheet(headers)
-        mock_update = MagicMock()
-
-        with patch("business_core.sheets.find_row_by_id", return_value=(2, {"ID": "PRS-002"})):
-            with patch("business_core.sheets.get_business_sheet", return_value=mock_sheet):
-                with patch("business_core.sheets.update_business_cell", mock_update):
-                    from business_core.business_builder import save_client_drive_to_sheets
-                    result = save_client_drive_to_sheets(
-                        "PRS-002", "folder_xyz", "https://drive.google.com/folder_xyz"
-                    )
-
-        self.assertTrue(result)
-        self.assertEqual(len(mock_update.call_args_list), 1)
-
-    def test_returns_false_when_prs_id_not_found(self):
-        with patch("business_core.sheets.find_row_by_id", return_value=None):
-            from business_core.business_builder import save_client_drive_to_sheets
-            result = save_client_drive_to_sheets("PRS-999", "x", "y")
-        self.assertFalse(result)
-
-    def test_returns_false_on_sheets_exception(self):
-        with patch("business_core.sheets.find_row_by_id", side_effect=Exception("sheets error")):
-            from business_core.business_builder import save_client_drive_to_sheets
-            result = save_client_drive_to_sheets("PRS-001", "x", "y")
-        self.assertFalse(result)
-
-    def test_does_not_raise(self):
-        """save_client_drive_to_sheets никогда не бросает исключение"""
-        with patch("business_core.sheets.find_row_by_id", side_effect=RuntimeError("boom")):
-            from business_core.business_builder import save_client_drive_to_sheets
-            try:
-                save_client_drive_to_sheets("PRS-001", "x", "y")
-            except Exception as e:
-                self.fail(f"save_client_drive_to_sheets бросил исключение: {e}")
 
 
 # ─────────────────────────────────────────────────────────────

@@ -741,15 +741,6 @@ def update_person_drive_info(person_id: str, folder_id: str, folder_url: str) ->
     return bool(result.get("ok") and result.get("changed"))
 
 
-def _col_letter(col_index: int) -> str:
-    """Преобразовать 1-based индекс колонки в букву (A, B, ..., Z, AA, ...)."""
-    result = ""
-    while col_index > 0:
-        col_index, rem = divmod(col_index - 1, 26)
-        result = chr(65 + rem) + result
-    return result
-
-
 def _normalize_name(name: str) -> str:
     """Нормализовать имя: trim + lower + убрать двойные пробелы."""
     return normalize_person_name(name)
@@ -999,54 +990,6 @@ def provision_client_drive(
             "biz_id":     None,
             "error":      str(exc),
         }
-
-
-def save_client_drive_to_sheets(
-    prs_id:     str,
-    folder_id:  str,
-    folder_url: str,
-) -> bool:
-    """
-    Сохранить Drive-ссылку и ID папки клиента в PEOPLE_REGISTRY.
-
-    Ищет строку по prs_id, определяет позицию колонок
-    "Google Drive" и "Drive Folder ID" по реальным заголовкам.
-
-    Args:
-        prs_id:     ID клиента (первая колонка PEOPLE_REGISTRY)
-        folder_id:  Google Drive folder ID
-        folder_url: ссылка на папку клиента
-
-    Returns:
-        True если успешно, False если ошибка или строка не найдена
-    """
-    try:
-        from business_core.sheets import (
-            find_row_by_id, update_business_cell, get_business_sheet,
-        )
-
-        row_result = find_row_by_id("people_registry", prs_id)
-        if not row_result:
-            log.warning(f"save_client_drive_to_sheets: prs_id '{prs_id}' не найден")
-            return False
-
-        row_num, _ = row_result
-        actual_headers = get_business_sheet("people_registry").row_values(1)
-
-        if "Google Drive" in actual_headers:
-            col = actual_headers.index("Google Drive") + 1
-            update_business_cell("people_registry", row_num, col, folder_url)
-            log.debug(f"save_client_drive_to_sheets: 'Google Drive' col={col} ← {folder_url}")
-
-        if "Drive Folder ID" in actual_headers:
-            col = actual_headers.index("Drive Folder ID") + 1
-            update_business_cell("people_registry", row_num, col, folder_id)
-            log.debug(f"save_client_drive_to_sheets: 'Drive Folder ID' col={col} ← {folder_id}")
-
-        return True
-    except Exception as exc:
-        log.warning(f"save_client_drive_to_sheets error: {exc}")
-        return False
 
 
 def get_business_creation_status(result: dict) -> str:

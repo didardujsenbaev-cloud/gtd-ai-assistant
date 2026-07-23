@@ -182,12 +182,11 @@ def _run_newclient_confirm(sheet, find_existing_return=None, biz_id_resolved="BI
                    return_value=find_existing_return), \
              patch("business_core.business_builder.add_biz_id_to_person") as mock_add_biz, \
              patch("business_core.business_builder.update_person_drive_info") as mock_upd_drive, \
-             patch("business_core.business_builder.save_client_drive_to_sheets") as mock_save_drive, \
              patch("business_core.business_builder.provision_client_drive",
                    return_value={"ok": False, "error": "Drive не задан для этого бизнеса"}):
             await newclient_confirm(update, context)
 
-        return update, context, mock_add_biz, mock_upd_drive, mock_save_drive
+        return update, context, mock_add_biz, mock_upd_drive
 
     return asyncio.run(run())
 
@@ -197,7 +196,7 @@ class TestNewClientHeaderSafeStandardOrder(unittest.TestCase):
 
     def setUp(self):
         self.sheet = _make_people_sheet(STANDARD_HEADERS)
-        self.update, self.context, self.add_biz, self.upd_drive, self.save_drive = \
+        self.update, self.context, self.add_biz, self.upd_drive = \
             _run_newclient_confirm(self.sheet, find_existing_return=None)
 
     def test_1_client_created(self):
@@ -353,7 +352,7 @@ class TestNewClientSameBizNoNewRow(unittest.TestCase):
         sheet = _make_people_sheet(STANDARD_HEADERS)
         with patch("business_core.person_manager.create_person") as mock_create, \
              patch("business_core.person_manager.update_person") as mock_update:
-            update, context, add_biz, upd_drive, save_drive = _run_newclient_confirm(
+            update, context, add_biz, upd_drive = _run_newclient_confirm(
                 sheet,
                 find_existing_return={"prs_id": "PRS-001", "same_biz": True, "drive_url": ""},
             )
@@ -372,7 +371,7 @@ class TestNewClientOtherBizNoNewRow(unittest.TestCase):
         sheet = _make_people_sheet(STANDARD_HEADERS)
         with patch("business_core.person_manager.create_person") as mock_create, \
              patch("business_core.person_manager.update_person") as mock_update:
-            update, context, add_biz, upd_drive, save_drive = _run_newclient_confirm(
+            update, context, add_biz, upd_drive = _run_newclient_confirm(
                 sheet,
                 find_existing_return={"prs_id": "PRS-002", "same_biz": False, "drive_url": ""},
                 biz_id_resolved="BIZ-002",

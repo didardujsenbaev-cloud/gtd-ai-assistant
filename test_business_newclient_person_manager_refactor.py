@@ -398,24 +398,6 @@ class TestStatusNewDriveUsesPersonManager(unittest.TestCase):
 
         mock_upd_drive.assert_called_once_with("PRS-105", "fid-105", "https://drive.google.com/fid-105")
 
-    def test_status_new_drive_never_calls_save_client_drive_to_sheets(self):
-        th = _fresh_th()
-        update = _make_confirm_update()
-        context = _make_confirm_context()
-
-        with patch("business_core.business_builder.find_existing_person", return_value=None), \
-             patch("business_core.person_manager.create_person",
-                   return_value={"ok": True, "person_id": "PRS-106", "error": None}), \
-             patch("business_core.person_manager.update_person",
-                   return_value={"ok": True, "changed": True, "updated_fields": (), "error": None}), \
-             patch("business_core.business_builder.provision_client_drive",
-                   return_value={"ok": True, "folder_id": "fid-106", "folder_url": "https://drive.google.com/fid-106"}), \
-             patch("business_core.business_builder.update_person_drive_info"), \
-             patch("business_core.business_builder.save_client_drive_to_sheets") as mock_save_drive:
-            _run(th.newclient_confirm(update, context))
-
-        mock_save_drive.assert_not_called()
-
     def test_status_new_drive_success_reply_unchanged(self):
         th = _fresh_th()
         update = _make_confirm_update()
