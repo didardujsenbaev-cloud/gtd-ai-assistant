@@ -1,14 +1,29 @@
 """
 Roadmap Manager — дорожные карты по клиентам, услугам и проектам.
 
-Не обращается к Google Sheets (это задача sheets.py).
-Не обращается к Telegram.
-Только чистая Python-логика над объектами Roadmap/RoadmapStage.
+Canonical Sheets-facing owner (Phase 28B/28C/28D/28G/28H) of two
+реестров:
+  ROADMAPS       — единственный writer: create_roadmap_record(),
+                   recalculate_roadmap_progress(), maybe_complete_roadmap().
+  ROADMAP_STAGES — единственный writer: ensure_roadmap_stages(),
+                   update_stage_fields(), update_stage_status_in_sheet().
+
+Не обращается к Telegram и к business_core.business_builder (Core не
+знает об orchestration-слое). Не импортирует Extension-модули
+(stage_entity_relations, knowledge_manager, ...).
+
+Строки 1–~793 (Roadmap/RoadmapStage dataclasses, create_roadmap(),
+update_stage_status(), advance_stage(), ...) — более старая, отдельная
+in-memory модель, которая ДЕЙСТВИТЕЛЬНО не обращается к Google Sheets;
+она не подключена к производственным вызовам (см. Phase 27A/27B —
+сохранена намеренно, удаление не входит в текущий scope).
 
 Связи:
   business_id  → business_registry
   service_id   → service_catalog
   client_id    → people_registry
+  object_id    → object_registry
+  template_id  → roadmap_template_registry (через roadmap_template_manager)
   gtd_project_id → Google Sheets PROJECTS (через GTD Master)
 """
 

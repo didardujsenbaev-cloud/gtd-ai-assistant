@@ -9,11 +9,20 @@ Phase 8B: Roadmap Template Core.
                                Real Roadmap → Real Stages
 
 Листы:
-  ROADMAP_TEMPLATE_REGISTRY — карточки шаблонов (RTMPL-001)
-  ROADMAP_TEMPLATE_STAGES   — этапы шаблонов (TSTG-001)
+  ROADMAP_TEMPLATE_REGISTRY — карточки шаблонов (RTMPL-001), единственный
+                              writer этого модуля.
+  ROADMAP_TEMPLATE_STAGES   — этапы шаблонов (TSTG-001), единственный
+                              writer этого модуля (включая
+                              update_template_stage_knowledge_ids() —
+                              Phase 28F owner API, вызываемый
+                              knowledge_manager вместо прямой записи).
 
-Зависимости только от business_core.sheets.
-GTD Core не импортируется.
+Зависимости: business_core.sheets, business_core.service_manager
+(link_service_to_roadmap_template), business_core.roadmap_manager
+(create_stages_from_template_record() делегирует создание
+ROADMAP_STAGES в roadmap_manager.ensure_roadmap_stages() — Core -> Core,
+Phase 28D). Не импортирует Extension-модули (stage_entity_relations,
+knowledge_manager) — Phase 28E. GTD Core не импортируется.
 """
 
 from __future__ import annotations
