@@ -311,57 +311,30 @@ def link_knowledge_to_template_stage(
     Обновляет колонки SOP IDs, Checklist IDs, Materials IDs,
     Document Template IDs, FAQ IDs без перезаписи уже привязанных.
 
+    Phase 28F: ROADMAP_TEMPLATE_STAGES is owned exclusively by
+    business_core.roadmap_template_manager — this function no longer
+    touches that sheet itself (no get_business_sheet/update_cell here
+    anymore) and delegates the actual read-merge-write to that
+    module's own update_template_stage_knowledge_ids() owner API.
+    _merge_ids() above is retained as-is (still a valid, tested helper)
+    but is no longer called from this function — the equivalent merge
+    logic now lives with the write, in roadmap_template_manager.py.
+
     Returns:
         {"ok": bool, "updated": bool, "error": str | None}
     """
     if not template_stage_id:
         return {"ok": False, "updated": False, "error": "template_stage_id обязателен"}
 
-    knowledge_map = {
-        "SOP IDs":               sop_ids or [],
-        "Checklist IDs":         checklist_ids or [],
-        "Materials IDs":         material_ids or [],
-        "Document Template IDs": document_template_ids or [],
-        "FAQ IDs":               faq_ids or [],
-    }
-    # Проверяем — есть ли что обновлять
-    if all(not v for v in knowledge_map.values()):
-        return {"ok": True, "updated": False, "error": None}
-
-    try:
-        from business_core.sheets import get_business_sheet
-        sheet      = get_business_sheet("roadmap_template_stages")
-        all_values = sheet.get_all_values()
-        if len(all_values) < 2:
-            return {"ok": False, "updated": False, "error": "Лист пуст"}
-        headers = all_values[0]
-
-        for i, row in enumerate(all_values[1:], start=2):
-            if not row or not row[0].strip():
-                continue
-            if row[0].strip() != template_stage_id:
-                continue
-
-            for col_name, new_ids in knowledge_map.items():
-                if not new_ids:
-                    continue
-                col_idx = headers.index(col_name) if col_name in headers else None
-                if col_idx is None:
-                    continue
-                existing = row[col_idx].strip() if col_idx < len(row) else ""
-                merged   = _merge_ids(existing, new_ids)
-                if merged != existing:
-                    sheet.update_cell(i, col_idx + 1, merged)
-
-            log.info(f"link_knowledge_to_template_stage: {template_stage_id}")
-            return {"ok": True, "updated": True, "error": None}
-
-        return {"ok": False, "updated": False,
-                "error": f"Stage {template_stage_id} не найден"}
-
-    except Exception as exc:
-        log.error(f"link_knowledge_to_template_stage error: {exc}")
-        return {"ok": False, "updated": False, "error": str(exc)}
+    from business_core.roadmap_template_manager import update_template_stage_knowledge_ids
+    return update_template_stage_knowledge_ids(
+        template_stage_id,
+        sop_ids=sop_ids,
+        checklist_ids=checklist_ids,
+        material_ids=material_ids,
+        document_template_ids=document_template_ids,
+        faq_ids=faq_ids,
+    )
 
 
 def find_knowledge_by_template_stage(template_stage_id: str) -> dict:

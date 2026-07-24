@@ -387,7 +387,13 @@ class TestStartRoadmapWithStandardTemplate(unittest.TestCase):
                        return_value={"obj_id": "OBJ-001", "biz_id": "BIZ-001",
                                      "client_id": "PRS-001"}), \
                  patch("business_core.business_builder.create_roadmap_for_object",
-                       return_value={"ok": True, "roadmap_id": "RM-010", "error": None}), \
+                       return_value={
+                           "ok": True, "roadmap_id": "RM-010", "error": None,
+                           "core_created": True, "stages_created": True,
+                           "stages_count": 15, "stage_ids": [], "used_template": True,
+                           "relation_copy_errors": (), "relation_copy_created_count": 0,
+                           "partial_success": False, "partial_failure": False, "warnings": (),
+                       }), \
                  patch("business_core.business_builder.update_object_roadmap_id"), \
                  patch("business_core.roadmap_template_manager.find_roadmap_template_by_id",
                        return_value={"Template ID": "RMT-IZH-ALM-STANDARD-001"}), \

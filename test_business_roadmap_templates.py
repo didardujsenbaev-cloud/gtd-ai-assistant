@@ -409,7 +409,14 @@ class TestCreateStagesFromTemplateRecord(unittest.TestCase):
 
 
 # ────────────────────────────────────────────────────────────
-# Phase 18C-3: create_stages_from_template_record — relation-copy hookup
+# Phase 28D/28E: create_stages_from_template_record no longer copies
+# Stage Entity Relations itself — that Extension-layer orchestration
+# moved to business_core.business_builder.create_roadmap_for_object()
+# (see test_business_object_roadmaps.py's
+# TestCreateRoadmapForObjectExtensionOrchestration for the relocated
+# relation-copy/partial-failure coverage). This function now always
+# returns the neutral/empty relation-copy fields, and must never import
+# or call business_core.stage_entity_relations at all.
 # ────────────────────────────────────────────────────────────
 
 class TestCreateStagesFromTemplateRecordRelationCopy(unittest.TestCase):
@@ -417,157 +424,65 @@ class TestCreateStagesFromTemplateRecordRelationCopy(unittest.TestCase):
         return [
             {"stage_id": f"TSTG-{i:03d}", "template_id": "RTMPL-001", "order": str(i),
              "stage_name": f"Этап {i}", "description": "", "required_docs": "",
-             "responsible": "", "estimated_days": "", "notes": ""}
+             "responsible": "", "estimated_days": "", "notes": "",
+             "sop_ids": [], "checklist_ids": [], "material_ids": [],
+             "document_template_ids": [], "faq_ids": []}
             for i in range(1, n + 1)
         ]
 
-    def _run(self, copy_side_effect, n=2, generated_ids=None):
+    def _run(self, n=2, generated_ids=None):
         m = _fresh()
         generated_ids = generated_ids or [f"STAGE-{i:03d}" for i in range(1, n + 1)]
+        sheet = _rmstage_sheet()
+        sheet.get_all_values.return_value = [RM_STAGE_HEADERS]
         with patch.object(m, "find_template_stages", return_value=self._template_stages(n)), \
-             patch("business_core.sheets.get_business_sheet", return_value=_rmstage_sheet()), \
+             patch("business_core.sheets.get_business_sheet", return_value=sheet), \
              patch("business_core.sheets.batch_append_business_rows"), \
-             patch("business_core.knowledge_manager.find_knowledge_by_template_stage", return_value={}), \
-             patch("business_core.sheets.generate_next_ids", return_value=generated_ids), \
-             patch("business_core.stage_entity_relations.copy_template_relations_to_stage",
-                   side_effect=copy_side_effect) as mock_copy:
+             patch("business_core.sheets.generate_next_ids", return_value=generated_ids):
             result = m.create_stages_from_template_record("RM-001", "RTMPL-001")
-        return result, mock_copy
+        return result
 
-    def test_copy_called_once_per_stage_in_order_with_correct_args(self):
-        from business_core.stage_entity_relations import CopyRelationsResult
-
-        def _copy(template_stage_id, stage_id):
-            return CopyRelationsResult(template_stage_id=template_stage_id, stage_id=stage_id, created=())
-
-        result, mock_copy = self._run(_copy)
-        self.assertEqual(mock_copy.call_count, 2)
-        self.assertEqual(
-            [c.args for c in mock_copy.call_args_list],
-            [("TSTG-001", "STAGE-001"), ("TSTG-002", "STAGE-002")],
-        )
-
-    def test_relation_copy_errors_aggregated(self):
-        from business_core.stage_entity_relations import CopyRelationsResult
-
-        def _copy(template_stage_id, stage_id):
-            if template_stage_id == "TSTG-001":
-                return CopyRelationsResult(
-                    template_stage_id=template_stage_id, stage_id=stage_id,
-                    errors=(("REL-X", ("boom",)),), ok=False,
-                )
-            return CopyRelationsResult(template_stage_id=template_stage_id, stage_id=stage_id)
-
-        result, _ = self._run(_copy)
-        self.assertTrue(result["ok"])  # stage creation itself still succeeded
-        self.assertEqual(result["stages_count"], 2)
-        self.assertEqual(len(result["relation_copy_errors"]), 1)
-        self.assertEqual(result["relation_copy_errors"][0][0], "STAGE-001")
-        self.assertEqual(result["relation_copy_errors"][0][1], "TSTG-001")
-
-    def test_relation_copy_created_count_aggregated(self):
-        from business_core.stage_entity_relations import CopyRelationsResult
-
-        def _copy(template_stage_id, stage_id):
-            return CopyRelationsResult(
-                template_stage_id=template_stage_id, stage_id=stage_id,
-                created=({"Entity ID": "DOC-002"},),
-            )
-
-        result, _ = self._run(_copy)
-        self.assertEqual(result["relation_copy_created_count"], 2)  # 2 stages x 1 created each
-
-    def test_zero_relations_case_still_succeeds(self):
-        from business_core.stage_entity_relations import CopyRelationsResult
-
-        def _copy(template_stage_id, stage_id):
-            return CopyRelationsResult(template_stage_id=template_stage_id, stage_id=stage_id, created=())
-
-        result, _ = self._run(_copy)
+    def test_relation_copy_fields_are_always_neutral(self):
+        result = self._run()
         self.assertTrue(result["ok"])
+        self.assertEqual(result["stages_count"], 2)
+        self.assertFalse(result["partial_success"])
         self.assertEqual(result["relation_copy_errors"], ())
         self.assertEqual(result["relation_copy_created_count"], 0)
 
-    def test_legacy_knowledge_inheritance_unaffected_by_relation_copy_outcome(self):
-        """Document Template IDs / SOP / Checklist / FAQ comma-list
-        inheritance must be identical whether relation-copy succeeds,
-        fails, or is never called at all."""
-        from business_core.stage_entity_relations import CopyRelationsResult
-
+    def test_does_not_import_stage_entity_relations(self):
+        import ast
+        import inspect
         m = _fresh()
-        appended = []
+        src = inspect.getsource(m.create_stages_from_template_record)
+        tree = ast.parse(src)
+        imported = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module:
+                imported.add(node.module.split(".")[-1])
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    imported.add(alias.name.split(".")[-1])
+        self.assertNotIn("stage_entity_relations", imported)
+        self.assertNotIn("knowledge_manager", imported)
 
-        def capture(key, rows):
-            appended.extend(rows)
-
-        def _copy(template_stage_id, stage_id):
-            return CopyRelationsResult(
-                template_stage_id=template_stage_id, stage_id=stage_id,
-                errors=(("X", ("simulated failure",)),), ok=False,
-            )
-
+    def test_delegates_stage_creation_to_roadmap_manager_ensure_roadmap_stages(self):
+        m = _fresh()
+        sheet = _rmstage_sheet()
+        sheet.get_all_values.return_value = [RM_STAGE_HEADERS]
         with patch.object(m, "find_template_stages", return_value=self._template_stages(1)), \
-             patch("business_core.sheets.get_business_sheet", return_value=_rmstage_sheet()), \
-             patch("business_core.sheets.batch_append_business_rows", side_effect=capture), \
-             patch("business_core.knowledge_manager.find_knowledge_by_template_stage",
+             patch("business_core.roadmap_manager.ensure_roadmap_stages",
                    return_value={
-                       "sop_ids": ["SOP-001"], "checklist_ids": [], "material_ids": [],
-                       "document_template_ids": ["DOC-002"], "faq_ids": [],
-                   }), \
-             patch("business_core.sheets.generate_next_ids", return_value=["STAGE-001"]), \
-             patch("business_core.stage_entity_relations.copy_template_relations_to_stage", side_effect=_copy):
+                       "ok": True, "roadmap_id": "RM-001",
+                       "created_stage_ids": ["STAGE-001"], "created_from_orders": [1],
+                       "existing_stage_ids": [], "created_count": 1, "existing_count": 0,
+                       "total_count": 1, "error": None,
+                   }) as mock_ensure:
             result = m.create_stages_from_template_record("RM-001", "RTMPL-001")
-
+        mock_ensure.assert_called_once()
+        self.assertEqual(mock_ensure.call_args.args[0], "RM-001")
         self.assertTrue(result["ok"])
-        idx = {h: i for i, h in enumerate(RM_STAGE_HEADERS)}
-        row = appended[0]
-        self.assertEqual(row[idx["Document Template IDs"]], "DOC-002")
-        self.assertEqual(row[idx["SOP IDs"]], "SOP-001")
-        self.assertEqual(len(result["relation_copy_errors"]), 1)
-
-    def test_unexpected_exception_during_relation_copy_does_not_wipe_stage_results(self):
-        """Phase 18D production defect regression test: an unexpected
-        exception raised BY copy_template_relations_to_stage() itself
-        (e.g. a transient Google Sheets API error — not a structured
-        CopyRelationsResult(ok=False)) must never propagate up and
-        cause this function to report ok=False/stages_count=0/empty
-        stage_ids — the ROADMAP_STAGES rows are already committed by
-        the time relation-copy runs, so that would silently misreport
-        a real partial success as a total failure."""
-        def _copy(template_stage_id, stage_id):
-            raise RuntimeError("simulated transient API quota error")
-
-        result, mock_copy = self._run(_copy)
-        self.assertTrue(result["ok"])
-        self.assertEqual(result["stages_count"], 2)
-        self.assertEqual(result["stage_ids"], ["STAGE-001", "STAGE-002"])
-        self.assertTrue(result["partial_success"])
-        self.assertEqual(len(result["relation_copy_errors"]), 2)  # both stages hit the exception
-        for stage_id, template_stage_id, errors in result["relation_copy_errors"]:
-            self.assertIn("simulated transient API quota error", str(errors))
-
-    def test_partial_success_false_when_no_relation_errors(self):
-        from business_core.stage_entity_relations import CopyRelationsResult
-
-        def _copy(template_stage_id, stage_id):
-            return CopyRelationsResult(template_stage_id=template_stage_id, stage_id=stage_id, created=())
-
-        result, _ = self._run(_copy)
-        self.assertFalse(result["partial_success"])
-
-    def test_partial_success_true_when_relation_result_reports_error(self):
-        from business_core.stage_entity_relations import CopyRelationsResult
-
-        def _copy(template_stage_id, stage_id):
-            return CopyRelationsResult(
-                template_stage_id=template_stage_id, stage_id=stage_id,
-                errors=(("X", ("bad data",)),), ok=False,
-            )
-
-        result, _ = self._run(_copy)
-        self.assertTrue(result["partial_success"])
-        self.assertTrue(result["ok"])
-        self.assertEqual(result["stages_count"], 2)
+        self.assertEqual(result["stage_ids"], ["STAGE-001"])
 
 
 # ────────────────────────────────────────────────────────────
@@ -579,7 +494,10 @@ class TestCreateStagesFromTemplateRecordHeaderSafety(unittest.TestCase):
     _TEMPLATE_STAGES = [
         {"stage_id": "TSTG-001", "template_id": "RTMPL-001", "order": "1",
          "stage_name": "Диагностика", "description": "", "required_docs": "Паспорт",
-         "responsible": "Дидар", "estimated_days": "", "notes": "Заметка"},
+         "responsible": "Дидар", "estimated_days": "", "notes": "Заметка",
+         "sop_ids": ["SOP-001"], "checklist_ids": ["CHK-001"],
+         "material_ids": ["MAT-001"], "document_template_ids": ["DOC-001"],
+         "faq_ids": ["FAQ-001"]},
     ]
 
     def _knowledge(self):
@@ -599,9 +517,7 @@ class TestCreateStagesFromTemplateRecordHeaderSafety(unittest.TestCase):
              patch("business_core.sheets.get_business_sheet", return_value=sheet), \
              patch("business_core.sheets.batch_append_business_rows",
                    side_effect=lambda k, rows: captured.extend(rows)), \
-             patch("business_core.knowledge_manager.find_knowledge_by_template_stage",
-                   return_value=self._knowledge()), \
-             patch("business_core.sheets.generate_next_id", return_value="STAGE-001"):
+             patch("business_core.sheets.generate_next_ids", return_value=["STAGE-001"]):
             result = m.create_stages_from_template_record("RM-001", "RTMPL-001")
 
         self.assertTrue(result["ok"])
@@ -644,9 +560,7 @@ class TestCreateStagesFromTemplateRecordHeaderSafety(unittest.TestCase):
              patch("business_core.sheets.get_business_sheet", return_value=sheet), \
              patch("business_core.sheets.batch_append_business_rows",
                    side_effect=lambda k, rows: captured.extend(rows)), \
-             patch("business_core.knowledge_manager.find_knowledge_by_template_stage",
-                   return_value=self._knowledge()), \
-             patch("business_core.sheets.generate_next_id", return_value="STAGE-001"):
+             patch("business_core.sheets.generate_next_ids", return_value=["STAGE-001"]):
             result = m.create_stages_from_template_record("RM-001", "RTMPL-001")
 
         self.assertTrue(result["ok"])
@@ -670,9 +584,7 @@ class TestCreateStagesFromTemplateRecordHeaderSafety(unittest.TestCase):
              patch("business_core.sheets.get_business_sheet", return_value=sheet), \
              patch("business_core.sheets.batch_append_business_rows",
                    side_effect=lambda k, rows: captured.extend(rows)), \
-             patch("business_core.knowledge_manager.find_knowledge_by_template_stage",
-                   return_value={}), \
-             patch("business_core.sheets.generate_next_id", return_value="STAGE-001"):
+             patch("business_core.sheets.generate_next_ids", return_value=["STAGE-001"]):
             result = m.create_stages_from_template_record("RM-001", "RTMPL-001")
 
         self.assertTrue(result["ok"])
@@ -687,7 +599,9 @@ class TestCreateStagesFromTemplateRecordHeaderSafety(unittest.TestCase):
         two_stages = self._TEMPLATE_STAGES + [
             {"stage_id": "TSTG-002", "template_id": "RTMPL-001", "order": "2",
              "stage_name": "Сбор документов", "description": "", "required_docs": "",
-             "responsible": "", "estimated_days": "", "notes": ""},
+             "responsible": "", "estimated_days": "", "notes": "",
+             "sop_ids": [], "checklist_ids": [], "material_ids": [],
+             "document_template_ids": [], "faq_ids": []},
         ]
         sheet = _rmstage_sheet()
         calls = []
@@ -696,10 +610,7 @@ class TestCreateStagesFromTemplateRecordHeaderSafety(unittest.TestCase):
              patch("business_core.sheets.get_business_sheet", return_value=sheet), \
              patch("business_core.sheets.batch_append_business_rows",
                    side_effect=lambda k, rows: calls.append((k, rows))), \
-             patch("business_core.knowledge_manager.find_knowledge_by_template_stage",
-                   return_value={}), \
-             patch("business_core.sheets.generate_next_id",
-                   side_effect=["STAGE-001", "STAGE-002"]):
+             patch("business_core.sheets.generate_next_ids", return_value=["STAGE-001", "STAGE-002"]):
             result = m.create_stages_from_template_record("RM-001", "RTMPL-001")
 
         self.assertTrue(result["ok"])
@@ -714,17 +625,16 @@ class TestCreateStagesFromTemplateRecordHeaderSafety(unittest.TestCase):
         two_stages = self._TEMPLATE_STAGES + [
             {"stage_id": "TSTG-002", "template_id": "RTMPL-001", "order": "2",
              "stage_name": "Сбор документов", "description": "", "required_docs": "",
-             "responsible": "", "estimated_days": "", "notes": ""},
+             "responsible": "", "estimated_days": "", "notes": "",
+             "sop_ids": [], "checklist_ids": [], "material_ids": [],
+             "document_template_ids": [], "faq_ids": []},
         ]
         sheet = _rmstage_sheet()
 
         with patch.object(m, "find_template_stages", return_value=two_stages), \
              patch("business_core.sheets.get_business_sheet", return_value=sheet), \
              patch("business_core.sheets.batch_append_business_rows"), \
-             patch("business_core.knowledge_manager.find_knowledge_by_template_stage",
-                   return_value={}), \
-             patch("business_core.sheets.generate_next_id",
-                   side_effect=["STAGE-001", "STAGE-002"]):
+             patch("business_core.sheets.generate_next_ids", return_value=["STAGE-001", "STAGE-002"]):
             result = m.create_stages_from_template_record("RM-001", "RTMPL-001")
 
         self.assertEqual(result["stages_count"], 2)
@@ -779,7 +689,17 @@ class TestStartRoadmapWithTemplate(unittest.TestCase):
                 del sys.modules[k]
 
     def test_M_uses_service_template(self):
-        """M: /startroadmap использует шаблон из услуги."""
+        """M: /startroadmap использует шаблон из услуги.
+
+        Phase 28C: template auto-selection (from the service's own
+        default_roadmap_template_id) still happens in startroadmap_cmd
+        itself, unchanged — what changed is that stage creation from
+        that resolved template_id now happens INSIDE
+        create_roadmap_for_object, not via a separate call this handler
+        makes. So this asserts the resolved template_id is the one
+        passed to create_roadmap_for_object, rather than asserting a
+        (now nonexistent, from this handler's perspective) direct call
+        to create_stages_from_template_record."""
         import asyncio
         self._setup()
         from business_core.telegram_handlers import startroadmap_cmd
@@ -802,25 +722,29 @@ class TestStartRoadmapWithTemplate(unittest.TestCase):
                  patch("business_core.business_builder.find_object_by_id",
                        return_value={"obj_id": "OBJ-001", "biz_id": "BIZ-001", "client_id": "PRS-001"}), \
                  patch("business_core.business_builder.create_roadmap_for_object",
-                       return_value={"ok": True, "roadmap_id": "RM-010", "error": None}), \
+                       return_value={
+                           "ok": True, "roadmap_id": "RM-010", "error": None,
+                           "core_created": True, "stages_created": True,
+                           "stages_count": 5, "stage_ids": [], "used_template": True,
+                           "relation_copy_errors": (), "relation_copy_created_count": 0,
+                           "partial_success": False, "partial_failure": False, "warnings": (),
+                       }) as mock_create_rm, \
                  patch("business_core.business_builder.update_object_roadmap_id"), \
                  patch("business_core.service_manager.find_service_by_id", return_value=svc_mock), \
                  patch("business_core.roadmap_template_manager.find_roadmap_templates_by_service",
-                       return_value=[]), \
-                 patch("business_core.roadmap_template_manager.create_stages_from_template_record",
-                       return_value={"ok": True, "stages_count": 5,
-                                     "warning": None, "stage_ids": []}) as mock_tmpl, \
-                 patch("business_core.roadmap_manager.create_roadmap_stages_from_template",
-                       return_value={"ok": True, "stages_count": 0,
-                                     "warning": None, "stage_ids": []}) as mock_fallback:
+                       return_value=[]):
                 await startroadmap_cmd(update, context)
-                # Должен использовать шаблон из сервиса, не fallback
-                mock_tmpl.assert_called_once_with("RM-010", "RTMPL-001")
+                # Должен передать в create_roadmap_for_object именно
+                # шаблон из сервиса (не пустую строку/case_type-only путь).
+                self.assertEqual(mock_create_rm.call_args.kwargs["template_id"], "RTMPL-001")
 
         asyncio.run(run())
 
     def test_N_fallback_to_case_type(self):
-        """N: /startroadmap fallback на case_type если у сервиса нет шаблона."""
+        """N: /startroadmap передаёт case_type в create_roadmap_for_object,
+        когда у услуги нет привязанного шаблона (фактический fallback —
+        template_id=="" против case_type — теперь решается внутри
+        create_roadmap_for_object, Phase 28C)."""
         import asyncio
         self._setup()
         from business_core.telegram_handlers import startroadmap_cmd
@@ -846,21 +770,22 @@ class TestStartRoadmapWithTemplate(unittest.TestCase):
                  patch("business_core.business_builder.find_object_by_id",
                        return_value={"obj_id": "OBJ-001", "biz_id": "BIZ-001", "client_id": "PRS-001"}), \
                  patch("business_core.business_builder.create_roadmap_for_object",
-                       return_value={"ok": True, "roadmap_id": "RM-011", "error": None}), \
+                       return_value={
+                           "ok": True, "roadmap_id": "RM-011", "error": None,
+                           "core_created": True, "stages_created": True,
+                           "stages_count": 11, "stage_ids": [], "used_template": False,
+                           "relation_copy_errors": (), "relation_copy_created_count": 0,
+                           "partial_success": False, "partial_failure": False, "warnings": (),
+                       }) as mock_create_rm, \
                  patch("business_core.business_builder.update_object_roadmap_id"), \
                  patch("business_core.service_manager.find_service_by_id",
                        return_value=svc_mock_no_template), \
                  patch("business_core.roadmap_template_manager.find_roadmap_templates_by_service",
-                       return_value=[]), \
-                 patch("business_core.roadmap_template_manager.create_stages_from_template_record",
-                       return_value={"ok": True, "stages_count": 0,
-                                     "warning": "нет этапов", "stage_ids": []}) as mock_tmpl, \
-                 patch("business_core.roadmap_manager.create_roadmap_stages_from_template",
-                       return_value={"ok": True, "stages_count": 11,
-                                     "warning": None, "stage_ids": []}) as mock_fallback:
+                       return_value=[]):
                 await startroadmap_cmd(update, context)
-                # Т.к. template дал 0 этапов — должен использовать fallback
-                mock_fallback.assert_called_once()
+                call_kwargs = mock_create_rm.call_args.kwargs
+                self.assertEqual(call_kwargs["template_id"], "")
+                self.assertEqual(call_kwargs["case_type"], "legalization_reconstruction_house")
 
         asyncio.run(run())
 

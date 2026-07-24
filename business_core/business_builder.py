@@ -1355,6 +1355,16 @@ def generate_roadmap_id() -> str:
         return "RM-001"
 
 
+def _empty_roadmap_creation_result(error: str) -> dict:
+    return {
+        "ok": False, "roadmap_id": "", "error": error,
+        "core_created": False, "stages_created": False,
+        "stages_count": 0, "stage_ids": [], "used_template": False,
+        "relation_copy_errors": (), "relation_copy_created_count": 0,
+        "partial_success": False, "partial_failure": False, "warnings": (),
+    }
+
+
 def create_roadmap_for_object(
     obj_id:      str,
     biz_id:      str,
@@ -1366,7 +1376,31 @@ def create_roadmap_for_object(
     template_id: str = "",
 ) -> dict:
     """
-    Создать roadmap для объекта недвижимости в листе ROADMAPS.
+    Создать roadmap для объекта недвижимости и его этапы — единственная
+    orchestration-точка входа для этого потока (Phase 28C/28D/28E).
+
+    Поток (Phase 27B decision):
+      validate input
+      -> create_roadmap_record() через business_core.roadmap_manager
+         (Core-владелец ROADMAPS — эта функция сама больше не пишет
+         ROADMAPS напрямую)
+      -> read Template Stage rows через
+         business_core.roadmap_template_manager.find_template_stages()
+         (Core -> Core)
+      -> ensure_roadmap_stages() через business_core.roadmap_manager
+         (Core-владелец ROADMAP_STAGES)
+      -> Extension-copy orchestration (business_core.
+         stage_entity_relations.copy_template_relations_to_stage()) —
+         выполняется ЗДЕСЬ, в orchestration-слое, никогда внутри
+         roadmap_manager.py/roadmap_template_manager.py
+      -> fallback на встроенные ROADMAP_TEMPLATES (case_type) если
+         шаблон не дал этапов — та же built-in логика, что раньше жила
+         в telegram_handlers.startroadmap_cmd
+
+    Extension failure (relation-copy) никогда не откатывает уже
+    созданный Roadmap/Stages — видно через "partial_success"/
+    "partial_failure"/"relation_copy_errors", "ok" остаётся True, если
+    Core-часть (Roadmap + Stages) успешна.
 
     Args:
         obj_id:      OBJ-ID объекта (обязательный)
@@ -1376,75 +1410,131 @@ def create_roadmap_for_object(
         case_type:   тип кейса (legalization_reconstruction_house / ...)
         title:       заголовок roadmap (автогенерируется если пустой)
         notes:       примечания
-        template_id: RMT-... шаблон, фактически использованный для этапов
+        template_id: RMT-... шаблон для создания этапов
 
     Returns:
         {
-            "ok":          bool,
+            "ok":          bool,   # True если Roadmap (+ Stages, если применимо) созданы
             "roadmap_id":  str,
             "error":       str | None,
+            # Phase 28C/28D/28E, additive:
+            "core_created":                bool,   # Roadmap row создан
+            "stages_created":              bool,   # хотя бы один Stage создан
+            "stages_count":                int,
+            "stage_ids":                   list[str],
+            "used_template":               bool,   # True если этапы взяты из RMT-шаблона, не built-in case_type
+            "relation_copy_errors":        tuple,  # (stage_id, template_stage_id, errors) per failed stage
+            "relation_copy_created_count": int,
+            "partial_success":             bool,   # Core ok, но Extension copy частично упал
+            "partial_failure":             bool,   # alias of partial_success — same meaning, kept for clarity at call sites
+            "warnings":                    tuple,  # non-fatal messages (e.g. "шаблон не содержит этапов")
         }
     """
     if not obj_id or not biz_id or not client_id:
-        return {
-            "ok": False, "roadmap_id": "",
-            "error": "Обязательные поля: obj_id, biz_id, client_id",
-        }
+        return _empty_roadmap_creation_result("Обязательные поля: obj_id, biz_id, client_id")
 
-    try:
-        from business_core.sheets import (
-            append_business_row,
-            get_business_sheet,
-            row_from_header_map,
-        )
-        now        = datetime.now().strftime("%Y-%m-%d")
-        roadmap_id = generate_roadmap_id()
+    if not title:
+        title = f"Roadmap {obj_id}" + (f" / {service_id}" if service_id else "")
 
-        # Автогенерация заголовка
-        if not title:
-            title = f"Roadmap {obj_id}" + (f" / {service_id}" if service_id else "")
+    from business_core.roadmap_manager import create_roadmap_record
 
-        # Строка собирается по ФАКТИЧЕСКИМ заголовкам листа, а не по
-        # жёстко заданным позициям — так запись никогда не съедет
-        # относительно реального расположения колонок (см. баг RM-027,
-        # где Object ID оказался записан под колонкой 'Template ID').
-        sheet   = get_business_sheet("roadmaps")
-        headers = sheet.row_values(1)
+    rm_result = create_roadmap_record(
+        business_id=biz_id, client_id=client_id, object_id=obj_id,
+        service_id=service_id, template_id=template_id,
+        client_name=title, case_type=case_type, notes=notes,
+    )
+    if not rm_result["ok"]:
+        log.error(f"create_roadmap_for_object: {rm_result['error']}")
+        return _empty_roadmap_creation_result(rm_result["error"])
 
-        values = {
-            "Roadmap ID":        roadmap_id,
-            "Business ID":       biz_id,
-            "Service ID":        service_id,
-            "City":              "",
-            "Client ID":         client_id,
-            "Client Name":       title,
-            "GTD Project ID":    "",
-            "Responsible":       "",
-            "Status":            "active",
-            "Created":           now,
-            "Expected":          "",
-            "Progress %":        "0",
-            "Notes":             notes,
-            "Last Updated":      now,
-            "Object ID":         obj_id,
-            "Parent Roadmap ID": "",
-            "Case Type":         case_type,
-            "Template ID":       template_id,
-        }
+    roadmap_id = rm_result["roadmap_id"]
+    log.info(f"create_roadmap_for_object: {roadmap_id} / {obj_id} / {case_type}")
 
+    stages_count = 0
+    stage_ids: list[str] = []
+    used_template = False
+    warnings: list[str] = []
+    relation_copy_errors: list[tuple] = []
+    relation_copy_created_count = 0
+
+    if template_id:
         try:
-            row = row_from_header_map(headers, values)
-        except ValueError as header_exc:
-            log.error(f"create_roadmap_for_object: {header_exc}")
-            return {"ok": False, "roadmap_id": "", "error": str(header_exc)}
+            from business_core.roadmap_template_manager import find_template_stages
+            template_stage_rows = find_template_stages(template_id)
+        except Exception as exc:
+            template_stage_rows = []
+            warnings.append(str(exc))
 
-        append_business_row("roadmaps", row)
-        log.info(f"create_roadmap_for_object: {roadmap_id} / {obj_id} / {case_type}")
-        return {"ok": True, "roadmap_id": roadmap_id, "error": None}
+        if template_stage_rows:
+            from business_core.roadmap_manager import ensure_roadmap_stages
+            stage_result = ensure_roadmap_stages(roadmap_id, template_stage_rows)
 
-    except Exception as exc:
-        log.error(f"create_roadmap_for_object error: {exc}")
-        return {"ok": False, "roadmap_id": "", "error": str(exc)}
+            if stage_result["ok"]:
+                used_template = True
+                stage_ids = stage_result["created_stage_ids"]
+                stages_count = stage_result["created_count"]
+
+                # Extension orchestration: relation-copy for newly
+                # created stages only — existing ones (idempotent
+                # retry) were already copied on a prior call.
+                if stage_ids:
+                    order_to_template_stage_id = {
+                        int(r["order"]): r.get("stage_id", "")
+                        for r in template_stage_rows if str(r.get("order", "")).isdigit()
+                    }
+                    from business_core.stage_entity_relations import copy_template_relations_to_stage
+                    for new_stage_id, order in zip(stage_ids, stage_result["created_from_orders"]):
+                        source_template_stage_id = order_to_template_stage_id.get(order, "")
+                        if not source_template_stage_id:
+                            continue
+                        try:
+                            rel_result = copy_template_relations_to_stage(source_template_stage_id, new_stage_id)
+                            relation_copy_created_count += len(rel_result.created)
+                            if not rel_result.ok:
+                                relation_copy_errors.append(
+                                    (new_stage_id, source_template_stage_id, rel_result.errors)
+                                )
+                        except Exception as exc:
+                            relation_copy_errors.append((new_stage_id, source_template_stage_id, (str(exc),)))
+            else:
+                warnings.append(stage_result.get("error") or "Не удалось создать этапы из шаблона")
+        else:
+            warnings.append(f"Шаблон {template_id} не содержит этапов.")
+
+    # Fallback: built-in ROADMAP_TEMPLATES keyed by case_type — same
+    # condition telegram_handlers.startroadmap_cmd used to apply
+    # itself: no template attempted, or the template attempt yielded
+    # zero stages.
+    if not used_template or stages_count == 0:
+        try:
+            from business_core.roadmap_manager import create_roadmap_stages_from_template
+            fb_result = create_roadmap_stages_from_template(roadmap_id, case_type)
+            if fb_result.get("stages_count", 0) > 0:
+                stage_ids = fb_result.get("stage_ids", [])
+                stages_count = fb_result.get("stages_count", 0)
+                used_template = False
+            elif fb_result.get("warning"):
+                warnings.append(fb_result["warning"])
+        except Exception as exc:
+            warnings.append(str(exc))
+
+    partial_failure = bool(relation_copy_errors)
+
+    return {
+        "ok": True,
+        "roadmap_id": roadmap_id,
+        "error": None,
+        "core_created": True,
+        "stages_created": stages_count > 0,
+        "stages_count": stages_count,
+        "stage_ids": stage_ids,
+        "used_template": used_template,
+        "relation_copy_errors": tuple(relation_copy_errors),
+        "relation_copy_created_count": relation_copy_created_count,
+        "partial_success": partial_failure,
+        "partial_failure": partial_failure,
+        "warnings": tuple(warnings),
+    }
 
 
 def find_roadmap_by_id(roadmap_id: str) -> Optional[dict]:

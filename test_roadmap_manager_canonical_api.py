@@ -507,5 +507,64 @@ class TestEnsureRoadmapStages(unittest.TestCase):
         self.assertNotIn("knowledge_manager", imported)
 
 
+# ─────────────────────────────────────────────────────────────
+# update_stage_fields — Phase 28D canonical replacement for
+# telegram_handlers._stage_edit_execute's former direct Sheets access
+# ─────────────────────────────────────────────────────────────
+
+class TestUpdateStageFields(unittest.TestCase):
+    def test_requires_stage_id(self):
+        rm = _fresh_rm()
+        result = rm.update_stage_fields("", {"Responsible": "Иван"})
+        self.assertFalse(result["ok"])
+
+    def test_stage_not_found(self):
+        rm = _fresh_rm()
+        with patch("business_core.sheets.find_row_by_id", return_value=None):
+            result = rm.update_stage_fields("STAGE-999", {"Responsible": "Иван"})
+        self.assertFalse(result["ok"])
+        self.assertIn("STAGE-999", result["error"])
+
+    def test_writes_only_allowed_columns(self):
+        rm = _fresh_rm()
+        sheet = MagicMock()
+        sheet.row_values.return_value = STAGES_HEADERS
+        with patch("business_core.sheets.find_row_by_id", return_value=(2, {})), \
+             patch("business_core.sheets.get_business_sheet", return_value=sheet):
+            result = rm.update_stage_fields("STAGE-001", {
+                "Responsible": "Иван", "Stage ID": "HACKED", "Order": "99",
+            })
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["written_fields"], ("Responsible",))
+        written_cols = [c.args[1] for c in sheet.update_cell.call_args_list]
+        idx = {h: i + 1 for i, h in enumerate(STAGES_HEADERS)}
+        self.assertEqual(written_cols, [idx["Responsible"]])
+
+    def test_writes_multiple_allowed_columns(self):
+        rm = _fresh_rm()
+        sheet = MagicMock()
+        sheet.row_values.return_value = STAGES_HEADERS
+        with patch("business_core.sheets.find_row_by_id", return_value=(3, {})), \
+             patch("business_core.sheets.get_business_sheet", return_value=sheet):
+            result = rm.update_stage_fields("STAGE-001", {
+                "Blocking Reason": "нет доступа", "Status": "blocked",
+            })
+        self.assertTrue(result["ok"])
+        self.assertEqual(set(result["written_fields"]), {"Blocking Reason", "Status"})
+        self.assertEqual(sheet.update_cell.call_count, 2)
+        for c in sheet.update_cell.call_args_list:
+            self.assertEqual(c.args[0], 3)
+
+    def test_rereads_row_before_writing(self):
+        """Read-before-Write (ENGINEERING_STANDARDS.md) — staleness guard."""
+        rm = _fresh_rm()
+        sheet = MagicMock()
+        sheet.row_values.return_value = STAGES_HEADERS
+        with patch("business_core.sheets.find_row_by_id", return_value=(2, {})) as mock_find, \
+             patch("business_core.sheets.get_business_sheet", return_value=sheet):
+            rm.update_stage_fields("STAGE-001", {"Priority": "high"})
+        mock_find.assert_called_once_with("roadmap_stages", "STAGE-001")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

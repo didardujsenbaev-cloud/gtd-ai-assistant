@@ -272,9 +272,9 @@ async def show_roadmaps(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         filter_biz_id    = args.get("biz_id",    "")
         filter_client_id = args.get("client_id", "")
 
-        from business_core.sheets import read_business_sheet
+        from business_core.roadmap_manager import list_roadmaps
 
-        rows = read_business_sheet("roadmaps")
+        rows = list_roadmaps()
         if not rows:
             await _reply(update,
                 "🗺 *Дорожные карты*\n\n"
@@ -284,14 +284,14 @@ async def show_roadmaps(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
         # Применить фильтры
         if filter_obj_id:
-            rows = [r for r in rows if r.get("Object ID", "") == filter_obj_id]
+            rows = [r for r in rows if r.get("object_id", "") == filter_obj_id]
         if filter_biz_id:
-            rows = [r for r in rows if r.get("Business ID", "") == filter_biz_id]
+            rows = [r for r in rows if r.get("business_id", "") == filter_biz_id]
         if filter_client_id:
-            rows = [r for r in rows if r.get("Client ID", "") == filter_client_id]
+            rows = [r for r in rows if r.get("client_id", "") == filter_client_id]
 
-        active = [r for r in rows if r.get("Status", "") not in ("completed", "cancelled")]
-        done   = [r for r in rows if r.get("Status", "") == "completed"]
+        active = [r for r in rows if r.get("status", "") not in ("completed", "cancelled")]
+        done   = [r for r in rows if r.get("status", "") == "completed"]
 
         filter_info = ""
         if filter_obj_id:
@@ -304,14 +304,14 @@ async def show_roadmaps(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         lines = [f"🗺 *Дорожные карты* ({len(active)} активных{filter_info})\n"]
 
         for r in active:
-            rm_id    = r.get("Roadmap ID", "?")
-            client   = r.get("Client Name", "?")
-            city     = r.get("City", "")
-            biz_id   = r.get("Business ID", "")
-            obj_id   = r.get("Object ID", "")
-            svc_id   = r.get("Service ID", "")
-            case_t   = r.get("Case Type", "")
-            progress = r.get("Progress %", "0")
+            rm_id    = r.get("roadmap_id", "?")
+            client   = r.get("client_name", "?")
+            city     = r.get("city", "")
+            biz_id   = r.get("business_id", "")
+            obj_id   = r.get("object_id", "")
+            svc_id   = r.get("service_id", "")
+            case_t   = r.get("case_type", "")
+            progress = r.get("progress", "0")
 
             try:
                 pct = float(progress)
@@ -338,8 +338,7 @@ async def show_roadmaps(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             lines.append(f"  {bar} {pct:.0f}%")
 
             # Показать текущий этап если есть (legacy Stage X columns)
-            for i in range(1, 11):
-                stage_status = r.get(f"Stage {i} Status", "")
+            for i, stage_status in enumerate(r.get("legacy_stage_statuses", []), start=1):
                 if stage_status in ("in_progress", "blocked", "waiting"):
                     lines.append(f"  ⬅ Этап {i}: {stage_status}")
                     break
@@ -615,69 +614,46 @@ async def newroadmap_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     nr = context.user_data.get("nr", {})
 
+    # Phase 28C/28D: this legacy state is unreachable in production —
+    # the /newroadmap entry point (newroadmap_start) always replies with
+    # a redirect to /startroadmap and returns ConversationHandler.END
+    # immediately (Phase 10.2E), so this conversation state is never
+    # actually entered by a real user. It is kept, per the "no command
+    # removal in this phase" constraint, but no longer writes ROADMAPS/
+    # ROADMAP_STAGES directly — it now calls the same canonical
+    # orchestration entry point /startroadmap uses. This legacy flow has
+    # no Object ID concept (it is client/service-centric, not
+    # object-centric), so create_roadmap_for_object correctly rejects it
+    # with a clear error — an honest reflection of this path's real,
+    # already-dead status rather than an invented Object ID.
     try:
-        from business_core.sheets import (
-            read_business_sheet, append_business_row, generate_next_id
+        from business_core.business_builder import create_roadmap_for_object
+
+        result = create_roadmap_for_object(
+            obj_id="",
+            biz_id=nr.get("business_id", ""),
+            client_id=nr.get("client_id", ""),
+            service_id=nr.get("service_id", ""),
+            title=nr.get("client_name", ""),
+            notes="",
         )
-        from business_core.roadmap_manager import (
-            create_roadmap, get_stage_template
-        )
-        from datetime import date, timedelta
 
-        # Генерируем ID
-        rm_id = generate_next_id("roadmaps", "RM")
-        template = get_stage_template(
-            nr.get("service_id", ""),
-            nr.get("service_name", ""),
-        )
-        expected = (date.today() + timedelta(days=nr.get("expected_days", 60))).isoformat()
-
-        # Формируем строку для ROADMAPS
-        stage_statuses = ["not_started"] * 10
-        row_values = [
-            rm_id,
-            nr.get("business_id", ""),
-            nr.get("service_id", ""),
-            nr.get("city", ""),
-            nr.get("client_id", ""),
-            nr.get("client_name", ""),
-            "",          # GTD Project ID — заполнить позже
-            "Дидар",     # Responsible
-            "active",
-            datetime.now().strftime("%Y-%m-%d"),
-            expected,
-            "0",         # Progress %
-        ] + stage_statuses[:10] + [""]  # Notes
-
-        append_business_row("roadmaps", row_values)
-
-        # Строки этапов
-        for i, tmpl in enumerate(template, start=1):
-            stage_id = f"STAGE-{rm_id.replace('RM-', '')}-{i:02d}"
-            stage_row = [
-                stage_id, rm_id, str(i), tmpl["name"],
-                "not_started", "", "", "", "Дидар",
-                ", ".join(tmpl.get("docs_required", [])), "", "",
-            ]
-            append_business_row("roadmap_stages", stage_row)
-
-        # Обновляем кеш inbox_bridge
-        try:
-            from business_core.inbox_bridge import invalidate_cache
-            invalidate_cache()
-        except Exception:
-            pass
-
-        await update.message.reply_text(
-            f"✅ *Дорожная карта создана!*\n\n"
-            f"🆔 ID: `{rm_id}`\n"
-            f"👤 Клиент: {nr.get('client_name', '?')}\n"
-            f"🛠 Услуга: {nr.get('service_name', '?')}\n"
-            f"📋 Этапов: {len(template)}\n\n"
-            f"Первый шаг: /roadmaps",
-            parse_mode="Markdown",
-            reply_markup=ReplyKeyboardRemove(),
-        )
+        if not result["ok"]:
+            await update.message.reply_text(
+                f"❌ Ошибка сохранения: {result['error']}\n\nПопробуй /startroadmap",
+                reply_markup=ReplyKeyboardRemove(),
+            )
+        else:
+            await update.message.reply_text(
+                f"✅ *Дорожная карта создана!*\n\n"
+                f"🆔 ID: `{result['roadmap_id']}`\n"
+                f"👤 Клиент: {nr.get('client_name', '?')}\n"
+                f"🛠 Услуга: {nr.get('service_name', '?')}\n"
+                f"📋 Этапов: {result.get('stages_count', 0)}\n\n"
+                f"Первый шаг: /roadmaps",
+                parse_mode="Markdown",
+                reply_markup=ReplyKeyboardRemove(),
+            )
 
     except Exception as e:
         log.error(f"newroadmap_confirm error: {e}")
@@ -2286,14 +2262,8 @@ async def startroadmap_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             create_roadmap_for_object,
             update_object_roadmap_id,
         )
-        from business_core.roadmap_manager import (
-            create_roadmap_stages_from_template,
-            ROADMAP_TEMPLATES,
-        )
-        from business_core.roadmap_template_manager import (
-            create_stages_from_template_record,
-            find_roadmap_templates_by_service,
-        )
+        from business_core.roadmap_manager import ROADMAP_TEMPLATES
+        from business_core.roadmap_template_manager import find_roadmap_templates_by_service
         from business_core.service_manager import find_service_by_id
 
         obj = find_object_by_id(obj_id)
@@ -2372,7 +2342,12 @@ async def startroadmap_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                         )
                         await _reply(update, "\n".join(hint_lines))
 
-        # ── Создать roadmap ────────────────────────────────────
+        # ── Создать roadmap + этапы ─────────────────────────────
+        # Phase 28C: create_roadmap_for_object теперь единственная
+        # orchestration-точка входа — сама создаёт Roadmap, читает
+        # Template Stage rows, создаёт Stages и выполняет Extension-copy
+        # (Stage Entity Relations), с fallback на встроенные
+        # ROADMAP_TEMPLATES по case_type, если шаблон не дал этапов.
         rm_result = create_roadmap_for_object(
             obj_id=obj_id,
             biz_id=biz_id,
@@ -2387,25 +2362,8 @@ async def startroadmap_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await _reply(update, f"❌ Не удалось создать roadmap: {rm_result['error']}")
             return
 
-        roadmap_id = rm_result["roadmap_id"]
-
-        # ── Создать этапы ──────────────────────────────────────
-        stages_result   = None
-        used_template   = False
-
-        if template_id_to_use:
-            stages_result = create_stages_from_template_record(roadmap_id, template_id_to_use)
-            used_template = True
-
-        # Fallback: встроенные шаблоны через case_type
-        if not stages_result or not stages_result.get("ok") or stages_result.get("stages_count", 0) == 0:
-            stages_result_fb = create_roadmap_stages_from_template(roadmap_id, case_type)
-            if stages_result_fb.get("stages_count", 0) > 0:
-                stages_result = stages_result_fb
-                used_template = False
-
-        if not stages_result:
-            stages_result = {"ok": True, "stages_count": 0, "warning": "Шаблон не найден", "stage_ids": []}
+        roadmap_id    = rm_result["roadmap_id"]
+        used_template = rm_result.get("used_template", False)
 
         update_object_roadmap_id(obj_id, roadmap_id)
 
@@ -2422,10 +2380,10 @@ async def startroadmap_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         elif case_type and case_type != "general":
             lines.append(f"Case Type: `{case_type}`")
 
-        if stages_result.get("warning") and not stages_result.get("stages_count"):
-            lines.append(f"\n⚠️ {stages_result['warning']}")
+        count = rm_result.get("stages_count", 0)
+        if count == 0 and rm_result.get("warnings"):
+            lines.append(f"\n⚠️ {rm_result['warnings'][0]}")
         else:
-            count = stages_result.get("stages_count", 0)
             lines.append(f"Этапов создано: {count}")
             # Показать первые 5 названий
             if not used_template:
@@ -2439,13 +2397,14 @@ async def startroadmap_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
         lines.append(f"\nПросмотр этапов: `/stages roadmap_id={roadmap_id}`")
 
-        # Phase 18C-3: этапы уже созданы независимо от этого — ошибка
-        # копирования relation-строк не меняет ничего выше, только
-        # добавляет отдельное предупреждение, если она произошла.
-        if stages_result.get("relation_copy_errors"):
+        # Phase 18C-3/28C: этапы уже созданы независимо от этого — ошибка
+        # копирования relation-строк (теперь выполняемого в
+        # create_roadmap_for_object, а не внутри roadmap_template_manager)
+        # не меняет ничего выше, только добавляет отдельное предупреждение.
+        if rm_result.get("relation_copy_errors"):
             lines.append(
                 f"\n⚠️ Часть связей документов не скопирована для "
-                f"{len(stages_result['relation_copy_errors'])} этап(ов). "
+                f"{len(rm_result['relation_copy_errors'])} этап(ов). "
                 f"Этапы созданы корректно; связи можно досоздать позже."
             )
 
@@ -2487,8 +2446,7 @@ async def stages_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
 
     try:
-        from business_core.roadmap_manager import get_stages_for_roadmap
-        from business_core.business_builder import find_roadmap_by_id
+        from business_core.roadmap_manager import get_stages_for_roadmap, find_roadmap_by_id
 
         rm = find_roadmap_by_id(roadmap_id)
         stages = get_stages_for_roadmap(roadmap_id)
@@ -2499,7 +2457,7 @@ async def stages_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
         header = f"📋 *Этапы {roadmap_id}*"
         if rm:
-            header += f" — {rm.get('title', '')}"
+            header += f" — {rm.get('client_name', '')}"
             if rm.get("case_type"):
                 header += f" (`{rm['case_type']}`)"
 
@@ -2823,39 +2781,21 @@ async def _stage_edit_execute(update: Update, context: ContextTypes.DEFAULT_TYPE
         return ConversationHandler.END
 
     try:
-        from business_core.sheets import find_row_by_id, get_business_sheet
+        from business_core.roadmap_manager import update_stage_fields
 
         stage_id = snap["stage_id"]
-        # Перечитываем строку прямо перед записью — защита от staleness
-        # между показом карточки и подтверждением. find_row_by_id
-        # гарантирует ровно одно совпадение по Stage ID (первая строка).
-        found = find_row_by_id("roadmap_stages", stage_id)
-        if not found:
+        # Phase 28D: point-write now goes through roadmap_manager's
+        # canonical field-update primitive (staleness re-read + header-
+        # mapped write + column allowlist all now live there) instead of
+        # this handler touching Sheets directly.
+        result = update_stage_fields(stage_id, snap["writes"])
+
+        if not result["ok"]:
             await update.message.reply_text(
-                f"❌ Этап {stage_id} больше не найден — изменение не выполнено.",
+                f"❌ {result['error']}",
                 reply_markup=ReplyKeyboardRemove(),
             )
         else:
-            row_number, _live_row = found
-            sheet = get_business_sheet("roadmap_stages")
-            headers = sheet.row_values(1)
-
-            def _col(name):
-                return headers.index(name) + 1 if name in headers else None
-
-            # Защита от случайного расширения области записи: только
-            # разрешённые Phase 14A колонки могут быть записаны отсюда.
-            allowed_columns = {
-                "Responsible", "Due Date", "Priority",
-                "Blocking Reason", "Status",
-            }
-            for column_name, value in snap["writes"].items():
-                if column_name not in allowed_columns:
-                    continue
-                col = _col(column_name)
-                if col:
-                    sheet.update_cell(row_number, col, value)
-
             await update.message.reply_text(
                 f"✅ Этап {stage_id} обновлён\n\n"
                 f"Поле: {snap['field_label']}\n"
@@ -5694,7 +5634,7 @@ async def milestones_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
         lines = [
             f"💰 *Коммерческие этапы: {roadmap_id}*",
-            f"Object:   `{rm.get('obj_id',     '—')}`",
+            f"Object:   `{rm.get('object_id',  '—')}`",
             f"Service:  `{rm.get('service_id', '—')}`",
             f"Template: `{template_id}`",
             "",

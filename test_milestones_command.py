@@ -295,7 +295,7 @@ class TestMilestonesMap(unittest.TestCase):
     def test_3_get_commercial_milestones_returns_3_for_alm_002(self):
         """3: get_commercial_milestones_for_roadmap возвращает 3 milestone."""
         rm = _fresh_rm()
-        with patch("business_core.business_builder.find_roadmap_by_id",
+        with patch("business_core.roadmap_manager.find_roadmap_by_id",
                    return_value=FAKE_ROADMAP), \
              patch("business_core.roadmap_manager._resolve_template_id",
                    return_value=TEMPLATE_ID_ALM), \
@@ -308,7 +308,7 @@ class TestMilestonesMap(unittest.TestCase):
     def test_3_milestones_have_loaded_stages(self):
         """3: каждый milestone имеет loaded_stages и stage_range."""
         rm = _fresh_rm()
-        with patch("business_core.business_builder.find_roadmap_by_id",
+        with patch("business_core.roadmap_manager.find_roadmap_by_id",
                    return_value=FAKE_ROADMAP), \
              patch("business_core.roadmap_manager._resolve_template_id",
                    return_value=TEMPLATE_ID_ALM), \
@@ -323,7 +323,7 @@ class TestMilestonesMap(unittest.TestCase):
     def test_3_cm1_has_4_loaded_stages(self):
         """3: CM-1 загружает 4 этапа."""
         rm = _fresh_rm()
-        with patch("business_core.business_builder.find_roadmap_by_id",
+        with patch("business_core.roadmap_manager.find_roadmap_by_id",
                    return_value=FAKE_ROADMAP), \
              patch("business_core.roadmap_manager._resolve_template_id",
                    return_value=TEMPLATE_ID_ALM), \
@@ -335,7 +335,7 @@ class TestMilestonesMap(unittest.TestCase):
     def test_3_cm2_has_6_loaded_stages(self):
         """3: CM-2 загружает 6 этапов."""
         rm = _fresh_rm()
-        with patch("business_core.business_builder.find_roadmap_by_id",
+        with patch("business_core.roadmap_manager.find_roadmap_by_id",
                    return_value=FAKE_ROADMAP), \
              patch("business_core.roadmap_manager._resolve_template_id",
                    return_value=TEMPLATE_ID_ALM), \
@@ -347,7 +347,7 @@ class TestMilestonesMap(unittest.TestCase):
     def test_3_cm3_has_3_loaded_stages(self):
         """3: CM-3 загружает 3 этапа."""
         rm = _fresh_rm()
-        with patch("business_core.business_builder.find_roadmap_by_id",
+        with patch("business_core.roadmap_manager.find_roadmap_by_id",
                    return_value=FAKE_ROADMAP), \
              patch("business_core.roadmap_manager._resolve_template_id",
                    return_value=TEMPLATE_ID_ALM), \
@@ -413,7 +413,7 @@ class TestTotalPrice(unittest.TestCase):
     def test_4_get_commercial_total_price(self):
         """4: get_commercial_milestones_for_roadmap возвращает total_price=950000."""
         rm = _fresh_rm()
-        with patch("business_core.business_builder.find_roadmap_by_id",
+        with patch("business_core.roadmap_manager.find_roadmap_by_id",
                    return_value=FAKE_ROADMAP), \
              patch("business_core.roadmap_manager._resolve_template_id",
                    return_value=TEMPLATE_ID_ALM), \
@@ -527,7 +527,7 @@ class TestNoWrites(unittest.TestCase):
         """5: get_commercial_milestones_for_roadmap не пишет в Sheets."""
         rm     = _fresh_rm()
         writes = []
-        with patch("business_core.business_builder.find_roadmap_by_id",
+        with patch("business_core.roadmap_manager.find_roadmap_by_id",
                    return_value=FAKE_ROADMAP), \
              patch("business_core.roadmap_manager._resolve_template_id",
                    return_value=TEMPLATE_ID_ALM), \
@@ -578,7 +578,7 @@ class TestNoNewStages(unittest.TestCase):
             if "stage" in sheet_key:
                 writes.append((sheet_key, row))
 
-        with patch("business_core.business_builder.find_roadmap_by_id",
+        with patch("business_core.roadmap_manager.find_roadmap_by_id",
                    return_value=FAKE_ROADMAP), \
              patch("business_core.roadmap_manager._resolve_template_id",
                    return_value=TEMPLATE_ID_ALM), \
@@ -598,7 +598,7 @@ class TestUnsupportedTemplate(unittest.TestCase):
     def test_7_empty_template_returns_no_milestones(self):
         """7: пустой template_id → milestones = []."""
         rm = _fresh_rm()
-        with patch("business_core.business_builder.find_roadmap_by_id",
+        with patch("business_core.roadmap_manager.find_roadmap_by_id",
                    return_value=FAKE_ROADMAP), \
              patch("business_core.roadmap_manager._resolve_template_id",
                    return_value=""), \
@@ -611,7 +611,7 @@ class TestUnsupportedTemplate(unittest.TestCase):
     def test_7_unknown_template_returns_no_milestones(self):
         """7: неизвестный template_id → milestones = []."""
         rm = _fresh_rm()
-        with patch("business_core.business_builder.find_roadmap_by_id",
+        with patch("business_core.roadmap_manager.find_roadmap_by_id",
                    return_value=FAKE_ROADMAP), \
              patch("business_core.roadmap_manager._resolve_template_id",
                    return_value="RMT-UNKNOWN-999"), \

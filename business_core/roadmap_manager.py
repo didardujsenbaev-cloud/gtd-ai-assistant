@@ -1020,8 +1020,11 @@ def get_commercial_milestones_for_roadmap(roadmap_id: str) -> dict:
         }
 
     try:
-        from business_core.business_builder import find_roadmap_by_id as _find_rm
-        roadmap = _find_rm(roadmap_id)
+        # Phase 28E: this used to delegate to business_builder.find_roadmap_by_id
+        # (a Core -> orchestration-layer dependency). find_roadmap_by_id is now
+        # this module's own canonical function (Phase 28B), defined further down
+        # in this same file — no import needed, and no more reverse dependency.
+        roadmap = find_roadmap_by_id(roadmap_id)
     except Exception as exc:
         return {
             "ok": False, "error": str(exc), "roadmap": None,
@@ -1629,8 +1632,13 @@ def find_roadmap_by_id(roadmap_id: str) -> Optional[dict]:
     Returns:
         dict с полями row_num, roadmap_id, business_id, service_id,
         client_id, client_name, status, created, object_id,
-        parent_roadmap_id, case_type, template_id, progress,
-        notes — или None, если roadmap не найден.
+        parent_roadmap_id, case_type, template_id, progress, notes,
+        city, legacy_stage_statuses (list of 10 strings — the legacy
+        "Stage 1 Status".."Stage 10 Status" per-roadmap columns, kept
+        for callers like /roadmaps that still display them; the source
+        of truth for stage state is ROADMAP_STAGES, read via
+        get_stages_for_roadmap()/find_stage_by_id(), never this list)
+        — или None, если roadmap не найден.
     """
     if not roadmap_id:
         return None
@@ -1646,28 +1654,31 @@ def find_roadmap_by_id(roadmap_id: str) -> Optional[dict]:
         headers = sheet.row_values(1)
         row = sheet.row_values(cell.row)
 
+        stage_status_headers = [f"Stage {i} Status" for i in range(1, 11)]
         wanted = [
             "Roadmap ID", "Business ID", "Service ID", "Client ID", "Client Name",
             "Status", "Created", "Object ID", "Parent Roadmap ID", "Case Type",
-            "Template ID", "Progress %", "Notes",
-        ]
+            "Template ID", "Progress %", "Notes", "City",
+        ] + stage_status_headers
         v = read_row_by_headers(headers, row, wanted)
 
         return {
-            "row_num":            cell.row,
-            "roadmap_id":         v["Roadmap ID"],
-            "business_id":        v["Business ID"],
-            "service_id":         v["Service ID"],
-            "client_id":          v["Client ID"],
-            "client_name":        v["Client Name"],
-            "status":             v["Status"],
-            "created":            v["Created"],
-            "object_id":          v["Object ID"],
-            "parent_roadmap_id":  v["Parent Roadmap ID"],
-            "case_type":          v["Case Type"],
-            "template_id":        v["Template ID"],
-            "progress":           v["Progress %"],
-            "notes":              v["Notes"],
+            "row_num":               cell.row,
+            "roadmap_id":            v["Roadmap ID"],
+            "business_id":           v["Business ID"],
+            "service_id":            v["Service ID"],
+            "client_id":             v["Client ID"],
+            "client_name":           v["Client Name"],
+            "status":                v["Status"],
+            "created":               v["Created"],
+            "object_id":             v["Object ID"],
+            "parent_roadmap_id":     v["Parent Roadmap ID"],
+            "case_type":             v["Case Type"],
+            "template_id":           v["Template ID"],
+            "progress":              v["Progress %"],
+            "notes":                 v["Notes"],
+            "city":                  v["City"],
+            "legacy_stage_statuses": [v[h] for h in stage_status_headers],
         }
 
     except Exception as exc:
@@ -1727,6 +1738,8 @@ def list_roadmaps(
                 "template_id":       _get(row, "Template ID"),
                 "progress":          _get(row, "Progress %"),
                 "notes":             _get(row, "Notes"),
+                "city":              _get(row, "City"),
+                "legacy_stage_statuses": [_get(row, f"Stage {i} Status") for i in range(1, 11)],
             }
 
             if business_id is not None and candidate["business_id"] != business_id:
@@ -1925,21 +1938,36 @@ def ensure_roadmap_stages(
     telegram_handlers — those are Extension-layer/orchestration
     concerns wired by the caller in a later phase.
 
+    If a template_stage_rows entry also carries any of "sop_ids",
+    "checklist_ids", "material_ids", "document_template_ids", "faq_ids"
+    (each a list[str] — the shape business_core.roadmap_template_manager.
+    find_template_stages() returns since Phase 28E), those are merged
+    into the new stage row's own "SOP IDs"/"Checklist IDs"/
+    "Materials IDs"/"Document Template IDs"/"FAQ IDs" columns exactly
+    as business_core.roadmap_template_manager.create_stages_from_template_record()
+    used to do internally — this is a same-registry field copy, not an
+    Extension call.
+
     Returns:
         {
-            "ok":                 bool,
-            "roadmap_id":         str,
-            "created_stage_ids":  list[str],
-            "existing_stage_ids": list[str],
-            "created_count":      int,
-            "existing_count":     int,
-            "total_count":        int,
-            "error":              str | None,
+            "ok":                   bool,
+            "roadmap_id":           str,
+            "created_stage_ids":    list[str],
+            "created_from_orders":  list[int],  # parallel to created_stage_ids —
+                                                  # the Order each created stage
+                                                  # came from, so a caller can map
+                                                  # a new stage_id back to its
+                                                  # source template_stage_rows entry
+            "existing_stage_ids":   list[str],
+            "created_count":        int,
+            "existing_count":       int,
+            "total_count":          int,
+            "error":                str | None,
         }
     """
     empty_result = {
         "ok": True, "roadmap_id": roadmap_id,
-        "created_stage_ids": [], "existing_stage_ids": [],
+        "created_stage_ids": [], "created_from_orders": [], "existing_stage_ids": [],
         "created_count": 0, "existing_count": 0, "total_count": 0,
         "error": None,
     }
@@ -2001,18 +2029,29 @@ def ensure_roadmap_stages(
         new_stage_ids = generate_next_ids("roadmap_stages", len(to_create))
 
         rows = []
+        created_from_orders: list[int] = []
         for tmpl_row, stage_id in zip(to_create, new_stage_ids):
+            order = int(str(tmpl_row.get("order", "")).strip())
             values = {
                 "Stage ID":       stage_id,
                 "Roadmap ID":     roadmap_id,
-                "Order":          str(tmpl_row.get("order", "")),
+                "Order":          str(order),
                 "Name":           tmpl_row.get("stage_name", ""),
                 "Status":         "pending",
                 "Docs Required":  tmpl_row.get("required_docs", ""),
                 "Responsible":    tmpl_row.get("responsible", ""),
                 "Notes":          tmpl_row.get("notes", ""),
+                # Phase 8C knowledge bindings — same-registry field copy
+                # from the template stage row, not an Extension call
+                # (see this function's docstring).
+                "SOP IDs":               ",".join(tmpl_row.get("sop_ids", [])),
+                "Checklist IDs":         ",".join(tmpl_row.get("checklist_ids", [])),
+                "Materials IDs":         ",".join(tmpl_row.get("material_ids", [])),
+                "Document Template IDs": ",".join(tmpl_row.get("document_template_ids", [])),
+                "FAQ IDs":               ",".join(tmpl_row.get("faq_ids", [])),
             }
             rows.append(row_from_header_map(headers, values))
+            created_from_orders.append(order)
 
         batch_append_business_rows("roadmap_stages", rows)
 
@@ -2025,6 +2064,7 @@ def ensure_roadmap_stages(
         return {
             "ok": True, "roadmap_id": roadmap_id,
             "created_stage_ids": created_stage_ids,
+            "created_from_orders": created_from_orders,
             "existing_stage_ids": existing_stage_ids,
             "created_count": len(created_stage_ids),
             "existing_count": len(existing_stage_ids),
@@ -2036,8 +2076,69 @@ def ensure_roadmap_stages(
         log.error(f"ensure_roadmap_stages({roadmap_id}) error: {exc}")
         return {
             "ok": False, "roadmap_id": roadmap_id,
-            "created_stage_ids": [], "existing_stage_ids": existing_stage_ids,
+            "created_stage_ids": [], "created_from_orders": [], "existing_stage_ids": existing_stage_ids,
             "created_count": 0, "existing_count": len(existing_stage_ids),
             "total_count": len(existing_stage_ids),
             "error": str(exc),
         }
+
+
+_STAGE_FIELD_UPDATE_ALLOWED_COLUMNS = {
+    "Responsible", "Due Date", "Priority", "Blocking Reason", "Status",
+}
+
+
+def update_stage_fields(stage_id: str, writes: dict) -> dict:
+    """
+    Phase 28D: canonical point-write of one or more ROADMAP_STAGES
+    field(s) other than the full Status-transition flow (see
+    update_stage_status_in_sheet() for that) — the shared write
+    primitive behind /assignstage, /duedate, /priority, /blockstage,
+    /unblockstage, replacing telegram_handlers._stage_edit_execute's
+    former direct Sheets access.
+
+    Restricted to a fixed column allowlist (Responsible, Due Date,
+    Priority, Blocking Reason, Status) — the same Phase 14A Stage
+    Management Core columns this write path has always been scoped to;
+    any other key in `writes` is silently ignored, exactly matching
+    the prior behavior.
+
+    Re-reads the row via find_row_by_id() immediately before writing
+    (staleness guard — Read-before-Write, ENGINEERING_STANDARDS.md),
+    header-mapped, never a positional column assumption.
+
+    Returns:
+        {"ok": bool, "stage_id": str, "written_fields": tuple, "error": str | None}
+    """
+    if not stage_id:
+        return {"ok": False, "stage_id": stage_id, "written_fields": (), "error": "stage_id обязателен"}
+
+    try:
+        from business_core.sheets import find_row_by_id, get_business_sheet
+
+        found = find_row_by_id("roadmap_stages", stage_id)
+        if not found:
+            return {"ok": False, "stage_id": stage_id, "written_fields": (),
+                     "error": f"Этап {stage_id} больше не найден — изменение не выполнено."}
+
+        row_number, _live_row = found
+        sheet = get_business_sheet("roadmap_stages")
+        headers = sheet.row_values(1)
+
+        def _col(name):
+            return headers.index(name) + 1 if name in headers else None
+
+        written = []
+        for column_name, value in (writes or {}).items():
+            if column_name not in _STAGE_FIELD_UPDATE_ALLOWED_COLUMNS:
+                continue
+            col = _col(column_name)
+            if col:
+                sheet.update_cell(row_number, col, value)
+                written.append(column_name)
+
+        return {"ok": True, "stage_id": stage_id, "written_fields": tuple(written), "error": None}
+
+    except Exception as exc:
+        log.error(f"update_stage_fields({stage_id}) error: {exc}")
+        return {"ok": False, "stage_id": stage_id, "written_fields": (), "error": str(exc)}

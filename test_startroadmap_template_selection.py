@@ -111,24 +111,33 @@ class TestNoTemplateId(unittest.TestCase):
 class TestExplicitTemplateId(unittest.TestCase):
 
     def test_2_explicit_template_id_used(self):
-        """2: явный template_id — stages создаются именно из него."""
+        """2: явный template_id передаётся в create_roadmap_for_object.
+
+        Phase 28C: stage creation from the resolved template_id now
+        happens INSIDE create_roadmap_for_object (which is mocked as a
+        whole here) rather than via a separate
+        create_stages_from_template_record call this handler makes
+        directly — so this asserts the template_id argument
+        create_roadmap_for_object receives, instead of a call to a
+        function it no longer calls itself."""
         cmd = _fresh_handlers()
         upd, ctx = _make_update(
             "/startroadmap obj_id=OBJ-001 service_id=SVC-IZH-001 template_id=RMT-IZH-ALM-STANDARD-002",
             ["obj_id=OBJ-001", "service_id=SVC-IZH-001", "template_id=RMT-IZH-ALM-STANDARD-002"],
         )
-        stages_calls = []
-
-        def mock_stages(roadmap_id, template_id):
-            stages_calls.append(template_id)
-            return {"ok": True, "stages_count": 13, "warning": None, "stage_ids": []}
 
         async def run():
             with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
                  patch("business_core.business_builder.find_object_by_id",
                        return_value={"obj_id": "OBJ-001", "biz_id": "BIZ-001", "client_id": "PRS-001"}), \
                  patch("business_core.business_builder.create_roadmap_for_object",
-                       return_value={"ok": True, "roadmap_id": "RM-101", "error": None}), \
+                       return_value={
+                           "ok": True, "roadmap_id": "RM-101", "error": None,
+                           "core_created": True, "stages_created": True,
+                           "stages_count": 13, "stage_ids": [], "used_template": True,
+                           "relation_copy_errors": (), "relation_copy_created_count": 0,
+                           "partial_success": False, "partial_failure": False, "warnings": (),
+                       }) as mock_create_rm, \
                  patch("business_core.business_builder.update_object_roadmap_id"), \
                  patch("business_core.roadmap_template_manager.find_roadmap_template_by_id",
                        return_value={"template_id": "RMT-IZH-ALM-STANDARD-002",
@@ -136,16 +145,12 @@ class TestExplicitTemplateId(unittest.TestCase):
                                      "template_name": "Обычный путь / с законченными СМР"}), \
                  patch("business_core.roadmap_template_manager.find_roadmap_templates_by_service",
                        return_value=[]), \
-                 patch("business_core.service_manager.find_service_by_id", return_value=None), \
-                 patch("business_core.roadmap_template_manager.create_stages_from_template_record",
-                       side_effect=mock_stages), \
-                 patch("business_core.roadmap_manager.create_roadmap_stages_from_template",
-                       return_value={"stages_count": 0}):
+                 patch("business_core.service_manager.find_service_by_id", return_value=None):
                 await cmd(upd, ctx)
+                self.assertEqual(mock_create_rm.call_args.kwargs["template_id"], "RMT-IZH-ALM-STANDARD-002",
+                                 "create_roadmap_for_object должен вызываться с явным template_id")
 
         _run(run())
-        self.assertEqual(stages_calls, ["RMT-IZH-ALM-STANDARD-002"],
-                         "create_stages_from_template_record должен вызываться с явным template_id")
         reply = _last_reply(upd)
         self.assertIn("RM-101", reply)
         self.assertIn("RMT-IZH-ALM-STANDARD-002", reply)
@@ -163,7 +168,13 @@ class TestExplicitTemplateId(unittest.TestCase):
                  patch("business_core.business_builder.find_object_by_id",
                        return_value={"obj_id": "OBJ-001", "biz_id": "BIZ-001", "client_id": "PRS-001"}), \
                  patch("business_core.business_builder.create_roadmap_for_object",
-                       return_value={"ok": True, "roadmap_id": "RM-102", "error": None}), \
+                       return_value={
+                           "ok": True, "roadmap_id": "RM-102", "error": None,
+                           "core_created": True, "stages_created": True,
+                           "stages_count": 15, "stage_ids": [], "used_template": True,
+                           "relation_copy_errors": (), "relation_copy_created_count": 0,
+                           "partial_success": False, "partial_failure": False, "warnings": (),
+                       }), \
                  patch("business_core.business_builder.update_object_roadmap_id"), \
                  patch("business_core.roadmap_template_manager.find_roadmap_template_by_id",
                        return_value={"template_id": "RMT-IZH-ALM-STANDARD-001",
@@ -171,11 +182,7 @@ class TestExplicitTemplateId(unittest.TestCase):
                                      "template_name": "Обычный путь / с проведением СМР"}), \
                  patch("business_core.roadmap_template_manager.find_roadmap_templates_by_service",
                        return_value=[]), \
-                 patch("business_core.service_manager.find_service_by_id", return_value=None), \
-                 patch("business_core.roadmap_template_manager.create_stages_from_template_record",
-                       return_value={"ok": True, "stages_count": 15, "warning": None, "stage_ids": []}), \
-                 patch("business_core.roadmap_manager.create_roadmap_stages_from_template",
-                       return_value={"stages_count": 0}):
+                 patch("business_core.service_manager.find_service_by_id", return_value=None):
                 await cmd(upd, ctx)
 
         _run(run())
@@ -361,40 +368,43 @@ class TestMultipleTemplates(unittest.TestCase):
         self.assertIn("RMT-IZH-ALM-STANDARD-002", all_replies)
 
     def test_5_first_template_still_used_as_fallback(self):
-        """5: при нескольких шаблонах без template_id — всё равно создаётся roadmap."""
+        """5: при нескольких шаблонах без template_id — всё равно создаётся roadmap.
+
+        Phase 28C: asserts the auto-selected (first) template_id is
+        the one passed to create_roadmap_for_object, since stage
+        creation from it now happens inside that function rather than
+        via a direct create_stages_from_template_record call from this
+        handler."""
         cmd = _fresh_handlers()
         upd, ctx = _make_update(
             "/startroadmap obj_id=OBJ-001 service_id=SVC-IZH-001",
             ["obj_id=OBJ-001", "service_id=SVC-IZH-001"],
         )
-        stages_calls = []
-
-        def mock_stages(roadmap_id, template_id):
-            stages_calls.append(template_id)
-            return {"ok": True, "stages_count": 12, "warning": None, "stage_ids": []}
 
         async def run():
             with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
                  patch("business_core.business_builder.find_object_by_id",
                        return_value={"obj_id": "OBJ-001", "biz_id": "BIZ-001", "client_id": "PRS-001"}), \
                  patch("business_core.business_builder.create_roadmap_for_object",
-                       return_value={"ok": True, "roadmap_id": "RM-201", "error": None}), \
+                       return_value={
+                           "ok": True, "roadmap_id": "RM-201", "error": None,
+                           "core_created": True, "stages_created": True,
+                           "stages_count": 12, "stage_ids": [], "used_template": True,
+                           "relation_copy_errors": (), "relation_copy_created_count": 0,
+                           "partial_success": False, "partial_failure": False, "warnings": (),
+                       }) as mock_create_rm, \
                  patch("business_core.business_builder.update_object_roadmap_id"), \
                  patch("business_core.service_manager.find_service_by_id",
                        return_value={"service_id": "SVC-IZH-001", "default_roadmap_template_id": ""}), \
                  patch("business_core.roadmap_template_manager.find_roadmap_template_by_id",
                        return_value=None), \
                  patch("business_core.roadmap_template_manager.find_roadmap_templates_by_service",
-                       return_value=self._three_templates()), \
-                 patch("business_core.roadmap_template_manager.create_stages_from_template_record",
-                       side_effect=mock_stages), \
-                 patch("business_core.roadmap_manager.create_roadmap_stages_from_template",
-                       return_value={"stages_count": 0}):
+                       return_value=self._three_templates()):
                 await cmd(upd, ctx)
+                # Должен использоваться первый шаблон
+                self.assertEqual(mock_create_rm.call_args.kwargs["template_id"], "RMT-IZH-ALM-LEGALIZATION-001")
 
         _run(run())
-        # Должен использоваться первый шаблон
-        self.assertIn("RMT-IZH-ALM-LEGALIZATION-001", stages_calls)
 
     def test_5_single_template_no_hint(self):
         """5: при одном шаблоне — подсказка со списком не нужна (не падает)."""

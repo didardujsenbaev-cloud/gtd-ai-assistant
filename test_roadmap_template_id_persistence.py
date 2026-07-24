@@ -105,7 +105,7 @@ class TestTemplateIdWrite(unittest.TestCase):
         with patch("business_core.sheets.get_business_sheet", return_value=sheet), \
              patch("business_core.sheets.append_business_row",
                    side_effect=lambda k, r: rows.append((k, r))), \
-             patch.object(bb, "generate_roadmap_id", return_value="RM-500"):
+             patch("business_core.sheets.generate_next_id", return_value="RM-500"):
             result = bb.create_roadmap_for_object(
                 obj_id="OBJ-001", biz_id="BIZ-001", client_id="PRS-001",
                 service_id="SVC-IZH-001", case_type="legalization",
@@ -145,7 +145,7 @@ class TestTemplateIdWrite(unittest.TestCase):
         with patch("business_core.sheets.get_business_sheet", return_value=sheet), \
              patch("business_core.sheets.append_business_row",
                    side_effect=lambda k, r: rows.append((k, r))), \
-             patch.object(bb, "generate_roadmap_id", return_value="RM-503"):
+             patch("business_core.sheets.generate_next_id", return_value="RM-503"):
             result = bb.create_roadmap_for_object(
                 obj_id="OBJ-009", biz_id="BIZ-001", client_id="PRS-001",
                 service_id="SVC-IZH-001", case_type="general",
@@ -169,7 +169,7 @@ class TestTemplateIdWrite(unittest.TestCase):
         with patch("business_core.sheets.get_business_sheet", return_value=sheet), \
              patch("business_core.sheets.append_business_row",
                    side_effect=lambda k, r: rows.append((k, r))), \
-             patch.object(bb, "generate_roadmap_id", return_value="RM-501"):
+             patch("business_core.sheets.generate_next_id", return_value="RM-501"):
             result = bb.create_roadmap_for_object(
                 obj_id="OBJ-002", biz_id="BIZ-001", client_id="PRS-001",
                 service_id="SVC-IZH-001",
@@ -192,7 +192,7 @@ class TestTemplateIdWrite(unittest.TestCase):
         with patch("business_core.sheets.get_business_sheet", return_value=sheet), \
              patch("business_core.sheets.append_business_row",
                    side_effect=lambda k, r: rows.append((k, r))), \
-             patch.object(bb, "generate_roadmap_id", return_value="RM-504"):
+             patch("business_core.sheets.generate_next_id", return_value="RM-504"):
             result = bb.create_roadmap_for_object(
                 obj_id="OBJ-010", biz_id="BIZ-001", client_id="PRS-001",
                 service_id="SVC-IZH-001", template_id="RMT-X",
@@ -376,18 +376,23 @@ class TestEndToEndStartroadmapToMilestones(unittest.TestCase):
 
         self.assertEqual(captured.get("template_id"), "RMT-IZH-ALM-STANDARD-002",
                          "startroadmap_cmd должен передавать явный template_id в create_roadmap_for_object")
-        self.assertEqual(stages_calls, ["RMT-IZH-ALM-STANDARD-002"])
+        # Phase 28C: stage creation from this template_id now happens
+        # INSIDE create_roadmap_for_object (faked above as a whole, so
+        # create_stages_from_template_record is never actually reached
+        # from this handler) — the template_id-propagation assertion
+        # above (captured["template_id"]) is what proves the fix this
+        # test exists for.
 
         # ── Roadmap теперь "существует" с тем template_id, что реально сохранился ──
         persisted_roadmap = {
-            "roadmap_id": "RM-300", "biz_id": "BIZ-001", "service_id": "SVC-IZH-001",
-            "client_id": "PRS-001", "title": "Roadmap OBJ-001", "status": "active",
-            "created": "2026-07-16", "obj_id": "OBJ-001", "case_type": "general",
+            "roadmap_id": "RM-300", "business_id": "BIZ-001", "service_id": "SVC-IZH-001",
+            "client_id": "PRS-001", "client_name": "Roadmap OBJ-001", "status": "active",
+            "created": "2026-07-16", "object_id": "OBJ-001", "case_type": "general",
             "notes": "", "progress": "0",
             "template_id": captured["template_id"],
         }
 
-        with patch("business_core.business_builder.find_roadmap_by_id",
+        with patch("business_core.roadmap_manager.find_roadmap_by_id",
                    return_value=persisted_roadmap), \
              patch("business_core.roadmap_manager.get_stages_for_roadmap",
                    return_value=FAKE_STAGES):
@@ -432,7 +437,7 @@ class TestBackwardCompatibilityOldRoadmaps(unittest.TestCase):
             "roadmap_id": "RM-022", "service_id": "SVC-IZH-001",
             "notes": "", "case_type": "legalization",
         }
-        with patch("business_core.business_builder.find_roadmap_by_id",
+        with patch("business_core.roadmap_manager.find_roadmap_by_id",
                    return_value=old_roadmap), \
              patch("business_core.service_manager.find_service_by_id",
                    return_value={"service_id": "SVC-IZH-001",

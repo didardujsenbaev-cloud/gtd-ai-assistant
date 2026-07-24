@@ -353,6 +353,16 @@ def _increment_template_stages_count(template_id: str) -> None:
 def find_template_stages(template_id: str) -> list[dict]:
     """
     Получить все этапы шаблона, отсортированные по Order.
+
+    Phase 28E: also returns each stage's own knowledge-ID columns
+    (sop_ids/checklist_ids/material_ids/document_template_ids/faq_ids,
+    each a list[str]) — read directly from this same ROADMAP_TEMPLATE_STAGES
+    row, since this module already owns that registry. This replaces
+    the former business_core.knowledge_manager.find_knowledge_by_template_stage()
+    call that create_stages_from_template_record() used to make — that
+    was a Core -> Extension read dependency for data that physically
+    lives in a registry this module already owns; no Extension import
+    is needed to read a column of your own sheet.
     """
     if not template_id:
         return []
@@ -370,6 +380,10 @@ def find_template_stages(template_id: str) -> list[dict]:
             except IndexError:
                 return ""
 
+        def _ids(row, h):
+            val = _g(row, h)
+            return [x.strip() for x in val.split(",") if x.strip()]
+
         t_col   = headers.index("Template ID") if "Template ID" in headers else None
         results = []
         for row in all_values[1:]:
@@ -386,6 +400,11 @@ def find_template_stages(template_id: str) -> list[dict]:
                     "responsible":   _g(row, "Responsible"),
                     "estimated_days":_g(row, "Estimated Days"),
                     "notes":         _g(row, "Notes"),
+                    "sop_ids":               _ids(row, "SOP IDs"),
+                    "checklist_ids":         _ids(row, "Checklist IDs"),
+                    "material_ids":          _ids(row, "Materials IDs"),
+                    "document_template_ids": _ids(row, "Document Template IDs"),
+                    "faq_ids":               _ids(row, "FAQ IDs"),
                 })
         results.sort(key=lambda x: int(x["order"]) if x["order"].isdigit() else 0)
         return results
@@ -405,30 +424,42 @@ def create_stages_from_template_record(roadmap_id: str, template_id: str) -> dic
     В отличие от create_roadmap_stages_from_template (который использует
     встроенные ROADMAP_TEMPLATES), этот метод читает этапы из Google Sheets.
 
+    Phase 28D/28E: this function no longer writes ROADMAP_STAGES itself
+    and no longer imports business_core.knowledge_manager or
+    business_core.stage_entity_relations. It now reads the template
+    stages (via find_template_stages(), which since Phase 28E also
+    carries each stage's own knowledge-ID columns) and delegates the
+    actual Stage row creation to business_core.roadmap_manager.
+    ensure_roadmap_stages() — the single approved owner of
+    ROADMAP_STAGES writes. This is a Core -> Core call (Roadmap Template
+    Manager -> Roadmap Manager), not a layering violation.
+
+    Relation-copying (business_core.stage_entity_relations.
+    copy_template_relations_to_stage(), previously done inline here) is
+    an Extension-layer concern and has moved to the orchestrator,
+    business_core.business_builder.create_roadmap_for_object() — this
+    function itself never calls it anymore. "partial_success"/
+    "relation_copy_errors"/"relation_copy_created_count" are kept in
+    the return shape for backward compatibility with any caller still
+    reading those keys, but are now always the neutral/empty values
+    below, since this function performs no relation-copying of its own.
+
     Returns:
         {
             "ok":           bool,
             "stages_count": int,
             "warning":      str | None,
             "stage_ids":    list[str],
-            # Phase 18C-3 (hardened in Phase 18D after a real production
-            # defect): additive, only present once at least one stage
-            # row was actually created this call. "ok"/"stages_count"
-            # always reflect the STAGE rows alone — a relation-copy
-            # failure (expected or unexpected, including a transient API
-            # error) NEVER flips "ok" to False or "stages_count" to 0,
-            # since the stages themselves are already committed by that
-            # point. "partial_success" is the single boolean signal that
-            # stages succeeded but at least one relation copy did not.
-            "partial_success":             bool,
-            "relation_copy_errors":        tuple,  # (stage_id, template_stage_id, errors) per failed stage
-            "relation_copy_created_count": int,
+            "partial_success":             bool,   # always False — see above
+            "relation_copy_errors":        tuple,   # always () — see above
+            "relation_copy_created_count": int,     # always 0 — see above
         }
     """
     if not roadmap_id or not template_id:
         return {
             "ok": False, "stages_count": 0,
             "warning": "roadmap_id и template_id обязательны", "stage_ids": [],
+            "partial_success": False, "relation_copy_errors": (), "relation_copy_created_count": 0,
         }
 
     template_stages = find_template_stages(template_id)
@@ -437,111 +468,28 @@ def create_stages_from_template_record(roadmap_id: str, template_id: str) -> dic
             "ok": True, "stages_count": 0,
             "warning": f"Шаблон {template_id} не содержит этапов.",
             "stage_ids": [],
+            "partial_success": False, "relation_copy_errors": (), "relation_copy_created_count": 0,
         }
 
     try:
-        from business_core.sheets import (
-            batch_append_business_rows,
-            generate_next_ids,
-            get_business_sheet,
-            row_from_header_map,
-        )
-        from business_core.knowledge_manager import find_knowledge_by_template_stage
-        now       = datetime.now().strftime("%Y-%m-%d %H:%M")
-        stage_ids = []
-        rows      = []
+        from business_core.roadmap_manager import ensure_roadmap_stages
 
-        # Phase 10.2B.1: строка формируется по ФАКТИЧЕСКИМ заголовкам
-        # листа ROADMAP_STAGES, а не по жёсткой позиции — не зависит от
-        # порядка колонок и не молчит, если ожидаемая колонка отсутствует.
-        sheet   = get_business_sheet("roadmap_stages")
-        headers = sheet.row_values(1)
-
-        # Phase 11F: все Stage ID для этого batch резервируются ОДНИМ
-        # чтением листа до цикла — иначе generate_next_id() внутри цикла
-        # видел бы одно и то же (ещё не записанное) состояние листа на
-        # каждой итерации и вернул бы один и тот же ID для всех строк
-        # (см. Phase 11E production bug).
-        new_stage_ids = generate_next_ids("roadmap_stages", len(template_stages))
-
-        for ts, stage_id in zip(template_stages, new_stage_ids):
-            template_stage_id = ts.get("stage_id", "")
-
-            # Получаем knowledge IDs из шаблонного этапа
-            knowledge        = find_knowledge_by_template_stage(template_stage_id) if template_stage_id else {}
-            sop_ids          = ",".join(knowledge.get("sop_ids",               []))
-            checklist_ids    = ",".join(knowledge.get("checklist_ids",         []))
-            material_ids     = ",".join(knowledge.get("material_ids",          []))
-            doc_template_ids = ",".join(knowledge.get("document_template_ids", []))
-            faq_ids          = ",".join(knowledge.get("faq_ids",               []))
-
-            values = {
-                "Stage ID":     stage_id,
-                "Roadmap ID":   roadmap_id,
-                "Order":        ts.get("order", ""),
-                "Name":         ts.get("stage_name", ""),
-                "Status":       "pending",
-                "Responsible":  ts.get("responsible", ""),
-                "Docs Required": ts.get("required_docs", ""),
-                "Notes":        ts.get("notes", ""),
-                # Phase 8C: knowledge IDs скопированы из шаблона
-                "SOP IDs":                 sop_ids,
-                "Checklist IDs":           checklist_ids,
-                "Materials IDs":           material_ids,
-                "Document Template IDs":   doc_template_ids,
-                "FAQ IDs":                 faq_ids,
-                # Due Date / Completed At / GTD Action ID / Docs Received
-                # намеренно не переданы — остаются "" (как и раньше).
+        result = ensure_roadmap_stages(roadmap_id, template_stages)
+        if not result["ok"]:
+            return {
+                "ok": False, "stages_count": 0,
+                "warning": result.get("error", ""), "stage_ids": [],
+                "partial_success": False, "relation_copy_errors": (), "relation_copy_created_count": 0,
             }
-            row = row_from_header_map(headers, values)
-            rows.append(row)
-            stage_ids.append(stage_id)
-
-        # Batch-запись всех этапов одним API-вызовом вместо N отдельных
-        if rows:
-            batch_append_business_rows("roadmap_stages", rows)
-
-        # Phase 18C-3: копируем активные STAGE_ENTITY_RELATIONS шаблонного
-        # этапа в новые instance-relations — ТОЛЬКО после того, как все
-        # ROADMAP_STAGES строки этого batch уже записаны выше (никогда не
-        # раньше, чем существует целевая строка). Ошибка копирования
-        # relation-строк НЕ считается провалом создания самих этапов
-        # (они уже реально созданы) — она видна отдельно через
-        # "relation_copy_errors"/"partial_success", не через "ok".
-        #
-        # Phase 18D production defect fix: each iteration is wrapped in
-        # its OWN try/except. Before this fix, an unexpected exception
-        # from copy_template_relations_to_stage() (e.g. a transient
-        # Google Sheets API quota error, observed live in Phase 18D)
-        # propagated all the way to this function's outer except block,
-        # which then returned ok=False/stages_count=0 — even though the
-        # 8 ROADMAP_STAGES rows had already been committed successfully
-        # moments earlier. That silently misreported a real, partial
-        # success as a total failure, risking a duplicate-stage retry.
-        relation_copy_errors: list[tuple] = []
-        relation_copy_created_count = 0
-        if rows:
-            from business_core.stage_entity_relations import copy_template_relations_to_stage
-            for ts, stage_id in zip(template_stages, new_stage_ids):
-                template_stage_id = ts.get("stage_id", "")
-                if not template_stage_id:
-                    continue
-                try:
-                    result = copy_template_relations_to_stage(template_stage_id, stage_id)
-                    relation_copy_created_count += len(result.created)
-                    if not result.ok:
-                        relation_copy_errors.append((stage_id, template_stage_id, result.errors))
-                except Exception as exc:
-                    relation_copy_errors.append((stage_id, template_stage_id, (str(exc),)))
 
         return {
             "ok": True,
-            "stages_count": len(stage_ids),
+            "stages_count": result["created_count"],
             "warning": None,
-            "partial_success": bool(relation_copy_errors),
-            "stage_ids": stage_ids,
-            "relation_copy_errors": tuple(relation_copy_errors),
-            "relation_copy_created_count": relation_copy_created_count,
+            "stage_ids": result["created_stage_ids"],
+            "partial_success": False,
+            "relation_copy_errors": (),
+            "relation_copy_created_count": 0,
         }
 
     except Exception as exc:
@@ -549,4 +497,105 @@ def create_stages_from_template_record(roadmap_id: str, template_id: str) -> dic
         return {
             "ok": False, "stages_count": 0,
             "warning": str(exc), "stage_ids": [],
+            "partial_success": False, "relation_copy_errors": (), "relation_copy_created_count": 0,
         }
+
+
+# ═══════════════════════════════════════════════════════════════
+# Phase 28F: Template Stage knowledge-ID ownership.
+#
+# ROADMAP_TEMPLATE_STAGES is owned exclusively by this module. Before
+# Phase 28F, business_core.knowledge_manager.link_knowledge_to_template_stage()
+# wrote directly to this sheet via update_cell() — an Extension-layer
+# module writing a Core registry. This function is the sole owner API
+# for that write; knowledge_manager now calls it instead of touching
+# the sheet itself.
+# ═══════════════════════════════════════════════════════════════
+
+def _merge_id_list(existing: str, new_ids: list[str]) -> str:
+    """
+    Union existing comma-separated IDs with new_ids, de-duplicated,
+    order-preserving. Local, intentional duplicate of business_core.
+    knowledge_manager._merge_ids()'s exact logic — kept private and
+    self-contained here rather than imported, matching the same
+    reasoning as business_core.stage_entity_relations._parse_legacy_id_list()
+    (Phase 26B): the write now belongs to this module, so its merge
+    logic does too.
+    """
+    parts = [x.strip() for x in existing.split(",") if x.strip()]
+    result = list(parts)
+    for nid in new_ids:
+        nid = nid.strip()
+        if nid and nid not in result:
+            result.append(nid)
+    return ",".join(result)
+
+
+def update_template_stage_knowledge_ids(
+    template_stage_id: str,
+    sop_ids: list[str] | None = None,
+    checklist_ids: list[str] | None = None,
+    material_ids: list[str] | None = None,
+    document_template_ids: list[str] | None = None,
+    faq_ids: list[str] | None = None,
+) -> dict:
+    """
+    Merge (union, never overwrite) knowledge IDs into one
+    ROADMAP_TEMPLATE_STAGES row's SOP IDs / Checklist IDs /
+    Materials IDs / Document Template IDs / FAQ IDs columns.
+
+    Header-mapped: column positions are read from the sheet's actual
+    header row, never assumed by position. Only columns for which
+    new IDs were actually passed are touched; a column already
+    containing all of the given IDs is left unwritten (no-op merge).
+
+    Returns:
+        {"ok": bool, "updated": bool, "error": str | None}
+    """
+    if not template_stage_id:
+        return {"ok": False, "updated": False, "error": "template_stage_id обязателен"}
+
+    knowledge_map = {
+        "SOP IDs":               sop_ids or [],
+        "Checklist IDs":         checklist_ids or [],
+        "Materials IDs":         material_ids or [],
+        "Document Template IDs": document_template_ids or [],
+        "FAQ IDs":               faq_ids or [],
+    }
+    if all(not v for v in knowledge_map.values()):
+        return {"ok": True, "updated": False, "error": None}
+
+    try:
+        from business_core.sheets import get_business_sheet
+        sheet      = get_business_sheet("roadmap_template_stages")
+        all_values = sheet.get_all_values()
+        if len(all_values) < 2:
+            return {"ok": False, "updated": False, "error": "Лист пуст"}
+        headers = all_values[0]
+
+        for i, row in enumerate(all_values[1:], start=2):
+            if not row or not row[0].strip():
+                continue
+            if row[0].strip() != template_stage_id:
+                continue
+
+            for col_name, new_ids in knowledge_map.items():
+                if not new_ids:
+                    continue
+                col_idx = headers.index(col_name) if col_name in headers else None
+                if col_idx is None:
+                    continue
+                existing = row[col_idx].strip() if col_idx < len(row) else ""
+                merged = _merge_id_list(existing, new_ids)
+                if merged != existing:
+                    sheet.update_cell(i, col_idx + 1, merged)
+
+            log.info(f"update_template_stage_knowledge_ids: {template_stage_id}")
+            return {"ok": True, "updated": True, "error": None}
+
+        return {"ok": False, "updated": False,
+                "error": f"Stage {template_stage_id} не найден"}
+
+    except Exception as exc:
+        log.error(f"update_template_stage_knowledge_ids({template_stage_id}) error: {exc}")
+        return {"ok": False, "updated": False, "error": str(exc)}

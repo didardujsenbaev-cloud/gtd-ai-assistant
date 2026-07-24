@@ -209,6 +209,171 @@ class TestCreateRoadmapForObject(unittest.TestCase):
         self.assertFalse(result["ok"])
 
 
+class TestCreateRoadmapForObjectExtensionOrchestration(unittest.TestCase):
+    """
+    Phase 28C/28E: create_roadmap_for_object() is now the single
+    orchestration entry point — it calls roadmap_manager.create_roadmap_record()
+    (never writes ROADMAPS itself), reads Template Stage rows via
+    roadmap_template_manager.find_template_stages(), calls roadmap_manager.
+    ensure_roadmap_stages() for Stage creation, and — as the orchestrator,
+    not Core — calls stage_entity_relations.copy_template_relations_to_stage()
+    directly for newly created stages. Extension (relation-copy) failures
+    must never hide that the Roadmap/Stages were genuinely created.
+    """
+
+    def _reload_bb(self):
+        for key in list(sys.modules.keys()):
+            if "business_core" in key:
+                del sys.modules[key]
+        import business_core.business_builder as bb
+        return bb
+
+    def _template_rows(self):
+        return [
+            {"stage_id": "TSTG-001", "order": "1", "stage_name": "Этап 1",
+             "required_docs": "", "responsible": "", "notes": ""},
+            {"stage_id": "TSTG-002", "order": "2", "stage_name": "Этап 2",
+             "required_docs": "", "responsible": "", "notes": ""},
+        ]
+
+    def test_calls_roadmap_manager_create_roadmap_record_not_raw_sheets(self):
+        bb = self._reload_bb()
+        with patch("business_core.roadmap_manager.create_roadmap_record",
+                   return_value={"ok": True, "roadmap_id": "RM-900", "roadmap": {}, "error": None}) as mock_create, \
+             patch("business_core.roadmap_template_manager.find_template_stages", return_value=[]), \
+             patch("business_core.sheets.append_business_row") as mock_append:
+            result = bb.create_roadmap_for_object(
+                obj_id="OBJ-900", biz_id="BIZ-001", client_id="PRS-001",
+                service_id="SVC-001", template_id="RMT-001",
+            )
+        self.assertTrue(result["ok"])
+        mock_create.assert_called_once()
+        mock_append.assert_not_called()
+
+    def test_extension_relation_copy_failure_is_visible_but_core_still_ok(self):
+        """Extension failure must never be reported as if nothing was
+        created — ok stays True (Core succeeded), partial_failure/
+        partial_success become True, and the error is visible in
+        relation_copy_errors."""
+        bb = self._reload_bb()
+
+        def failing_copy(template_stage_id, stage_id):
+            raise RuntimeError("simulated transient relation-copy failure")
+
+        with patch("business_core.roadmap_manager.create_roadmap_record",
+                   return_value={"ok": True, "roadmap_id": "RM-901", "roadmap": {}, "error": None}), \
+             patch("business_core.roadmap_template_manager.find_template_stages",
+                   return_value=self._template_rows()), \
+             patch("business_core.roadmap_manager.ensure_roadmap_stages",
+                   return_value={
+                       "ok": True, "roadmap_id": "RM-901",
+                       "created_stage_ids": ["STAGE-001", "STAGE-002"],
+                       "created_from_orders": [1, 2],
+                       "existing_stage_ids": [], "created_count": 2, "existing_count": 0,
+                       "total_count": 2, "error": None,
+                   }), \
+             patch("business_core.stage_entity_relations.copy_template_relations_to_stage",
+                   side_effect=failing_copy):
+            result = bb.create_roadmap_for_object(
+                obj_id="OBJ-901", biz_id="BIZ-001", client_id="PRS-001",
+                service_id="SVC-001", template_id="RMT-001",
+            )
+
+        self.assertTrue(result["ok"], "Core (Roadmap + Stages) succeeded — ok must stay True")
+        self.assertTrue(result["core_created"])
+        self.assertTrue(result["stages_created"])
+        self.assertEqual(result["stages_count"], 2)
+        self.assertTrue(result["partial_success"])
+        self.assertTrue(result["partial_failure"])
+        self.assertEqual(len(result["relation_copy_errors"]), 2)
+        for stage_id, template_stage_id, errors in result["relation_copy_errors"]:
+            self.assertIn("simulated transient relation-copy failure", str(errors))
+
+    def test_relation_copy_success_reports_no_partial_failure(self):
+        from business_core.stage_entity_relations import CopyRelationsResult
+        bb = self._reload_bb()
+
+        def ok_copy(template_stage_id, stage_id):
+            return CopyRelationsResult(template_stage_id=template_stage_id, stage_id=stage_id, created=())
+
+        with patch("business_core.roadmap_manager.create_roadmap_record",
+                   return_value={"ok": True, "roadmap_id": "RM-902", "roadmap": {}, "error": None}), \
+             patch("business_core.roadmap_template_manager.find_template_stages",
+                   return_value=self._template_rows()), \
+             patch("business_core.roadmap_manager.ensure_roadmap_stages",
+                   return_value={
+                       "ok": True, "roadmap_id": "RM-902",
+                       "created_stage_ids": ["STAGE-001", "STAGE-002"],
+                       "created_from_orders": [1, 2],
+                       "existing_stage_ids": [], "created_count": 2, "existing_count": 0,
+                       "total_count": 2, "error": None,
+                   }), \
+             patch("business_core.stage_entity_relations.copy_template_relations_to_stage",
+                   side_effect=ok_copy) as mock_copy:
+            result = bb.create_roadmap_for_object(
+                obj_id="OBJ-902", biz_id="BIZ-001", client_id="PRS-001",
+                service_id="SVC-001", template_id="RMT-001",
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["partial_success"])
+        self.assertFalse(result["partial_failure"])
+        self.assertEqual(result["relation_copy_errors"], ())
+        self.assertEqual(mock_copy.call_count, 2)
+        self.assertEqual(
+            [c.args for c in mock_copy.call_args_list],
+            [("TSTG-001", "STAGE-001"), ("TSTG-002", "STAGE-002")],
+        )
+
+    def test_retry_with_no_new_stages_does_not_call_relation_copy_again(self):
+        """Idempotent retry: if ensure_roadmap_stages reports zero newly
+        created stages (everything already existed), relation-copy is
+        not attempted again for them — matches ensure_roadmap_stages's
+        own idempotency guarantee."""
+        bb = self._reload_bb()
+
+        with patch("business_core.roadmap_manager.create_roadmap_record",
+                   return_value={"ok": True, "roadmap_id": "RM-903", "roadmap": {}, "error": None}), \
+             patch("business_core.roadmap_template_manager.find_template_stages",
+                   return_value=self._template_rows()), \
+             patch("business_core.roadmap_manager.ensure_roadmap_stages",
+                   return_value={
+                       "ok": True, "roadmap_id": "RM-903",
+                       "created_stage_ids": [], "created_from_orders": [],
+                       "existing_stage_ids": ["STAGE-001", "STAGE-002"],
+                       "created_count": 0, "existing_count": 2,
+                       "total_count": 2, "error": None,
+                   }), \
+             patch("business_core.stage_entity_relations.copy_template_relations_to_stage") as mock_copy:
+            result = bb.create_roadmap_for_object(
+                obj_id="OBJ-903", biz_id="BIZ-001", client_id="PRS-001",
+                service_id="SVC-001", template_id="RMT-001",
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["stages_count"], 0)
+        mock_copy.assert_not_called()
+
+    def test_does_not_import_extension_modules_at_module_level(self):
+        """business_builder.py is the orchestrator, not Core — it IS
+        allowed to import Extension modules (unlike roadmap_manager.py/
+        roadmap_template_manager.py), and does so, function-locally,
+        only inside create_roadmap_for_object's relation-copy branch."""
+        import ast
+        bb = self._reload_bb()
+        import inspect
+        src = inspect.getsource(bb)
+        tree = ast.parse(src)
+        module_level_imports = set()
+        for node in tree.body:
+            if isinstance(node, ast.ImportFrom) and node.module:
+                module_level_imports.add(node.module.split(".")[-1])
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    module_level_imports.add(alias.name.split(".")[-1])
+        self.assertNotIn("stage_entity_relations", module_level_imports)
+
+
 # ────────────────────────────────────────────────────────────
 # E: update_object_roadmap_id
 # ────────────────────────────────────────────────────────────
@@ -621,7 +786,22 @@ class TestStartRoadmapCommand(unittest.TestCase):
         mock_find_obj.return_value = {
             "obj_id": "OBJ-001", "biz_id": "BIZ-001", "client_id": "PRS-001",
         }
-        mock_create_rm.return_value = {"ok": True, "roadmap_id": "RM-001", "error": None}
+        # Phase 28C: create_roadmap_for_object is now the single
+        # orchestration entry point — it creates the Roadmap AND the
+        # Stages internally, so its own mocked return value carries
+        # stages_count/used_template. create_roadmap_stages_from_template
+        # (mock_stages) is no longer called directly from startroadmap_cmd
+        # at all (that call, if any, now happens inside
+        # create_roadmap_for_object, which is mocked as a whole here) —
+        # kept patched only so a stray real call would be caught, not to
+        # assert it's invoked.
+        mock_create_rm.return_value = {
+            "ok": True, "roadmap_id": "RM-001", "error": None,
+            "core_created": True, "stages_created": True,
+            "stages_count": 11, "stage_ids": [], "used_template": False,
+            "relation_copy_errors": (), "relation_copy_created_count": 0,
+            "partial_success": False, "partial_failure": False, "warnings": (),
+        }
         mock_stages.return_value    = {
             "ok": True, "stages_count": 11, "warning": None, "stage_ids": [],
         }
@@ -639,10 +819,16 @@ class TestStartRoadmapCommand(unittest.TestCase):
         self.assertEqual(call_kwargs.kwargs.get("obj_id") or call_kwargs[1].get("obj_id", ""), "OBJ-001")
 
     def test_J_startroadmap_creates_stages(self):
-        """J: /startroadmap создает stages."""
+        """J: /startroadmap показывает количество созданных stages
+        (Phase 28C: stage creation now happens inside
+        create_roadmap_for_object itself, so this asserts the reply
+        reflects its mocked stages_count rather than asserting a direct
+        call to create_roadmap_stages_from_template)."""
         import asyncio
         update, mock_find, mock_rm, mock_st, mock_upd = asyncio.run(self._run_startroadmap())
-        mock_st.assert_called_once_with("RM-001", "legalization_reconstruction_house")
+        mock_st.assert_not_called()
+        reply_text = update.message.reply_text.call_args[0][0]
+        self.assertIn("11", reply_text)
 
     def test_K_startroadmap_does_not_create_gtd_tasks(self):
         """K: /startroadmap НЕ создает GTD tasks."""
@@ -702,18 +888,7 @@ class TestShowRoadmapsCommand(unittest.TestCase):
             update.effective_chat.id  = 123
 
             with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
-                 patch("business_core.sheets.read_business_sheet", return_value=[{
-                     "Roadmap ID": "RM-001",
-                     "Business ID": "BIZ-001",
-                     "Service ID":  "SVC-001",
-                     "City":        "Алматы",
-                     "Client ID":   "PRS-001",
-                     "Client Name": "Test Client",
-                     "Status":      "active",
-                     "Progress %":  "50",
-                     "Object ID":   "OBJ-001",
-                     "Case Type":   "legalization_reconstruction_house",
-                 }]):
+                 patch("business_core.sheets.get_business_sheet", return_value=mock_ws):
                 await show_roadmaps(update, context)
 
             update.message.reply_text.assert_called_once()
@@ -734,14 +909,17 @@ class TestShowRoadmapsCommand(unittest.TestCase):
                     del sys.modules[key]
             from business_core.telegram_handlers import show_roadmaps
 
-            rows_data = [
-                {"Roadmap ID": "RM-001", "Object ID": "OBJ-001", "Status": "active",
-                 "Progress %": "0", "Client Name": "A", "Business ID": "", "City": "",
-                 "Service ID": "", "Case Type": ""},
-                {"Roadmap ID": "RM-002", "Object ID": "OBJ-002", "Status": "active",
-                 "Progress %": "0", "Client Name": "B", "Business ID": "", "City": "",
-                 "Service ID": "", "Case Type": ""},
+            row_1 = [
+                "RM-001", "", "", "", "", "A", "", "", "active", "", "", "0",
+                "", "", "", "", "", "", "", "", "", "", "", "",
+                "OBJ-001", "", "", "",
             ]
+            row_2 = [
+                "RM-002", "", "", "", "", "B", "", "", "active", "", "", "0",
+                "", "", "", "", "", "", "", "", "", "", "", "",
+                "OBJ-002", "", "", "",
+            ]
+            mock_ws = _make_roadmaps_sheet([row_1, row_2])
 
             update  = MagicMock()
             context = MagicMock()
@@ -750,7 +928,7 @@ class TestShowRoadmapsCommand(unittest.TestCase):
             update.effective_chat.id  = 123
 
             with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
-                 patch("business_core.sheets.read_business_sheet", return_value=rows_data):
+                 patch("business_core.sheets.get_business_sheet", return_value=mock_ws):
                 await show_roadmaps(update, context)
 
             msg = update.message.reply_text.call_args[0][0]

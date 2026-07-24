@@ -1,13 +1,22 @@
 """
-Phase 28A: Roadmap domain ownership architecture guards.
+Phase 28A/28CDEF: Roadmap domain ownership architecture guards.
 
-Source of truth: the Phase 27B architecture decision report. This file
-does not declare the CURRENT architecture correct — several known
-violations (documented in Phase 27A/27B) still exist and are pinned
-here as explicit, narrowly-scoped, phase-tagged debt so they cannot
-silently grow. Each debt entry names the exact phase that is expected
-to remove it. When that phase lands, the corresponding allowlist entry
-must be deleted (not widened) and the guard becomes strict.
+Source of truth: the Phase 27B architecture decision report. Phase
+28AB installed these guards with several documented, phase-tagged debt
+allowlists (business_builder.py/telegram_handlers.py writing ROADMAPS
+directly, roadmap_template_manager.py writing ROADMAP_STAGES and
+importing stage_entity_relations/knowledge_manager, knowledge_manager.py
+writing ROADMAP_TEMPLATE_STAGES directly, roadmap_manager.py importing
+business_builder). Phase 28CDEF resolved every one of those — this file
+now enforces the fully-strict target architecture with no debt
+allowlists remaining:
+
+  ROADMAPS writers                 == {roadmap_manager.py}
+  ROADMAP_STAGES writers           == {roadmap_manager.py}
+  roadmap_manager imports business_builder  == NO
+  roadmap_manager imports Extension          == NO
+  roadmap_template_manager imports Extension == NO
+  knowledge_manager direct Template Stage registry access == NO
 
 No network, no Google Sheets access — pure AST/source inspection of
 files already on disk.
@@ -24,11 +33,10 @@ BUSINESS_CORE = WORKSPACE / "business_core"
 
 # Extension-layer modules (ENGINEERING_STANDARDS.md: Organization,
 # Relation, Document, Knowledge, Automation, AI, Reporting, Integration)
-# that a Core Roadmap module must never import, now or after any future
-# phase. document_manager/materials_manager are included even though
-# grep shows no current file named exactly that — the rule is about the
-# module name, not today's file inventory, so a future rename/addition
-# is caught too.
+# that a Core Roadmap module must never import. document_manager/
+# materials_manager are included even though grep shows no current file
+# named exactly that — the rule is about the module name, not today's
+# file inventory, so a future rename/addition is caught too.
 FORBIDDEN_EXTENSION_MODULES = {
     "stage_entity_relations",
     "knowledge_manager",
@@ -70,12 +78,14 @@ def _imported_module_names(path: Path) -> set[str]:
     return names
 
 
-class TestRoadmapManagerHasZeroExtensionImports(unittest.TestCase):
+class TestRoadmapManagerHasZeroExtensionOrOrchestrationImports(unittest.TestCase):
     """roadmap_manager.py is Core (ENGINEERING_STANDARDS.md: Business ->
     Client -> Service -> Roadmap -> Stage). It must never import an
-    Extension-layer module. Phase 27A confirmed it clean here, and
-    Phase 28B's new additive API must not introduce any — this guard
-    has no debt allowlist because none is known to exist."""
+    Extension-layer module, Telegram, or business_builder. Phase 28E
+    removed the last remaining known exception (get_commercial_
+    milestones_for_roadmap's business_builder.find_roadmap_by_id usage,
+    replaced by this module's own Phase 28B find_roadmap_by_id) — this
+    guard is now fully strict, no debt allowlist."""
 
     def test_no_forbidden_extension_imports(self):
         path = BUSINESS_CORE / "roadmap_manager.py"
@@ -85,113 +95,34 @@ class TestRoadmapManagerHasZeroExtensionImports(unittest.TestCase):
             f"roadmap_manager.py must not import Extension-layer modules, found: {found}",
         )
 
-    def test_no_telegram_import(self):
-        path = BUSINESS_CORE / "roadmap_manager.py"
-        found = _imported_module_names(path) & {"telegram_handlers"}
-        self.assertEqual(
-            found, set(),
-            f"roadmap_manager.py must not import the Telegram layer, found: {found}",
-        )
-
-
-class TestRoadmapManagerOrchestrationDebtIsPinned(unittest.TestCase):
-    """
-    Phase 28A discovered (not previously flagged this precisely in
-    Phase 27A) that roadmap_manager.py's pre-existing
-    get_commercial_milestones_for_roadmap() imports
-    business_builder.find_roadmap_by_id() internally, to resolve a
-    Roadmap row before feeding it to _resolve_template_id(). This
-    predates Phase 28AB entirely and is a real, live, production-called
-    dependency (via /milestones) — not something safe to silently swap
-    for the new Phase 28B find_roadmap_by_id() in this phase, since the
-    two functions return different dict key names (business_builder's
-    "obj_id"/"biz_id"/"title" vs. this module's "object_id"/
-    "business_id"/"client_name"), and telegram_handlers.milestones_cmd
-    reads rm.get('obj_id')/rm.get('service_id') directly — swapping
-    without also updating that read site would silently break /milestones
-    display. Fixing this safely is Phase 28C's job (once business_builder
-    itself is being migrated anyway).
-
-    This guard does not approve the dependency — it only prevents any
-    OTHER orchestration import from being added to roadmap_manager.py
-    beyond this one, already-known, already-scoped case.
-    """
-
-    # temporary architectural debt — remove in Phase 28C
-    KNOWN_DEBT = {
-        "business_builder": "Phase 28C — get_commercial_milestones_for_roadmap's "
-                             "business_builder.find_roadmap_by_id usage; requires "
-                             "coordinated update of telegram_handlers.milestones_cmd's "
-                             "obj_id/service_id reads alongside the swap",
-    }
-
-    def test_orchestration_imports_match_known_debt_exactly(self):
+    def test_no_forbidden_orchestration_imports(self):
         path = BUSINESS_CORE / "roadmap_manager.py"
         found = _imported_module_names(path) & FORBIDDEN_ORCHESTRATION_MODULES
-        expected = set(self.KNOWN_DEBT.keys())
-
-        new_violations = found - expected
         self.assertEqual(
-            new_violations, set(),
-            f"roadmap_manager.py imports NEW, previously-undocumented "
-            f"orchestration modules beyond the known Phase 28C debt: {new_violations}",
-        )
-
-        resolved_early = expected - found
-        self.assertEqual(
-            resolved_early, set(),
-            f"Known debt entries {resolved_early} are no longer imported — "
-            f"update KNOWN_DEBT (see this class's docstring) to remove them.",
+            found, set(),
+            f"roadmap_manager.py must not import Telegram/orchestration modules, found: {found}",
         )
 
 
-class TestRoadmapTemplateManagerExtensionDebtIsPinned(unittest.TestCase):
-    """
-    roadmap_template_manager.py is also Core, but Phase 27A found it
-    currently imports two Extension-layer modules directly — a
-    confirmed, documented violation of the Core -> Extension
-    prohibition (ENGINEERING_STANDARDS.md §2). Phase 28E is the phase
-    committed to removing both.
+class TestRoadmapTemplateManagerHasZeroExtensionOrOrchestrationImports(unittest.TestCase):
+    """roadmap_template_manager.py is also Core. Phase 28E removed its
+    two known Extension imports (stage_entity_relations,
+    knowledge_manager) — find_template_stages() now reads knowledge-ID
+    columns directly (same-registry read, no Extension dependency) and
+    create_stages_from_template_record() delegates Stage creation to
+    roadmap_manager.ensure_roadmap_stages() (Core -> Core) instead of
+    writing ROADMAP_STAGES itself and copying relations inline. This
+    guard is now fully strict, no debt allowlist."""
 
-    This guard does NOT approve of the debt — it only prevents it from
-    growing. If the found set ever contains anything beyond exactly
-    these two entries, this test fails. If Phase 28E removes them
-    early, this test will fail too (found set becomes smaller than
-    expected) — at that point delete KNOWN_DEBT entries here and this
-    class stops applying (or convert it into a strict "must be empty"
-    guard, merging into the class above).
-    """
-
-    # temporary architectural debt — remove in Phase 28E
-    KNOWN_DEBT = {
-        "stage_entity_relations": "Phase 28E — Extension orchestration extraction",
-        "knowledge_manager":      "Phase 28E — Extension orchestration extraction",
-    }
-
-    def test_extension_imports_match_known_debt_exactly(self):
+    def test_no_forbidden_extension_imports(self):
         path = BUSINESS_CORE / "roadmap_template_manager.py"
         found = _imported_module_names(path) & FORBIDDEN_EXTENSION_MODULES
-        expected = set(self.KNOWN_DEBT.keys())
-
-        new_violations = found - expected
         self.assertEqual(
-            new_violations, set(),
-            f"roadmap_template_manager.py imports NEW, previously-undocumented "
-            f"Extension modules beyond the known Phase 28E debt: {new_violations}",
-        )
-
-        resolved_early = expected - found
-        self.assertEqual(
-            resolved_early, set(),
-            f"Known debt entries {resolved_early} are no longer imported — "
-            f"great, but this test file must be updated to remove them from "
-            f"KNOWN_DEBT (see this class's docstring) before this can be "
-            f"reported as passing.",
+            found, set(),
+            f"roadmap_template_manager.py must not import Extension-layer modules, found: {found}",
         )
 
     def test_no_forbidden_orchestration_imports(self):
-        """No known debt here — roadmap_template_manager.py must never
-        import Telegram or business_builder, now or later."""
         path = BUSINESS_CORE / "roadmap_template_manager.py"
         found = _imported_module_names(path) & FORBIDDEN_ORCHESTRATION_MODULES
         self.assertEqual(
@@ -251,77 +182,36 @@ _CANDIDATE_WRITER_FILES = [
 ]
 
 
-class TestRoadmapsRegistryWriteAllowlist(unittest.TestCase):
-    """
-    ROADMAPS ("roadmaps" sheet_key) target owner is roadmap_manager.py
-    (Phase 27B). Today it has two known non-owner writers — this guard
-    pins that exact set so a THIRD, undocumented writer cannot appear
-    silently before Phase 28C migrates the known ones away.
-    """
+class TestRoadmapsRegistryWriteOwnership(unittest.TestCase):
+    """ROADMAPS ("roadmaps" sheet_key) — Phase 28C migrated both
+    non-owner writers (business_builder.create_roadmap_for_object now
+    calls roadmap_manager.create_roadmap_record instead of writing
+    directly; telegram_handlers.newroadmap_confirm now calls
+    business_builder.create_roadmap_for_object instead of writing
+    directly). roadmap_manager.py is now the sole writer — fully
+    strict, no debt allowlist."""
 
-    # temporary architectural debt — remove in Phase 28C
-    EXPECTED_WRITERS = {
-        "business_builder.py":    "Phase 28C — orchestration writer, to migrate to roadmap_manager.create_roadmap_record",
-        "telegram_handlers.py":   "Phase 28C — legacy /newroadmap raw write, to migrate to the canonical path",
-        "roadmap_manager.py":     "approved owner — Phase 28B added create_roadmap_record (this phase)",
-    }
-
-    def test_writers_match_known_allowlist_exactly(self):
+    def test_only_roadmap_manager_writes_roadmaps(self):
         found = _files_writing_registry(_CANDIDATE_WRITER_FILES, {"roadmaps"})
-        expected = set(self.EXPECTED_WRITERS.keys())
-
-        unexpected = found - expected
         self.assertEqual(
-            unexpected, set(),
-            f"NEW, undocumented writer(s) of ROADMAPS found: {unexpected}. "
-            f"Every write to 'roadmaps' must go through roadmap_manager.py "
-            f"(Phase 27B) — if this is intentional, it must be reflected in "
-            f"a phase decision, not silently added.",
-        )
-
-        missing = expected - found
-        self.assertEqual(
-            missing, set(),
-            f"Expected writer(s) {missing} no longer write ROADMAPS — update "
-            f"EXPECTED_WRITERS (great progress, but keep this guard honest).",
+            found, {"roadmap_manager.py"},
+            f"ROADMAPS must be written only by roadmap_manager.py, found: {found}",
         )
 
 
-class TestRoadmapStagesRegistryWriteAllowlist(unittest.TestCase):
-    """
-    ROADMAP_STAGES ("roadmap_stages" sheet_key) target owner is
-    roadmap_manager.py (Phase 27B). Today it has three known non-owner-
-    consolidated writers (roadmap_manager.py itself already writes it
-    via the legacy create_roadmap_stages_from_template AND the new
-    Phase 28B ensure_roadmap_stages — both are the approved owner, so
-    that's fine) plus two other files with debt tagged for later
-    phases.
-    """
+class TestRoadmapStagesRegistryWriteOwnership(unittest.TestCase):
+    """ROADMAP_STAGES ("roadmap_stages" sheet_key) — Phase 28D/28C
+    migrated every non-owner writer: roadmap_template_manager.
+    create_stages_from_template_record() now delegates to roadmap_manager.
+    ensure_roadmap_stages() instead of writing directly; telegram_handlers.
+    newroadmap_confirm() no longer writes stages inline. roadmap_manager.py
+    is now the sole writer — fully strict, no debt allowlist."""
 
-    # temporary architectural debt — remove in Phase 28C/28D
-    EXPECTED_WRITERS = {
-        "roadmap_manager.py":          "approved owner — legacy create_roadmap_stages_from_template + Phase 28B ensure_roadmap_stages",
-        "roadmap_template_manager.py": "Phase 28D — Stage write consolidation into roadmap_manager",
-        "telegram_handlers.py":        "Phase 28C/28D — legacy /newroadmap inline stage creation",
-    }
-
-    def test_writers_match_known_allowlist_exactly(self):
+    def test_only_roadmap_manager_writes_roadmap_stages(self):
         found = _files_writing_registry(_CANDIDATE_WRITER_FILES, {"roadmap_stages"})
-        expected = set(self.EXPECTED_WRITERS.keys())
-
-        unexpected = found - expected
         self.assertEqual(
-            unexpected, set(),
-            f"NEW, undocumented writer(s) of ROADMAP_STAGES found: {unexpected}. "
-            f"Every write to 'roadmap_stages' must go through roadmap_manager.py "
-            f"(Phase 27B).",
-        )
-
-        missing = expected - found
-        self.assertEqual(
-            missing, set(),
-            f"Expected writer(s) {missing} no longer write ROADMAP_STAGES — "
-            f"update EXPECTED_WRITERS.",
+            found, {"roadmap_manager.py"},
+            f"ROADMAP_STAGES must be written only by roadmap_manager.py, found: {found}",
         )
 
 
@@ -329,12 +219,9 @@ def _functions_reading_and_writing(path: Path, read_sheet_key: str) -> set[str]:
     """
     Names of every function in `path` whose body BOTH calls
     get_business_sheet(read_sheet_key) AND calls update_cell(...)
-    anywhere within the same function — the exact shape of
-    knowledge_manager.link_knowledge_to_template_stage()'s direct write
-    to ROADMAP_TEMPLATE_STAGES (Phase 27A finding). Function-local, not
-    whole-module, since a file may legitimately READ a registry in one
-    function while a DIFFERENT function elsewhere writes an unrelated
-    one.
+    anywhere within the same function. Function-local, not whole-module,
+    since a file may legitimately READ a registry in one function while
+    a DIFFERENT function elsewhere writes an unrelated one.
     """
     src = path.read_text(encoding="utf-8")
     tree = ast.parse(src, str(path))
@@ -362,75 +249,107 @@ def _functions_reading_and_writing(path: Path, read_sheet_key: str) -> set[str]:
     return hits
 
 
-class TestRoadmapTemplateStagesDirectWriteDebtIsPinned(unittest.TestCase):
+class TestRoadmapTemplateStagesWriteOwnership(unittest.TestCase):
     """
     ROADMAP_TEMPLATE_STAGES target owner is roadmap_template_manager.py
-    (Phase 27B). Phase 27A found knowledge_manager.py writes it directly
-    via update_cell() inside link_knowledge_to_template_stage() — an
-    Extension-layer module writing a Core registry. Phase 28F is the
-    phase committed to removing this.
-
-    Narrowly scoped to the two files actually implicated, using a
-    function-level (not whole-module) correlation of
-    get_business_sheet("roadmap_template_stages") + update_cell() in
-    the same function body, matching the exact shape of the known
-    violation without a fragile whole-repo scan.
+    (Phase 27B). Phase 28F removed knowledge_manager.py's direct
+    update_cell() write inside link_knowledge_to_template_stage() —
+    that function now delegates to roadmap_template_manager.
+    update_template_stage_knowledge_ids(), the sole owner API for this
+    write. Fully strict: knowledge_manager.py must have zero functions
+    matching this get_business_sheet+update_cell shape.
     """
 
-    # temporary architectural debt — remove in Phase 28F
-    EXPECTED_WRITE_FUNCTIONS = {
-        "knowledge_manager.py": {"link_knowledge_to_template_stage"},
-        "roadmap_template_manager.py": set(),  # approved owner; currently uses append_business_row, not update_cell, for its own writes
-    }
+    def test_knowledge_manager_has_no_direct_template_stage_write(self):
+        path = BUSINESS_CORE / "knowledge_manager.py"
+        found_funcs = _functions_reading_and_writing(path, "roadmap_template_stages")
+        self.assertEqual(
+            found_funcs, set(),
+            f"knowledge_manager.py must not write ROADMAP_TEMPLATE_STAGES directly, "
+            f"found writing function(s): {found_funcs}",
+        )
 
-    def test_only_known_functions_write_template_stages_via_update_cell(self):
-        for filename, expected_funcs in self.EXPECTED_WRITE_FUNCTIONS.items():
-            path = BUSINESS_CORE / filename
-            found_funcs = _functions_reading_and_writing(path, "roadmap_template_stages")
+    def test_owner_api_exists_on_roadmap_template_manager(self):
+        import business_core.roadmap_template_manager as rtm
+        self.assertTrue(
+            callable(getattr(rtm, "update_template_stage_knowledge_ids", None)),
+            "roadmap_template_manager.update_template_stage_knowledge_ids must exist and be callable",
+        )
 
-            unexpected = found_funcs - expected_funcs
-            self.assertEqual(
-                unexpected, set(),
-                f"{filename} has NEW, undocumented function(s) writing "
-                f"ROADMAP_TEMPLATE_STAGES via update_cell: {unexpected}",
-            )
+    def test_knowledge_manager_delegates_to_owner_api(self):
+        import ast
+        import inspect
+        import business_core.knowledge_manager as km
+        src = inspect.getsource(km.link_knowledge_to_template_stage)
+        tree = ast.parse(src)
+        imported = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module:
+                imported.add(node.module.split(".")[-1])
+        self.assertIn("roadmap_template_manager", imported)
 
 
 class TestCanonicalRoadmapApiExists(unittest.TestCase):
-    """Phase 28B: the new additive canonical API must exist as public,
-    callable functions on business_core.roadmap_manager. Presence-only
-    — behavioral correctness is covered by test_roadmap_manager_canonical_api.py."""
+    """Phase 28B/28D: the canonical API must exist as public, callable
+    functions on business_core.roadmap_manager. Presence-only —
+    behavioral correctness is covered by test_roadmap_manager_canonical_api.py."""
 
-    EXPECTED_NEW_FUNCTIONS = (
+    EXPECTED_FUNCTIONS = (
         "find_roadmap_by_id",
         "list_roadmaps",
         "find_active_roadmap_for_object",
         "create_roadmap_record",
         "ensure_roadmap_stages",
+        "update_stage_fields",
     )
 
-    # Pre-existing canonical Stage-read functions this phase must NOT
-    # remove, rename, or change the return shape of.
+    # Pre-existing canonical Stage-read/write functions this phase must
+    # NOT remove, rename, or change the return shape of.
     EXPECTED_UNCHANGED_FUNCTIONS = (
         "get_stages_for_roadmap",
         "find_stage_by_id",
+        "update_stage_status_in_sheet",
     )
 
-    def test_new_functions_exist_and_are_callable(self):
+    def test_functions_exist_and_are_callable(self):
         import business_core.roadmap_manager as rm
-        for name in self.EXPECTED_NEW_FUNCTIONS:
+        for name in self.EXPECTED_FUNCTIONS:
             self.assertTrue(
                 callable(getattr(rm, name, None)),
                 f"business_core.roadmap_manager.{name} must exist and be callable",
             )
 
-    def test_preexisting_stage_read_functions_untouched(self):
+    def test_preexisting_stage_functions_untouched(self):
         import business_core.roadmap_manager as rm
         for name in self.EXPECTED_UNCHANGED_FUNCTIONS:
             self.assertTrue(
                 callable(getattr(rm, name, None)),
                 f"business_core.roadmap_manager.{name} must still exist",
             )
+
+
+class TestTelegramHandlersNoDirectRoadmapRegistryWrites(unittest.TestCase):
+    """TELEGRAM_HANDLERS_WRITE_ROADMAP_REGISTRIES_DIRECTLY == NO
+    (Phase 28C/28D target invariant). telegram_handlers.py must not
+    itself call append_business_row/batch_append_business_rows/
+    update_cell against "roadmaps" or "roadmap_stages" — every write
+    must be routed through business_core.roadmap_manager or
+    business_core.business_builder."""
+
+    def test_no_append_writes_to_roadmap_registries(self):
+        found = _files_writing_registry(
+            [BUSINESS_CORE / "telegram_handlers.py"], {"roadmaps", "roadmap_stages"},
+        )
+        self.assertEqual(found, set(), f"telegram_handlers.py must not write Roadmap registries directly: {found}")
+
+    def test_no_update_cell_writes_to_roadmap_stages(self):
+        found_funcs = _functions_reading_and_writing(
+            BUSINESS_CORE / "telegram_handlers.py", "roadmap_stages",
+        )
+        self.assertEqual(
+            found_funcs, set(),
+            f"telegram_handlers.py must not write roadmap_stages via update_cell, found: {found_funcs}",
+        )
 
 
 if __name__ == "__main__":
