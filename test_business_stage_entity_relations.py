@@ -315,6 +315,34 @@ class TestValidateRelationReferences(_PatchedCase):
         errors = ser.validate_relation_references(record)
         self.assertEqual(errors, [])  # no crash; nothing to check without a dispatch entry
 
+    def test_role_entity_type_valid_reference_has_no_errors(self):
+        """Phase 24B: Role existence is checked via
+        organization_manager.find_role_by_id(), not a raw role_registry
+        Sheet read — a Role that the manager reports as found produces
+        no error."""
+        ser = self._ser()
+        record = _rel_row(**{"Entity Type": "role", "Entity ID": "ROLE-001"})
+        with patch(
+            "business_core.organization_manager.find_role_by_id",
+            return_value={"role_id": "ROLE-001"},
+        ) as mock_find_role:
+            errors = ser.validate_relation_references(record)
+        mock_find_role.assert_called_once_with("ROLE-001")
+        self.assertEqual(errors, [])
+
+    def test_role_entity_type_dangling_reference_reported(self):
+        """A Role the manager cannot find is still reported as a
+        dangling Entity ID — never silently dropped."""
+        ser = self._ser()
+        record = _rel_row(**{"Entity Type": "role", "Entity ID": "ROLE-999"})
+        with patch(
+            "business_core.organization_manager.find_role_by_id",
+            return_value=None,
+        ) as mock_find_role:
+            errors = ser.validate_relation_references(record)
+        mock_find_role.assert_called_once_with("ROLE-999")
+        self.assertTrue(any("ROLE-999" in e and "not found" in e for e in errors))
+
 
 # ────────────────────────────────────────────────────────────
 # Active-duplicate detection: find_active_duplicate_relation
@@ -392,6 +420,58 @@ class TestEntityTypeDispatcher(unittest.TestCase):
         entry = ser.ENTITY_TYPE_DISPATCH["role"]
         self.assertEqual(entry["sheet_key"], "role_registry")
         self.assertEqual(entry["id_column"], "Role ID")
+
+
+# ────────────────────────────────────────────────────────────
+# Architecture guard: Role FK validation ownership (Phase 24B)
+# ────────────────────────────────────────────────────────────
+
+class TestRoleValidationArchitectureGuard(unittest.TestCase):
+    def test_role_branch_does_not_call_find_row_by_id(self):
+        """Phase 24B: validate_relation_references() must route Role
+        existence checks through organization_manager.find_role_by_id(),
+        never through a raw find_row_by_id("role_registry", ...) Sheet
+        read. This inspects the AST of the "if entity_type == 'role'"
+        branch specifically — every other branch (Template Stage ID,
+        Stage ID, and the non-role dispatch fallback) is untouched by
+        this guard and keeps using find_row_by_id as before."""
+        import ast
+        import inspect
+
+        ser = _fresh_ser()
+        source = inspect.getsource(ser.validate_relation_references)
+        tree = ast.parse(source)
+        func_node = tree.body[0]
+        self.assertIsInstance(func_node, ast.FunctionDef)
+
+        def is_role_check(node):
+            return (
+                isinstance(node, ast.If)
+                and isinstance(node.test, ast.Compare)
+                and isinstance(node.test.left, ast.Name)
+                and node.test.left.id == "entity_type"
+                and any(isinstance(c, ast.Constant) and c.value == "role" for c in node.test.comparators)
+            )
+
+        role_if_nodes = [n for n in ast.walk(func_node) if is_role_check(n)]
+        self.assertEqual(len(role_if_nodes), 1, "expected exactly one 'entity_type == role' branch")
+        role_branch = role_if_nodes[0].body
+
+        def calls_named(nodes, name):
+            for stmt in nodes:
+                for call in ast.walk(stmt):
+                    if isinstance(call, ast.Call) and isinstance(call.func, ast.Name) and call.func.id == name:
+                        return True
+            return False
+
+        self.assertTrue(
+            calls_named(role_branch, "find_role_by_id"),
+            "role branch must call organization_manager.find_role_by_id",
+        )
+        self.assertFalse(
+            calls_named(role_branch, "find_row_by_id"),
+            "role branch must not call the raw sheets.find_row_by_id",
+        )
 
 
 # ────────────────────────────────────────────────────────────

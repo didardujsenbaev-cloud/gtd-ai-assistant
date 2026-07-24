@@ -207,7 +207,15 @@ def validate_relation_references(record: dict) -> list[str]:
     entity_id = record.get("Entity ID", "") or ""
     dispatch = ENTITY_TYPE_DISPATCH.get(entity_type)
     if dispatch is not None and not _is_blank(entity_id):
-        found = find_row_by_id(dispatch["sheet_key"], entity_id)
+        if entity_type == "role":
+            # Phase 24B: Role existence is Organization Manager's own
+            # domain — route through its public API instead of a raw
+            # role_registry Sheet read. Every other entity type keeps
+            # the generic dispatch["sheet_key"] lookup unchanged.
+            from business_core.organization_manager import find_role_by_id
+            found = find_role_by_id(entity_id)
+        else:
+            found = find_row_by_id(dispatch["sheet_key"], entity_id)
         if found is None:
             errors.append(
                 f"Entity ID {entity_id!r} not found in {dispatch['sheet_key']} "
