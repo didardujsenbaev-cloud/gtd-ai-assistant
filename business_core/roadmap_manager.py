@@ -1597,3 +1597,447 @@ def maybe_complete_roadmap(
         log.error(f"maybe_complete_roadmap({roadmap_id}) error: {exc}")
         return {"ok": False, "error": str(exc), "roadmap_id": roadmap_id,
                 "old_status": "", "new_status": "", "changed": False}
+
+
+# ═══════════════════════════════════════════════════════════════
+# Phase 28B: Canonical Sheets-facing Roadmap/Roadmap Stage API.
+#
+# Additive only — no existing caller is rewired to these functions in
+# this phase (Phase 28C+ will do that). This is deliberately a
+# low-level persistence API: it does not validate that Business/
+# Client/Object/Service IDs actually exist elsewhere (that FK-existence
+# check stays in the orchestration layer, business_builder.py, per the
+# Phase 27B architecture decision — adding it here would create a new
+# cross-domain dependency this module must not have), never copies
+# Stage Entity Relations or Knowledge (Extension-layer concerns, wired
+# by the orchestrator in a later phase), and never imports
+# business_core.telegram_handlers or business_core.business_builder.
+# ═══════════════════════════════════════════════════════════════
+
+def find_roadmap_by_id(roadmap_id: str) -> Optional[dict]:
+    """
+    Canonical, header-mapped single-row read of ROADMAPS by Roadmap ID.
+
+    Mirrors the read pattern already used by find_stage_by_id() in this
+    same module (targeted sheet.find() + read_row_by_headers(), never a
+    positional-index assumption — see RM-027 in business_builder.py for
+    why that matters). This is an independent implementation, not a
+    delegation to business_builder.find_roadmap_by_id() — Phase 27B
+    decided business_builder.py will eventually call INTO this module,
+    not the other way around.
+
+    Returns:
+        dict с полями row_num, roadmap_id, business_id, service_id,
+        client_id, client_name, status, created, object_id,
+        parent_roadmap_id, case_type, template_id, progress,
+        notes — или None, если roadmap не найден.
+    """
+    if not roadmap_id:
+        return None
+
+    try:
+        from business_core.sheets import get_business_sheet, read_row_by_headers
+
+        sheet = get_business_sheet("roadmaps")
+        cell = sheet.find(roadmap_id, in_column=1)
+        if not cell:
+            return None
+
+        headers = sheet.row_values(1)
+        row = sheet.row_values(cell.row)
+
+        wanted = [
+            "Roadmap ID", "Business ID", "Service ID", "Client ID", "Client Name",
+            "Status", "Created", "Object ID", "Parent Roadmap ID", "Case Type",
+            "Template ID", "Progress %", "Notes",
+        ]
+        v = read_row_by_headers(headers, row, wanted)
+
+        return {
+            "row_num":            cell.row,
+            "roadmap_id":         v["Roadmap ID"],
+            "business_id":        v["Business ID"],
+            "service_id":         v["Service ID"],
+            "client_id":          v["Client ID"],
+            "client_name":        v["Client Name"],
+            "status":             v["Status"],
+            "created":            v["Created"],
+            "object_id":          v["Object ID"],
+            "parent_roadmap_id":  v["Parent Roadmap ID"],
+            "case_type":          v["Case Type"],
+            "template_id":        v["Template ID"],
+            "progress":           v["Progress %"],
+            "notes":              v["Notes"],
+        }
+
+    except Exception as exc:
+        log.warning(f"find_roadmap_by_id({roadmap_id}) error: {exc}")
+        return None
+
+
+def list_roadmaps(
+    business_id: Optional[str] = None,
+    client_id: Optional[str] = None,
+    object_id: Optional[str] = None,
+    service_id: Optional[str] = None,
+    status: Optional[str] = None,
+) -> list[dict]:
+    """
+    Canonical, header-mapped listing of ROADMAPS, optionally filtered by
+    any combination of the given fields (all AND-combined; a filter
+    left as None is not applied). Deliberately no query DSL beyond
+    this — every filter this module's own callers need today is a
+    simple equality match on one column.
+
+    Returns rows in the same dict shape as find_roadmap_by_id(), each
+    additionally carrying "row_num".
+    """
+    try:
+        from business_core.sheets import get_business_sheet, get_header_index_map
+
+        sheet = get_business_sheet("roadmaps")
+        all_values = sheet.get_all_values()
+        if len(all_values) < 2:
+            return []
+
+        headers = all_values[0]
+        idx = get_header_index_map(headers)
+
+        def _get(row: list[str], header: str) -> str:
+            col = idx.get(header)
+            return row[col].strip() if col is not None and col < len(row) else ""
+
+        results: list[dict] = []
+        for row_num, row in enumerate(all_values[1:], start=2):
+            if not row or not row[0].strip():
+                continue
+
+            candidate = {
+                "row_num":           row_num,
+                "roadmap_id":        _get(row, "Roadmap ID"),
+                "business_id":       _get(row, "Business ID"),
+                "service_id":        _get(row, "Service ID"),
+                "client_id":         _get(row, "Client ID"),
+                "client_name":       _get(row, "Client Name"),
+                "status":            _get(row, "Status"),
+                "created":           _get(row, "Created"),
+                "object_id":         _get(row, "Object ID"),
+                "parent_roadmap_id": _get(row, "Parent Roadmap ID"),
+                "case_type":         _get(row, "Case Type"),
+                "template_id":       _get(row, "Template ID"),
+                "progress":          _get(row, "Progress %"),
+                "notes":             _get(row, "Notes"),
+            }
+
+            if business_id is not None and candidate["business_id"] != business_id:
+                continue
+            if client_id is not None and candidate["client_id"] != client_id:
+                continue
+            if object_id is not None and candidate["object_id"] != object_id:
+                continue
+            if service_id is not None and candidate["service_id"] != service_id:
+                continue
+            if status is not None and candidate["status"] != status:
+                continue
+
+            results.append(candidate)
+
+        return results
+
+    except Exception as exc:
+        log.warning(f"list_roadmaps(...) error: {exc}")
+        return []
+
+
+def find_active_roadmap_for_object(object_id: str, service_id: str) -> Optional[dict]:
+    """
+    Read-only duplicate-detection primitive: is there already an ACTIVE
+    Roadmap for this (Object ID, Service ID) pair?
+
+    Duplicate key: (Object ID, Service ID) — matches the same
+    "only active rows count as a duplicate" convention already used by
+    business_core.stage_entity_relations.find_active_duplicate_relation()
+    and business_core.organization_manager's assignment layer.
+
+    This phase adds the read primitive only. No caller is wired to
+    reject a duplicate yet — that orchestration policy is Phase 28G's
+    job, applied in business_builder.py, per the Phase 27B decision.
+
+    Returns:
+        The first matching active Roadmap row (same dict shape as
+        find_roadmap_by_id()), or None if no active Roadmap exists for
+        this Object+Service.
+    """
+    if not object_id or not service_id:
+        return None
+
+    matches = list_roadmaps(object_id=object_id, service_id=service_id, status="active")
+    return matches[0] if matches else None
+
+
+def create_roadmap_record(
+    *,
+    business_id: str,
+    client_id: str,
+    object_id: str,
+    service_id: str = "",
+    template_id: str = "",
+    city: str = "",
+    client_name: str = "",
+    case_type: str = "",
+    notes: str = "",
+    status: str = "active",
+) -> dict:
+    """
+    Canonical, header-mapped creation of exactly one ROADMAPS row.
+
+    Low-level persistence only — deliberately does NOT:
+      - verify that business_id/client_id/object_id/service_id/
+        template_id actually exist elsewhere (presence-only validation
+        here; existence-checking is an orchestration-layer concern,
+        wired in business_builder.py starting Phase 28C, per the
+        Phase 27B architecture decision — adding it here would give
+        this module a new cross-domain dependency it must not have);
+      - check for an existing active Roadmap for this Object+Service
+        (see find_active_roadmap_for_object() — enforcing that as a
+        rejection policy is Phase 28G's job, in the orchestrator);
+      - create any ROADMAP_STAGES rows (see ensure_roadmap_stages());
+      - call anything in business_core.stage_entity_relations,
+        business_core.knowledge_manager, business_core.business_builder,
+        or business_core.telegram_handlers.
+
+    Required: business_id, client_id, object_id (non-empty strings).
+    `status` must be one of ROADMAP_STATUSES.
+
+    Returns:
+        {
+            "ok":         bool,
+            "roadmap_id": str,
+            "roadmap":    dict | None,  # same shape as find_roadmap_by_id()
+            "error":      str | None,
+        }
+    """
+    if not business_id or not client_id or not object_id:
+        return {
+            "ok": False, "roadmap_id": "", "roadmap": None,
+            "error": "Обязательные поля: business_id, client_id, object_id",
+        }
+
+    if status not in ROADMAP_STATUSES:
+        return {
+            "ok": False, "roadmap_id": "", "roadmap": None,
+            "error": f"Status must be one of {ROADMAP_STATUSES}, got {status!r}",
+        }
+
+    try:
+        from business_core.sheets import (
+            append_business_row, generate_next_id, get_business_sheet, row_from_header_map,
+        )
+
+        now = datetime.now().strftime("%Y-%m-%d")
+        roadmap_id = generate_next_id("roadmaps")
+
+        if not client_name:
+            client_name = f"Roadmap {object_id}" + (f" / {service_id}" if service_id else "")
+
+        sheet = get_business_sheet("roadmaps")
+        headers = sheet.row_values(1)
+
+        values = {
+            "Roadmap ID":        roadmap_id,
+            "Business ID":       business_id,
+            "Service ID":        service_id,
+            "City":              city,
+            "Client ID":         client_id,
+            "Client Name":       client_name,
+            "GTD Project ID":    "",
+            "Responsible":       "",
+            "Status":            status,
+            "Created":           now,
+            "Expected":          "",
+            "Progress %":        "0",
+            "Notes":             notes,
+            "Last Updated":      now,
+            "Object ID":         object_id,
+            "Parent Roadmap ID": "",
+            "Case Type":         case_type,
+            "Template ID":       template_id,
+        }
+
+        try:
+            row = row_from_header_map(headers, values)
+        except ValueError as header_exc:
+            log.error(f"create_roadmap_record: {header_exc}")
+            return {"ok": False, "roadmap_id": "", "roadmap": None, "error": str(header_exc)}
+
+        append_business_row("roadmaps", row)
+        log.info(f"create_roadmap_record: {roadmap_id} / {object_id} / {service_id}")
+
+        roadmap = {
+            "row_num": None,
+            "roadmap_id": roadmap_id,
+            "business_id": business_id,
+            "service_id": service_id,
+            "client_id": client_id,
+            "client_name": client_name,
+            "status": status,
+            "created": now,
+            "object_id": object_id,
+            "parent_roadmap_id": "",
+            "case_type": case_type,
+            "template_id": template_id,
+            "progress": "0",
+            "notes": notes,
+        }
+        return {"ok": True, "roadmap_id": roadmap_id, "roadmap": roadmap, "error": None}
+
+    except Exception as exc:
+        log.error(f"create_roadmap_record error: {exc}")
+        return {"ok": False, "roadmap_id": "", "roadmap": None, "error": str(exc)}
+
+
+def ensure_roadmap_stages(
+    roadmap_id: str,
+    template_stage_rows: list[dict],
+) -> dict:
+    """
+    Idempotent, canonical creation of ROADMAP_STAGES rows for an
+    existing roadmap_id, from already-read Template Stage rows (e.g.
+    business_core.roadmap_template_manager.find_template_stages()'s
+    return shape — this function deliberately accepts already-resolved
+    rows rather than a template_id, so this module never has to import
+    roadmap_template_manager to read ROADMAP_TEMPLATE_STAGES itself;
+    the orchestrator reads the template stages and passes them in).
+
+    Stage uniqueness key: (Roadmap ID, Order). A stage whose Order
+    already exists among this roadmap_id's current stages is treated
+    as already created and skipped — never duplicated. Only Orders
+    missing from the existing set are written. Calling this function
+    twice with the same arguments creates nothing the second time.
+
+    New stages are always written with Status "pending" (validated
+    against STAGE_STATUS_CANONICAL) — never the legacy "not_started"
+    value that /newroadmap still seeds.
+
+    Does not copy Stage Entity Relations or Knowledge, and does not
+    call business_core.stage_entity_relations, business_core.
+    knowledge_manager, business_core.business_builder, or business_core.
+    telegram_handlers — those are Extension-layer/orchestration
+    concerns wired by the caller in a later phase.
+
+    Returns:
+        {
+            "ok":                 bool,
+            "roadmap_id":         str,
+            "created_stage_ids":  list[str],
+            "existing_stage_ids": list[str],
+            "created_count":      int,
+            "existing_count":     int,
+            "total_count":        int,
+            "error":              str | None,
+        }
+    """
+    empty_result = {
+        "ok": True, "roadmap_id": roadmap_id,
+        "created_stage_ids": [], "existing_stage_ids": [],
+        "created_count": 0, "existing_count": 0, "total_count": 0,
+        "error": None,
+    }
+
+    if not roadmap_id:
+        return {**empty_result, "ok": False, "error": "roadmap_id не указан"}
+
+    if "pending" not in STAGE_STATUS_CANONICAL:
+        # Defensive — STAGE_STATUS_CANONICAL is a module constant that
+        # should never actually change without deliberate review, but a
+        # write function should never silently write a value its own
+        # canonical set doesn't recognize.
+        return {**empty_result, "ok": False,
+                "error": "'pending' отсутствует в STAGE_STATUS_CANONICAL"}
+
+    existing = get_stages_for_roadmap(roadmap_id)
+    existing_stage_ids = [s.get("stage_id", "") for s in existing]
+    existing_orders = {
+        int(s["order"]) for s in existing
+        if str(s.get("order", "")).isdigit()
+    }
+
+    if not template_stage_rows:
+        return {
+            **empty_result,
+            "existing_stage_ids": existing_stage_ids,
+            "existing_count": len(existing_stage_ids),
+            "total_count": len(existing_stage_ids),
+        }
+
+    to_create: list[dict] = []
+    seen_orders: set[int] = set()
+    for tmpl_row in template_stage_rows:
+        raw_order = str(tmpl_row.get("order", "")).strip()
+        if not raw_order.isdigit():
+            continue
+        order = int(raw_order)
+        if order in existing_orders or order in seen_orders:
+            continue
+        seen_orders.add(order)
+        to_create.append(tmpl_row)
+
+    if not to_create:
+        return {
+            **empty_result,
+            "existing_stage_ids": existing_stage_ids,
+            "existing_count": len(existing_stage_ids),
+            "total_count": len(existing_stage_ids),
+        }
+
+    try:
+        from business_core.sheets import (
+            batch_append_business_rows, generate_next_ids, get_business_sheet, row_from_header_map,
+        )
+
+        now = datetime.now().strftime("%Y-%m-%d %H:%M")
+        sheet = get_business_sheet("roadmap_stages")
+        headers = sheet.row_values(1)
+        new_stage_ids = generate_next_ids("roadmap_stages", len(to_create))
+
+        rows = []
+        for tmpl_row, stage_id in zip(to_create, new_stage_ids):
+            values = {
+                "Stage ID":       stage_id,
+                "Roadmap ID":     roadmap_id,
+                "Order":          str(tmpl_row.get("order", "")),
+                "Name":           tmpl_row.get("stage_name", ""),
+                "Status":         "pending",
+                "Docs Required":  tmpl_row.get("required_docs", ""),
+                "Responsible":    tmpl_row.get("responsible", ""),
+                "Notes":          tmpl_row.get("notes", ""),
+            }
+            rows.append(row_from_header_map(headers, values))
+
+        batch_append_business_rows("roadmap_stages", rows)
+
+        created_stage_ids = list(new_stage_ids)
+        log.info(
+            f"ensure_roadmap_stages: roadmap={roadmap_id} "
+            f"created={len(created_stage_ids)} existing={len(existing_stage_ids)}"
+        )
+
+        return {
+            "ok": True, "roadmap_id": roadmap_id,
+            "created_stage_ids": created_stage_ids,
+            "existing_stage_ids": existing_stage_ids,
+            "created_count": len(created_stage_ids),
+            "existing_count": len(existing_stage_ids),
+            "total_count": len(existing_stage_ids) + len(created_stage_ids),
+            "error": None,
+        }
+
+    except Exception as exc:
+        log.error(f"ensure_roadmap_stages({roadmap_id}) error: {exc}")
+        return {
+            "ok": False, "roadmap_id": roadmap_id,
+            "created_stage_ids": [], "existing_stage_ids": existing_stage_ids,
+            "created_count": 0, "existing_count": len(existing_stage_ids),
+            "total_count": len(existing_stage_ids),
+            "error": str(exc),
+        }
