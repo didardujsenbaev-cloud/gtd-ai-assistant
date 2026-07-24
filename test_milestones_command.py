@@ -559,7 +559,7 @@ class TestNoNewStages(unittest.TestCase):
              patch("business_core.roadmap_manager.get_commercial_milestones_for_roadmap",
                    return_value={"ok": True, "error": None, "roadmap": FAKE_ROADMAP,
                                  "template_id": "", "milestones": [], "stages": [], "total_price": 0}), \
-             patch("business_core.roadmap_template_manager.create_stages_from_template_record",
+             patch("business_core.business_builder.create_stages_from_template_record",
                    side_effect=lambda *a, **kw: calls.append((a, kw))):
             asyncio.run(
                 th.milestones_cmd(

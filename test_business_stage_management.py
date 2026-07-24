@@ -131,15 +131,12 @@ class TestSchemaBackwardCompatibility(unittest.TestCase):
             "", "", "", "", "",
         ]  # 17 колонок — ровно как до Phase 14A, без Start Date/Priority/Blocking Reason
         self.assertEqual(len(old_row), 17)
-        row_dict = {
-            STAGE_HEADERS[j]: (old_row[j] if j < len(old_row) else "")
-            for j in range(len(STAGE_HEADERS))
-        }
+        sheet = _make_stage_sheet(old_row)
         update, context = _upd("/stage stage_id=STAGE-001"), _ctx(args=["stage_id=STAGE-001"])
 
         async def run():
             with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
-                 patch("business_core.sheets.find_row_by_id", return_value=(2, row_dict)):
+                 patch("business_core.sheets.get_business_sheet", return_value=sheet):
                 await th.stage_cmd(update, context)
 
         asyncio.run(run())
@@ -231,7 +228,7 @@ class TestStageCmd(unittest.TestCase):
     def test_not_found(self):
         th = _fresh_th()
         sheet = _make_stage_sheet()
-        sheet.get_all_values.return_value = [STAGE_HEADERS]
+        sheet.find.return_value = None
         update, context = _upd("/stage stage_id=STAGE-999"), _ctx(args=["stage_id=STAGE-999"])
 
         async def run():
@@ -309,10 +306,12 @@ class TestAssignStage(unittest.TestCase):
         th = _fresh_th()
         context = _ctx(args=["stage_id=STAGE-999", "responsible=Иван"])
         update = _upd("/assignstage stage_id=STAGE-999 responsible=Иван")
+        sheet = _make_stage_sheet()
+        sheet.find.return_value = None
 
         async def run():
             with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
-                 patch("business_core.sheets.find_row_by_id", return_value=None):
+                 patch("business_core.sheets.get_business_sheet", return_value=sheet):
                 return await th.assignstage_start(update, context)
 
         from telegram.ext import ConversationHandler

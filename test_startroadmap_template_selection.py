@@ -78,8 +78,6 @@ class TestNoTemplateId(unittest.TestCase):
                  patch("business_core.roadmap_template_manager.find_roadmap_templates_by_service",
                        return_value=[{"template_id": "RMT-IZH-ALM-LEGALIZATION-001",
                                       "service_id": "SVC-IZH-001", "template_name": "Легализация"}]), \
-                 patch("business_core.roadmap_template_manager.create_stages_from_template_record",
-                       return_value=stages_mock), \
                  patch("business_core.roadmap_manager.create_roadmap_stages_from_template",
                        return_value={"stages_count": 0}):
                 await cmd(upd, ctx)
@@ -350,8 +348,6 @@ class TestMultipleTemplates(unittest.TestCase):
                        return_value=None), \
                  patch("business_core.roadmap_template_manager.find_roadmap_templates_by_service",
                        return_value=self._three_templates()), \
-                 patch("business_core.roadmap_template_manager.create_stages_from_template_record",
-                       return_value={"ok": True, "stages_count": 12, "warning": None, "stage_ids": []}), \
                  patch("business_core.roadmap_manager.create_roadmap_stages_from_template",
                        return_value={"stages_count": 0}):
                 # Capture all reply calls
@@ -429,8 +425,6 @@ class TestMultipleTemplates(unittest.TestCase):
                  patch("business_core.roadmap_template_manager.find_roadmap_templates_by_service",
                        return_value=[{"template_id": "RMT-IZH-ALM-NEWBUILD-001",
                                       "service_id": "SVC-IZH-002", "template_name": "Новое строительство"}]), \
-                 patch("business_core.roadmap_template_manager.create_stages_from_template_record",
-                       return_value={"ok": True, "stages_count": 18, "warning": None, "stage_ids": []}), \
                  patch("business_core.roadmap_manager.create_roadmap_stages_from_template",
                        return_value={"stages_count": 0}):
                 await cmd(upd, ctx)

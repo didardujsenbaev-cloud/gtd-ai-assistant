@@ -126,6 +126,15 @@ def _fresh():
     return m
 
 
+def _fresh_with_builder():
+    for k in list(sys.modules):
+        if "business_core" in k:
+            del sys.modules[k]
+    import business_core.roadmap_template_manager as m
+    import business_core.business_builder as bb
+    return m, bb
+
+
 # ────────────────────────────────────────────────────────────
 # A/B: ID generation
 # ────────────────────────────────────────────────────────────
@@ -356,7 +365,7 @@ class TestCreateStagesFromTemplateRecord(unittest.TestCase):
 
     def test_J_creates_real_stages(self):
         """J: create_stages_from_template_record создает реальные этапы."""
-        m = _fresh()
+        m, bb = _fresh_with_builder()
         template_stages = [
             {"stage_id": "TSTG-001", "template_id": "RTMPL-001", "order": "1",
              "stage_name": "Этап 1", "description": "", "required_docs": "",
@@ -379,7 +388,7 @@ class TestCreateStagesFromTemplateRecord(unittest.TestCase):
                    return_value={}), \
              patch("business_core.sheets.generate_next_id",
                    side_effect=["STAGE-001", "STAGE-002"]):
-            result = m.create_stages_from_template_record("RM-001", "RTMPL-001")
+            result = bb.create_stages_from_template_record("RM-001", "RTMPL-001")
 
         self.assertTrue(result["ok"])
         self.assertEqual(result["stages_count"], 2)
@@ -393,9 +402,9 @@ class TestCreateStagesFromTemplateRecord(unittest.TestCase):
 
     def test_K_empty_template_returns_warning(self):
         """K: шаблон без этапов → warning, не падает."""
-        m = _fresh()
+        m, bb = _fresh_with_builder()
         with patch.object(m, "find_template_stages", return_value=[]):
-            result = m.create_stages_from_template_record("RM-001", "RTMPL-001")
+            result = bb.create_stages_from_template_record("RM-001", "RTMPL-001")
 
         self.assertTrue(result["ok"])
         self.assertEqual(result["stages_count"], 0)
@@ -403,8 +412,8 @@ class TestCreateStagesFromTemplateRecord(unittest.TestCase):
 
     def test_K_empty_args_returns_error(self):
         """K: пустые аргументы → ok=False."""
-        m = _fresh()
-        result = m.create_stages_from_template_record("", "RTMPL-001")
+        _, bb = _fresh_with_builder()
+        result = bb.create_stages_from_template_record("", "RTMPL-001")
         self.assertFalse(result["ok"])
 
 
@@ -431,7 +440,7 @@ class TestCreateStagesFromTemplateRecordRelationCopy(unittest.TestCase):
         ]
 
     def _run(self, n=2, generated_ids=None):
-        m = _fresh()
+        m, bb = _fresh_with_builder()
         generated_ids = generated_ids or [f"STAGE-{i:03d}" for i in range(1, n + 1)]
         sheet = _rmstage_sheet()
         sheet.get_all_values.return_value = [RM_STAGE_HEADERS]
@@ -439,7 +448,7 @@ class TestCreateStagesFromTemplateRecordRelationCopy(unittest.TestCase):
              patch("business_core.sheets.get_business_sheet", return_value=sheet), \
              patch("business_core.sheets.batch_append_business_rows"), \
              patch("business_core.sheets.generate_next_ids", return_value=generated_ids):
-            result = m.create_stages_from_template_record("RM-001", "RTMPL-001")
+            result = bb.create_stages_from_template_record("RM-001", "RTMPL-001")
         return result
 
     def test_relation_copy_fields_are_always_neutral(self):
@@ -453,8 +462,8 @@ class TestCreateStagesFromTemplateRecordRelationCopy(unittest.TestCase):
     def test_does_not_import_stage_entity_relations(self):
         import ast
         import inspect
-        m = _fresh()
-        src = inspect.getsource(m.create_stages_from_template_record)
+        m, bb = _fresh_with_builder()
+        src = inspect.getsource(bb.create_stages_from_template_record)
         tree = ast.parse(src)
         imported = set()
         for node in ast.walk(tree):
@@ -467,7 +476,7 @@ class TestCreateStagesFromTemplateRecordRelationCopy(unittest.TestCase):
         self.assertNotIn("knowledge_manager", imported)
 
     def test_delegates_stage_creation_to_roadmap_manager_ensure_roadmap_stages(self):
-        m = _fresh()
+        m, bb = _fresh_with_builder()
         sheet = _rmstage_sheet()
         sheet.get_all_values.return_value = [RM_STAGE_HEADERS]
         with patch.object(m, "find_template_stages", return_value=self._template_stages(1)), \
@@ -478,7 +487,7 @@ class TestCreateStagesFromTemplateRecordRelationCopy(unittest.TestCase):
                        "existing_stage_ids": [], "created_count": 1, "existing_count": 0,
                        "total_count": 1, "error": None,
                    }) as mock_ensure:
-            result = m.create_stages_from_template_record("RM-001", "RTMPL-001")
+            result = bb.create_stages_from_template_record("RM-001", "RTMPL-001")
         mock_ensure.assert_called_once()
         self.assertEqual(mock_ensure.call_args.args[0], "RM-001")
         self.assertTrue(result["ok"])
@@ -509,7 +518,7 @@ class TestCreateStagesFromTemplateRecordHeaderSafety(unittest.TestCase):
 
     def test_standard_header_order_produces_correct_row(self):
         """1: стандартный порядок заголовков — значения на своих местах."""
-        m = _fresh()
+        m, bb = _fresh_with_builder()
         sheet = _rmstage_sheet()
         captured = []
 
@@ -518,7 +527,7 @@ class TestCreateStagesFromTemplateRecordHeaderSafety(unittest.TestCase):
              patch("business_core.sheets.batch_append_business_rows",
                    side_effect=lambda k, rows: captured.extend(rows)), \
              patch("business_core.sheets.generate_next_ids", return_value=["STAGE-001"]):
-            result = m.create_stages_from_template_record("RM-001", "RTMPL-001")
+            result = bb.create_stages_from_template_record("RM-001", "RTMPL-001")
 
         self.assertTrue(result["ok"])
         idx = {h: i for i, h in enumerate(RM_STAGE_HEADERS)}
@@ -544,7 +553,7 @@ class TestCreateStagesFromTemplateRecordHeaderSafety(unittest.TestCase):
 
     def test_shuffled_header_order_gives_same_values_by_name(self):
         """2: результат не зависит от перестановки заголовков листа."""
-        m = _fresh()
+        m, bb = _fresh_with_builder()
         shuffled = [
             "FAQ IDs", "Notes", "Stage ID", "Docs Received", "Roadmap ID",
             "Document Template IDs", "Order", "Responsible", "Name",
@@ -561,7 +570,7 @@ class TestCreateStagesFromTemplateRecordHeaderSafety(unittest.TestCase):
              patch("business_core.sheets.batch_append_business_rows",
                    side_effect=lambda k, rows: captured.extend(rows)), \
              patch("business_core.sheets.generate_next_ids", return_value=["STAGE-001"]):
-            result = m.create_stages_from_template_record("RM-001", "RTMPL-001")
+            result = bb.create_stages_from_template_record("RM-001", "RTMPL-001")
 
         self.assertTrue(result["ok"])
         idx = {h: i for i, h in enumerate(shuffled)}
@@ -575,7 +584,7 @@ class TestCreateStagesFromTemplateRecordHeaderSafety(unittest.TestCase):
 
     def test_unknown_extra_columns_remain_empty(self):
         """4: неизвестные дополнительные колонки листа остаются пустыми."""
-        m = _fresh()
+        m, bb = _fresh_with_builder()
         with_extra = RM_STAGE_HEADERS + ["Custom Future Field"]
         sheet = _ws([with_extra])
         captured = []
@@ -585,7 +594,7 @@ class TestCreateStagesFromTemplateRecordHeaderSafety(unittest.TestCase):
              patch("business_core.sheets.batch_append_business_rows",
                    side_effect=lambda k, rows: captured.extend(rows)), \
              patch("business_core.sheets.generate_next_ids", return_value=["STAGE-001"]):
-            result = m.create_stages_from_template_record("RM-001", "RTMPL-001")
+            result = bb.create_stages_from_template_record("RM-001", "RTMPL-001")
 
         self.assertTrue(result["ok"])
         idx = {h: i for i, h in enumerate(with_extra)}
@@ -595,7 +604,7 @@ class TestCreateStagesFromTemplateRecordHeaderSafety(unittest.TestCase):
 
     def test_batch_append_called_exactly_once(self):
         """5: batch append вызывается один раз для всех этапов шаблона."""
-        m = _fresh()
+        m, bb = _fresh_with_builder()
         two_stages = self._TEMPLATE_STAGES + [
             {"stage_id": "TSTG-002", "template_id": "RTMPL-001", "order": "2",
              "stage_name": "Сбор документов", "description": "", "required_docs": "",
@@ -611,7 +620,7 @@ class TestCreateStagesFromTemplateRecordHeaderSafety(unittest.TestCase):
              patch("business_core.sheets.batch_append_business_rows",
                    side_effect=lambda k, rows: calls.append((k, rows))), \
              patch("business_core.sheets.generate_next_ids", return_value=["STAGE-001", "STAGE-002"]):
-            result = m.create_stages_from_template_record("RM-001", "RTMPL-001")
+            result = bb.create_stages_from_template_record("RM-001", "RTMPL-001")
 
         self.assertTrue(result["ok"])
         self.assertEqual(len(calls), 1, "batch_append_business_rows должен вызываться ровно один раз")
@@ -621,7 +630,7 @@ class TestCreateStagesFromTemplateRecordHeaderSafety(unittest.TestCase):
 
     def test_stage_count_and_ids_unchanged(self):
         """6: количество этапов и stage_ids соответствуют шаблону."""
-        m = _fresh()
+        m, bb = _fresh_with_builder()
         two_stages = self._TEMPLATE_STAGES + [
             {"stage_id": "TSTG-002", "template_id": "RTMPL-001", "order": "2",
              "stage_name": "Сбор документов", "description": "", "required_docs": "",
@@ -635,7 +644,7 @@ class TestCreateStagesFromTemplateRecordHeaderSafety(unittest.TestCase):
              patch("business_core.sheets.get_business_sheet", return_value=sheet), \
              patch("business_core.sheets.batch_append_business_rows"), \
              patch("business_core.sheets.generate_next_ids", return_value=["STAGE-001", "STAGE-002"]):
-            result = m.create_stages_from_template_record("RM-001", "RTMPL-001")
+            result = bb.create_stages_from_template_record("RM-001", "RTMPL-001")
 
         self.assertEqual(result["stages_count"], 2)
         self.assertEqual(result["stage_ids"], ["STAGE-001", "STAGE-002"])
@@ -643,10 +652,10 @@ class TestCreateStagesFromTemplateRecordHeaderSafety(unittest.TestCase):
     def test_empty_template_behavior_unchanged_no_sheet_access(self):
         """7: пустой шаблон — поведение (warning, ok=True, 0 этапов) не изменилось,
         и обращения к листу ROADMAP_STAGES не происходит вовсе."""
-        m = _fresh()
+        m, bb = _fresh_with_builder()
         with patch.object(m, "find_template_stages", return_value=[]), \
              patch("business_core.sheets.get_business_sheet") as mock_get_sheet:
-            result = m.create_stages_from_template_record("RM-001", "RTMPL-001")
+            result = bb.create_stages_from_template_record("RM-001", "RTMPL-001")
 
         self.assertTrue(result["ok"])
         self.assertEqual(result["stages_count"], 0)

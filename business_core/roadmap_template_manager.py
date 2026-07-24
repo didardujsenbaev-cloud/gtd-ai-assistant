@@ -18,11 +18,15 @@ Phase 8B: Roadmap Template Core.
                               knowledge_manager вместо прямой записи).
 
 Зависимости: business_core.sheets, business_core.service_manager
-(link_service_to_roadmap_template), business_core.roadmap_manager
-(create_stages_from_template_record() делегирует создание
-ROADMAP_STAGES в roadmap_manager.ensure_roadmap_stages() — Core -> Core,
-Phase 28D). Не импортирует Extension-модули (stage_entity_relations,
-knowledge_manager) — Phase 28E. GTD Core не импортируется.
+(link_service_to_roadmap_template). Не импортирует business_core.roadmap_manager
+(Closeout Remediation finding #2 — this used to import roadmap_manager
+via create_stages_from_template_record(), which together with
+roadmap_manager's own import of find_roadmap_templates_by_service()
+formed a Core <-> Core circular dependency between the two *_manager.py
+modules; that orchestration now lives in
+business_builder.create_stages_from_template_record() instead). Не
+импортирует Extension-модули (stage_entity_relations, knowledge_manager)
+— Phase 28E. GTD Core не импортируется.
 """
 
 from __future__ import annotations
@@ -423,91 +427,14 @@ def find_template_stages(template_id: str) -> list[dict]:
 
 
 # ═══════════════════════════════════════════════════════════════
-# Integration: create real roadmap stages from template
+# Note: create_stages_from_template_record() (create real ROADMAP_STAGES
+# rows from a template) moved to business_core.business_builder as of
+# Closeout Remediation finding #2 — it delegated Stage creation to
+# roadmap_manager.ensure_roadmap_stages(), which together with
+# roadmap_manager's own import of this module formed a circular
+# *_manager.py <-> *_manager.py dependency. This module no longer
+# imports business_core.roadmap_manager anywhere.
 # ═══════════════════════════════════════════════════════════════
-
-def create_stages_from_template_record(roadmap_id: str, template_id: str) -> dict:
-    """
-    Создать реальные этапы roadmap из шаблона ROADMAP_TEMPLATE_STAGES.
-
-    В отличие от create_roadmap_stages_from_template (который использует
-    встроенные ROADMAP_TEMPLATES), этот метод читает этапы из Google Sheets.
-
-    Phase 28D/28E: this function no longer writes ROADMAP_STAGES itself
-    and no longer imports business_core.knowledge_manager or
-    business_core.stage_entity_relations. It now reads the template
-    stages (via find_template_stages(), which since Phase 28E also
-    carries each stage's own knowledge-ID columns) and delegates the
-    actual Stage row creation to business_core.roadmap_manager.
-    ensure_roadmap_stages() — the single approved owner of
-    ROADMAP_STAGES writes. This is a Core -> Core call (Roadmap Template
-    Manager -> Roadmap Manager), not a layering violation.
-
-    Relation-copying (business_core.stage_entity_relations.
-    copy_template_relations_to_stage(), previously done inline here) is
-    an Extension-layer concern and has moved to the orchestrator,
-    business_core.business_builder.create_roadmap_for_object() — this
-    function itself never calls it anymore. "partial_success"/
-    "relation_copy_errors"/"relation_copy_created_count" are kept in
-    the return shape for backward compatibility with any caller still
-    reading those keys, but are now always the neutral/empty values
-    below, since this function performs no relation-copying of its own.
-
-    Returns:
-        {
-            "ok":           bool,
-            "stages_count": int,
-            "warning":      str | None,
-            "stage_ids":    list[str],
-            "partial_success":             bool,   # always False — see above
-            "relation_copy_errors":        tuple,   # always () — see above
-            "relation_copy_created_count": int,     # always 0 — see above
-        }
-    """
-    if not roadmap_id or not template_id:
-        return {
-            "ok": False, "stages_count": 0,
-            "warning": "roadmap_id и template_id обязательны", "stage_ids": [],
-            "partial_success": False, "relation_copy_errors": (), "relation_copy_created_count": 0,
-        }
-
-    template_stages = find_template_stages(template_id)
-    if not template_stages:
-        return {
-            "ok": True, "stages_count": 0,
-            "warning": f"Шаблон {template_id} не содержит этапов.",
-            "stage_ids": [],
-            "partial_success": False, "relation_copy_errors": (), "relation_copy_created_count": 0,
-        }
-
-    try:
-        from business_core.roadmap_manager import ensure_roadmap_stages
-
-        result = ensure_roadmap_stages(roadmap_id, template_stages)
-        if not result["ok"]:
-            return {
-                "ok": False, "stages_count": 0,
-                "warning": result.get("error", ""), "stage_ids": [],
-                "partial_success": False, "relation_copy_errors": (), "relation_copy_created_count": 0,
-            }
-
-        return {
-            "ok": True,
-            "stages_count": result["created_count"],
-            "warning": None,
-            "stage_ids": result["created_stage_ids"],
-            "partial_success": False,
-            "relation_copy_errors": (),
-            "relation_copy_created_count": 0,
-        }
-
-    except Exception as exc:
-        log.error(f"create_stages_from_template_record error: {exc}")
-        return {
-            "ok": False, "stages_count": 0,
-            "warning": str(exc), "stage_ids": [],
-            "partial_success": False, "relation_copy_errors": (), "relation_copy_created_count": 0,
-        }
 
 
 # ═══════════════════════════════════════════════════════════════

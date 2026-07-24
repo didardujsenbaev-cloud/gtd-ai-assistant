@@ -395,8 +395,6 @@ class TestStartRoadmapWithSeedService(unittest.TestCase):
                        return_value={"Template ID": "RMT-IZH-ALM-LEGALIZATION-001"}), \
                  patch("business_core.roadmap_template_manager.find_roadmap_templates_by_service",
                        return_value=[]), \
-                 patch("business_core.roadmap_template_manager.create_stages_from_template_record",
-                       return_value=stages_mock) as mock_stages, \
                  patch("business_core.roadmap_manager.create_roadmap_stages_from_template",
                        return_value={"stages_count": 0}):
                 await startroadmap_cmd(update, context)

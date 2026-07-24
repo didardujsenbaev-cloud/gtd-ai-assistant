@@ -2256,6 +2256,20 @@ async def startroadmap_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
         return
 
+    if not service_id.strip():
+        # Phase Closeout Remediation (finding #1): service_id is part of
+        # the (Object ID, Service ID) duplicate key — silently defaulting
+        # to "" here let a blank Service ID reach create_roadmap_for_object,
+        # which then skipped the active-Roadmap reuse lookup entirely and
+        # created a second, distinct Roadmap for an Object that already
+        # had one (the RM-002 incident). Required now, same as obj_id.
+        await _reply(update,
+            "❌ Не указан service\\_id.\n\n"
+            "Пример:\n`/startroadmap obj_id=OBJ-001 service_id=SVC-001 "
+            "case_type=legalization_reconstruction_house`"
+        )
+        return
+
     try:
         from business_core.business_builder import (
             find_object_by_id,
@@ -2701,26 +2715,29 @@ SE_CONFIRM = 50  # общее состояние подтверждения дл
 STAGE_PRIORITY_VALUES = ("low", "normal", "high", "urgent")
 
 
-def _stage_row_display(row: dict) -> str:
+def _stage_row_display(stage: dict) -> str:
+    """stage: canonical dict from roadmap_manager.find_stage_by_id()
+    (Closeout Remediation finding #3 — no longer a raw sheet-header-keyed
+    row from find_row_by_id)."""
     lines = [
-        f"📌 Этап {row.get('Stage ID', '')}",
+        f"📌 Этап {stage.get('stage_id', '')}",
         "",
-        f"Roadmap: {row.get('Roadmap ID', '')}",
-        f"Order: {row.get('Order', '')}",
-        f"Название: {row.get('Name', '')}",
-        f"Статус: {row.get('Status', '')}",
-        f"Ответственный: {row.get('Responsible', '') or '—'}",
-        f"Start Date: {row.get('Start Date', '') or '—'}",
-        f"Due Date: {row.get('Due Date', '') or '—'}",
-        f"Completed At: {row.get('Completed At', '') or '—'}",
+        f"Roadmap: {stage.get('roadmap_id', '')}",
+        f"Order: {stage.get('order', '')}",
+        f"Название: {stage.get('name', '')}",
+        f"Статус: {stage.get('status', '')}",
+        f"Ответственный: {stage.get('responsible', '') or '—'}",
+        f"Start Date: {stage.get('start_date', '') or '—'}",
+        f"Due Date: {stage.get('due_date', '') or '—'}",
+        f"Completed At: {stage.get('completed_at', '') or '—'}",
         # Пустой Priority отображается как 'normal' по умолчанию — это
         # только отображение, ничего не пишется в Sheets, пока
         # пользователь явно не вызовет /priority.
-        f"Приоритет: {row.get('Priority', '') or 'normal'}",
-        f"Blocking Reason: {row.get('Blocking Reason', '') or '—'}",
-        f"Required Docs: {row.get('Docs Required', '') or '—'}",
-        f"Checklist IDs: {row.get('Checklist IDs', '') or '—'}",
-        f"Notes: {row.get('Notes', '') or '—'}",
+        f"Приоритет: {stage.get('priority', '') or 'normal'}",
+        f"Blocking Reason: {stage.get('blocking_reason', '') or '—'}",
+        f"Required Docs: {stage.get('docs_required', '') or '—'}",
+        f"Checklist IDs: {stage.get('checklist_ids', '') or '—'}",
+        f"Notes: {stage.get('notes', '') or '—'}",
     ]
     return "\n".join(lines)
 
@@ -2747,13 +2764,12 @@ async def stage_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     try:
-        from business_core.sheets import find_row_by_id
-        found = find_row_by_id("roadmap_stages", stage_id)
-        if not found:
+        from business_core.roadmap_manager import find_stage_by_id
+        stage = find_stage_by_id(stage_id)
+        if not stage:
             await _reply(update, f"❌ Этап {stage_id} не найден.")
             return
-        _, row = found
-        await _reply(update, _stage_row_display(row))
+        await _reply(update, _stage_row_display(stage))
     except Exception as e:
         log.error(f"stage_cmd error: {e}")
         await _reply(update, f"❌ Ошибка: {e}")
@@ -2871,17 +2887,16 @@ async def assignstage_start(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         )
         return ConversationHandler.END
 
-    from business_core.sheets import find_row_by_id
-    found = find_row_by_id("roadmap_stages", stage_id)
-    if not found:
+    from business_core.roadmap_manager import find_stage_by_id
+    stage = find_stage_by_id(stage_id)
+    if not stage:
         await update.message.reply_text(f"❌ Этап {stage_id} не найден.")
         return ConversationHandler.END
-    _, row = found
 
     return await _stage_edit_start(
         update, context, stage_id=stage_id, field_label="Ответственный",
         writes={"Responsible": responsible},
-        old_value_display=row.get("Responsible", ""),
+        old_value_display=stage.get("responsible", ""),
         new_value_display=responsible or "не назначен",
         snapshot_key="se_assign",
     )
@@ -2925,17 +2940,16 @@ async def duedate_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         await update.message.reply_text("❌ Дата должна быть в формате ГГГГ-ММ-ДД, например 2026-08-01.")
         return ConversationHandler.END
 
-    from business_core.sheets import find_row_by_id
-    found = find_row_by_id("roadmap_stages", stage_id)
-    if not found:
+    from business_core.roadmap_manager import find_stage_by_id
+    stage = find_stage_by_id(stage_id)
+    if not stage:
         await update.message.reply_text(f"❌ Этап {stage_id} не найден.")
         return ConversationHandler.END
-    _, row = found
 
     return await _stage_edit_start(
         update, context, stage_id=stage_id, field_label="Due Date",
         writes={"Due Date": date_val},
-        old_value_display=row.get("Due Date", ""),
+        old_value_display=stage.get("due_date", ""),
         new_value_display=date_val or "снят",
         snapshot_key="se_duedate",
     )
@@ -2976,17 +2990,16 @@ async def priority_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return ConversationHandler.END
 
-    from business_core.sheets import find_row_by_id
-    found = find_row_by_id("roadmap_stages", stage_id)
-    if not found:
+    from business_core.roadmap_manager import find_stage_by_id
+    stage = find_stage_by_id(stage_id)
+    if not stage:
         await update.message.reply_text(f"❌ Этап {stage_id} не найден.")
         return ConversationHandler.END
-    _, row = found
 
     return await _stage_edit_start(
         update, context, stage_id=stage_id, field_label="Приоритет",
         writes={"Priority": level},
-        old_value_display=row.get("Priority", "") or "normal",
+        old_value_display=stage.get("priority", "") or "normal",
         new_value_display=level,
         snapshot_key="se_priority",
     )
@@ -3020,17 +3033,16 @@ async def blockstage_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
         return ConversationHandler.END
 
-    from business_core.sheets import find_row_by_id
-    found = find_row_by_id("roadmap_stages", stage_id)
-    if not found:
+    from business_core.roadmap_manager import find_stage_by_id
+    stage = find_stage_by_id(stage_id)
+    if not stage:
         await update.message.reply_text(f"❌ Этап {stage_id} не найден.")
         return ConversationHandler.END
-    _, row = found
 
     return await _stage_edit_start(
         update, context, stage_id=stage_id, field_label="Блокировка (Status → blocked)",
         writes={"Blocking Reason": reason, "Status": "blocked"},
-        old_value_display=row.get("Blocking Reason", ""),
+        old_value_display=stage.get("blocking_reason", ""),
         new_value_display=reason,
         snapshot_key="se_block",
     )
@@ -3058,23 +3070,22 @@ async def unblockstage_start(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text("❌ Использование:\n/unblockstage stage_id=STAGE-001")
         return ConversationHandler.END
 
-    from business_core.sheets import find_row_by_id
-    found = find_row_by_id("roadmap_stages", stage_id)
-    if not found:
+    from business_core.roadmap_manager import find_stage_by_id
+    stage = find_stage_by_id(stage_id)
+    if not stage:
         await update.message.reply_text(f"❌ Этап {stage_id} не найден.")
         return ConversationHandler.END
-    _, row = found
 
     writes = {"Blocking Reason": ""}
     # Возвращаем в pending только если этап действительно был blocked —
     # не трогаем Status, если он уже done/skipped/in_progress по другой причине.
-    if row.get("Status", "") == "blocked":
+    if stage.get("raw_status", "") == "blocked":
         writes["Status"] = "pending"
 
     return await _stage_edit_start(
         update, context, stage_id=stage_id, field_label="Разблокировка",
         writes=writes,
-        old_value_display=row.get("Blocking Reason", "") or "—",
+        old_value_display=stage.get("blocking_reason", "") or "—",
         new_value_display="снято",
         snapshot_key="se_unblock",
     )

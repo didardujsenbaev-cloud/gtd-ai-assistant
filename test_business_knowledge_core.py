@@ -445,6 +445,13 @@ class TestStartRoadmapCopiesKnowledge(unittest.TestCase):
     separately. These tests now mock find_template_stages() to return
     rows WITH those keys already populated, matching find_template_stages()'s
     actual post-Phase-28E return shape.
+
+    Closeout Remediation (finding #2): create_stages_from_template_record()
+    itself moved to business_core.business_builder (to break a
+    roadmap_manager <-> roadmap_template_manager circular import) — these
+    tests still patch find_template_stages on the roadmap_template_manager
+    module object (rtm), since business_builder's lazy import resolves it
+    from there at call time, but now call business_builder's function.
     """
 
     def test_S_knowledge_ids_copied_to_real_stages(self):
@@ -452,6 +459,7 @@ class TestStartRoadmapCopiesKnowledge(unittest.TestCase):
         for k in list(sys.modules):
             if "business_core" in k: del sys.modules[k]
         import business_core.roadmap_template_manager as rtm
+        import business_core.business_builder as bb
 
         template_stages = [
             {"stage_id": "TSTG-001", "template_id": "RTMPL-001", "order": "1",
@@ -477,7 +485,7 @@ class TestStartRoadmapCopiesKnowledge(unittest.TestCase):
              patch("business_core.sheets.batch_append_business_rows",
                    side_effect=lambda k, rows: appended.extend(rows)), \
              patch("business_core.sheets.generate_next_ids", return_value=["STAGE-001"]):
-            result = rtm.create_stages_from_template_record("RM-001", "RTMPL-001")
+            result = bb.create_stages_from_template_record("RM-001", "RTMPL-001")
 
         self.assertTrue(result["ok"])
         self.assertEqual(result["stages_count"], 1)
@@ -491,6 +499,7 @@ class TestStartRoadmapCopiesKnowledge(unittest.TestCase):
         for k in list(sys.modules):
             if "business_core" in k: del sys.modules[k]
         import business_core.roadmap_template_manager as rtm
+        import business_core.business_builder as bb
 
         template_stages = [
             {"stage_id": "TSTG-002", "template_id": "RTMPL-001", "order": "1",
@@ -514,7 +523,7 @@ class TestStartRoadmapCopiesKnowledge(unittest.TestCase):
              patch("business_core.sheets.get_business_sheet", return_value=sheet), \
              patch("business_core.sheets.batch_append_business_rows"), \
              patch("business_core.sheets.generate_next_ids", return_value=["STAGE-002"]):
-            result = rtm.create_stages_from_template_record("RM-001", "RTMPL-001")
+            result = bb.create_stages_from_template_record("RM-001", "RTMPL-001")
 
         self.assertTrue(result["ok"])
         self.assertEqual(result["stages_count"], 1)

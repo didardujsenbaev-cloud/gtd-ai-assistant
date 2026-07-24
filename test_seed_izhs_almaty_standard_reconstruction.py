@@ -397,8 +397,6 @@ class TestStartRoadmapWithStandardTemplate(unittest.TestCase):
                  patch("business_core.business_builder.update_object_roadmap_id"), \
                  patch("business_core.roadmap_template_manager.find_roadmap_template_by_id",
                        return_value={"Template ID": "RMT-IZH-ALM-STANDARD-001"}), \
-                 patch("business_core.roadmap_template_manager.create_stages_from_template_record",
-                       return_value=stages_mock), \
                  patch("business_core.service_manager.find_service_by_id", return_value=None), \
                  patch("business_core.roadmap_template_manager.find_roadmap_templates_by_service",
                        return_value=[]), \

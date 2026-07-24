@@ -44,12 +44,13 @@ def _fresh_sheets():
     return s
 
 
-def _fresh_template_manager():
+def _fresh_template_manager_and_builder():
     for k in list(sys.modules):
         if "business_core" in k:
             del sys.modules[k]
     import business_core.roadmap_template_manager as m
-    return m
+    import business_core.business_builder as bb
+    return m, bb
 
 
 def _ws(rows):
@@ -231,7 +232,7 @@ class TestCreateStagesNoDuplicateIds(unittest.TestCase):
     Stage ID+Name preserved unchanged."""
 
     def test_eight_stages_get_eight_unique_ids(self):
-        m = _fresh_template_manager()
+        m, bb = _fresh_template_manager_and_builder()
         batch_calls = []
 
         def capture(key, rows):
@@ -244,7 +245,7 @@ class TestCreateStagesNoDuplicateIds(unittest.TestCase):
                    side_effect=capture), \
              patch("business_core.knowledge_manager.find_knowledge_by_template_stage",
                    return_value={}):
-            result = m.create_stages_from_template_record("RM-001", "RMT-IZH-ALM-STANDARD-001")
+            result = bb.create_stages_from_template_record("RM-001", "RMT-IZH-ALM-STANDARD-001")
 
         self.assertTrue(result["ok"])
         self.assertEqual(result["stages_count"], 8)
@@ -272,7 +273,7 @@ class TestCreateStagesNoDuplicateIds(unittest.TestCase):
 
     def test_single_stage_template_still_works(self):
         """H (integration): a 1-stage template still produces exactly one ID."""
-        m = _fresh_template_manager()
+        m, bb = _fresh_template_manager_and_builder()
         batch_calls = []
 
         with patch.object(m, "find_template_stages",
@@ -283,7 +284,7 @@ class TestCreateStagesNoDuplicateIds(unittest.TestCase):
                    side_effect=lambda k, rows: batch_calls.append(rows)), \
              patch("business_core.knowledge_manager.find_knowledge_by_template_stage",
                    return_value={}):
-            result = m.create_stages_from_template_record("RM-001", "RMT-IZH-ALM-STANDARD-001")
+            result = bb.create_stages_from_template_record("RM-001", "RMT-IZH-ALM-STANDARD-001")
 
         self.assertTrue(result["ok"])
         self.assertEqual(result["stages_count"], 1)
@@ -293,7 +294,7 @@ class TestCreateStagesNoDuplicateIds(unittest.TestCase):
     def test_continues_from_existing_stages_on_other_roadmaps(self):
         """Batch creation on top of a non-empty sheet continues sequentially,
         does not collide with previously-persisted Stage IDs."""
-        m = _fresh_template_manager()
+        m, bb = _fresh_template_manager_and_builder()
         batch_calls = []
 
         with patch.object(m, "find_template_stages",
@@ -305,7 +306,7 @@ class TestCreateStagesNoDuplicateIds(unittest.TestCase):
                    side_effect=lambda k, rows: batch_calls.append(rows)), \
              patch("business_core.knowledge_manager.find_knowledge_by_template_stage",
                    return_value={}):
-            result = m.create_stages_from_template_record("RM-002", "RMT-IZH-ALM-STANDARD-001")
+            result = bb.create_stages_from_template_record("RM-002", "RMT-IZH-ALM-STANDARD-001")
 
         self.assertTrue(result["ok"])
         self.assertEqual(result["stage_ids"], ["STAGE-004", "STAGE-005", "STAGE-006"])

@@ -1176,8 +1176,14 @@ def find_stage_by_id(stage_id: str) -> Optional[dict]:
 
     Returns:
         dict с полями row_num, stage_id, roadmap_id, order, name, status,
-        due_date, completed_at, responsible, notes — или None, если этап
-        не найден.
+        raw_status, due_date, completed_at, responsible, notes,
+        start_date, priority, blocking_reason, docs_required,
+        docs_received, checklist_ids — или None, если этап не найден.
+        (start_date/priority/blocking_reason/docs_required/docs_received/
+        checklist_ids added additively — Closeout Remediation finding #3 —
+        so telegram_handlers's read-only /stage display can be migrated
+        onto this owner API without losing any field it already shows;
+        no existing key removed or renamed.)
     """
     if not stage_id:
         return None
@@ -1196,21 +1202,29 @@ def find_stage_by_id(stage_id: str) -> Optional[dict]:
         wanted = [
             "Stage ID", "Roadmap ID", "Order", "Name", "Status",
             "Due Date", "Completed At", "Responsible", "Notes",
+            "Start Date", "Priority", "Blocking Reason",
+            "Docs Required", "Docs Received", "Checklist IDs",
         ]
         v = read_row_by_headers(headers, row, wanted)
 
         return {
-            "row_num":      cell.row,
-            "stage_id":     v["Stage ID"],
-            "roadmap_id":   v["Roadmap ID"],
-            "order":        v["Order"],
-            "name":         v["Name"],
-            "status":       normalize_stage_status(v["Status"]),
-            "raw_status":   v["Status"],
-            "due_date":     v["Due Date"],
-            "completed_at": v["Completed At"],
-            "responsible":  v["Responsible"],
-            "notes":        v["Notes"],
+            "row_num":         cell.row,
+            "stage_id":        v["Stage ID"],
+            "roadmap_id":      v["Roadmap ID"],
+            "order":           v["Order"],
+            "name":            v["Name"],
+            "status":          normalize_stage_status(v["Status"]),
+            "raw_status":      v["Status"],
+            "due_date":        v["Due Date"],
+            "completed_at":    v["Completed At"],
+            "responsible":     v["Responsible"],
+            "notes":           v["Notes"],
+            "start_date":      v["Start Date"],
+            "priority":        v["Priority"],
+            "blocking_reason": v["Blocking Reason"],
+            "docs_required":   v["Docs Required"],
+            "docs_received":   v["Docs Received"],
+            "checklist_ids":   v["Checklist IDs"],
         }
 
     except Exception as exc:

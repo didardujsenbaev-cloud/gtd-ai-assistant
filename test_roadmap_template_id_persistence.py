@@ -366,8 +366,6 @@ class TestEndToEndStartroadmapToMilestones(unittest.TestCase):
                  patch("business_core.service_manager.find_service_by_id",
                        return_value={"service_id": "SVC-IZH-001",
                                      "default_roadmap_template_id": "RMT-IZH-ALM-LEGALIZATION-001"}), \
-                 patch("business_core.roadmap_template_manager.create_stages_from_template_record",
-                       side_effect=mock_stages), \
                  patch("business_core.roadmap_manager.create_roadmap_stages_from_template",
                        return_value={"stages_count": 0}):
                 await th.startroadmap_cmd(upd, ctx)

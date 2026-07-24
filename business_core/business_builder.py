@@ -1485,6 +1485,19 @@ def create_roadmap_for_object(
     if not obj_id or not biz_id or not client_id:
         return _empty_roadmap_creation_result("Обязательные поля: obj_id, biz_id, client_id")
 
+    # Closeout Remediation (finding #1) — defense-in-depth: service_id is
+    # part of the (Object ID, Service ID) duplicate key that
+    # find_active_roadmap_for_object() uses to prevent a second active
+    # Roadmap for the same Object. A blank/whitespace-only service_id
+    # must never reach Roadmap creation — it previously bypassed the
+    # reuse lookup entirely (`if service_id else None`) and created a
+    # distinct, dedup-invisible Roadmap (the RM-002 incident). This is
+    # enforced here even though telegram_handlers.startroadmap_cmd now
+    # also validates it, so any other/future caller gets the same
+    # guarantee — no Roadmap record, no Stage rows, no Extension calls.
+    if not service_id or not service_id.strip():
+        return _empty_roadmap_creation_result("service_id обязателен")
+
     if not title:
         title = f"Roadmap {obj_id}" + (f" / {service_id}" if service_id else "")
 
@@ -1493,7 +1506,9 @@ def create_roadmap_for_object(
     warnings: list[str] = []
     template_warning = None
 
-    existing = find_active_roadmap_for_object(obj_id, service_id) if service_id else None
+    # service_id is now guaranteed non-empty above — no conditional
+    # bypass of the dedup lookup remains.
+    existing = find_active_roadmap_for_object(obj_id, service_id)
 
     if existing is not None:
         # Data-integrity visibility (Phase 28G): more than one active
@@ -1659,6 +1674,87 @@ def create_roadmap_for_object(
         },
         "knowledge_result": {"merged_inline": used_template},
     }
+
+
+def create_stages_from_template_record(roadmap_id: str, template_id: str) -> dict:
+    """
+    Создать реальные этапы roadmap из шаблона ROADMAP_TEMPLATE_STAGES.
+
+    Closeout Remediation (finding #2): moved here from
+    business_core.roadmap_template_manager, where it used to call
+    roadmap_manager.ensure_roadmap_stages() — a Roadmap Template Manager
+    -> Roadmap Manager import that, combined with roadmap_manager's own
+    (necessary, read-only) import of
+    roadmap_template_manager.find_roadmap_templates_by_service() inside
+    _resolve_template_id(), formed a circular dependency between the two
+    *_manager.py modules. This orchestration (reading template stage rows
+    from one manager, then handing them to the other manager's owner API
+    for the actual Stage row creation) belongs in this orchestration
+    layer, not inside either manager. roadmap_template_manager.py no
+    longer defines or calls this function.
+
+    Note: business_builder.create_roadmap_for_object() does this same
+    find_template_stages() + ensure_roadmap_stages() sequence inline
+    already (it does not call this function) — this standalone version
+    is kept for any other/future direct caller with the same signature
+    and return shape as before the move.
+
+    Returns:
+        {
+            "ok":           bool,
+            "stages_count": int,
+            "warning":      str | None,
+            "stage_ids":    list[str],
+            "partial_success":             bool,   # always False
+            "relation_copy_errors":        tuple,   # always ()
+            "relation_copy_created_count": int,     # always 0
+        }
+    """
+    if not roadmap_id or not template_id:
+        return {
+            "ok": False, "stages_count": 0,
+            "warning": "roadmap_id и template_id обязательны", "stage_ids": [],
+            "partial_success": False, "relation_copy_errors": (), "relation_copy_created_count": 0,
+        }
+
+    from business_core.roadmap_template_manager import find_template_stages
+    template_stages = find_template_stages(template_id)
+    if not template_stages:
+        return {
+            "ok": True, "stages_count": 0,
+            "warning": f"Шаблон {template_id} не содержит этапов.",
+            "stage_ids": [],
+            "partial_success": False, "relation_copy_errors": (), "relation_copy_created_count": 0,
+        }
+
+    try:
+        from business_core.roadmap_manager import ensure_roadmap_stages
+
+        result = ensure_roadmap_stages(roadmap_id, template_stages)
+        if not result["ok"]:
+            return {
+                "ok": False, "stages_count": 0,
+                "warning": result.get("error", ""), "stage_ids": [],
+                "partial_success": False, "relation_copy_errors": (), "relation_copy_created_count": 0,
+            }
+
+        return {
+            "ok": True,
+            "stages_count": result["created_count"],
+            "warning": None,
+            "stage_ids": result["created_stage_ids"],
+            "partial_success": False,
+            "relation_copy_errors": (),
+            "relation_copy_created_count": 0,
+        }
+
+    except Exception as exc:
+        log.error(f"create_stages_from_template_record error: {exc}")
+        return {
+            "ok": False, "stages_count": 0,
+            "warning": str(exc), "stage_ids": [],
+            "partial_success": False, "relation_copy_errors": (), "relation_copy_created_count": 0,
+        }
 
 
 def find_roadmap_by_id(roadmap_id: str) -> Optional[dict]:

@@ -108,11 +108,16 @@ class TestRoadmapTemplateManagerHasZeroExtensionOrOrchestrationImports(unittest.
     """roadmap_template_manager.py is also Core. Phase 28E removed its
     two known Extension imports (stage_entity_relations,
     knowledge_manager) — find_template_stages() now reads knowledge-ID
-    columns directly (same-registry read, no Extension dependency) and
-    create_stages_from_template_record() delegates Stage creation to
-    roadmap_manager.ensure_roadmap_stages() (Core -> Core) instead of
-    writing ROADMAP_STAGES itself and copying relations inline. This
-    guard is now fully strict, no debt allowlist."""
+    columns directly (same-registry read, no Extension dependency).
+    Closeout Remediation (finding #2) additionally removed this module's
+    only remaining business_core.roadmap_manager import
+    (create_stages_from_template_record(), which used to delegate Stage
+    creation to roadmap_manager.ensure_roadmap_stages() from here) —
+    that orchestration now lives in business_builder.
+    create_stages_from_template_record() instead, breaking the
+    roadmap_manager <-> roadmap_template_manager import cycle (see
+    TestNoRoadmapManagerCircularDependency below). This guard is now
+    fully strict, no debt allowlist."""
 
     def test_no_forbidden_extension_imports(self):
         path = BUSINESS_CORE / "roadmap_template_manager.py"
@@ -201,9 +206,11 @@ class TestRoadmapsRegistryWriteOwnership(unittest.TestCase):
 
 class TestRoadmapStagesRegistryWriteOwnership(unittest.TestCase):
     """ROADMAP_STAGES ("roadmap_stages" sheet_key) — Phase 28D/28C
-    migrated every non-owner writer: roadmap_template_manager.
-    create_stages_from_template_record() now delegates to roadmap_manager.
-    ensure_roadmap_stages() instead of writing directly; telegram_handlers.
+    migrated every non-owner writer: roadmap_template_manager no longer
+    contains any Stage-creation function at all (Closeout Remediation
+    finding #2 moved create_stages_from_template_record() to
+    business_builder, which itself only ever delegates to roadmap_manager.
+    ensure_roadmap_stages() instead of writing directly); telegram_handlers.
     newroadmap_confirm() no longer writes stages inline. roadmap_manager.py
     is now the sole writer — fully strict, no debt allowlist."""
 
@@ -440,6 +447,200 @@ class TestLegacyStatusNeverWritten(unittest.TestCase):
             set(rm.ROADMAP_STATUSES),
             {"active", "completed", "on_hold", "cancelled"},
         )
+
+
+class TestNoRoadmapManagerCircularDependency(unittest.TestCase):
+    """
+    Closeout Remediation (finding #2): CORE_ROADMAP_DEPENDENCY_CYCLE_EXISTS
+    must be NO. Before this remediation, roadmap_manager.py imported
+    roadmap_template_manager.find_roadmap_templates_by_service() (inside
+    _resolve_template_id) AND roadmap_template_manager.py imported
+    roadmap_manager.ensure_roadmap_stages() (inside
+    create_stages_from_template_record) — a genuine circular *_manager.py
+    <-> *_manager.py dependency, both directions function-local/lazy so
+    neither raised ImportError, but forbidden by ENGINEERING_STANDARDS.md.
+    create_stages_from_template_record() moved to business_builder,
+    removing the roadmap_template_manager -> roadmap_manager edge
+    entirely. roadmap_manager -> roadmap_template_manager (the
+    _resolve_template_id lookup) is the one remaining, single-direction
+    edge — not a cycle. This check is AST-based (module-level or
+    function-local imports, anywhere in the file) so it cannot be
+    defeated by moving an import inside a function.
+    """
+
+    def test_roadmap_template_manager_does_not_import_roadmap_manager(self):
+        path = BUSINESS_CORE / "roadmap_template_manager.py"
+        found = _imported_module_names(path) & {"roadmap_manager"}
+        self.assertEqual(
+            found, set(),
+            "roadmap_template_manager.py must not import business_core.roadmap_manager "
+            "anywhere (module-level or function-local) — this is the edge that used to "
+            "close the roadmap_manager <-> roadmap_template_manager import cycle.",
+        )
+
+    def test_no_cycle_between_the_two_roadmap_managers(self):
+        rm_path  = BUSINESS_CORE / "roadmap_manager.py"
+        rtm_path = BUSINESS_CORE / "roadmap_template_manager.py"
+        rm_imports_rtm = "roadmap_template_manager" in _imported_module_names(rm_path)
+        rtm_imports_rm = "roadmap_manager" in _imported_module_names(rtm_path)
+        self.assertFalse(
+            rm_imports_rtm and rtm_imports_rm,
+            "roadmap_manager.py and roadmap_template_manager.py must not import each "
+            f"other simultaneously (cycle): roadmap_manager imports roadmap_template_manager "
+            f"= {rm_imports_rtm}, roadmap_template_manager imports roadmap_manager = {rtm_imports_rm}",
+        )
+
+    def test_template_stage_retrieval_still_works(self):
+        import business_core.roadmap_template_manager as rtm
+        self.assertTrue(callable(getattr(rtm, "find_template_stages", None)))
+
+    def test_business_builder_owns_create_stages_from_template_record(self):
+        import business_core.business_builder as bb
+        import business_core.roadmap_template_manager as rtm
+        self.assertTrue(
+            callable(getattr(bb, "create_stages_from_template_record", None)),
+            "business_core.business_builder.create_stages_from_template_record must exist "
+            "— the orchestration moved here from roadmap_template_manager.",
+        )
+        self.assertIsNone(
+            getattr(rtm, "create_stages_from_template_record", None),
+            "business_core.roadmap_template_manager.create_stages_from_template_record "
+            "must no longer exist — it was the function that imported roadmap_manager.",
+        )
+
+    def test_create_roadmap_for_object_still_creates_stages_via_ensure_roadmap_stages(self):
+        import inspect
+        import business_core.business_builder as bb
+        src = inspect.getsource(bb.create_roadmap_for_object)
+        self.assertIn("ensure_roadmap_stages", src)
+        self.assertIn("find_template_stages", src)
+
+
+class TestTelegramHandlersNeverReadRoadmapStagesDirectly(unittest.TestCase):
+    """
+    Closeout Remediation (finding #3): TELEGRAM_HANDLERS_READ_ROADMAP_STAGES_DIRECTLY
+    must be NO. The six Stage-field commands (/stage, /assignstage, /duedate,
+    /priority, /blockstage, /unblockstage) used to call
+    business_core.sheets.find_row_by_id("roadmap_stages", ...) directly,
+    bypassing the existing owner API roadmap_manager.find_stage_by_id().
+    This is a source-level, not just a per-handler, guarantee: no raw
+    Sheets read of the roadmap_stages registry anywhere in
+    telegram_handlers.py — AST-based, catches find_row_by_id,
+    get_worksheet, and get_business_sheet calls against the
+    "roadmap_stages" sheet_key, module-level or function-local.
+    """
+
+    def test_no_raw_roadmap_stages_reads_in_telegram_handlers(self):
+        path = BUSINESS_CORE / "telegram_handlers.py"
+        src = path.read_text(encoding="utf-8")
+        tree = ast.parse(src, str(path))
+        raw_read_funcs = {"find_row_by_id", "get_worksheet", "get_business_sheet"}
+        hits: list[str] = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            fname = node.func.id if isinstance(node.func, ast.Name) else getattr(node.func, "attr", None)
+            if fname not in raw_read_funcs:
+                continue
+            for arg in node.args:
+                if isinstance(arg, ast.Constant) and arg.value == "roadmap_stages":
+                    hits.append(f"{fname}(...) at line {node.lineno}")
+        self.assertEqual(
+            hits, [],
+            f"telegram_handlers.py must not read roadmap_stages directly, found: {hits} "
+            f"— use business_core.roadmap_manager.find_stage_by_id() instead.",
+        )
+
+    def test_find_stage_by_id_is_used_by_telegram_handlers(self):
+        path = BUSINESS_CORE / "telegram_handlers.py"
+        src = path.read_text(encoding="utf-8")
+        self.assertIn(
+            "find_stage_by_id", src,
+            "telegram_handlers.py should call roadmap_manager.find_stage_by_id() "
+            "for its Stage-field commands.",
+        )
+
+    def test_owner_api_find_stage_by_id_exists(self):
+        import business_core.roadmap_manager as rm
+        self.assertTrue(callable(getattr(rm, "find_stage_by_id", None)))
+
+
+class TestEmptyServiceIdCannotReachRoadmapCreation(unittest.TestCase):
+    """
+    Closeout Remediation (finding #1): EMPTY_SERVICE_ID_CAN_REACH_ROADMAP_CREATION
+    must be NO, and INVALID_SERVICE_ID_CAUSES_NO_ROADMAP_WRITE must be YES.
+    service_id is part of the (Object ID, Service ID) duplicate key
+    find_active_roadmap_for_object() uses to prevent a second active
+    Roadmap for the same Object (see the RM-002 production incident) — a
+    blank service_id must never bypass that lookup. Both the Telegram
+    handler and business_builder.create_roadmap_for_object() (defense in
+    depth) must reject it before any write.
+    """
+
+    def test_builder_rejects_empty_service_id_without_any_write(self):
+        from unittest.mock import patch
+        import business_core.business_builder as bb
+
+        with patch("business_core.roadmap_manager.create_roadmap_record") as mock_create, \
+             patch("business_core.sheets.append_business_row") as mock_append, \
+             patch("business_core.sheets.batch_append_business_rows") as mock_batch:
+            result = bb.create_roadmap_for_object(
+                obj_id="OBJ-001", biz_id="BIZ-001", client_id="PRS-001",
+                service_id="", case_type="general",
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertIn("service_id", result["error"])
+        mock_create.assert_not_called()
+        mock_append.assert_not_called()
+        mock_batch.assert_not_called()
+
+    def test_builder_rejects_whitespace_only_service_id(self):
+        import business_core.business_builder as bb
+        result = bb.create_roadmap_for_object(
+            obj_id="OBJ-001", biz_id="BIZ-001", client_id="PRS-001",
+            service_id="   ", case_type="general",
+        )
+        self.assertFalse(result["ok"])
+
+    def test_builder_dedup_lookup_no_longer_conditional_on_service_id(self):
+        """The find_active_roadmap_for_object(...) call must not be
+        wrapped in a conditional (ternary) expression gated on
+        service_id — after validation, service_id is always truthy, so
+        the old `find_active_roadmap_for_object(...) if service_id else
+        None` bypass pattern must be gone, and the call site must be a
+        plain, unconditional assignment."""
+        import ast
+        import inspect
+        import business_core.business_builder as bb
+        src = inspect.getsource(bb.create_roadmap_for_object)
+        tree = ast.parse(src)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.IfExp):
+                for sub in ast.walk(node):
+                    if isinstance(sub, ast.Call):
+                        fname = sub.func.id if isinstance(sub.func, ast.Name) else getattr(sub.func, "attr", None)
+                        self.assertNotEqual(
+                            fname, "find_active_roadmap_for_object",
+                            "find_active_roadmap_for_object() must not be called inside a "
+                            "conditional expression gated on service_id.",
+                        )
+
+    def test_handler_validates_service_id_before_builder_call(self):
+        path = BUSINESS_CORE / "telegram_handlers.py"
+        src = path.read_text(encoding="utf-8")
+        start = src.index("async def startroadmap_cmd")
+        end = src.index("\nasync def ", start + 10)
+        body = src[start:end]
+        self.assertIn("service_id", body)
+        self.assertIn("create_roadmap_for_object", body)
+        # The service_id-emptiness check must appear before the
+        # create_roadmap_for_object import/call in source order.
+        service_check_pos = body.find("service_id.strip()")
+        call_pos = body.find("create_roadmap_for_object")
+        self.assertNotEqual(service_check_pos, -1, "no service_id validation found in startroadmap_cmd")
+        self.assertLess(service_check_pos, call_pos,
+                        "service_id must be validated before create_roadmap_for_object is called")
 
 
 if __name__ == "__main__":
