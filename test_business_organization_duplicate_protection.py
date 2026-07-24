@@ -413,11 +413,14 @@ class TestNormalizationHelper(unittest.TestCase):
 class TestRegressionAndGuards(unittest.TestCase):
 
     def test_only_business_core_sheets_imported(self):
-        """organization_manager.py must still depend only on
-        business_core.sheets after this phase's additions — the
-        normalization helper was deliberately reimplemented locally
-        rather than imported from business_builder.py, to preserve this
-        exact guarantee."""
+        """organization_manager.py must depend only on business_core.sheets
+        and, since Phase 23D-4C, business_core.person_manager (a
+        sanctioned Extension -> Core read-only dependency for
+        assign_person_to_role()'s person_id existence check — see
+        ENGINEERING_STANDARDS.md §2). The normalization helper was
+        deliberately reimplemented locally rather than imported from
+        business_builder.py, to preserve this guarantee against any
+        Extension-to-Extension dependency."""
         path = WORKSPACE / "business_core" / "organization_manager.py"
         src = path.read_text(encoding="utf-8")
         tree = ast.parse(src, str(path))
@@ -425,7 +428,7 @@ class TestRegressionAndGuards(unittest.TestCase):
         for node in ast.walk(tree):
             if isinstance(node, ast.ImportFrom) and node.module and node.module.startswith("business_core"):
                 imports.add(node.module)
-        self.assertEqual(imports, {"business_core.sheets"})
+        self.assertEqual(imports, {"business_core.sheets", "business_core.person_manager"})
 
     def test_no_gtd_imports(self):
         path = WORKSPACE / "business_core" / "organization_manager.py"

@@ -753,7 +753,11 @@ class TestModuleOnlyDependsOnSheets(unittest.TestCase):
                 for a in node.names:
                     if a.name.startswith("business_core"):
                         business_core_imports.add(a.name)
-        self.assertEqual(business_core_imports, {"business_core.sheets"})
+        # Phase 23D-4C: business_core.person_manager is a sanctioned
+        # Extension -> Core read-only dependency (ENGINEERING_STANDARDS.md
+        # §2), used only by assign_person_to_role()'s person_id existence
+        # check.
+        self.assertEqual(business_core_imports, {"business_core.sheets", "business_core.person_manager"})
 
     def test_no_top_level_import_side_effects(self):
         """All business_core.sheets imports are deferred inside function

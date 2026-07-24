@@ -297,23 +297,31 @@ class TestUpdateArchiveRoleFunction(unittest.TestCase):
 
 class TestAssignPersonToRole(unittest.TestCase):
 
-    def _people_role_assignment_sheets(self, person_exists=True, role_exists=True):
-        people_sheet = MagicMock()
-        people_sheet.get_all_values.return_value = [["ID"], ["PRS-001"]] if person_exists else [["ID"]]
+    def _people_role_assignment_sheets(self, role_exists=True):
         role_sheet = _make_sheet(ROLE_HEADERS, ROLE_ROW) if role_exists else MagicMock()
         if not role_exists:
             role_sheet.find.return_value = None
         assignment_sheet = MagicMock()
         assignment_sheet.get_all_values.return_value = [ASSIGNMENT_HEADERS]
         return {
-            "people_registry": people_sheet,
             "role_registry": role_sheet,
             "person_role_assignments": assignment_sheet,
         }
 
+    def _find_person_patch(self, exists=True):
+        """Phase 23D-4C: person_id existence is now checked via
+        person_manager.find_person_by_id(), not a raw people_registry
+        Sheet read — mock it directly rather than routing through
+        get_business_sheet()."""
+        return patch(
+            "business_core.person_manager.find_person_by_id",
+            return_value=({"person_id": "PRS-001"} if exists else None),
+        )
+
     def test_assign_minimal_success(self):
         om = _fresh_om()
-        with patch("business_core.sheets.get_business_sheet",
+        with self._find_person_patch(exists=True), \
+             patch("business_core.sheets.get_business_sheet",
                    side_effect=_multi_get(self._people_role_assignment_sheets())):
             result = om.assign_person_to_role("PRS-001", "ROLE-001", "2026-01-01")
         self.assertTrue(result["ok"])
@@ -355,29 +363,35 @@ class TestAssignPersonToRole(unittest.TestCase):
 
     def test_assign_unknown_person_rejected(self):
         om = _fresh_om()
-        with patch("business_core.sheets.get_business_sheet",
-                   side_effect=_multi_get(self._people_role_assignment_sheets(person_exists=False))):
+        with self._find_person_patch(exists=False), \
+             patch("business_core.sheets.get_business_sheet",
+                   side_effect=_multi_get(self._people_role_assignment_sheets())):
             result = om.assign_person_to_role("PRS-999", "ROLE-001", "2026-01-01")
         self.assertFalse(result["ok"])
         self.assertIn("PRS-999", result["error"])
 
     def test_assign_unknown_role_rejected(self):
         om = _fresh_om()
-        with patch("business_core.sheets.get_business_sheet",
+        with self._find_person_patch(exists=True), \
+             patch("business_core.sheets.get_business_sheet",
                    side_effect=_multi_get(self._people_role_assignment_sheets(role_exists=False))):
             result = om.assign_person_to_role("PRS-001", "ROLE-999", "2026-01-01")
         self.assertFalse(result["ok"])
         self.assertIn("ROLE-999", result["error"])
 
     def test_assign_does_not_write_to_people_registry(self):
-        """Only a read-only find_row_by_id check into people_registry —
-        never a write (Layer Dependency Rules)."""
+        """Phase 23D-4C: person_id existence is validated via
+        person_manager.find_person_by_id() — a read-only Person Manager
+        call, never a raw people_registry Sheet access — and this
+        function must still never write to people_registry
+        (Layer Dependency Rules)."""
         om = _fresh_om()
         sheets = self._people_role_assignment_sheets()
-        with patch("business_core.sheets.get_business_sheet", side_effect=_multi_get(sheets)):
+        with self._find_person_patch(exists=True), \
+             patch("business_core.sheets.get_business_sheet", side_effect=_multi_get(sheets)) as mock_get_sheet:
             om.assign_person_to_role("PRS-001", "ROLE-001", "2026-01-01")
-        sheets["people_registry"].update_cell.assert_not_called()
-        sheets["people_registry"].append_row.assert_not_called()
+        for call in mock_get_sheet.call_args_list:
+            self.assertNotEqual(call.args[0], "people_registry")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -733,7 +747,9 @@ class TestFullApiSurfaceContract(unittest.TestCase):
 
 class TestModuleOnlyDependsOnSheets(unittest.TestCase):
     """Layer Dependency Rules (ENGINEERING_STANDARDS.md §2) — re-verified
-    after Phase 21C's additions."""
+    after Phase 21C's additions and Phase 23D-4C's sanctioned Extension
+    Manager -> Core Manager (Person Manager) read-only dependency for
+    assign_person_to_role()'s person_id existence check."""
 
     def test_only_business_core_sheets_imported_within_business_core(self):
         path = WORKSPACE / "business_core" / "organization_manager.py"
@@ -748,7 +764,13 @@ class TestModuleOnlyDependsOnSheets(unittest.TestCase):
                 for a in node.names:
                     if a.name.startswith("business_core"):
                         business_core_imports.add(a.name)
-        self.assertEqual(business_core_imports, {"business_core.sheets"})
+        # Phase 23D-4C: business_core.person_manager is now a sanctioned
+        # Extension -> Core read-only dependency (ENGINEERING_STANDARDS.md
+        # §2) — this is not a Layer Dependency Rules violation, since
+        # organization_manager.py never imports from any other Extension
+        # manager or writes to PEOPLE_REGISTRY (see the dedicated
+        # never-writes-to-people_registry guard below).
+        self.assertEqual(business_core_imports, {"business_core.sheets", "business_core.person_manager"})
 
     def test_no_gtd_imports(self):
         path = WORKSPACE / "business_core" / "organization_manager.py"
@@ -770,6 +792,34 @@ class TestModuleOnlyDependsOnSheets(unittest.TestCase):
         _fresh_om()
         mtime_after = os.path.getmtime(env_path)
         self.assertEqual(mtime_before, mtime_after)
+
+
+class TestAssignPersonToRoleNoDirectRegistryRead(unittest.TestCase):
+    """Phase 23D-4C architecture guard: assign_person_to_role()'s
+    person_id existence check must call no direct find_row_by_id()/
+    get_business_sheet()/read_business_sheet()/get_all_values()/
+    get_all_records() for people_registry — only Person Manager's
+    find_person_by_id()."""
+
+    def test_no_direct_registry_read_calls_remain(self):
+        import inspect
+        om = _fresh_om()
+        source = inspect.getsource(om.assign_person_to_role)
+        tree = ast.parse(source)
+
+        forbidden_calls = {
+            "find_row_by_id", "get_business_sheet", "read_business_sheet",
+            "get_all_values", "get_all_records",
+        }
+        found_calls = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                func = node.func
+                name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
+                if name in forbidden_calls:
+                    found_calls.add(name)
+
+        self.assertEqual(found_calls, set())
 
 
 if __name__ == "__main__":

@@ -1263,8 +1263,8 @@ def assign_person_to_role(
         }
 
     try:
-        from business_core.sheets import find_row_by_id
-        if not find_row_by_id("people_registry", person_id):
+        from business_core.person_manager import find_person_by_id
+        if not find_person_by_id(person_id):
             return {"ok": False, "assignment_id": "", "error": f"Person '{person_id}' не найден"}
     except Exception as exc:
         log.error(f"assign_person_to_role person_id validation error: {exc}")
