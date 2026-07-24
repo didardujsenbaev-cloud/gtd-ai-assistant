@@ -931,10 +931,28 @@ class TestStartRoadmapConvergentRetryUX(unittest.TestCase):
             "roadmap_created": False, "roadmap_reused": True,
             "stages_count": 0, "used_template": True, "template_id": "RMT-EXISTING",
             "template_warning": "requested_template_id (RMT-NEW) differs from existing_template_id (RMT-EXISTING); existing Roadmap template retained",
-            "warnings": (), "relation_copy_errors": (),
+            "warnings": ("requested_template_id (RMT-NEW) differs from existing_template_id (RMT-EXISTING); existing Roadmap template retained",),
+            "relation_copy_errors": (),
         }))
         self.assertIn("RMT-NEW", reply)
         self.assertIn("RMT-EXISTING", reply)
+
+    def test_template_mismatch_warning_shown_exactly_once(self):
+        """Regression (found via Phase 28GH production smoke test):
+        template_warning is also present in "warnings" (for API
+        completeness), but the handler must show it only once, not
+        twice."""
+        import asyncio
+        warning_text = "Запрошенный шаблон (RMT-NEW) отличается от уже сохранённого (RMT-EXISTING) — сохранён прежний шаблон Roadmap."
+        reply = asyncio.run(self._run({
+            "ok": True, "roadmap_id": "RM-204", "error": None,
+            "roadmap_created": False, "roadmap_reused": True,
+            "stages_count": 0, "used_template": True, "template_id": "RMT-EXISTING",
+            "template_warning": warning_text,
+            "warnings": (warning_text,),
+            "relation_copy_errors": (),
+        }))
+        self.assertEqual(reply.count("сохранён прежний шаблон"), 1)
 
 
 # ────────────────────────────────────────────────────────────

@@ -2393,8 +2393,14 @@ async def startroadmap_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         elif case_type and case_type != "general":
             lines.append(f"Case Type: `{case_type}`")
 
-        if count == 0 and rm_result.get("warnings"):
-            lines.append(f"\n⚠️ {rm_result['warnings'][0]}")
+        # Phase 28G: template_warning is also present in "warnings" (for
+        # API completeness — other callers may only look at "warnings"),
+        # but is displayed via its own dedicated line below — exclude it
+        # here to avoid showing the same message twice.
+        template_warning = rm_result.get("template_warning")
+        other_warnings = [w for w in rm_result.get("warnings", ()) if w != template_warning]
+        if count == 0 and other_warnings:
+            lines.append(f"\n⚠️ {other_warnings[0]}")
         elif roadmap_created:
             lines.append(f"Этапов создано: {count}")
         elif count > 0:
@@ -2414,8 +2420,8 @@ async def startroadmap_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 if len(stage_names) > 5:
                     lines.append(f"   ... (+{len(stage_names) - 5} этапов)")
 
-        if rm_result.get("template_warning"):
-            lines.append(f"\n⚠️ {rm_result['template_warning']}")
+        if template_warning:
+            lines.append(f"\n⚠️ {template_warning}")
 
         lines.append(f"\nПросмотр этапов: `/stages roadmap_id={roadmap_id}`")
 

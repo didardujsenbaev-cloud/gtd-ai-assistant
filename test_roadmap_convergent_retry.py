@@ -306,6 +306,28 @@ class TestTemplateMismatchPolicy(unittest.TestCase):
         self.assertIn("RMT-EXISTING-001", result["template_warning"])
         self.assertIn(result["template_warning"], result["warnings"])
 
+    def test_template_mismatch_warning_has_no_unescaped_markdown_underscores(self):
+        """Regression (found via Phase 28GH production smoke test):
+        this message is displayed verbatim in Telegram with
+        parse_mode="Markdown" — an unescaped underscore is silently
+        consumed as an italic delimiter (e.g. "requested_template_id"
+        rendered as "requestedtemplateid"). The message text must
+        contain no raw underscores at all."""
+        bb = _fresh_bb()
+        existing_roadmap = {
+            "roadmap_id": "RM-115", "object_id": "OBJ-115", "service_id": "SVC-115",
+            "status": "active", "template_id": "RMT-EXISTING-001",
+        }
+        with patch("business_core.roadmap_manager.find_active_roadmap_for_object", return_value=existing_roadmap), \
+             patch("business_core.roadmap_manager.list_roadmaps", return_value=[existing_roadmap]), \
+             patch("business_core.roadmap_template_manager.find_template_stages", return_value=[]):
+            result = bb.create_roadmap_for_object(
+                obj_id="OBJ-115", biz_id="BIZ-001", client_id="PRS-001",
+                service_id="SVC-115", template_id="RMT-DIFFERENT-002",
+            )
+
+        self.assertNotIn("_", result["template_warning"])
+
     def test_no_mismatch_warning_when_templates_match(self):
         bb = _fresh_bb()
         existing_roadmap = {

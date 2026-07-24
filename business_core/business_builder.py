@@ -1515,10 +1515,15 @@ def create_roadmap_for_object(
         if existing_template_id:
             effective_template_id = existing_template_id
             if template_id and template_id != existing_template_id:
+                # No underscores in the human-readable text — this
+                # message is shown verbatim in Telegram (Markdown
+                # parse_mode), where unescaped underscores are consumed
+                # as italic delimiters and silently dropped (a real bug
+                # found via the Phase 28GH production smoke test).
                 template_warning = (
-                    f"requested_template_id ({template_id}) differs from "
-                    f"existing_template_id ({existing_template_id}); "
-                    f"existing Roadmap template retained"
+                    f"Запрошенный шаблон ({template_id}) отличается от уже "
+                    f"сохранённого ({existing_template_id}) — сохранён "
+                    f"прежний шаблон Roadmap."
                 )
                 warnings.append(template_warning)
         else:
