@@ -176,7 +176,7 @@ class TestResolveAndValidateLinks(unittest.TestCase):
     def test_valid_full_chain_resolves(self):
         drm = _fresh_drm()
         with patch("business_core.sheets.read_business_sheet", side_effect=_read_business_sheet_side_effect), \
-             patch("business_core.business_builder.get_person_biz_ids", return_value=["BIZ-001"]):
+             patch("business_core.person_manager.find_person_by_id", return_value={"biz_ids": ["BIZ-001"]}):
             result = drm.resolve_and_validate_links(
                 business_id="BIZ-001", client_id="PRS-001", object_id="OBJ-001",
                 roadmap_id="RM-001", stage_id="STAGE-001",
@@ -189,7 +189,7 @@ class TestResolveAndValidateLinks(unittest.TestCase):
         должны подтянуться автоматически."""
         drm = _fresh_drm()
         with patch("business_core.sheets.read_business_sheet", side_effect=_read_business_sheet_side_effect), \
-             patch("business_core.business_builder.get_person_biz_ids", return_value=["BIZ-001"]):
+             patch("business_core.person_manager.find_person_by_id", return_value={"biz_ids": ["BIZ-001"]}):
             result = drm.resolve_and_validate_links(business_id="BIZ-001", stage_id="STAGE-001")
         self.assertTrue(result["ok"])
         self.assertEqual(result["resolved"]["roadmap_id"], "RM-001")
@@ -303,7 +303,7 @@ class TestRegisterDocStart(unittest.TestCase):
         async def run():
             with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
                  patch("business_core.sheets.read_business_sheet", side_effect=_read_business_sheet_side_effect), \
-                 patch("business_core.business_builder.get_person_biz_ids", return_value=["BIZ-001"]), \
+                 patch("business_core.person_manager.find_person_by_id", return_value={"biz_ids": ["BIZ-001"]}), \
                  patch("integrations.google_drive_adapter.get_drive_service", return_value=MagicMock()), \
                  patch("integrations.google_drive_adapter.get_file_metadata", return_value=GOOD_META):
                 return await th.registerdoc_start(update, context)
@@ -331,7 +331,7 @@ class TestRegisterDocStart(unittest.TestCase):
         async def run():
             with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
                  patch("business_core.sheets.read_business_sheet", side_effect=_read_business_sheet_side_effect), \
-                 patch("business_core.business_builder.get_person_biz_ids", return_value=["BIZ-001"]), \
+                 patch("business_core.person_manager.find_person_by_id", return_value={"biz_ids": ["BIZ-001"]}), \
                  patch("integrations.google_drive_adapter.get_drive_service", return_value=MagicMock()), \
                  patch("integrations.google_drive_adapter.get_file_metadata", return_value=GOOD_META):
                 await th.registerdoc_start(update, context)
@@ -604,7 +604,7 @@ class TestOldRegistriesUntouched(unittest.TestCase):
         async def start():
             with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
                  patch("business_core.sheets.read_business_sheet", side_effect=_read_business_sheet_side_effect), \
-                 patch("business_core.business_builder.get_person_biz_ids", return_value=["BIZ-001"]), \
+                 patch("business_core.person_manager.find_person_by_id", return_value={"biz_ids": ["BIZ-001"]}), \
                  patch("integrations.google_drive_adapter.get_drive_service", return_value=MagicMock()), \
                  patch("integrations.google_drive_adapter.get_file_metadata", return_value=GOOD_META):
                 await th.registerdoc_start(update, context)
@@ -635,6 +635,37 @@ class TestNoLiveApi(unittest.TestCase):
             import business_core.telegram_handlers  # noqa: F401
             import business_core.document_registry_manager  # noqa: F401
         mock_get_sheet.assert_not_called()
+
+
+class TestNoDirectPeopleRegistryRead(unittest.TestCase):
+    """Phase 23D-4A architecture guard: resolve_and_validate_links()
+    and resolve_target_drive_folder() must call no direct
+    get_business_sheet()/read_business_sheet() for people_registry —
+    only Person Manager's find_person_by_id()."""
+
+    def _assert_no_people_registry_read(self, func):
+        import ast
+        import inspect
+
+        source = inspect.getsource(func)
+        tree = ast.parse(source)
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                func_node = node.func
+                name = func_node.attr if isinstance(func_node, ast.Attribute) else getattr(func_node, "id", None)
+                if name in ("get_business_sheet", "read_business_sheet") and node.args:
+                    first_arg = node.args[0]
+                    if isinstance(first_arg, ast.Constant) and first_arg.value == "people_registry":
+                        self.fail(f"{func.__name__} still directly reads people_registry via {name}()")
+
+    def test_resolve_and_validate_links_no_direct_people_read(self):
+        from business_core.document_registry_manager import resolve_and_validate_links
+        self._assert_no_people_registry_read(resolve_and_validate_links)
+
+    def test_resolve_target_drive_folder_no_direct_people_read(self):
+        from business_core.document_registry_manager import resolve_target_drive_folder
+        self._assert_no_people_registry_read(resolve_target_drive_folder)
 
 
 if __name__ == "__main__":

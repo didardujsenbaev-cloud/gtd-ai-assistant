@@ -286,8 +286,8 @@ class TestUploadDocDetailsStep(unittest.TestCase):
             with contextlib.ExitStack() as stack:
                 stack.enter_context(patch("business_core.sheets.read_business_sheet",
                                            side_effect=_read_business_sheet_side_effect))
-                stack.enter_context(patch("business_core.business_builder.get_person_biz_ids",
-                                           return_value=["BIZ-001"]))
+                stack.enter_context(patch("business_core.person_manager.find_person_by_id",
+                                           return_value={"biz_ids": ["BIZ-001"], "drive_folder_id": "PRSFOLDER1"}))
                 stack.enter_context(patch("integrations.google_drive_adapter.get_drive_service",
                                            return_value=MagicMock()))
                 stack.enter_context(patch("integrations.google_drive_adapter.get_file_metadata",
@@ -899,7 +899,9 @@ class TestResolveTargetDriveFolder(unittest.TestCase):
 
     def test_client_priority_without_object(self):
         drm = _fresh_drm()
-        with patch("business_core.sheets.read_business_sheet", side_effect=_read_business_sheet_side_effect):
+        with patch("business_core.sheets.read_business_sheet", side_effect=_read_business_sheet_side_effect), \
+             patch("business_core.person_manager.find_person_by_id",
+                   return_value={"drive_folder_id": "PRSFOLDER1"}):
             result = drm.resolve_target_drive_folder("BIZ-001", client_id="PRS-001")
         self.assertEqual(result["level"], "client")
         self.assertEqual(result["folder_id"], "PRSFOLDER1")

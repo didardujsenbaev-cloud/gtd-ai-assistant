@@ -298,7 +298,7 @@ class TestStageResponsibilityCommand(unittest.TestCase):
             "person_id": "PRS-001", "relation_id": "REL-010", "errors": (),
         }
         role = {"role_id": "ROLE-001", "role_name": "Coordinator", "status": "active"}
-        person_row = {"ФИО": "Иван Иванов", "Имя": "Иван"}
+        person = {"full_name": "Иван Иванов", "short_name": "Иван"}
         assignments = [{"person_id": "PRS-001", "assignment_type": "primary"}]
 
         async def run():
@@ -306,7 +306,7 @@ class TestStageResponsibilityCommand(unittest.TestCase):
                  patch("business_core.work_assignment_manager.resolve_stage_responsibility",
                        return_value=resolve_result), \
                  patch("business_core.organization_manager.find_role_by_id", return_value=role), \
-                 patch("business_core.sheets.find_row_by_id", return_value=(2, person_row)), \
+                 patch("business_core.person_manager.find_person_by_id", return_value=person), \
                  patch("business_core.organization_manager.list_assignments_for_role", return_value=assignments):
                 await th.stageresponsibility_cmd(upd, ctx)
 
@@ -418,7 +418,7 @@ class TestStageResponsibilityCommand(unittest.TestCase):
                  patch("business_core.work_assignment_manager.resolve_stage_responsibility",
                        return_value=resolve_result), \
                  patch("business_core.organization_manager.find_role_by_id", return_value=role), \
-                 patch("business_core.sheets.find_row_by_id", return_value=None), \
+                 patch("business_core.person_manager.find_person_by_id", return_value=None), \
                  patch("business_core.organization_manager.list_assignments_for_role", return_value=[]):
                 await th.stageresponsibility_cmd(upd, ctx)
 
@@ -487,9 +487,10 @@ class TestHandlersDelegateOnlyToApprovedApis(unittest.TestCase):
         _run(run())
 
     def test_stageresponsibility_never_calls_get_business_sheet_directly_for_writes(self):
-        """Read-only: it MAY read via find_row_by_id (people_registry
-        display lookup) but must never call get_business_sheet() itself
-        (that would imply a raw, unmanaged Sheets access)."""
+        """Read-only: it MAY read via person_manager.find_person_by_id()
+        (Phase 23D-4A — people_registry display lookup) but must never
+        call get_business_sheet() itself (that would imply a raw,
+        unmanaged Sheets access)."""
         th = _fresh_th()
         upd, ctx = _make_update("/stageresponsibility stage_id=STAGE-001", ["stage_id=STAGE-001"])
         resolve_result = {
@@ -506,6 +507,27 @@ class TestHandlersDelegateOnlyToApprovedApis(unittest.TestCase):
                 mock_sheet.assert_not_called()
 
         _run(run())
+
+    def test_stageresponsibility_no_direct_registry_read_calls_remain(self):
+        """Phase 23D-4A architecture guard: stageresponsibility_cmd()'s
+        person-name lookup must call no direct get_business_sheet()/
+        find_row_by_id() — only Person Manager's find_person_by_id()."""
+        import ast
+        import inspect
+        th = _fresh_th()
+        source = inspect.getsource(th.stageresponsibility_cmd)
+        tree = ast.parse(source)
+
+        forbidden_calls = {"get_business_sheet", "find_row_by_id", "get_all_records"}
+        found_calls = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                func = node.func
+                name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
+                if name in forbidden_calls:
+                    found_calls.add(name)
+
+        self.assertEqual(found_calls, set())
 
 
 # ─────────────────────────────────────────────────────────────

@@ -1103,17 +1103,36 @@ async def editclient_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
         return ConversationHandler.END
 
-    from business_core.sheets import find_row_by_id
-    found = find_row_by_id("people_registry", client_id)
-    if not found:
+    from business_core.person_manager import find_person_by_id
+    person = find_person_by_id(client_id)
+    if not person:
         await update.message.reply_text(f"❌ Клиент {client_id} не найден.")
         return ConversationHandler.END
 
-    row_number, row = found
+    # "Бизнесы" (free-text business display name) is not part of
+    # find_person_by_id()'s canonical field set — derived here from
+    # Primary Biz ID via the existing business_builder.get_business_config()
+    # (a BIZ_REGISTRY read, not PEOPLE_REGISTRY) rather than adding a new
+    # Person Manager API.
+    biz_name = ""
+    if person["primary_biz_id"]:
+        from business_core.business_builder import get_business_config
+        biz_name = get_business_config(person["primary_biz_id"]).get("name", "")
+
+    biz_ids_display = ",".join(person["biz_ids"])
+    current = {
+        "ФИО": person["full_name"],
+        "Телефон": person["phone"],
+        "Бизнесы": biz_name,
+        "Biz IDs": biz_ids_display,
+        "Комментарий": person["notes"],
+    }
+
+    row_number = person["row_num"]
     context.user_data["ec"] = {
         "client_id": client_id,
         "row_number": row_number,
-        "current": row,
+        "current": current,
     }
     context.user_data.pop("ec_confirmed_snapshot", None)
 
@@ -1121,10 +1140,10 @@ async def editclient_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         "✏️ Редактирование клиента",
         "",
         f"ID: {client_id}",
-        f"ФИО: {row.get('ФИО', '')}",
-        f"Телефон: {row.get('Телефон', '')}",
-        f"Бизнес: {row.get('Бизнесы', '')} (Biz IDs: {row.get('Biz IDs', '')})",
-        f"Комментарий: {row.get('Комментарий', '')}",
+        f"ФИО: {current['ФИО']}",
+        f"Телефон: {current['Телефон']}",
+        f"Бизнес: {current['Бизнесы']} (Biz IDs: {current['Biz IDs']})",
+        f"Комментарий: {current['Комментарий']}",
         "",
         "Выбери поле для изменения:",
     ]
@@ -2030,33 +2049,16 @@ async def newobject_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         )
 
         # Проверяем что клиент существует и связан с бизнесом
-        try:
-            from business_core.sheets import get_business_sheet
-            prs_sheet  = get_business_sheet("people_registry")
-            all_vals   = prs_sheet.get_all_values()
-            client_row = None
-            if len(all_vals) > 1:
-                headers = all_vals[0]
-                biz_ids_col = headers.index("Biz IDs") if "Biz IDs" in headers else None
-                prim_col    = headers.index("Primary Biz ID") if "Primary Biz ID" in headers else None
-                for row in all_vals[1:]:
-                    if row and row[0] == client_id:
-                        client_row = row
-                        break
-        except Exception:
-            client_row = None
+        from business_core.person_manager import find_person_by_id
+        person = find_person_by_id(client_id)
 
-        if client_row is None:
+        if person is None:
             await _reply(update, f"❌ Клиент `{client_id}` не найден в PEOPLE_REGISTRY")
             return
 
         # Добавляем biz_id к клиенту если нужно
         try:
-            biz_ids_in_row = []
-            if biz_ids_col is not None and biz_ids_col < len(client_row):
-                from business_core.business_builder import normalize_biz_ids
-                biz_ids_in_row = normalize_biz_ids(client_row[biz_ids_col])
-            if biz_id not in biz_ids_in_row:
+            if biz_id not in person["biz_ids"]:
                 add_biz_id_to_person(client_id, biz_id)
         except Exception:
             pass
@@ -6188,11 +6190,10 @@ async def stageresponsibility_cmd(update: Update, context: ContextTypes.DEFAULT_
             person_name = "—"
             assignment_type = ""
             try:
-                from business_core.sheets import find_row_by_id
-                found = find_row_by_id("people_registry", result["person_id"])
-                if found:
-                    _, row = found
-                    person_name = row.get("ФИО") or row.get("Имя") or "—"
+                from business_core.person_manager import find_person_by_id
+                person = find_person_by_id(result["person_id"])
+                if person:
+                    person_name = person.get("full_name") or person.get("short_name") or "—"
             except Exception:
                 pass
             try:

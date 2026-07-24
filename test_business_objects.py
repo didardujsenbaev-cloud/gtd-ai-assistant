@@ -323,11 +323,11 @@ class TestProvisionObjectDrive(unittest.TestCase):
 
         from business_core.business_builder import provision_object_drive
 
-        # Мок PEOPLE_REGISTRY (нет папки клиента)
-        with patch("business_core.sheets.get_business_sheet") as mock_gs:
-            prs_headers = ["ID", "ФИО", "Drive Folder ID", "Google Drive"]
-            prs_row     = ["PRS-001", "Иван Петров", "", ""]
-            mock_gs.return_value = _mock_sheet(prs_headers, [prs_row])
+        # Мок Person Manager (нет папки клиента)
+        with patch("business_core.person_manager.find_person_by_id") as mock_find:
+            mock_find.return_value = {
+                "full_name": "Иван Петров", "drive_folder_id": "", "google_drive": "",
+            }
             with patch.dict(os.environ, {"GOOGLE_CREDENTIALS_FILE": "/fake/creds.json"}):
                 result = provision_object_drive("BIZ-001", "PRS-001", "OBJ-001", "Алматы", "ул. 1")
 
@@ -354,10 +354,11 @@ class TestProvisionObjectDrive(unittest.TestCase):
         from business_core.business_builder import provision_object_drive
 
         # Клиент уже имеет Drive Folder ID
-        with patch("business_core.sheets.get_business_sheet") as mock_gs:
-            prs_headers = ["ID", "ФИО", "Drive Folder ID", "Google Drive"]
-            prs_row     = ["PRS-001", "Мария", "existing-client-folder", "https://cl/exist"]
-            mock_gs.return_value = _mock_sheet(prs_headers, [prs_row])
+        with patch("business_core.person_manager.find_person_by_id") as mock_find:
+            mock_find.return_value = {
+                "full_name": "Мария", "drive_folder_id": "existing-client-folder",
+                "google_drive": "https://cl/exist",
+            }
             with patch.dict(os.environ, {"GOOGLE_CREDENTIALS_FILE": "/fake/creds.json"}):
                 result = provision_object_drive("BIZ-001", "PRS-001", "OBJ-002", "Астана", "пр. 5")
 
@@ -381,10 +382,10 @@ class TestProvisionObjectDrive(unittest.TestCase):
 
         from business_core.business_builder import provision_object_drive
 
-        with patch("business_core.sheets.get_business_sheet") as mock_gs:
-            prs_headers = ["ID", "ФИО", "Drive Folder ID", "Google Drive"]
-            prs_row     = ["PRS-001", "Кто-то", "", ""]
-            mock_gs.return_value = _mock_sheet(prs_headers, [prs_row])
+        with patch("business_core.person_manager.find_person_by_id") as mock_find:
+            mock_find.return_value = {
+                "full_name": "Кто-то", "drive_folder_id": "", "google_drive": "",
+            }
             with patch.dict(os.environ, {"GOOGLE_CREDENTIALS_FILE": "/fake/creds.json"}):
                 with patch("business_core.business_builder.provision_client_drive") as mock_pcl:
                     with patch("business_core.business_builder.update_person_drive_info"):
@@ -392,6 +393,32 @@ class TestProvisionObjectDrive(unittest.TestCase):
                         result = provision_object_drive("BIZ-001", "PRS-001", "OBJ-003", "Алматы", "ул.")
 
         mock_upd.assert_called_once_with("OBJ-003", drive_folder_id="saved-id", google_drive_url="https://saved")
+
+
+class TestProvisionObjectDriveNoDirectRegistryRead(unittest.TestCase):
+    """Phase 23D-4A architecture guard: provision_object_drive()'s
+    client lookup must call no direct get_business_sheet()/
+    find_row_by_id() for people_registry — only Person Manager's
+    find_person_by_id()."""
+
+    def test_no_direct_registry_read_calls_remain(self):
+        import ast
+        import inspect
+        from business_core.business_builder import provision_object_drive
+
+        source = inspect.getsource(provision_object_drive)
+        tree = ast.parse(source)
+
+        forbidden_calls = {"get_business_sheet", "find_row_by_id", "get_all_records"}
+        found_calls = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                func = node.func
+                name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
+                if name in forbidden_calls:
+                    found_calls.add(name)
+
+        self.assertEqual(found_calls, set())
 
 
 # ─── M, N. create_object_folder ─────────────────────────────────────────────
@@ -531,6 +558,32 @@ class TestParseKvArgs(unittest.TestCase):
         self.assertEqual(result["biz_id"], "BIZ-001")
         self.assertEqual(result["address"], "ул. Ленина 5")
         self.assertEqual(result["area"], "120")
+
+
+class TestNewObjectCmdNoDirectRegistryRead(unittest.TestCase):
+    """Phase 23D-4A architecture guard: newobject_cmd()'s client
+    existence/Biz-ID check must call no direct get_business_sheet()/
+    find_row_by_id() for people_registry — only Person Manager's
+    find_person_by_id()."""
+
+    def test_no_direct_registry_read_calls_remain(self):
+        import ast
+        import inspect
+        from business_core.telegram_handlers import newobject_cmd
+
+        source = inspect.getsource(newobject_cmd)
+        tree = ast.parse(source)
+
+        forbidden_calls = {"get_business_sheet", "find_row_by_id", "get_all_records"}
+        found_calls = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                func = node.func
+                name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
+                if name in forbidden_calls:
+                    found_calls.add(name)
+
+        self.assertEqual(found_calls, set())
 
 
 if __name__ == "__main__":

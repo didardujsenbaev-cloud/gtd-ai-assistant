@@ -140,7 +140,7 @@ def resolve_and_validate_links(
         {"ok": False, "error": str}
     """
     from business_core.sheets import read_business_sheet
-    from business_core.business_builder import get_person_biz_ids
+    from business_core.person_manager import find_person_by_id
 
     if not business_id:
         return {"ok": False, "error": "Business ID обязателен."}
@@ -226,11 +226,10 @@ def resolve_and_validate_links(
 
     # ── Client -> Business ───────────────────────────────────────
     if resolved_client_id:
-        people = read_business_sheet("people_registry")
-        person = next((p for p in people if p.get("ID", "") == resolved_client_id), None)
+        person = find_person_by_id(resolved_client_id)
         if person is None:
             return {"ok": False, "error": f"Client {resolved_client_id} не найден."}
-        person_biz_ids = get_person_biz_ids(resolved_client_id)
+        person_biz_ids = person["biz_ids"]
         if person_biz_ids and business_id not in person_biz_ids:
             return {
                 "ok": False,
@@ -299,6 +298,7 @@ def resolve_target_drive_folder(
         {"ok": False, "error": str}
     """
     from business_core.sheets import read_business_sheet
+    from business_core.person_manager import find_person_by_id
 
     if object_id:
         objects = read_business_sheet("object_registry")
@@ -308,9 +308,8 @@ def resolve_target_drive_folder(
             return {"ok": True, "folder_id": folder_id, "level": "object", "source_id": object_id}
 
     if client_id:
-        people = read_business_sheet("people_registry")
-        person = next((p for p in people if p.get("ID", "") == client_id), None)
-        folder_id = (person or {}).get("Drive Folder ID", "").strip()
+        person = find_person_by_id(client_id)
+        folder_id = (person or {}).get("drive_folder_id", "") or ""
         if folder_id:
             return {"ok": True, "folder_id": folder_id, "level": "client", "source_id": client_id}
 

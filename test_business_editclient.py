@@ -54,22 +54,30 @@ def _ctx(args=None):
 
 
 def _existing_person(client_id="PRS-001", fio="Кайрат", phone="87087632894",
-                      biz_display="узаконение недвижимости", drive_id="DRIVE-ABC123",
-                      biz_ids="", primary_biz=""):
-    """The dict shape find_row_by_id()/find_person_by_id() return for a
-    row — used both as editclient_start()'s pre-fetch result and as
-    person_manager.find_person_by_id()'s existence-check return value."""
+                      drive_folder_id="DRIVE-ABC123",
+                      biz_ids=None, primary_biz_id="", row_num=2):
+    """The canonical dict shape person_manager.find_person_by_id()
+    returns — used both as editclient_start()'s pre-fetch result and as
+    editclient_confirm()'s structural existence-check return value.
+    Phase 23D-4A: editclient_start() now reads through
+    find_person_by_id() instead of a raw find_row_by_id() tuple, so
+    this fixture matches that canonical shape (not raw sheet headers)."""
     return {
-        "ID": client_id,
-        "ФИО": fio,
-        "Имя": fio.split()[0] if fio.split() else fio,
-        "Телефон": phone,
-        "Тип": "клиент",
-        "Бизнесы": biz_display,
-        "Комментарий": "",
-        "Drive Folder ID": drive_id,
-        "Biz IDs": biz_ids,
-        "Primary Biz ID": primary_biz,
+        "row_num": row_num,
+        "person_id": client_id,
+        "full_name": fio,
+        "short_name": fio.split()[0] if fio.split() else fio,
+        "phone": phone,
+        "phone2": "", "whatsapp": "", "telegram": "", "email": "",
+        "city": "", "company": "", "position": "",
+        "person_type": "клиент", "subtype": "",
+        "trust_level": "", "status": "active", "warmth": "",
+        "notes": "",
+        "biz_ids": biz_ids if biz_ids is not None else [],
+        "company_id": "", "citizenship": "", "passport_id": "",
+        "primary_biz_id": primary_biz_id,
+        "google_drive": "", "drive_folder_id": drive_folder_id,
+        "first_contact_date": "", "last_contact_date": "",
     }
 
 
@@ -80,7 +88,7 @@ class TestEditClientEntityNotFound(unittest.TestCase):
 
         async def run():
             with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
-                 patch("business_core.sheets.find_row_by_id", return_value=None):
+                 patch("business_core.person_manager.find_person_by_id", return_value=None):
                 return await handlers["start"](_upd("/editclient client_id=PRS-999"), context)
 
         result = asyncio.run(run())
@@ -92,12 +100,12 @@ class TestEditClientEntityNotFound(unittest.TestCase):
 def _walk_to_confirm(handlers, field_button="Телефон", new_value="87001112233",
                       existing_row=None, biz_rows=None):
     context = _ctx(args=["client_id=PRS-001"])
-    row = existing_row or _existing_person()
+    person = existing_row or _existing_person()
     biz_rows = biz_rows or [{"ID": "BIZ-001", "Название": "Узаконение недвижимости", "Статус": "active"}]
 
     async def run():
         with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
-             patch("business_core.sheets.find_row_by_id", return_value=(2, row)), \
+             patch("business_core.person_manager.find_person_by_id", return_value=person), \
              patch("business_core.sheets.read_business_sheet", return_value=biz_rows):
             await handlers["start"](_upd("/editclient client_id=PRS-001"), context)
             await handlers["field"](_upd(field_button), context)
@@ -300,12 +308,12 @@ class TestEditClientBusinessSavesId(unittest.TestCase):
     def test_unresolvable_business_reprompts_without_writing(self):
         handlers = _fresh_import()
         context = _ctx(args=["client_id=PRS-001"])
-        row = _existing_person()
+        person = _existing_person()
         biz_rows = [{"ID": "BIZ-001", "Название": "Узаконение недвижимости", "Статус": "active"}]
 
         async def run():
             with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
-                 patch("business_core.sheets.find_row_by_id", return_value=(2, row)), \
+                 patch("business_core.person_manager.find_person_by_id", return_value=person), \
                  patch("business_core.sheets.read_business_sheet", return_value=biz_rows):
                 await handlers["start"](_upd("/editclient client_id=PRS-001"), context)
                 await handlers["field"](_upd("Бизнес"), context)
@@ -358,6 +366,37 @@ class TestEditClientNoDirectRegistryAccess(unittest.TestCase):
         source = inspect.getsource(editclient_confirm)
         self.assertNotIn("headers.index(", source)
         self.assertNotIn(".row_values(1)", source)
+
+
+class TestEditClientStartNoDirectRegistryRead(unittest.TestCase):
+    """Phase 23D-4A architecture guard: editclient_start() must call no
+    direct get_business_sheet()/find_row_by_id()/get_all_records() —
+    only Person Manager's find_person_by_id()."""
+
+    def test_no_direct_registry_read_calls_remain(self):
+        import ast
+        import inspect
+        from business_core.telegram_handlers import editclient_start
+
+        source = inspect.getsource(editclient_start)
+        tree = ast.parse(source)
+
+        forbidden_calls = {"get_business_sheet", "find_row_by_id", "get_all_records"}
+        found_calls = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                func = node.func
+                name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
+                if name in forbidden_calls:
+                    found_calls.add(name)
+            if isinstance(node, ast.ImportFrom) and node.module == "business_core.sheets":
+                for alias in node.names:
+                    self.assertNotIn(
+                        alias.name, {"get_business_sheet", "find_row_by_id"},
+                        f"editclient_start must not import {alias.name} from business_core.sheets",
+                    )
+
+        self.assertEqual(found_calls, set())
 
 
 class TestEditClientNoLiveApi(unittest.TestCase):

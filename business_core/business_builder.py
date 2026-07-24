@@ -1365,29 +1365,12 @@ def provision_object_drive(
         client_name       = client_id  # fallback
         client_drive_url  = ""
 
-        try:
-            from business_core.sheets import get_business_sheet
-            sheet = get_business_sheet("people_registry")
-            all_vals = sheet.get_all_values()
-            if all_vals and len(all_vals) > 1:
-                headers = all_vals[0]
-
-                def _col(h):
-                    return headers.index(h) if h in headers else None
-
-                name_col     = _col("ФИО") or 1
-                drive_col    = _col("Drive Folder ID")
-                drive_url_col = _col("Google Drive")
-
-                for row in all_vals[1:]:
-                    if not row or row[0] != client_id:
-                        continue
-                    client_name      = row[name_col].strip() if name_col < len(row) else client_id
-                    client_folder_id = (row[drive_col].strip()     if drive_col    is not None and drive_col    < len(row) else "")
-                    client_drive_url = (row[drive_url_col].strip() if drive_url_col is not None and drive_url_col < len(row) else "")
-                    break
-        except Exception:
-            pass
+        from business_core.person_manager import find_person_by_id
+        person = find_person_by_id(client_id)
+        if person:
+            client_name      = person["full_name"] or client_id
+            client_folder_id = person["drive_folder_id"] or ""
+            client_drive_url = person["google_drive"] or ""
 
         # 3. Папку клиента нужно получить/создать если нет
         if not client_folder_id:
