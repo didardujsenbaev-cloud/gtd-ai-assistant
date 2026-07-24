@@ -14,10 +14,14 @@ relation rows are ever written to production in this phase.
 
 from __future__ import annotations
 
+import ast
 import sys
 import unittest
 import unittest.mock
+from pathlib import Path
 from unittest.mock import patch
+
+WORKSPACE = Path(__file__).parent
 
 
 def _fresh_ser():
@@ -475,6 +479,60 @@ class TestRoleValidationArchitectureGuard(unittest.TestCase):
 
 
 # ────────────────────────────────────────────────────────────
+# Architecture guard: Relation Layer must not depend on the
+# Document Layer (Phase 26B)
+# ────────────────────────────────────────────────────────────
+
+class TestNoDocumentLayerDependency(unittest.TestCase):
+    """ENGINEERING_STANDARDS.md, Layer Dependency Rules: the Document
+    Layer (business_core.document_requirements) may depend on the
+    Relation Layer (business_core.stage_entity_relations), never the
+    reverse. Phase 26A found a violation (a function-local import of
+    document_requirements._parse_id_list inside
+    compare_legacy_document_relations()); Phase 26B removed it. This
+    guard is module-wide, not just scoped to that one function, since
+    the documented rule applies to the whole Relation Layer — any
+    future reintroduction anywhere in this module must fail here."""
+
+    def test_module_does_not_import_document_requirements(self):
+        path = WORKSPACE / "business_core" / "stage_entity_relations.py"
+        src = path.read_text(encoding="utf-8")
+        tree = ast.parse(src, str(path))
+
+        forbidden = "document_requirements"
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    self.assertNotIn(
+                        forbidden, alias.name,
+                        f"forbidden import: 'import {alias.name}'",
+                    )
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                self.assertNotIn(
+                    forbidden, node.module,
+                    f"forbidden import: 'from {node.module} import ...'",
+                )
+
+    def test_no_import_statement_references_parse_id_list(self):
+        """Prose mentions of document_requirements.py or its
+        _parse_id_list() convention in docstrings/comments are fine
+        (that module IS allowed to depend on this one, and this
+        module's own docs legitimately explain the local duplicate) —
+        what must never reappear is an actual import statement pulling
+        _parse_id_list from document_requirements."""
+        path = WORKSPACE / "business_core" / "stage_entity_relations.py"
+        src = path.read_text(encoding="utf-8")
+        tree = ast.parse(src, str(path))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                for alias in node.names:
+                    self.assertNotEqual(
+                        alias.name, "_parse_id_list",
+                        "must not import _parse_id_list from any module",
+                    )
+
+
+# ────────────────────────────────────────────────────────────
 # Read-only / no-write guarantees
 # ────────────────────────────────────────────────────────────
 
@@ -504,6 +562,50 @@ class TestReadOnlyGuarantees(unittest.TestCase):
         source = inspect.getsource(ser)
         self.assertNotIn("anthropic", source.lower())
         self.assertNotIn("get_drive_service", source)
+
+
+# ────────────────────────────────────────────────────────────
+# Phase 26B: _parse_legacy_id_list() — local replacement for the
+# removed business_core.document_requirements._parse_id_list import.
+# Must remain byte-for-byte behaviorally identical to that function.
+# ────────────────────────────────────────────────────────────
+
+class TestParseLegacyIdList(unittest.TestCase):
+    def test_empty_string_returns_empty_list(self):
+        ser = _fresh_ser()
+        self.assertEqual(ser._parse_legacy_id_list(""), [])
+
+    def test_none_returns_empty_list(self):
+        ser = _fresh_ser()
+        self.assertEqual(ser._parse_legacy_id_list(None), [])
+
+    def test_single_id(self):
+        ser = _fresh_ser()
+        self.assertEqual(ser._parse_legacy_id_list("DOC-002"), ["DOC-002"])
+
+    def test_multiple_ids_preserve_order(self):
+        ser = _fresh_ser()
+        self.assertEqual(ser._parse_legacy_id_list("DOC-002,DOC-003,DOC-004"), ["DOC-002", "DOC-003", "DOC-004"])
+
+    def test_whitespace_around_tokens_is_stripped(self):
+        ser = _fresh_ser()
+        self.assertEqual(ser._parse_legacy_id_list(" DOC-002 , DOC-003 "), ["DOC-002", "DOC-003"])
+
+    def test_duplicate_ids_deduplicated_keeping_first_occurrence_order(self):
+        ser = _fresh_ser()
+        self.assertEqual(ser._parse_legacy_id_list("DOC-002,DOC-003,DOC-002"), ["DOC-002", "DOC-003"])
+
+    def test_empty_tokens_between_commas_are_dropped(self):
+        ser = _fresh_ser()
+        self.assertEqual(ser._parse_legacy_id_list("DOC-002,,DOC-003,"), ["DOC-002", "DOC-003"])
+
+    def test_only_commas_returns_empty_list(self):
+        ser = _fresh_ser()
+        self.assertEqual(ser._parse_legacy_id_list(",,,"), [])
+
+    def test_return_type_is_list(self):
+        ser = _fresh_ser()
+        self.assertIsInstance(ser._parse_legacy_id_list("DOC-002"), list)
 
 
 # ────────────────────────────────────────────────────────────

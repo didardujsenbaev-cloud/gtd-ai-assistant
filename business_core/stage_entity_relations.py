@@ -64,6 +64,22 @@ def _is_blank(value: str) -> bool:
     return not (value or "").strip()
 
 
+def _parse_legacy_id_list(raw: str) -> list[str]:
+    """Comma-separated -> de-duplicated (order-preserving) list of IDs.
+    Local, intentional duplicate of business_core.document_requirements
+    ._parse_id_list()'s exact logic — kept private and self-contained
+    here rather than imported, since the Relation Layer must not depend
+    on the Document Layer (ENGINEERING_STANDARDS.md, Layer Dependency
+    Rules). Any behavior change to the legacy comma-list format must be
+    applied identically in both places."""
+    seen: dict[str, None] = {}
+    for token in (raw or "").split(","):
+        token = token.strip()
+        if token and token not in seen:
+            seen[token] = None
+    return list(seen.keys())
+
+
 # ─────────────────────────────────────────────────────────────
 # Read-only listing
 # ─────────────────────────────────────────────────────────────
@@ -310,7 +326,6 @@ def compare_legacy_document_relations() -> DocumentRelationAudit:
     already established for the legacy engine (document_requirements.py).
     """
     from business_core.sheets import read_business_sheet
-    from business_core.document_requirements import _parse_id_list
 
     template_stage_rows = read_business_sheet("roadmap_template_stages")
     known_stage_ids = {r.get("Stage ID", "") for r in template_stage_rows if r.get("Stage ID", "")}
@@ -337,7 +352,7 @@ def compare_legacy_document_relations() -> DocumentRelationAudit:
     for row in template_stage_rows:
         tstg_id = row.get("Stage ID", "")
         raw_legacy = row.get("Document Template IDs", "") or ""
-        legacy_ids = tuple(_parse_id_list(raw_legacy))
+        legacy_ids = tuple(_parse_legacy_id_list(raw_legacy))
         raw_tokens = [t.strip() for t in raw_legacy.split(",") if t.strip()]
         legacy_duplicate_ids = tuple(sorted({t for t in raw_tokens if raw_tokens.count(t) > 1}))
 
