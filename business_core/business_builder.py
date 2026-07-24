@@ -1362,6 +1362,11 @@ def _empty_roadmap_creation_result(error: str) -> dict:
         "stages_count": 0, "stage_ids": [], "used_template": False,
         "relation_copy_errors": (), "relation_copy_created_count": 0,
         "partial_success": False, "partial_failure": False, "warnings": (),
+        "roadmap_created": False, "roadmap_reused": False,
+        "template_id": "", "template_warning": None,
+        "existing_stage_ids": [], "existing_stage_count": 0, "total_stage_count": 0,
+        "relations_result": {"created_count": 0, "errors": ()},
+        "knowledge_result": {"merged_inline": False},
     }
 
 
@@ -1376,31 +1381,62 @@ def create_roadmap_for_object(
     template_id: str = "",
 ) -> dict:
     """
-    Создать roadmap для объекта недвижимости и его этапы — единственная
-    orchestration-точка входа для этого потока (Phase 28C/28D/28E).
+    Ensure/converge a Roadmap (+ Stages + Extension data) for this
+    Object+Service — the single orchestration entry point for this
+    flow (Phase 28C/28D/28E/28G).
 
-    Поток (Phase 27B decision):
+    Convergent-retry semantics (Phase 28G): calling this twice with the
+    same (obj_id, service_id) never creates a second Roadmap and never
+    duplicates Stages — the second call finds the existing active
+    Roadmap (duplicate key: (Object ID, Service ID), via
+    roadmap_manager.find_active_roadmap_for_object() — never Client ID/
+    Business ID/Template ID/title), reuses it, and only fills in
+    whatever Core/Extension state is still missing:
+
       validate input
-      -> create_roadmap_record() через business_core.roadmap_manager
-         (Core-владелец ROADMAPS — эта функция сама больше не пишет
-         ROADMAPS напрямую)
-      -> read Template Stage rows через
-         business_core.roadmap_template_manager.find_template_stages()
-         (Core -> Core)
-      -> ensure_roadmap_stages() через business_core.roadmap_manager
-         (Core-владелец ROADMAP_STAGES)
-      -> Extension-copy orchestration (business_core.
-         stage_entity_relations.copy_template_relations_to_stage()) —
-         выполняется ЗДЕСЬ, в orchestration-слое, никогда внутри
-         roadmap_manager.py/roadmap_template_manager.py
-      -> fallback на встроенные ROADMAP_TEMPLATES (case_type) если
-         шаблон не дал этапов — та же built-in логика, что раньше жила
-         в telegram_handlers.startroadmap_cmd
+      -> find_active_roadmap_for_object(obj_id, service_id)
+      -> if none: create_roadmap_record() (roadmap_created=True)
+      -> if found: reuse it (roadmap_reused=True) — its OWN stored
+         template_id (if any) wins over a newly-requested one (see
+         "Template mismatch policy" below)
+      -> read Template Stage rows (Core -> Core,
+         roadmap_template_manager.find_template_stages())
+      -> ensure_roadmap_stages() — idempotent, only creates missing
+         Stage Orders (roadmap_manager.py owns ROADMAP_STAGES)
+      -> Extension-copy (stage_entity_relations.copy_template_relations_to_stage())
+         only for NEWLY created stages this call — stages that already
+         existed were already copied on a prior call, and
+         copy_template_relations_to_stage() is itself idempotent
+         (find_active_duplicate_relation-gated), so retrying it is safe
+         even if this orchestration retries the same stage twice
+      -> built-in ROADMAP_TEMPLATES (case_type) fallback ONLY if this
+         Roadmap has zero Stages in total (never re-triggered just
+         because zero stages were created THIS call — that would
+         wrongly create a second, differently-IDed stage set on a pure
+         idempotent retry where everything already existed)
 
-    Extension failure (relation-copy) никогда не откатывает уже
-    созданный Roadmap/Stages — видно через "partial_success"/
-    "partial_failure"/"relation_copy_errors", "ok" остаётся True, если
-    Core-часть (Roadmap + Stages) успешна.
+    Template mismatch policy (Phase 28G): if the existing (reused)
+    Roadmap already has a non-empty template_id, it is the source of
+    truth — a differently-requested template_id is never silently
+    applied; instead "template_warning" reports the mismatch and
+    "template_id" in the result reflects the one actually used (the
+    existing Roadmap's). If the existing Roadmap's template_id is
+    empty, the newly requested/resolved one is used for Stage creation
+    this call, but is NOT written back onto the existing ROADMAPS row
+    (no owner API exists yet for that narrow field update — deferred,
+    not silently improvised; see the Phase 28G report).
+
+    Extension failure (relation-copy) never rolls back an already-
+    committed Roadmap/Stages — visible via "partial_success"/
+    "partial_failure"/"relation_copy_errors"; "ok" stays True whenever
+    Core (Roadmap + Stages) succeeded.
+
+    Data-integrity visibility: if more than one ACTIVE Roadmap already
+    exists for this (Object ID, Service ID) — a state this function
+    never itself creates, but could already exist in data predating
+    this guarantee — the first (sheet-order) one is used, exactly as
+    find_active_roadmap_for_object() already behaves, but a warning is
+    added making this visible rather than silently picking one.
 
     Args:
         obj_id:      OBJ-ID объекта (обязательный)
@@ -1408,26 +1444,42 @@ def create_roadmap_for_object(
         client_id:   PRS-ID клиента (обязательный)
         service_id:  SVC-ID услуги
         case_type:   тип кейса (legalization_reconstruction_house / ...)
-        title:       заголовок roadmap (автогенерируется если пустой)
-        notes:       примечания
-        template_id: RMT-... шаблон для создания этапов
+        title:       заголовок roadmap (автогенерируется если пустой,
+                     используется только при создании нового Roadmap)
+        notes:       примечания (используется только при создании)
+        template_id: RMT-... шаблон для создания этапов (requested;
+                     see Template mismatch policy above for what
+                     actually gets used on a reuse)
 
     Returns:
         {
-            "ok":          bool,   # True если Roadmap (+ Stages, если применимо) созданы
+            "ok":          bool,
             "roadmap_id":  str,
             "error":       str | None,
-            # Phase 28C/28D/28E, additive:
-            "core_created":                bool,   # Roadmap row создан
-            "stages_created":              bool,   # хотя бы один Stage создан
-            "stages_count":                int,
-            "stage_ids":                   list[str],
-            "used_template":               bool,   # True если этапы взяты из RMT-шаблона, не built-in case_type
-            "relation_copy_errors":        tuple,  # (stage_id, template_stage_id, errors) per failed stage
+            # Phase 28C/28D/28E:
+            "core_created":                bool,   # Core state (Roadmap, whether new or reused) is present
+            "stages_created":              bool,   # at least one NEW Stage created this call
+            "stages_count":                int,    # NEW stages created this call
+            "stage_ids":                   list[str],  # NEW stage IDs created this call
+            "used_template":               bool,
+            "relation_copy_errors":        tuple,
             "relation_copy_created_count": int,
-            "partial_success":             bool,   # Core ok, но Extension copy частично упал
-            "partial_failure":             bool,   # alias of partial_success — same meaning, kept for clarity at call sites
-            "warnings":                    tuple,  # non-fatal messages (e.g. "шаблон не содержит этапов")
+            "partial_success":             bool,
+            "partial_failure":             bool,
+            "warnings":                    tuple,
+            # Phase 28G, additive:
+            "roadmap_created":    bool,  # True only if a brand-new ROADMAPS row was created this call
+            "roadmap_reused":     bool,  # True if an existing active Roadmap was found and reused
+            "template_id":        str,   # the template_id actually used for Stage creation this call
+            "template_warning":   str | None,
+            "existing_stage_ids": list[str],  # Stage IDs that already existed before this call
+            "existing_stage_count": int,
+            "total_stage_count":    int,  # existing + newly created this call
+            "relations_result":  {"created_count": int, "errors": tuple},
+            "knowledge_result":  {"merged_inline": bool},  # knowledge-ID copying happens
+                                  # inline inside ensure_roadmap_stages() (same-registry
+                                  # field merge, not a separate Extension step) — this
+                                  # dict documents that, it is not a second write path
         }
     """
     if not obj_id or not biz_id or not client_id:
@@ -1436,31 +1488,79 @@ def create_roadmap_for_object(
     if not title:
         title = f"Roadmap {obj_id}" + (f" / {service_id}" if service_id else "")
 
-    from business_core.roadmap_manager import create_roadmap_record
+    from business_core.roadmap_manager import create_roadmap_record, find_active_roadmap_for_object, list_roadmaps
 
-    rm_result = create_roadmap_record(
-        business_id=biz_id, client_id=client_id, object_id=obj_id,
-        service_id=service_id, template_id=template_id,
-        client_name=title, case_type=case_type, notes=notes,
-    )
-    if not rm_result["ok"]:
-        log.error(f"create_roadmap_for_object: {rm_result['error']}")
-        return _empty_roadmap_creation_result(rm_result["error"])
+    warnings: list[str] = []
+    template_warning = None
 
-    roadmap_id = rm_result["roadmap_id"]
-    log.info(f"create_roadmap_for_object: {roadmap_id} / {obj_id} / {case_type}")
+    existing = find_active_roadmap_for_object(obj_id, service_id) if service_id else None
+
+    if existing is not None:
+        # Data-integrity visibility (Phase 28G): more than one active
+        # Roadmap for this key is a pre-existing anomaly this function
+        # never itself creates — surface it rather than silently
+        # picking one.
+        all_active = list_roadmaps(object_id=obj_id, service_id=service_id, status="active")
+        if len(all_active) > 1:
+            warnings.append(
+                f"data integrity: {len(all_active)} active Roadmaps found for "
+                f"(Object ID={obj_id!r}, Service ID={service_id!r}) — using {existing['roadmap_id']}"
+            )
+
+        roadmap_id = existing["roadmap_id"]
+        roadmap_created = False
+        roadmap_reused = True
+
+        existing_template_id = (existing.get("template_id") or "").strip()
+        if existing_template_id:
+            effective_template_id = existing_template_id
+            if template_id and template_id != existing_template_id:
+                template_warning = (
+                    f"requested_template_id ({template_id}) differs from "
+                    f"existing_template_id ({existing_template_id}); "
+                    f"existing Roadmap template retained"
+                )
+                warnings.append(template_warning)
+        else:
+            # Existing Roadmap has no stored template — use the
+            # requested/resolved one for Stage creation this call.
+            # Deliberately NOT written back onto the existing ROADMAPS
+            # row: no owner API exists yet for that one narrow field
+            # update, and improvising a raw write here would violate
+            # this module's own "no direct Roadmap registry writes"
+            # boundary. Deferred — see the Phase 28G report.
+            effective_template_id = template_id
+
+        log.info(f"create_roadmap_for_object: reusing existing Roadmap {roadmap_id} / {obj_id} / {service_id}")
+
+    else:
+        rm_result = create_roadmap_record(
+            business_id=biz_id, client_id=client_id, object_id=obj_id,
+            service_id=service_id, template_id=template_id,
+            client_name=title, case_type=case_type, notes=notes,
+        )
+        if not rm_result["ok"]:
+            log.error(f"create_roadmap_for_object: {rm_result['error']}")
+            return _empty_roadmap_creation_result(rm_result["error"])
+
+        roadmap_id = rm_result["roadmap_id"]
+        roadmap_created = True
+        roadmap_reused = False
+        effective_template_id = template_id
+        log.info(f"create_roadmap_for_object: {roadmap_id} / {obj_id} / {case_type}")
 
     stages_count = 0
     stage_ids: list[str] = []
+    existing_stage_ids: list[str] = []
     used_template = False
-    warnings: list[str] = []
     relation_copy_errors: list[tuple] = []
     relation_copy_created_count = 0
+    total_stage_count = 0
 
-    if template_id:
+    if effective_template_id:
         try:
             from business_core.roadmap_template_manager import find_template_stages
-            template_stage_rows = find_template_stages(template_id)
+            template_stage_rows = find_template_stages(effective_template_id)
         except Exception as exc:
             template_stage_rows = []
             warnings.append(str(exc))
@@ -1472,11 +1572,15 @@ def create_roadmap_for_object(
             if stage_result["ok"]:
                 used_template = True
                 stage_ids = stage_result["created_stage_ids"]
+                existing_stage_ids = stage_result["existing_stage_ids"]
                 stages_count = stage_result["created_count"]
+                total_stage_count = stage_result["total_count"]
 
                 # Extension orchestration: relation-copy for newly
                 # created stages only — existing ones (idempotent
-                # retry) were already copied on a prior call.
+                # retry) were already copied on a prior call, and
+                # copy_template_relations_to_stage() is itself
+                # idempotent regardless.
                 if stage_ids:
                     order_to_template_stage_id = {
                         int(r["order"]): r.get("stage_id", "")
@@ -1499,19 +1603,22 @@ def create_roadmap_for_object(
             else:
                 warnings.append(stage_result.get("error") or "Не удалось создать этапы из шаблона")
         else:
-            warnings.append(f"Шаблон {template_id} не содержит этапов.")
+            warnings.append(f"Шаблон {effective_template_id} не содержит этапов.")
 
-    # Fallback: built-in ROADMAP_TEMPLATES keyed by case_type — same
-    # condition telegram_handlers.startroadmap_cmd used to apply
-    # itself: no template attempted, or the template attempt yielded
-    # zero stages.
-    if not used_template or stages_count == 0:
+    # Fallback: built-in ROADMAP_TEMPLATES keyed by case_type. Phase 28G
+    # fix: gated on total_stage_count == 0 (genuinely zero Stages exist
+    # for this Roadmap at all), NOT on "zero stages created THIS call"
+    # — the latter would wrongly re-trigger on a pure idempotent retry
+    # where every Stage already existed, creating a second, incompatible
+    # stage set under case_type-derived IDs.
+    if total_stage_count == 0:
         try:
             from business_core.roadmap_manager import create_roadmap_stages_from_template
             fb_result = create_roadmap_stages_from_template(roadmap_id, case_type)
             if fb_result.get("stages_count", 0) > 0:
                 stage_ids = fb_result.get("stage_ids", [])
                 stages_count = fb_result.get("stages_count", 0)
+                total_stage_count = stages_count
                 used_template = False
             elif fb_result.get("warning"):
                 warnings.append(fb_result["warning"])
@@ -1534,6 +1641,18 @@ def create_roadmap_for_object(
         "partial_success": partial_failure,
         "partial_failure": partial_failure,
         "warnings": tuple(warnings),
+        "roadmap_created": roadmap_created,
+        "roadmap_reused": roadmap_reused,
+        "template_id": effective_template_id,
+        "template_warning": template_warning,
+        "existing_stage_ids": existing_stage_ids,
+        "existing_stage_count": len(existing_stage_ids),
+        "total_stage_count": total_stage_count,
+        "relations_result": {
+            "created_count": relation_copy_created_count,
+            "errors": tuple(relation_copy_errors),
+        },
+        "knowledge_result": {"merged_inline": used_template},
     }
 
 

@@ -384,6 +384,9 @@ class TestStartRoadmapWithSeedService(unittest.TestCase):
 
         async def run():
             with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
+                 patch("business_core.business_builder.find_object_by_id",
+                       return_value={"obj_id": "OBJ-001", "biz_id": "BIZ-001", "client_id": "PRS-001"}), \
+                 patch("business_core.business_builder.update_object_roadmap_id", return_value=True), \
                  patch("business_core.service_manager.find_service_by_id",
                        return_value=service_mock), \
                  patch("business_core.business_builder.create_roadmap_for_object",

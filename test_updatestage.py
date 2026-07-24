@@ -137,15 +137,18 @@ class TestFindStageById(unittest.TestCase):
         sheet.find.assert_not_called()
 
     def test_reads_legacy_status_without_crashing(self):
-        """Этап с legacy-статусом (not_started, из /newroadmap) читается
-        как есть, без исключения — валидация статуса тут не происходит."""
+        """Phase 28H: этап с legacy-статусом (not_started, из /newroadmap)
+        читается без исключения и нормализуется к канонической форме
+        (pending) — сырое значение остаётся доступным через raw_status
+        для диагностики, но "status" всегда каноничен."""
         rm = _fresh_rm()
         legacy_row = list(STAGE_ROW)
         legacy_row[STAGES_HEADERS.index("Status")] = "not_started"
         sheet = _make_stage_sheet(row=legacy_row)
         with patch("business_core.sheets.get_business_sheet", return_value=sheet):
             stage = rm.find_stage_by_id("STAGE-001-01")
-        self.assertEqual(stage["status"], "not_started")
+        self.assertEqual(stage["status"], "pending")
+        self.assertEqual(stage["raw_status"], "not_started")
 
 
 # ────────────────────────────────────────────────────────────

@@ -50,6 +50,41 @@ STAGE_STATUS_CANONICAL = ("pending", "in_progress", "blocked", "done", "skipped"
 # не завершено. Решение подтверждено отдельно, не пересматривать здесь.
 DONE_SET = frozenset({"done", "skipped"})
 
+# Phase 28H: read-time normalization. Evidence-based, not guessed —
+# repository-wide search (code, tests, fixtures, production read-only
+# snapshot) found exactly one legacy value ever actually written to
+# real ROADMAP_STAGES.Status data: "not_started", by the now-retired
+# /newroadmap flow (Phase 28C removed that write path; existing rows
+# with this value are read-compatible, never rewritten in bulk here).
+# "waiting" appears only in the dead in-memory model's STAGE_STATUSES
+# tuple and in defensive icon-lookup dicts (STATUS_ICONS below,
+# telegram_handlers.stages_cmd's own status_icons) — no evidence it was
+# ever written to a real ROADMAP_STAGES row, so no alias is added for
+# it (Phase 28G/H instruction: "не угадывать автоматически").
+# ROADMAP_STATUSES has no legacy predecessor — it has always been the
+# complete canonical set (active/completed/on_hold/cancelled); the
+# "completed" mentioned in STAGE_STATUS_CANONICAL's own comment below
+# refers to the Roadmap-level status, not a Stage-level legacy value.
+STAGE_STATUS_READ_ALIASES: dict[str, str] = {
+    "not_started": "pending",
+}
+ROADMAP_STATUS_READ_ALIASES: dict[str, str] = {}
+
+
+def normalize_stage_status(raw_status: str) -> str:
+    """Read-time canonicalization for one Stage Status value. Unknown,
+    already-canonical, or empty values pass through unchanged — this
+    never raises and never hides an unrecognized value."""
+    return STAGE_STATUS_READ_ALIASES.get(raw_status, raw_status)
+
+
+def normalize_roadmap_status(raw_status: str) -> str:
+    """Read-time canonicalization for one Roadmap Status value. No
+    evidenced legacy alias exists today — kept as a real function (not
+    inlined) so a future evidenced alias has one place to be added."""
+    return ROADMAP_STATUS_READ_ALIASES.get(raw_status, raw_status)
+
+
 STATUS_ICONS = {
     "not_started": "⬜",
     "in_progress":  "🔵",
@@ -1094,12 +1129,14 @@ def get_stages_for_roadmap(roadmap_id: str) -> list[dict]:
             if not row or not row[0]:
                 continue
             if rm_col is not None and rm_col < len(row) and row[rm_col].strip() == roadmap_id:
+                raw_status = _get(row, "Status")
                 results.append({
                     "stage_id":   _get(row, "Stage ID"),
                     "roadmap_id": _get(row, "Roadmap ID"),
                     "order":      _get(row, "Order"),
                     "name":       _get(row, "Name"),
-                    "status":     _get(row, "Status"),
+                    "status":     normalize_stage_status(raw_status),
+                    "raw_status": raw_status,
                     "due_date":   _get(row, "Due Date"),
                     "notes":      _get(row, "Notes"),
                 })
@@ -1153,7 +1190,8 @@ def find_stage_by_id(stage_id: str) -> Optional[dict]:
             "roadmap_id":   v["Roadmap ID"],
             "order":        v["Order"],
             "name":         v["Name"],
-            "status":       v["Status"],
+            "status":       normalize_stage_status(v["Status"]),
+            "raw_status":   v["Status"],
             "due_date":     v["Due Date"],
             "completed_at": v["Completed At"],
             "responsible":  v["Responsible"],
@@ -1669,7 +1707,8 @@ def find_roadmap_by_id(roadmap_id: str) -> Optional[dict]:
             "service_id":            v["Service ID"],
             "client_id":             v["Client ID"],
             "client_name":           v["Client Name"],
-            "status":                v["Status"],
+            "status":                normalize_roadmap_status(v["Status"]),
+            "raw_status":            v["Status"],
             "created":               v["Created"],
             "object_id":             v["Object ID"],
             "parent_roadmap_id":     v["Parent Roadmap ID"],
@@ -1730,7 +1769,8 @@ def list_roadmaps(
                 "service_id":        _get(row, "Service ID"),
                 "client_id":         _get(row, "Client ID"),
                 "client_name":       _get(row, "Client Name"),
-                "status":            _get(row, "Status"),
+                "status":            normalize_roadmap_status(_get(row, "Status")),
+                "raw_status":        _get(row, "Status"),
                 "created":           _get(row, "Created"),
                 "object_id":         _get(row, "Object ID"),
                 "parent_roadmap_id": _get(row, "Parent Roadmap ID"),
@@ -2107,11 +2147,28 @@ def update_stage_fields(stage_id: str, writes: dict) -> dict:
     (staleness guard — Read-before-Write, ENGINEERING_STANDARDS.md),
     header-mapped, never a positional column assumption.
 
+    Phase 28H: if `writes` includes a "Status" key, its value is
+    validated against STAGE_STATUS_CANONICAL — a legacy value (e.g.
+    "not_started") is rejected with a clear error rather than written,
+    and NOTHING in `writes` is written for that call (all-or-nothing,
+    so a rejected Status never leaves other fields silently applied
+    while Status itself was skipped).
+
     Returns:
         {"ok": bool, "stage_id": str, "written_fields": tuple, "error": str | None}
     """
     if not stage_id:
         return {"ok": False, "stage_id": stage_id, "written_fields": (), "error": "stage_id обязателен"}
+
+    requested_status = (writes or {}).get("Status")
+    if requested_status is not None and requested_status not in STAGE_STATUS_CANONICAL:
+        return {
+            "ok": False, "stage_id": stage_id, "written_fields": (),
+            "error": (
+                f"Недопустимый статус '{requested_status}'. "
+                f"Допустимые значения: {', '.join(STAGE_STATUS_CANONICAL)}"
+            ),
+        }
 
     try:
         from business_core.sheets import find_row_by_id, get_business_sheet

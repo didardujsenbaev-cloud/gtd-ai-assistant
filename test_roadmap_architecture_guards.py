@@ -352,5 +352,95 @@ class TestTelegramHandlersNoDirectRoadmapRegistryWrites(unittest.TestCase):
         )
 
 
+class TestConvergentRetryUsesActiveRoadmapLookup(unittest.TestCase):
+    """Phase 28G: create_roadmap_for_object must consult
+    roadmap_manager.find_active_roadmap_for_object() before ever
+    creating a new ROADMAPS row — no duplicate-active-Roadmap bypass."""
+
+    def test_create_roadmap_for_object_calls_find_active_roadmap(self):
+        import inspect
+        import business_core.business_builder as bb
+        src = inspect.getsource(bb.create_roadmap_for_object)
+        self.assertIn("find_active_roadmap_for_object", src)
+
+
+def _files_containing_literal_status_write(candidate_files: list[Path], forbidden_value: str) -> set[str]:
+    """
+    Scans each file's AST for `forbidden_value` appearing as an actual
+    WRITE usage — the two shapes used throughout this codebase:
+      - a dict VALUE inside a dict literal (e.g. {"Status": "not_started"}),
+        the row_from_header_map(headers, values) pattern;
+      - a literal string argument to update_cell(...).
+
+    Deliberately does NOT flag `forbidden_value` appearing as a dict
+    KEY (e.g. STAGE_STATUS_READ_ALIASES = {"not_started": "pending"},
+    STATUS_ICONS = {"not_started": "..."}) — those are legitimate
+    read-alias/display-icon mappings, not writes. Also does not flag
+    plain attribute/comparison/default-value usage (e.g. the dead
+    in-memory RoadmapStage.status default, or `if x.status ==
+    "not_started"`) — neither is a Sheets write.
+    """
+    hits: set[str] = set()
+    for path in candidate_files:
+        if not path.exists():
+            continue
+        src = path.read_text(encoding="utf-8")
+        tree = ast.parse(src, str(path))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Dict):
+                for v in node.values:
+                    if isinstance(v, ast.Constant) and v.value == forbidden_value:
+                        hits.add(path.name)
+            elif isinstance(node, ast.Call):
+                fname = node.func.id if isinstance(node.func, ast.Name) else getattr(node.func, "attr", None)
+                if fname == "update_cell":
+                    for arg in node.args:
+                        if isinstance(arg, ast.Constant) and arg.value == forbidden_value:
+                            hits.add(path.name)
+    return hits
+
+
+class TestLegacyStatusNeverWritten(unittest.TestCase):
+    """
+    Phase 28H: "not_started" (the one evidenced legacy Stage status —
+    see roadmap_manager.STAGE_STATUS_READ_ALIASES's own docstring for
+    why no other legacy value is aliased) must never be WRITTEN by any
+    Roadmap-domain module again. This guard distinguishes write usage
+    (dict-literal values feeding row_from_header_map, or update_cell
+    literal arguments) from legitimate read-handling (alias-mapping
+    dict KEYS, icon-lookup dict KEYS, dead in-memory model defaults/
+    comparisons) — it does not blanket-forbid the string repository-wide.
+    """
+
+    _CANDIDATE_FILES = [
+        BUSINESS_CORE / "roadmap_manager.py",
+        BUSINESS_CORE / "roadmap_template_manager.py",
+        BUSINESS_CORE / "business_builder.py",
+        BUSINESS_CORE / "telegram_handlers.py",
+    ]
+
+    def test_not_started_is_never_a_write_value(self):
+        found = _files_containing_literal_status_write(self._CANDIDATE_FILES, "not_started")
+        self.assertEqual(
+            found, set(),
+            f"'not_started' found as an actual write value (dict value feeding a "
+            f"Sheets write, or a literal update_cell argument) in: {found} — "
+            f"only canonical STAGE_STATUS_CANONICAL values may ever be written.",
+        )
+
+    def test_canonical_constants_are_the_single_source_of_truth(self):
+        """Guards elsewhere in this file, and any future guard, must
+        read these same constants — not redeclare their own copies."""
+        import business_core.roadmap_manager as rm
+        self.assertEqual(
+            set(rm.STAGE_STATUS_CANONICAL),
+            {"pending", "in_progress", "blocked", "done", "skipped"},
+        )
+        self.assertEqual(
+            set(rm.ROADMAP_STATUSES),
+            {"active", "completed", "on_hold", "cancelled"},
+        )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

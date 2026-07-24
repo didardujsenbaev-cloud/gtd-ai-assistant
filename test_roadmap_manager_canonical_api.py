@@ -446,6 +446,43 @@ class TestEnsureRoadmapStages(unittest.TestCase):
             result = rm.ensure_roadmap_stages("RM-001", [_tmpl_row(1)])
 
         self.assertEqual(result["existing_stage_ids"], ["STAGE-777"])
+
+    def test_existing_stage_status_is_never_touched(self):
+        """Phase 28G scenario 7: existing Stage statuses are preserved
+        — ensure_roadmap_stages never issues any write (update_cell or
+        otherwise) for a stage that already exists."""
+        rm = _fresh_rm()
+        existing_rows = [
+            {"Stage ID": "STAGE-001", "Roadmap ID": "RM-001", "Order": "1",
+             "Name": "Stage 1", "Status": "done"},
+        ]
+        sheet = _make_stages_sheet(existing_rows)
+        with patch("business_core.sheets.get_business_sheet", return_value=sheet), \
+             patch("business_core.sheets.batch_append_business_rows") as mock_batch:
+            result = rm.ensure_roadmap_stages("RM-001", [_tmpl_row(1)])
+
+        self.assertEqual(result["existing_count"], 1)
+        mock_batch.assert_not_called()
+        sheet.update_cell.assert_not_called()
+
+    def test_existing_user_edited_fields_are_never_touched(self):
+        """Phase 28G scenario 8: existing user-edited fields
+        (Responsible, Notes, Due Date, ...) are preserved — same
+        guarantee as status, since ensure_roadmap_stages performs no
+        write at all for a stage whose Order already exists."""
+        rm = _fresh_rm()
+        existing_rows = [
+            {"Stage ID": "STAGE-001", "Roadmap ID": "RM-001", "Order": "1",
+             "Name": "Stage 1", "Status": "in_progress",
+             "Responsible": "Иван (user-edited)", "Notes": "custom note"},
+        ]
+        sheet = _make_stages_sheet(existing_rows)
+        with patch("business_core.sheets.get_business_sheet", return_value=sheet), \
+             patch("business_core.sheets.batch_append_business_rows") as mock_batch:
+            rm.ensure_roadmap_stages("RM-001", [_tmpl_row(1)])
+
+        mock_batch.assert_not_called()
+        sheet.update_cell.assert_not_called()
         mock_batch.assert_not_called()
 
     def test_new_stages_use_pending_not_not_started(self):
@@ -564,6 +601,127 @@ class TestUpdateStageFields(unittest.TestCase):
              patch("business_core.sheets.get_business_sheet", return_value=sheet):
             rm.update_stage_fields("STAGE-001", {"Priority": "high"})
         mock_find.assert_called_once_with("roadmap_stages", "STAGE-001")
+
+    def test_rejects_legacy_status_on_write(self):
+        """Phase 28H requirement 8: update_stage_fields must never write
+        a legacy status value like 'not_started'."""
+        rm = _fresh_rm()
+        result = rm.update_stage_fields("STAGE-001", {"Status": "not_started"})
+        self.assertFalse(result["ok"])
+        self.assertIn("not_started", result["error"])
+
+    def test_rejects_status_before_touching_sheets(self):
+        """An invalid Status must be rejected before any Sheets access —
+        including the other fields in the same call, all-or-nothing."""
+        rm = _fresh_rm()
+        with patch("business_core.sheets.find_row_by_id") as mock_find:
+            result = rm.update_stage_fields("STAGE-001", {"Status": "waiting", "Responsible": "Иван"})
+        self.assertFalse(result["ok"])
+        mock_find.assert_not_called()
+
+    def test_accepts_every_canonical_stage_status(self):
+        rm = _fresh_rm()
+        sheet = MagicMock()
+        sheet.row_values.return_value = STAGES_HEADERS
+        with patch("business_core.sheets.find_row_by_id", return_value=(2, {})), \
+             patch("business_core.sheets.get_business_sheet", return_value=sheet):
+            for status in rm.STAGE_STATUS_CANONICAL:
+                result = rm.update_stage_fields("STAGE-001", {"Status": status})
+                self.assertTrue(result["ok"], f"status {status!r} should be accepted")
+
+    def test_unrelated_field_update_does_not_touch_status(self):
+        """Phase 28H requirement 9: updating an unrelated field (e.g.
+        Responsible) must never write a Status value at all."""
+        rm = _fresh_rm()
+        sheet = MagicMock()
+        sheet.row_values.return_value = STAGES_HEADERS
+        with patch("business_core.sheets.find_row_by_id", return_value=(2, {})), \
+             patch("business_core.sheets.get_business_sheet", return_value=sheet):
+            result = rm.update_stage_fields("STAGE-001", {"Responsible": "Иван"})
+        self.assertEqual(result["written_fields"], ("Responsible",))
+        idx = {h: i + 1 for i, h in enumerate(STAGES_HEADERS)}
+        written_cols = [c.args[1] for c in sheet.update_cell.call_args_list]
+        self.assertNotIn(idx["Status"], written_cols)
+
+
+# ─────────────────────────────────────────────────────────────
+# Phase 28H: status normalization — read-time canonicalization
+# ─────────────────────────────────────────────────────────────
+
+class TestStageStatusNormalization(unittest.TestCase):
+    def test_not_started_is_read_as_pending(self):
+        rm = _fresh_rm()
+        self.assertEqual(rm.normalize_stage_status("not_started"), "pending")
+
+    def test_canonical_values_pass_through_unchanged(self):
+        rm = _fresh_rm()
+        for status in rm.STAGE_STATUS_CANONICAL:
+            self.assertEqual(rm.normalize_stage_status(status), status)
+
+    def test_unknown_value_passes_through_unchanged(self):
+        """Never guessed/invented aliases for unevidenced legacy values
+        (e.g. 'waiting') — pass through as-is rather than silently
+        remapping them."""
+        rm = _fresh_rm()
+        self.assertEqual(rm.normalize_stage_status("waiting"), "waiting")
+        self.assertEqual(rm.normalize_stage_status(""), "")
+
+    def test_get_stages_for_roadmap_normalizes_legacy_status(self):
+        rm = _fresh_rm()
+        sheet = _make_stages_sheet([
+            {"Stage ID": "STAGE-001", "Roadmap ID": "RM-001", "Order": "1",
+             "Name": "Stage 1", "Status": "not_started"},
+        ])
+        with patch("business_core.sheets.get_business_sheet", return_value=sheet):
+            stages = rm.get_stages_for_roadmap("RM-001")
+        self.assertEqual(stages[0]["status"], "pending")
+        self.assertEqual(stages[0]["raw_status"], "not_started")
+
+    def test_new_stage_writes_are_always_pending_never_not_started(self):
+        rm = _fresh_rm()
+        sheet = _make_stages_sheet([])
+        captured = {}
+        with patch("business_core.sheets.get_business_sheet", return_value=sheet), \
+             patch("business_core.sheets.generate_next_ids", return_value=["STAGE-001"]), \
+             patch("business_core.sheets.batch_append_business_rows",
+                   side_effect=lambda k, rows: captured.setdefault("rows", rows)):
+            rm.ensure_roadmap_stages("RM-001", [_tmpl_row(1)])
+        idx = {h: i for i, h in enumerate(STAGES_HEADERS)}
+        self.assertEqual(captured["rows"][0][idx["Status"]], "pending")
+
+
+class TestRoadmapStatusNormalization(unittest.TestCase):
+    def test_canonical_values_pass_through_unchanged(self):
+        rm = _fresh_rm()
+        for status in rm.ROADMAP_STATUSES:
+            self.assertEqual(rm.normalize_roadmap_status(status), status)
+
+    def test_no_evidenced_legacy_alias_exists(self):
+        """Phase 28H: repository-wide search found no evidenced legacy
+        Roadmap-level status — the alias map is intentionally empty,
+        not guessed."""
+        rm = _fresh_rm()
+        self.assertEqual(rm.ROADMAP_STATUS_READ_ALIASES, {})
+
+    def test_find_roadmap_by_id_exposes_raw_status(self):
+        rm = _fresh_rm()
+        sheet = _make_roadmaps_sheet([
+            {"Roadmap ID": "RM-001", "Status": "active"},
+        ])
+        with patch("business_core.sheets.get_business_sheet", return_value=sheet):
+            found = rm.find_roadmap_by_id("RM-001")
+        self.assertEqual(found["status"], "active")
+        self.assertEqual(found["raw_status"], "active")
+
+
+class TestCreateRoadmapRecordCanonicalStatusOnly(unittest.TestCase):
+    def test_rejects_legacy_roadmap_status(self):
+        rm = _fresh_rm()
+        result = rm.create_roadmap_record(
+            business_id="BIZ-001", client_id="PRS-001", object_id="OBJ-001",
+            status="draft",
+        )
+        self.assertFalse(result["ok"])
 
 
 if __name__ == "__main__":

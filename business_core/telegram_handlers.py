@@ -2362,38 +2362,60 @@ async def startroadmap_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await _reply(update, f"❌ Не удалось создать roadmap: {rm_result['error']}")
             return
 
-        roadmap_id    = rm_result["roadmap_id"]
-        used_template = rm_result.get("used_template", False)
+        roadmap_id      = rm_result["roadmap_id"]
+        used_template   = rm_result.get("used_template", False)
+        roadmap_created = rm_result.get("roadmap_created", True)
+        roadmap_reused  = rm_result.get("roadmap_reused", False)
+        effective_template_id = rm_result.get("template_id", "") or template_id_to_use
 
         update_object_roadmap_id(obj_id, roadmap_id)
 
         # ── Ответ ──────────────────────────────────────────────
+        # Phase 28G: distinguish new-Roadmap / reused-with-additions /
+        # already-fully-converged — never say "создан" for a reused one.
+        count = rm_result.get("stages_count", 0)
+        if roadmap_created:
+            header = "✅ *Roadmap создан*\n"
+        elif count > 0:
+            header = "ℹ️ *Roadmap уже существовал*\n"
+        else:
+            header = "ℹ️ *Roadmap уже существует и полностью настроен*\n"
+
         lines = [
-            "✅ *Roadmap создан*\n",
+            header,
             f"Roadmap ID: `{roadmap_id}`",
             f"Object ID:  `{obj_id}`",
             f"Service ID: `{service_id or '—'}`",
         ]
-        if template_id_to_use and used_template:
-            lines.append(f"Шаблон: `{template_id_to_use}`"
-                         + (f" _{template_source}_" if template_source else ""))
+        if effective_template_id and used_template:
+            lines.append(f"Шаблон: `{effective_template_id}`"
+                         + (f" _{template_source}_" if (template_source and roadmap_created) else ""))
         elif case_type and case_type != "general":
             lines.append(f"Case Type: `{case_type}`")
 
-        count = rm_result.get("stages_count", 0)
         if count == 0 and rm_result.get("warnings"):
             lines.append(f"\n⚠️ {rm_result['warnings'][0]}")
-        else:
+        elif roadmap_created:
             lines.append(f"Этапов создано: {count}")
-            # Показать первые 5 названий
-            if not used_template:
-                stage_names = ROADMAP_TEMPLATES.get(case_type, [])
-                if stage_names:
-                    lines.append("\n*Следующие шаги:*")
-                    for i, name in enumerate(stage_names[:5], start=1):
-                        lines.append(f"{i}. {name}")
-                    if len(stage_names) > 5:
-                        lines.append(f"   ... (+{len(stage_names) - 5} этапов)")
+        elif count > 0:
+            lines.append(f"Добавлено отсутствующих этапов: {count}")
+        else:
+            lines.append("Новых этапов не создано — все уже существовали.")
+
+        # Показать первые 5 названий built-in шаблона — только для
+        # НОВОГО Roadmap, использующего case_type-fallback (на reused
+        # Roadmap этапы уже существуют, показывать нечего).
+        if roadmap_created and not used_template:
+            stage_names = ROADMAP_TEMPLATES.get(case_type, [])
+            if stage_names:
+                lines.append("\n*Следующие шаги:*")
+                for i, name in enumerate(stage_names[:5], start=1):
+                    lines.append(f"{i}. {name}")
+                if len(stage_names) > 5:
+                    lines.append(f"   ... (+{len(stage_names) - 5} этапов)")
+
+        if rm_result.get("template_warning"):
+            lines.append(f"\n⚠️ {rm_result['template_warning']}")
 
         lines.append(f"\nПросмотр этапов: `/stages roadmap_id={roadmap_id}`")
 

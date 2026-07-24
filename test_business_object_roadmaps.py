@@ -855,6 +855,88 @@ class TestStartRoadmapCommand(unittest.TestCase):
         asyncio.run(run())
 
 
+class TestStartRoadmapConvergentRetryUX(unittest.TestCase):
+    """Phase 28G: /startroadmap must show a distinct message for each
+    of the three convergent-retry outcomes, and never say "создан" for
+    a reused Roadmap."""
+
+    def setUp(self):
+        for key in list(sys.modules.keys()):
+            if "business_core" in key:
+                del sys.modules[key]
+
+    def _make_update(self, text: str):
+        from unittest.mock import AsyncMock
+        update  = MagicMock()
+        context = MagicMock()
+        context.args = text.split() if text else []
+        update.message.text = "/startroadmap " + text
+        update.message.reply_text = AsyncMock()
+        update.effective_chat.id = 123
+        return update, context
+
+    async def _run(self, rm_result: dict):
+        from business_core.telegram_handlers import startroadmap_cmd
+        update, context = self._make_update("obj_id=OBJ-001 service_id=SVC-001")
+        with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
+             patch("business_core.business_builder.find_object_by_id",
+                   return_value={"obj_id": "OBJ-001", "biz_id": "BIZ-001", "client_id": "PRS-001"}), \
+             patch("business_core.business_builder.create_roadmap_for_object", return_value=rm_result), \
+             patch("business_core.business_builder.update_object_roadmap_id"), \
+             patch("business_core.service_manager.find_service_by_id", return_value=None), \
+             patch("business_core.roadmap_template_manager.find_roadmap_templates_by_service", return_value=[]):
+            await startroadmap_cmd(update, context)
+        return update.message.reply_text.call_args[0][0]
+
+    def test_new_roadmap_says_created(self):
+        import asyncio
+        reply = asyncio.run(self._run({
+            "ok": True, "roadmap_id": "RM-200", "error": None,
+            "roadmap_created": True, "roadmap_reused": False,
+            "stages_count": 5, "used_template": True, "template_id": "RMT-001",
+            "template_warning": None, "warnings": (), "relation_copy_errors": (),
+        }))
+        self.assertIn("Roadmap создан", reply)
+        self.assertIn("Этапов создано: 5", reply)
+        self.assertNotIn("уже существовал", reply)
+
+    def test_reused_roadmap_with_new_stages_says_reused_and_added(self):
+        import asyncio
+        reply = asyncio.run(self._run({
+            "ok": True, "roadmap_id": "RM-201", "error": None,
+            "roadmap_created": False, "roadmap_reused": True,
+            "stages_count": 2, "used_template": True, "template_id": "RMT-001",
+            "template_warning": None, "warnings": (), "relation_copy_errors": (),
+        }))
+        self.assertIn("уже существовал", reply)
+        self.assertIn("Добавлено отсутствующих этапов: 2", reply)
+        self.assertNotIn("✅ *Roadmap создан*", reply)
+
+    def test_reused_roadmap_fully_converged_says_nothing_new(self):
+        import asyncio
+        reply = asyncio.run(self._run({
+            "ok": True, "roadmap_id": "RM-202", "error": None,
+            "roadmap_created": False, "roadmap_reused": True,
+            "stages_count": 0, "used_template": True, "template_id": "RMT-001",
+            "template_warning": None, "warnings": (), "relation_copy_errors": (),
+        }))
+        self.assertIn("полностью настроен", reply)
+        self.assertIn("Новых этапов не создано", reply)
+        self.assertNotIn("Roadmap создан", reply)
+
+    def test_template_mismatch_warning_shown(self):
+        import asyncio
+        reply = asyncio.run(self._run({
+            "ok": True, "roadmap_id": "RM-203", "error": None,
+            "roadmap_created": False, "roadmap_reused": True,
+            "stages_count": 0, "used_template": True, "template_id": "RMT-EXISTING",
+            "template_warning": "requested_template_id (RMT-NEW) differs from existing_template_id (RMT-EXISTING); existing Roadmap template retained",
+            "warnings": (), "relation_copy_errors": (),
+        }))
+        self.assertIn("RMT-NEW", reply)
+        self.assertIn("RMT-EXISTING", reply)
+
+
 # ────────────────────────────────────────────────────────────
 # L: /roadmaps показывает список
 # ────────────────────────────────────────────────────────────
