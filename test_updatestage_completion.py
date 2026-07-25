@@ -95,11 +95,13 @@ class TestLastStageCompletesRoadmap(unittest.TestCase):
         reply = upd.message.reply_text.call_args[0][0]
         self.assertEqual(
             reply,
-            "✅ Этап обновлён\n"
+            "✅ Статус этапа обновлён\n"
             "Этап: `STAGE-001`\n"
-            "Статус: pending → done\n"
-            "Прогресс roadmap `RM-001`: 67% → 100%\n"
-            "✅ Roadmap `RM-001` завершён: active → completed",
+            "Roadmap: `RM-001`\n"
+            "Было: Ожидает (`pending`)\n"
+            "Стало: Выполнен (`done`)\n"
+            "Прогресс: 67% → 100%\n"
+            "🎉 Все этапы завершены. Roadmap `RM-001` переведена в статус «Завершена».",
         )
 
     def test_last_stage_skipped_completes_roadmap(self):
@@ -114,7 +116,7 @@ class TestLastStageCompletesRoadmap(unittest.TestCase):
             roadmap_status_before="active", roadmap_status_after="completed",
         )))
         reply = upd.message.reply_text.call_args[0][0]
-        self.assertIn("Roadmap `RM-001` завершён: active → completed", reply)
+        self.assertIn("🎉 Все этапы завершены. Roadmap `RM-001` переведена в статус «Завершена».", reply)
 
     def test_progress_below_100_roadmap_stays_active_no_extra_line(self):
         th = _fresh_th()
@@ -127,9 +129,9 @@ class TestLastStageCompletesRoadmap(unittest.TestCase):
             roadmap_status_before="active", roadmap_status_after="active",
         )))
         reply = upd.message.reply_text.call_args[0][0]
-        self.assertNotIn("завершён", reply)
-        self.assertNotIn("Roadmap `RM-001` уже имеет статус", reply)
-        self.assertIn("Прогресс roadmap `RM-001`: 33% → 67%", reply)
+        self.assertNotIn("🎉", reply)
+        self.assertNotIn("Завершена", reply)
+        self.assertIn("Прогресс: 33% → 67%", reply)
 
 
 class TestMaybeCompleteNotCalledOnErrors(unittest.TestCase):
@@ -177,8 +179,8 @@ class TestIdempotentAfterCompletion(unittest.TestCase):
             roadmap_status_before="completed", roadmap_status_after="completed",
         )))
         reply = upd.message.reply_text.call_args[0][0]
-        self.assertIn("уже имел статус", reply)
-        self.assertNotIn("завершён:", reply)
+        self.assertIn("уже имеет запрошенный статус", reply)
+        self.assertNotIn("🎉", reply)
 
     def test_active_roadmap_below_100_no_completed_message_on_repeat(self):
         th = _fresh_th()
@@ -212,7 +214,7 @@ class TestPartialFailureFromDownstream(unittest.TestCase):
         _run(_invoke(th, upd, ctx, result))
         reply = upd.message.reply_text.call_args[0][0]
         self.assertIn("⚠️", reply)
-        self.assertIn("частично", reply)
+        self.assertIn("не всё обновилось полностью", reply)
         self.assertIn("Повтор команды безопасен", reply)
 
 

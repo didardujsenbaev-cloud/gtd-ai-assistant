@@ -167,5 +167,63 @@ class TestStageManagerDependencyDirection(unittest.TestCase):
         self.assertEqual(found, set(), f"roadmap_manager.py must not import: {found}")
 
 
+class TestBlockUnblockCannotBypassTransitionStatus(unittest.TestCase):
+    """Phase 34D §2/§12: /blockstage and /unblockstage set Status via
+    the shared _stage_edit_execute confirm step — this guard confirms
+    that step routes any "Status" key through transition_stage_status(),
+    never through update_stage_fields/update_stage_admin_fields."""
+
+    def _stage_edit_execute_body(self) -> str:
+        path = BUSINESS_CORE / "telegram_handlers.py"
+        src = path.read_text(encoding="utf-8")
+        start = src.index("async def _stage_edit_execute")
+        end = src.index("\nasync def ", start + 10)
+        return src[start:end]
+
+    def test_status_key_routes_to_transition_stage_status(self):
+        body = self._stage_edit_execute_body()
+        self.assertIn("transition_stage_status", body)
+        self.assertIn('writes.pop("Status"', body)
+
+    def test_admin_only_writes_route_to_update_stage_admin_fields(self):
+        body = self._stage_edit_execute_body()
+        self.assertIn("update_stage_admin_fields", body)
+        self.assertNotIn("roadmap_manager.update_stage_fields(", body)
+
+
+class TestCentralizedStageUXMappingExists(unittest.TestCase):
+    """Phase 34D §3: one centralized result-code -> Russian message
+    mapping/renderer set exists for both transition and admin-field
+    results — no ad-hoc per-caller message construction duplicating it."""
+
+    def test_transition_and_admin_renderers_exist(self):
+        import business_core.telegram_handlers as th
+        self.assertTrue(callable(getattr(th, "_stage_transition_failure_message", None)))
+        self.assertTrue(callable(getattr(th, "_stage_transition_success_lines", None)))
+        self.assertTrue(callable(getattr(th, "_stage_admin_failure_message", None)))
+
+    def test_updatestage_uses_the_centralized_renderers(self):
+        path = BUSINESS_CORE / "telegram_handlers.py"
+        src = path.read_text(encoding="utf-8")
+        start = src.index("async def updatestage_cmd")
+        end = src.index("\nasync def ", start + 10)
+        body = src[start:end]
+        self.assertIn("_stage_transition_failure_message(", body)
+        self.assertIn("_stage_transition_success_lines(", body)
+
+    def test_unknown_code_has_safe_fallback_in_both_renderers(self):
+        import business_core.telegram_handlers as th
+        result = {"ok": False, "code": "SOME_FUTURE_CODE_NOT_YET_MAPPED", "error": "internal detail"}
+        msg = th._stage_transition_failure_message(result, "STAGE-001", "done")
+        self.assertNotIn("internal detail", msg)
+        self.assertIn("❌", msg)
+
+        admin_msg = th._stage_admin_failure_message(
+            {"ok": False, "code": "SOME_FUTURE_ADMIN_CODE", "error": "internal detail"}, "STAGE-001",
+        )
+        self.assertNotIn("internal detail", admin_msg)
+        self.assertIn("❌", admin_msg)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

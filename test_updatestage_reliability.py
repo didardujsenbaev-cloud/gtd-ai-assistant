@@ -436,7 +436,7 @@ class TestTelegramResponses(unittest.TestCase):
         _run(run())
         reply = upd.message.reply_text.call_args[0][0]
         self.assertIn("⚠️", reply)
-        self.assertIn("Статус подтверждён", reply)
+        self.assertIn("Статус сохранён", reply)
         self.assertIn("Completed At", reply)
         self.assertIn("Повтор команды безопасен", reply)
 
@@ -500,8 +500,9 @@ class TestTelegramResponses(unittest.TestCase):
 
         _run(run())
         reply = upd.message.reply_text.call_args[0][0]
-        self.assertIn("✅ Этап обновлён", reply)
-        self.assertIn("Статус: pending → done", reply)
+        self.assertIn("✅ Статус этапа обновлён", reply)
+        self.assertIn("Было: Ожидает (`pending`)", reply)
+        self.assertIn("Стало: Выполнен (`done`)", reply)
         self.assertNotIn("⚠️", reply)
 
     def test_progress_math_unchanged_in_response(self):
@@ -519,7 +520,7 @@ class TestTelegramResponses(unittest.TestCase):
 
         _run(run())
         reply = upd.message.reply_text.call_args[0][0]
-        self.assertIn("Прогресс roadmap `RM-001`: 33% → 67%", reply)
+        self.assertIn("Прогресс: 33% → 67%", reply)
 
     def test_roadmap_completion_response_unchanged(self):
         th = _fresh_th()
@@ -538,7 +539,7 @@ class TestTelegramResponses(unittest.TestCase):
 
         _run(run())
         reply = upd.message.reply_text.call_args[0][0]
-        self.assertIn("✅ Roadmap `RM-001` завершён: active → completed", reply)
+        self.assertIn("🎉 Все этапы завершены. Roadmap `RM-001` переведена в статус «Завершена».", reply)
 
 
 class TestStagesIconFix(unittest.TestCase):
