@@ -64,7 +64,7 @@ def _run_create(sheet, obj_id="OBJ-777", **overrides):
     create_object_record = _fresh_import()
     args = {**DEFAULT_ARGS, **overrides}
     with patch("business_core.sheets.get_business_sheet", return_value=sheet), \
-         patch("business_core.business_builder.generate_object_id", return_value=obj_id):
+         patch("business_core.object_manager.generate_object_id", return_value=obj_id):
         result = create_object_record(**args)
     return result, sheet
 
@@ -265,7 +265,7 @@ class TestObjectHeaderSafeIdAndDriveUnchanged(unittest.TestCase):
         sheet = _make_object_sheet(STANDARD_HEADERS)
         create_object_record = _fresh_import()
         with patch("business_core.sheets.get_business_sheet", return_value=sheet), \
-             patch("business_core.business_builder.generate_object_id",
+             patch("business_core.object_manager.generate_object_id",
                    return_value="OBJ-555") as mock_gen:
             result = create_object_record(**DEFAULT_ARGS)
         mock_gen.assert_called_once()
