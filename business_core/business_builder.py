@@ -1087,6 +1087,22 @@ def update_object_drive_info(
     return bool(result["ok"] and result["updated"])
 
 
+def _drive_result(
+    ok:              bool,
+    folder_id:       Optional[str] = None,
+    folder_url:      Optional[str] = None,
+    error:           Optional[str] = None,
+    drive_created:   bool = False,
+    drive_reused:    bool = False,
+    partial_failure: bool = False,
+) -> dict:
+    return {
+        "ok": ok, "folder_id": folder_id, "folder_url": folder_url, "error": error,
+        "drive_created": drive_created, "drive_reused": drive_reused,
+        "partial_failure": partial_failure,
+    }
+
+
 def provision_object_drive(
     biz_id:      str,
     client_id:   str,
@@ -1096,38 +1112,55 @@ def provision_object_drive(
     object_type: str = "",
 ) -> dict:
     """
-    Создать Drive-папку объекта недвижимости.
+    Создать (или переиспользовать) Drive-папку объекта недвижимости.
+
+    Phase 30D, ADR-014 Decision 14/Part 6 — retry-safe: если у объекта
+    в OBJECT_REGISTRY уже есть непустой Drive Folder ID, Drive API НЕ
+    вызывается вовсе — существующая ссылка переиспользуется
+    (drive_reused=True). Только если ссылка пуста, создаётся новая
+    папка, и попытка сохранить ссылку выполняется РОВНО один раз за
+    вызов — повторный вызов этой функции никогда не создаёт вторую
+    папку в Drive.
 
     Логика:
+    0. object_manager.find_object_by_id(obj_id) — если Drive Folder ID
+       уже установлен, вернуть его без обращения к Drive API.
     1. Получить Drive root через resolve_drive_root_for_business(biz_id).
     2. Если root не настроен → ok=False, нет исключения.
     3. Если у клиента уже есть Drive Folder ID → использовать его.
     4. Иначе — создать/получить папку клиента через provision_client_drive.
     5. Создать папку объекта внутри папки клиента.
-    6. Сохранить Drive Folder ID в OBJECT_REGISTRY.
+    6. Сохранить Drive Folder ID через object_manager.update_object_drive_info()
+       (only_if_empty=True — тот же safety net на стороне persistence).
 
     Returns:
         {
-            "ok":         bool,
-            "folder_id":  str | None,
-            "folder_url": str | None,
-            "error":      str | None,
+            "ok":              bool,
+            "folder_id":       str | None,
+            "folder_url":      str | None,
+            "error":           str | None,
+            "drive_created":   bool,  # True только если папка реально создана этим вызовом
+            "drive_reused":    bool,  # True если использована уже существующая ссылка
+            "partial_failure": bool,  # True если папка создана, но ссылка не сохранилась
         }
     """
+    from business_core.object_manager import find_object_by_id, update_object_drive_info as _om_update_drive_info
+
+    obj = find_object_by_id(obj_id)
+    if obj and obj.get("drive_folder_id"):
+        return _drive_result(
+            True, folder_id=obj["drive_folder_id"], folder_url=obj.get("drive_url") or None,
+            drive_reused=True,
+        )
+
     # 1. Drive root
     root_info = resolve_drive_root_for_business(biz_id)
     if not root_info["ok"]:
-        return {
-            "ok": False, "folder_id": None, "folder_url": None,
-            "error": root_info.get("error", "Drive root not configured"),
-        }
+        return _drive_result(False, error=root_info.get("error", "Drive root not configured"))
 
     creds_file = os.getenv("GOOGLE_CREDENTIALS_FILE", "").strip()
     if not creds_file:
-        return {
-            "ok": False, "folder_id": None, "folder_url": None,
-            "error": "GOOGLE_CREDENTIALS_FILE не задан",
-        }
+        return _drive_result(False, error="GOOGLE_CREDENTIALS_FILE не задан")
 
     try:
         # 2. Данные клиента (для имени папки и существующего Drive ID)
@@ -1176,20 +1209,33 @@ def provision_object_drive(
             root_folder_id=root_info["root_id"],
         )
 
-        if result["ok"]:
-            # 5. Сохранить в OBJECT_REGISTRY
-            update_object_drive_info(
-                obj_id,
-                drive_folder_id=result["folder_id"],
-                google_drive_url=result["folder_url"],
-            )
-            log.info(f"provision_object_drive: {obj_id} → {result['folder_url']}")
+        if not result["ok"]:
+            return _drive_result(False, error=result.get("error"))
 
-        return result
+        # 6. Сохранить ссылку в OBJECT_REGISTRY — ровно одна попытка,
+        # only_if_empty=True на стороне object_manager не даст создать
+        # вторую ссылку даже при гонке.
+        persisted = _om_update_drive_info(
+            obj_id, folder_id=result["folder_id"], folder_url=result["folder_url"], only_if_empty=True,
+        )
+        log.info(f"provision_object_drive: {obj_id} → {result['folder_url']}")
+
+        if not persisted["ok"]:
+            # Папка реально создана в Drive, но ссылка не сохранилась —
+            # видимый partial failure, не утверждаем полный успех молча.
+            return _drive_result(
+                True, folder_id=result["folder_id"], folder_url=result["folder_url"],
+                error=persisted.get("error"), drive_created=True, partial_failure=True,
+            )
+
+        return _drive_result(
+            True, folder_id=result["folder_id"], folder_url=result["folder_url"],
+            drive_created=True,
+        )
 
     except Exception as exc:
         log.warning(f"provision_object_drive({obj_id}) error: {exc}")
-        return {"ok": False, "folder_id": None, "folder_url": None, "error": str(exc)}
+        return _drive_result(False, error=str(exc))
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1340,6 +1386,29 @@ def create_roadmap_for_object(
     """
     if not obj_id or not biz_id or not client_id:
         return _empty_roadmap_creation_result("Обязательные поля: obj_id, biz_id, client_id")
+
+    # Phase 30D, ADR-014 Decision 7: Roadmap может быть создан только
+    # для существующего Object с разрешённым статусом (new/active/
+    # on_hold). Проверка — до Service-валидации, до find_active_roadmap_
+    # for_object(), до create_roadmap_record(), до ensure_roadmap_stages(),
+    # до update_object_roadmap_id(), до Extension operations — без
+    # production writes при отказе. Остаётся в orchestration
+    # (business_builder), не в roadmap_manager — тот же принцип, что уже
+    # применён к Service-валидации (Phase 29CD).
+    from business_core.object_manager import find_object_by_id, OBJECT_STATUSES, ROADMAP_ALLOWED_OBJECT_STATUSES
+    obj = find_object_by_id(obj_id)
+    if obj is None:
+        return _empty_roadmap_creation_result(f"Object {obj_id} не найден")
+    object_status = (obj.get("status") or "").strip().lower()
+    if object_status not in OBJECT_STATUSES:
+        return _empty_roadmap_creation_result(
+            f"Object {obj_id}: неизвестный статус '{object_status}' — Roadmap не создан"
+        )
+    if object_status not in ROADMAP_ALLOWED_OBJECT_STATUSES:
+        return _empty_roadmap_creation_result(
+            f"Object {obj_id} имеет статус '{object_status}' — "
+            f"Roadmap можно создать только для Object со статусом {', '.join(ROADMAP_ALLOWED_OBJECT_STATUSES)}"
+        )
 
     # Closeout Remediation (finding #1) — defense-in-depth: service_id is
     # part of the (Object ID, Service ID) duplicate key that
@@ -1684,43 +1753,35 @@ def find_roadmap_by_id(roadmap_id: str) -> Optional[dict]:
 
 
 def find_roadmaps_by_object(obj_id: str) -> list[dict]:
-    """Найти все roadmap для объекта по OBJ-ID."""
+    """
+    Найти все roadmap для объекта по OBJ-ID.
+
+    Phase 30D, Part 7: delegates to roadmap_manager.list_roadmaps(
+    object_id=...) — the canonical, header-mapped Roadmap owner API —
+    instead of a raw ROADMAPS read duplicated here. Translated back to
+    this function's existing (biz_id/title/obj_id-keyed, raw Status)
+    return shape for its existing caller/tests.
+    """
     if not obj_id:
         return []
     try:
-        from business_core.sheets import get_business_sheet
-        sheet = get_business_sheet("roadmaps")
-        all_values = sheet.get_all_values()
-        if len(all_values) < 2:
-            return []
-        headers = all_values[0]
-
-        def _col(h):
-            return headers.index(h) if h in headers else None
-
-        def _get(row, h):
-            c = _col(h)
-            return row[c].strip() if c is not None and c < len(row) else ""
-
-        obj_col = _col("Object ID")
-        results = []
-        for row in all_values[1:]:
-            if not row or not row[0]:
-                continue
-            if obj_col is not None and obj_col < len(row) and row[obj_col].strip() == obj_id:
-                results.append({
-                    "roadmap_id": _get(row, "Roadmap ID"),
-                    "biz_id":     _get(row, "Business ID"),
-                    "service_id": _get(row, "Service ID"),
-                    "client_id":  _get(row, "Client ID"),
-                    "title":      _get(row, "Client Name"),
-                    "status":     _get(row, "Status"),
-                    "created":    _get(row, "Created"),
-                    "obj_id":     _get(row, "Object ID"),
-                    "case_type":  _get(row, "Case Type"),
-                    "progress":   _get(row, "Progress %"),
-                })
-        return results
+        from business_core.roadmap_manager import list_roadmaps
+        rows = list_roadmaps(object_id=obj_id)
+        return [
+            {
+                "roadmap_id": r["roadmap_id"],
+                "biz_id":     r["business_id"],
+                "service_id": r["service_id"],
+                "client_id":  r["client_id"],
+                "title":      r["client_name"],
+                "status":     r["raw_status"],
+                "created":    r["created"],
+                "obj_id":     r["object_id"],
+                "case_type":  r["case_type"],
+                "progress":   r["progress"],
+            }
+            for r in rows
+        ]
     except Exception as exc:
         log.warning(f"find_roadmaps_by_object({obj_id}) error: {exc}")
         return []

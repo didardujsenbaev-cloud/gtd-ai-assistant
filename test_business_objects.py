@@ -285,9 +285,11 @@ class TestUpdateObjectDriveInfo(unittest.TestCase):
 
 class TestProvisionObjectDrive(unittest.TestCase):
 
+    @patch("business_core.object_manager.find_object_by_id")
     @patch("business_core.business_builder.resolve_drive_root_for_business")
-    def test_no_root_returns_not_ok(self, mock_resolve):  # L
+    def test_no_root_returns_not_ok(self, mock_resolve, mock_find_obj):  # L
         """Drive root не настроен → ok=False без исключения."""
+        mock_find_obj.return_value = {"drive_folder_id": "", "drive_url": ""}
         mock_resolve.return_value = {
             "root_id": "", "ok": False, "source": "none",
             "error": "Drive root not configured"
@@ -302,11 +304,13 @@ class TestProvisionObjectDrive(unittest.TestCase):
     @patch("business_core.business_builder.get_business_config")
     @patch("business_core.business_builder.provision_client_drive")
     @patch("business_core.business_builder.update_person_drive_info")
-    @patch("business_core.business_builder.update_object_drive_info")
+    @patch("business_core.object_manager.update_object_drive_info")
+    @patch("business_core.object_manager.find_object_by_id")
     @patch("integrations.google_drive_adapter.create_object_folder")
-    def test_uses_per_biz_root(self, mock_create, mock_upd_obj, mock_upd_person,
+    def test_uses_per_biz_root(self, mock_create, mock_find_obj, mock_upd_obj, mock_upd_person,
                                 mock_prov_cl, mock_cfg, mock_resolve):  # I
         """provision_object_drive использует per-biz root."""
+        mock_find_obj.return_value = {"drive_folder_id": "", "drive_url": ""}
         mock_resolve.return_value = {
             "root_id": "per-biz-root-111", "ok": True, "source": "biz_registry", "error": None
         }
@@ -318,7 +322,7 @@ class TestProvisionObjectDrive(unittest.TestCase):
         mock_create.return_value = {
             "ok": True, "folder_id": "obj-folder-1", "folder_url": "https://obj/1", "error": None
         }
-        mock_upd_obj.return_value = True
+        mock_upd_obj.return_value = {"ok": True, "object_id": "OBJ-001", "updated": True, "error": None}
         mock_upd_person.return_value = True
 
         from business_core.business_builder import provision_object_drive
@@ -338,10 +342,12 @@ class TestProvisionObjectDrive(unittest.TestCase):
 
     @patch("business_core.business_builder.resolve_drive_root_for_business")
     @patch("business_core.business_builder.get_business_config")
-    @patch("business_core.business_builder.update_object_drive_info")
+    @patch("business_core.object_manager.update_object_drive_info")
+    @patch("business_core.object_manager.find_object_by_id")
     @patch("integrations.google_drive_adapter.create_object_folder")
-    def test_uses_existing_client_folder(self, mock_create, mock_upd, mock_cfg, mock_resolve):  # J, M
+    def test_uses_existing_client_folder(self, mock_create, mock_find_obj, mock_upd, mock_cfg, mock_resolve):  # J, M
         """provision_object_drive использует существующую папку клиента."""
+        mock_find_obj.return_value = {"drive_folder_id": "", "drive_url": ""}
         mock_resolve.return_value = {
             "root_id": "root-1", "ok": True, "source": "env", "error": None
         }
@@ -349,7 +355,7 @@ class TestProvisionObjectDrive(unittest.TestCase):
         mock_create.return_value = {
             "ok": True, "folder_id": "obj-new", "folder_url": "https://obj/new", "error": None
         }
-        mock_upd.return_value = True
+        mock_upd.return_value = {"ok": True, "object_id": "OBJ-002", "updated": True, "error": None}
 
         from business_core.business_builder import provision_object_drive
 
@@ -369,16 +375,21 @@ class TestProvisionObjectDrive(unittest.TestCase):
 
     @patch("business_core.business_builder.resolve_drive_root_for_business")
     @patch("business_core.business_builder.get_business_config")
-    @patch("business_core.business_builder.update_object_drive_info")
+    @patch("business_core.object_manager.update_object_drive_info")
+    @patch("business_core.object_manager.find_object_by_id")
     @patch("integrations.google_drive_adapter.create_object_folder")
-    def test_drive_saved_to_object_registry(self, mock_create, mock_upd, mock_cfg, mock_resolve):  # K
-        """Drive Folder ID сохраняется в OBJECT_REGISTRY."""
+    def test_drive_saved_to_object_registry(self, mock_create, mock_find_obj, mock_upd, mock_cfg, mock_resolve):  # K
+        """Drive Folder ID сохраняется в OBJECT_REGISTRY через
+        object_manager.update_object_drive_info() (Phase 30D, Part 6 —
+        provision_object_drive delegates persistence to object_manager
+        directly, not via the business_builder wrapper)."""
         mock_resolve.return_value = {"root_id": "r", "ok": True, "source": "env", "error": None}
         mock_cfg.return_value = {"name": "X", "found": True}
+        mock_find_obj.return_value = {"drive_folder_id": "", "drive_url": ""}
         mock_create.return_value = {
             "ok": True, "folder_id": "saved-id", "folder_url": "https://saved", "error": None
         }
-        mock_upd.return_value = True
+        mock_upd.return_value = {"ok": True, "object_id": "OBJ-003", "updated": True, "error": None}
 
         from business_core.business_builder import provision_object_drive
 
@@ -392,7 +403,11 @@ class TestProvisionObjectDrive(unittest.TestCase):
                         mock_pcl.return_value = {"ok": True, "folder_id": "cl-f", "folder_url": "https://cl", "biz_id": "BIZ-001"}
                         result = provision_object_drive("BIZ-001", "PRS-001", "OBJ-003", "Алматы", "ул.")
 
-        mock_upd.assert_called_once_with("OBJ-003", drive_folder_id="saved-id", google_drive_url="https://saved")
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["drive_created"])
+        mock_upd.assert_called_once_with(
+            "OBJ-003", folder_id="saved-id", folder_url="https://saved", only_if_empty=True,
+        )
 
 
 class TestProvisionObjectDriveNoDirectRegistryRead(unittest.TestCase):
@@ -567,6 +582,18 @@ class TestNewObjectCmdNoDirectRegistryRead(unittest.TestCase):
     find_person_by_id()."""
 
     def test_no_direct_registry_read_calls_remain(self):
+        """
+        Phase 30D, Part 5: newobject_cmd() now legitimately calls
+        find_row_by_id("biz_registry", ...) for Business existence
+        validation (the same canonical primitive already used
+        everywhere else in Business Core for this check — see
+        ADR-014 Decision 5). That is NOT what this guard forbids —
+        this guard's original intent (Phase 23D-4A) is that
+        people_registry/Client-existence checks must go through
+        Person Manager's find_person_by_id(), never a raw read.
+        So the check is scoped to the literal sheet_key argument
+        rather than banning find_row_by_id() outright.
+        """
         import ast
         import inspect
         from business_core.telegram_handlers import newobject_cmd
@@ -580,8 +607,11 @@ class TestNewObjectCmdNoDirectRegistryRead(unittest.TestCase):
             if isinstance(node, ast.Call):
                 func = node.func
                 name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
-                if name in forbidden_calls:
-                    found_calls.add(name)
+                if name not in forbidden_calls:
+                    continue
+                if node.args and isinstance(node.args[0], ast.Constant) and node.args[0].value == "biz_registry":
+                    continue  # allowed — Business existence check (ADR-014 Decision 5)
+                found_calls.add(name)
 
         self.assertEqual(found_calls, set())
 

@@ -581,7 +581,9 @@ class TestEmptyServiceIdCannotReachRoadmapCreation(unittest.TestCase):
         from unittest.mock import patch
         import business_core.business_builder as bb
 
-        with patch("business_core.roadmap_manager.create_roadmap_record") as mock_create, \
+        with patch("business_core.object_manager.find_object_by_id",
+                   return_value={"object_id": "OBJ-001", "status": "new"}), \
+             patch("business_core.roadmap_manager.create_roadmap_record") as mock_create, \
              patch("business_core.sheets.append_business_row") as mock_append, \
              patch("business_core.sheets.batch_append_business_rows") as mock_batch:
             result = bb.create_roadmap_for_object(
@@ -596,11 +598,14 @@ class TestEmptyServiceIdCannotReachRoadmapCreation(unittest.TestCase):
         mock_batch.assert_not_called()
 
     def test_builder_rejects_whitespace_only_service_id(self):
+        from unittest.mock import patch
         import business_core.business_builder as bb
-        result = bb.create_roadmap_for_object(
-            obj_id="OBJ-001", biz_id="BIZ-001", client_id="PRS-001",
-            service_id="   ", case_type="general",
-        )
+        with patch("business_core.object_manager.find_object_by_id",
+                   return_value={"object_id": "OBJ-001", "status": "new"}):
+            result = bb.create_roadmap_for_object(
+                obj_id="OBJ-001", biz_id="BIZ-001", client_id="PRS-001",
+                service_id="   ", case_type="general",
+            )
         self.assertFalse(result["ok"])
 
     def test_builder_dedup_lookup_no_longer_conditional_on_service_id(self):

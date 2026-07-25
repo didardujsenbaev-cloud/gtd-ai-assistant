@@ -102,7 +102,9 @@ class TestTemplateIdWrite(unittest.TestCase):
         rows = []
         sheet = self._fake_sheet(CANONICAL_ROADMAPS_HEADERS)
 
-        with patch("business_core.service_manager.find_service_by_id",
+        with patch("business_core.object_manager.find_object_by_id",
+                   return_value={"object_id": "OBJ-TEST", "status": "new"}), \
+             patch("business_core.service_manager.find_service_by_id",
                    return_value={"service_id": "SVC-IZH-001", "status": "active"}), \
              patch("business_core.sheets.get_business_sheet", return_value=sheet), \
              patch("business_core.sheets.append_business_row",
@@ -144,7 +146,9 @@ class TestTemplateIdWrite(unittest.TestCase):
         ]
         sheet = self._fake_sheet(shuffled)
 
-        with patch("business_core.service_manager.find_service_by_id",
+        with patch("business_core.object_manager.find_object_by_id",
+                   return_value={"object_id": "OBJ-TEST", "status": "new"}), \
+             patch("business_core.service_manager.find_service_by_id",
                    return_value={"service_id": "SVC-IZH-001", "status": "active"}), \
              patch("business_core.sheets.get_business_sheet", return_value=sheet), \
              patch("business_core.sheets.append_business_row",
@@ -170,7 +174,9 @@ class TestTemplateIdWrite(unittest.TestCase):
         rows = []
         sheet = self._fake_sheet(CANONICAL_ROADMAPS_HEADERS)
 
-        with patch("business_core.service_manager.find_service_by_id",
+        with patch("business_core.object_manager.find_object_by_id",
+                   return_value={"object_id": "OBJ-TEST", "status": "new"}), \
+             patch("business_core.service_manager.find_service_by_id",
                    return_value={"service_id": "SVC-IZH-001", "status": "active"}), \
              patch("business_core.sheets.get_business_sheet", return_value=sheet), \
              patch("business_core.sheets.append_business_row",
@@ -195,7 +201,9 @@ class TestTemplateIdWrite(unittest.TestCase):
         old_headers = CANONICAL_ROADMAPS_HEADERS[:24]  # только до "Last Updated"
         sheet = self._fake_sheet(old_headers)
 
-        with patch("business_core.service_manager.find_service_by_id",
+        with patch("business_core.object_manager.find_object_by_id",
+                   return_value={"object_id": "OBJ-TEST", "status": "new"}), \
+             patch("business_core.service_manager.find_service_by_id",
                    return_value={"service_id": "SVC-IZH-001", "status": "active"}), \
              patch("business_core.sheets.get_business_sheet", return_value=sheet), \
              patch("business_core.sheets.append_business_row",

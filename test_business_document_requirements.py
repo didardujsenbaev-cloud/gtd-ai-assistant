@@ -718,18 +718,17 @@ class TestDocumentRequirementsQuery(_PatchedCase):
             self.assertFalse(drq.scope_exists("roadmap", "RM-NOPE"))
 
     def test_scope_exists_object(self):
+        """Phase 30D: 'object' scope now goes through
+        business_core.object_manager.find_object_by_id(), not the
+        generic find_row_by_id() primitive (see document_requirements_
+        query.scope_exists's own docstring)."""
         drq = _fresh_drq()
-        objects = [{"OBJ ID": "OBJ-001", "Client ID": "PRS-001", "Biz ID": "BIZ-001"}]
+        objects = {"OBJ-001": {"object_id": "OBJ-001", "client_id": "PRS-001", "biz_id": "BIZ-001"}}
 
-        def _find(sheet_key, record_id, *a, **kw):
-            if sheet_key == "object_registry":
-                for row in objects:
-                    if row.get("OBJ ID") == record_id:
-                        return (2, row)
-                return None
-            return None
+        def _find_object(object_id, *a, **kw):
+            return objects.get(object_id)
 
-        with patch("business_core.sheets.find_row_by_id", side_effect=_find):
+        with patch("business_core.object_manager.find_object_by_id", side_effect=_find_object):
             self.assertTrue(drq.scope_exists("object", "OBJ-001"))
             self.assertFalse(drq.scope_exists("object", "OBJ-NOPE"))
 

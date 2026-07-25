@@ -364,7 +364,9 @@ class TestRoadmapServiceStatusValidation(unittest.TestCase):
         retry behavior (reuse existing active Roadmap) is unchanged."""
         bb = _fresh_bb()
         existing_roadmap = {"roadmap_id": "RM-950", "template_id": "", "status": "active"}
-        with patch("business_core.service_manager.find_service_by_id",
+        with patch("business_core.object_manager.find_object_by_id",
+                   return_value={"object_id": "OBJ-001", "status": "new"}), \
+             patch("business_core.service_manager.find_service_by_id",
                    return_value={"service_id": "SVC-001", "status": "active"}), \
              patch("business_core.roadmap_manager.find_active_roadmap_for_object",
                    return_value=existing_roadmap), \

@@ -83,9 +83,27 @@ TEMPLATE_ROWS = [{"Document Template ID": "DOC-IZH-KP-001", "Biz ID": "BIZ-001"}
 def _patch_registries(doc_sheet=None):
     return [
         patch("business_core.sheets.read_business_sheet", side_effect=_read_business_sheet_side_effect),
+        patch("business_core.object_manager.find_object_by_id", side_effect=_find_object_by_id_side_effect),
         patch("business_core.sheets.get_business_sheet",
               return_value=doc_sheet if doc_sheet is not None else _make_doc_sheet()),
     ]
+
+
+def _find_object_by_id_side_effect(object_id, *a, **kw):
+    """Phase 30D: document_registry_manager now reads OBJECT_REGISTRY via
+    business_core.object_manager.find_object_by_id() (canonical dict
+    shape) instead of a raw read_business_sheet("object_registry")
+    call — this mirrors OBJECT_ROWS in the object_manager return shape."""
+    for row in OBJECT_ROWS:
+        if row.get("OBJ ID") == object_id:
+            return {
+                "object_id": row.get("OBJ ID", ""),
+                "client_id": row.get("Client ID", ""),
+                "biz_id": row.get("Biz ID", ""),
+                "drive_folder_id": row.get("Drive Folder ID", ""),
+                "drive_url": row.get("Google Drive", ""),
+            }
+    return None
 
 
 def _read_business_sheet_side_effect(sheet_key, *a, **kw):
@@ -161,21 +179,21 @@ class TestResolveAndValidateLinks(unittest.TestCase):
 
     def test_unknown_business_rejected(self):
         drm = _fresh_drm()
-        with patch("business_core.sheets.read_business_sheet", side_effect=_read_business_sheet_side_effect):
+        with patch("business_core.sheets.read_business_sheet", side_effect=_read_business_sheet_side_effect), patch("business_core.object_manager.find_object_by_id", side_effect=_find_object_by_id_side_effect):
             result = drm.resolve_and_validate_links(business_id="BIZ-999")
         self.assertFalse(result["ok"])
         self.assertIn("BIZ-999", result["error"])
 
     def test_unknown_stage_rejected(self):
         drm = _fresh_drm()
-        with patch("business_core.sheets.read_business_sheet", side_effect=_read_business_sheet_side_effect):
+        with patch("business_core.sheets.read_business_sheet", side_effect=_read_business_sheet_side_effect), patch("business_core.object_manager.find_object_by_id", side_effect=_find_object_by_id_side_effect):
             result = drm.resolve_and_validate_links(business_id="BIZ-001", stage_id="STAGE-999")
         self.assertFalse(result["ok"])
         self.assertIn("STAGE-999", result["error"])
 
     def test_valid_full_chain_resolves(self):
         drm = _fresh_drm()
-        with patch("business_core.sheets.read_business_sheet", side_effect=_read_business_sheet_side_effect), \
+        with patch("business_core.sheets.read_business_sheet", side_effect=_read_business_sheet_side_effect), patch("business_core.object_manager.find_object_by_id", side_effect=_find_object_by_id_side_effect), \
              patch("business_core.person_manager.find_person_by_id", return_value={"biz_ids": ["BIZ-001"]}):
             result = drm.resolve_and_validate_links(
                 business_id="BIZ-001", client_id="PRS-001", object_id="OBJ-001",
@@ -188,7 +206,7 @@ class TestResolveAndValidateLinks(unittest.TestCase):
         """Только stage_id указан — roadmap_id/object_id/client_id
         должны подтянуться автоматически."""
         drm = _fresh_drm()
-        with patch("business_core.sheets.read_business_sheet", side_effect=_read_business_sheet_side_effect), \
+        with patch("business_core.sheets.read_business_sheet", side_effect=_read_business_sheet_side_effect), patch("business_core.object_manager.find_object_by_id", side_effect=_find_object_by_id_side_effect), \
              patch("business_core.person_manager.find_person_by_id", return_value={"biz_ids": ["BIZ-001"]}):
             result = drm.resolve_and_validate_links(business_id="BIZ-001", stage_id="STAGE-001")
         self.assertTrue(result["ok"])
@@ -198,7 +216,7 @@ class TestResolveAndValidateLinks(unittest.TestCase):
 
     def test_contradictory_stage_roadmap_rejected(self):
         drm = _fresh_drm()
-        with patch("business_core.sheets.read_business_sheet", side_effect=_read_business_sheet_side_effect):
+        with patch("business_core.sheets.read_business_sheet", side_effect=_read_business_sheet_side_effect), patch("business_core.object_manager.find_object_by_id", side_effect=_find_object_by_id_side_effect):
             result = drm.resolve_and_validate_links(
                 business_id="BIZ-001", stage_id="STAGE-001", roadmap_id="RM-002",
             )
@@ -207,7 +225,7 @@ class TestResolveAndValidateLinks(unittest.TestCase):
 
     def test_contradictory_object_client_rejected(self):
         drm = _fresh_drm()
-        with patch("business_core.sheets.read_business_sheet", side_effect=_read_business_sheet_side_effect):
+        with patch("business_core.sheets.read_business_sheet", side_effect=_read_business_sheet_side_effect), patch("business_core.object_manager.find_object_by_id", side_effect=_find_object_by_id_side_effect):
             result = drm.resolve_and_validate_links(
                 business_id="BIZ-001", object_id="OBJ-001", client_id="PRS-999",
             )
@@ -216,14 +234,14 @@ class TestResolveAndValidateLinks(unittest.TestCase):
 
     def test_roadmap_belongs_to_different_business_rejected(self):
         drm = _fresh_drm()
-        with patch("business_core.sheets.read_business_sheet", side_effect=_read_business_sheet_side_effect):
+        with patch("business_core.sheets.read_business_sheet", side_effect=_read_business_sheet_side_effect), patch("business_core.object_manager.find_object_by_id", side_effect=_find_object_by_id_side_effect):
             result = drm.resolve_and_validate_links(business_id="BIZ-002", roadmap_id="RM-001")
         self.assertFalse(result["ok"])
         self.assertIn("Противоречие", result["error"])
 
     def test_unknown_document_template_rejected(self):
         drm = _fresh_drm()
-        with patch("business_core.sheets.read_business_sheet", side_effect=_read_business_sheet_side_effect):
+        with patch("business_core.sheets.read_business_sheet", side_effect=_read_business_sheet_side_effect), patch("business_core.object_manager.find_object_by_id", side_effect=_find_object_by_id_side_effect):
             result = drm.resolve_and_validate_links(business_id="BIZ-001", document_template_id="DOC-999")
         self.assertFalse(result["ok"])
         self.assertIn("DOC-999", result["error"])
@@ -288,7 +306,7 @@ class TestRegisterDocStart(unittest.TestCase):
 
         async def run():
             with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
-                 patch("business_core.sheets.read_business_sheet", side_effect=_read_business_sheet_side_effect):
+                 patch("business_core.sheets.read_business_sheet", side_effect=_read_business_sheet_side_effect), patch("business_core.object_manager.find_object_by_id", side_effect=_find_object_by_id_side_effect):
                 return await th.registerdoc_start(update, context)
 
         from telegram.ext import ConversationHandler
@@ -302,7 +320,7 @@ class TestRegisterDocStart(unittest.TestCase):
 
         async def run():
             with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
-                 patch("business_core.sheets.read_business_sheet", side_effect=_read_business_sheet_side_effect), \
+                 patch("business_core.sheets.read_business_sheet", side_effect=_read_business_sheet_side_effect), patch("business_core.object_manager.find_object_by_id", side_effect=_find_object_by_id_side_effect), \
                  patch("business_core.person_manager.find_person_by_id", return_value={"biz_ids": ["BIZ-001"]}), \
                  patch("integrations.google_drive_adapter.get_drive_service", return_value=MagicMock()), \
                  patch("integrations.google_drive_adapter.get_file_metadata", return_value=GOOD_META):
@@ -330,7 +348,7 @@ class TestRegisterDocStart(unittest.TestCase):
 
         async def run():
             with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
-                 patch("business_core.sheets.read_business_sheet", side_effect=_read_business_sheet_side_effect), \
+                 patch("business_core.sheets.read_business_sheet", side_effect=_read_business_sheet_side_effect), patch("business_core.object_manager.find_object_by_id", side_effect=_find_object_by_id_side_effect), \
                  patch("business_core.person_manager.find_person_by_id", return_value={"biz_ids": ["BIZ-001"]}), \
                  patch("integrations.google_drive_adapter.get_drive_service", return_value=MagicMock()), \
                  patch("integrations.google_drive_adapter.get_file_metadata", return_value=GOOD_META):
@@ -352,7 +370,7 @@ class TestRegisterDocStart(unittest.TestCase):
 
         async def run():
             with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
-                 patch("business_core.sheets.read_business_sheet", side_effect=_read_business_sheet_side_effect), \
+                 patch("business_core.sheets.read_business_sheet", side_effect=_read_business_sheet_side_effect), patch("business_core.object_manager.find_object_by_id", side_effect=_find_object_by_id_side_effect), \
                  patch("integrations.google_drive_adapter.get_drive_service", return_value=MagicMock()), \
                  patch("integrations.google_drive_adapter.get_file_metadata", return_value=trashed_meta):
                 return await th.registerdoc_start(update, context)
@@ -381,7 +399,7 @@ class TestRegisterDocConfirm(unittest.TestCase):
 
         async def run():
             with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
-                 patch("business_core.sheets.read_business_sheet", side_effect=_read_business_sheet_side_effect), \
+                 patch("business_core.sheets.read_business_sheet", side_effect=_read_business_sheet_side_effect), patch("business_core.object_manager.find_object_by_id", side_effect=_find_object_by_id_side_effect), \
                  patch("integrations.google_drive_adapter.get_drive_service", return_value=MagicMock()), \
                  patch("integrations.google_drive_adapter.get_file_metadata", return_value=meta or GOOD_META):
                 await th.registerdoc_start(update, context)
@@ -568,7 +586,7 @@ class TestDocs4StageCmd(unittest.TestCase):
 
         async def run():
             with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
-                 patch("business_core.sheets.read_business_sheet", side_effect=_read_business_sheet_side_effect):
+                 patch("business_core.sheets.read_business_sheet", side_effect=_read_business_sheet_side_effect), patch("business_core.object_manager.find_object_by_id", side_effect=_find_object_by_id_side_effect):
                 await th.docs4stage_cmd(update, context)
 
         asyncio.run(run())
@@ -603,7 +621,7 @@ class TestOldRegistriesUntouched(unittest.TestCase):
 
         async def start():
             with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
-                 patch("business_core.sheets.read_business_sheet", side_effect=_read_business_sheet_side_effect), \
+                 patch("business_core.sheets.read_business_sheet", side_effect=_read_business_sheet_side_effect), patch("business_core.object_manager.find_object_by_id", side_effect=_find_object_by_id_side_effect), \
                  patch("business_core.person_manager.find_person_by_id", return_value={"biz_ids": ["BIZ-001"]}), \
                  patch("integrations.google_drive_adapter.get_drive_service", return_value=MagicMock()), \
                  patch("integrations.google_drive_adapter.get_file_metadata", return_value=GOOD_META):

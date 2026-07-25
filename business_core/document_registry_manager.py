@@ -200,11 +200,11 @@ def resolve_and_validate_links(
 
     # ── Object -> Client, Object.Biz ─────────────────────────────
     if resolved_object_id:
-        objects = read_business_sheet("object_registry")
-        obj = next((o for o in objects if o.get("OBJ ID", "") == resolved_object_id), None)
+        from business_core.object_manager import find_object_by_id
+        obj = find_object_by_id(resolved_object_id)
         if obj is None:
             return {"ok": False, "error": f"Object {resolved_object_id} не найден."}
-        obj_biz_id = obj.get("Biz ID", "")
+        obj_biz_id = obj.get("biz_id", "")
         if obj_biz_id and obj_biz_id != business_id:
             return {
                 "ok": False,
@@ -213,7 +213,7 @@ def resolve_and_validate_links(
                     f"бизнесу {obj_biz_id}, а указан Business {business_id}."
                 ),
             }
-        obj_client_id = obj.get("Client ID", "")
+        obj_client_id = obj.get("client_id", "")
         if resolved_client_id and obj_client_id and resolved_client_id != obj_client_id:
             return {
                 "ok": False,
@@ -301,9 +301,9 @@ def resolve_target_drive_folder(
     from business_core.person_manager import find_person_by_id
 
     if object_id:
-        objects = read_business_sheet("object_registry")
-        obj = next((o for o in objects if o.get("OBJ ID", "") == object_id), None)
-        folder_id = (obj or {}).get("Drive Folder ID", "").strip()
+        from business_core.object_manager import find_object_by_id
+        obj = find_object_by_id(object_id)
+        folder_id = (obj or {}).get("drive_folder_id", "").strip()
         if folder_id:
             return {"ok": True, "folder_id": folder_id, "level": "object", "source_id": object_id}
 

@@ -114,6 +114,23 @@ def _read_business_sheet_side_effect(sheet_key, *a, **kw):
     }.get(sheet_key, [])
 
 
+def _find_object_by_id_side_effect(object_id, *a, **kw):
+    """Phase 30D: document_registry_manager now reads OBJECT_REGISTRY via
+    business_core.object_manager.find_object_by_id() (canonical dict
+    shape) instead of a raw read_business_sheet("object_registry")
+    call — this mirrors OBJECT_ROWS in the object_manager return shape."""
+    for row in OBJECT_ROWS:
+        if row.get("OBJ ID") == object_id:
+            return {
+                "object_id": row.get("OBJ ID", ""),
+                "client_id": row.get("Client ID", ""),
+                "biz_id": row.get("Biz ID", ""),
+                "drive_folder_id": row.get("Drive Folder ID", ""),
+                "drive_url": row.get("Google Drive", ""),
+            }
+    return None
+
+
 GOOD_FOLDER_META = {"ok": True, "name": "06 Клиенты", "mime_type": "application/vnd.google-apps.folder",
                     "trashed": False, "web_view_link": "https://drive.google.com/drive/folders/OBJFOLDER1"}
 GOOD_UPLOAD_META = {"ok": True, "name": "passport.pdf", "mime_type": "application/pdf",
@@ -286,6 +303,8 @@ class TestUploadDocDetailsStep(unittest.TestCase):
             with contextlib.ExitStack() as stack:
                 stack.enter_context(patch("business_core.sheets.read_business_sheet",
                                            side_effect=_read_business_sheet_side_effect))
+                stack.enter_context(patch("business_core.object_manager.find_object_by_id",
+                                           side_effect=_find_object_by_id_side_effect))
                 stack.enter_context(patch("business_core.person_manager.find_person_by_id",
                                            return_value={"biz_ids": ["BIZ-001"], "drive_folder_id": "PRSFOLDER1"}))
                 stack.enter_context(patch("integrations.google_drive_adapter.get_drive_service",
@@ -351,6 +370,8 @@ class TestUploadDocDetailsStep(unittest.TestCase):
 
         async def run():
             with patch("business_core.sheets.read_business_sheet", side_effect=side_effect), \
+                 patch("business_core.object_manager.find_object_by_id",
+                       side_effect=_find_object_by_id_side_effect), \
                  patch("business_core.business_builder.get_person_biz_ids", return_value=["BIZ-001"]):
                 return await th.uploaddoc_receive_details(update, context)
 
@@ -891,7 +912,8 @@ class TestUploadDocCancel(unittest.TestCase):
 class TestResolveTargetDriveFolder(unittest.TestCase):
     def test_object_priority(self):
         drm = _fresh_drm()
-        with patch("business_core.sheets.read_business_sheet", side_effect=_read_business_sheet_side_effect):
+        with patch("business_core.sheets.read_business_sheet", side_effect=_read_business_sheet_side_effect), \
+             patch("business_core.object_manager.find_object_by_id", side_effect=_find_object_by_id_side_effect):
             result = drm.resolve_target_drive_folder("BIZ-001", client_id="PRS-001", object_id="OBJ-001")
         self.assertTrue(result["ok"])
         self.assertEqual(result["level"], "object")
@@ -900,6 +922,7 @@ class TestResolveTargetDriveFolder(unittest.TestCase):
     def test_client_priority_without_object(self):
         drm = _fresh_drm()
         with patch("business_core.sheets.read_business_sheet", side_effect=_read_business_sheet_side_effect), \
+             patch("business_core.object_manager.find_object_by_id", side_effect=_find_object_by_id_side_effect), \
              patch("business_core.person_manager.find_person_by_id",
                    return_value={"drive_folder_id": "PRSFOLDER1"}):
             result = drm.resolve_target_drive_folder("BIZ-001", client_id="PRS-001")
@@ -908,20 +931,23 @@ class TestResolveTargetDriveFolder(unittest.TestCase):
 
     def test_business_priority_without_object_or_client(self):
         drm = _fresh_drm()
-        with patch("business_core.sheets.read_business_sheet", side_effect=_read_business_sheet_side_effect):
+        with patch("business_core.sheets.read_business_sheet", side_effect=_read_business_sheet_side_effect), \
+             patch("business_core.object_manager.find_object_by_id", side_effect=_find_object_by_id_side_effect):
             result = drm.resolve_target_drive_folder("BIZ-001")
         self.assertEqual(result["level"], "business")
         self.assertEqual(result["folder_id"], "BIZFOLDER1")
 
     def test_stage_id_argument_never_used_for_folder_selection(self):
         drm = _fresh_drm()
-        with patch("business_core.sheets.read_business_sheet", side_effect=_read_business_sheet_side_effect):
+        with patch("business_core.sheets.read_business_sheet", side_effect=_read_business_sheet_side_effect), \
+             patch("business_core.object_manager.find_object_by_id", side_effect=_find_object_by_id_side_effect):
             result = drm.resolve_target_drive_folder("BIZ-001", stage_id="STAGE-001")
         self.assertEqual(result["level"], "business")
 
     def test_no_folder_anywhere_fails(self):
         drm = _fresh_drm()
-        with patch("business_core.sheets.read_business_sheet", side_effect=_read_business_sheet_side_effect):
+        with patch("business_core.sheets.read_business_sheet", side_effect=_read_business_sheet_side_effect), \
+             patch("business_core.object_manager.find_object_by_id", side_effect=_find_object_by_id_side_effect):
             result = drm.resolve_target_drive_folder("BIZ-002")
         self.assertFalse(result["ok"])
         self.assertIn("error", result)

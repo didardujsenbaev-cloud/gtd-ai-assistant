@@ -1,33 +1,41 @@
 """
-Phase 30C: Object Manager Foundation architecture guards.
+Phase 30D: Object Domain ownership architecture guards (fully strict).
 
 Source of truth: DECISIONS.md ADR-014 (Phase 30B). Mirrors the pattern
 established in test_service_architecture_guards.py / test_roadmap_
 architecture_guards.py — pure AST/source inspection, no network, no
 Sheets.
 
-Foundation-state invariants checked NOW (strict, no allowlist):
-  object_manager imports orchestration/Telegram/roadmap/service/person/
-    Drive adapter/Extension modules == NO
-  object_manager dependency cycle == NO
-  object_manager contains the canonical Part-10 API
-  business_builder's Object compatibility wrappers perform zero raw
-    OBJECT_REGISTRY access (no get_business_sheet/append_business_row/
-    update_cell calls of their own — everything delegates to
-    object_manager)
-  OBJECT_REGISTRY write primitives (append_business_row, update_cell)
-    exist only in object_manager.py among production runtime modules
-    (business_builder.py's wrappers must not also implement them)
+Phase 30C shipped these guards with a transitional debt allowlist
+(telegram_handlers.py / document_registry_manager.py /
+document_requirements_query.py still reading/writing OBJECT_REGISTRY
+raw, caller migration not yet done). Phase 30D migrated every one of
+those callers onto business_core.object_manager's owner API — this
+file now enforces the fully-strict target architecture with NO debt
+allowlist remaining:
 
-Transitional debt (Phase 30C — caller migration NOT done, Phase 30D):
-  telegram_handlers.py still reads/writes OBJECT_REGISTRY raw
-    (editobject_start/editobject_confirm/objects_cmd)
-  document_registry_manager.py still reads OBJECT_REGISTRY raw
-  document_requirements_query.py still reads OBJECT_REGISTRY raw
-This debt is pinned to its EXACT known file set — this guard does not
-assert OBJECT_REGISTRY_RUNTIME_WRITERS == {object_manager.py} yet (that
-invariant is Phase 30D's target, once /editobject is migrated); it only
-asserts no NEW writer/reader has appeared beyond this known set.
+  OBJECT_REGISTRY_RUNTIME_WRITERS == {object_manager.py}
+  TELEGRAM_HANDLERS_WRITE_OBJECT_REGISTRY_DIRECTLY == NO
+  TELEGRAM_HANDLERS_READ_OBJECT_REGISTRY_DIRECTLY == NO
+  BUSINESS_BUILDER_WRITES_OBJECT_REGISTRY_DIRECTLY == NO
+  BUSINESS_BUILDER_RAW_READS_OBJECT_REGISTRY == NO
+  EXTENSION_MODULES_RAW_READ_OBJECT_REGISTRY == NO
+  OBJECT_MANAGER_DEPENDS_ON_ORCHESTRATION == NO
+  OBJECT_MANAGER_DEPENDENCY_CYCLE_EXISTS == NO
+  OBJECT_CREATION_USES_CANONICAL_DUPLICATE_POLICY == YES
+  OBJECT_CREATION_IS_IDEMPOTENT == YES
+  ROADMAP_CREATION_REQUIRES_EXISTING_ALLOWED_OBJECT == YES
+
+Approved exceptions (explicit, file/function-scoped, not blanket
+allowlists):
+  - report_manager.collect_snapshot(): approved read-only reporting
+    exception (raw read of OBJECT_REGISTRY, read-only, never used for
+    transactional decisions).
+  - business_core/synthetic_cleanup.py: CLI-only, allowlist-gated
+    admin maintenance tool, never imported by production/Telegram code
+    (see its own module docstring), not a production transactional
+    path.
+  No other file/function may write or read OBJECT_REGISTRY directly.
 """
 
 from __future__ import annotations
@@ -202,48 +210,63 @@ class TestObjectRegistryWritePrimitivesOwnedByObjectManager(unittest.TestCase):
         self.assertTrue(hits, "object_manager.py should contain the actual OBJECT_REGISTRY write primitive")
 
 
-class TestTransitionalDebtSnapshot(unittest.TestCase):
-    """Phase 30C foundation-only: caller migration has NOT happened yet.
-    This guard pins the EXACT known raw-access debt so it doesn't grow
-    silently — Phase 30D must remove these, not add to them."""
+class TestObjectRegistryOwnershipFullyStrict(unittest.TestCase):
+    """Phase 30D: caller migration is complete. No debt allowlist —
+    only the two explicitly approved, file/function-scoped exceptions
+    (report_manager.collect_snapshot read-only reporting;
+    synthetic_cleanup.py CLI-only admin tool) are excluded from the
+    candidate scan, everything else in business_core/ must be clean."""
 
-    _KNOWN_DEBT_FILES = {
-        "telegram_handlers.py",
-        "document_registry_manager.py",
-        "document_requirements_query.py",
-    }
+    _APPROVED_EXCEPTION_FILES = {"report_manager.py", "synthetic_cleanup.py"}
 
-    def test_no_new_raw_object_registry_readers_beyond_known_debt(self):
+    def test_object_registry_runtime_writers_is_object_manager_only(self):
         candidate_files = [
             p for p in BUSINESS_CORE.glob("*.py")
-            if p.name not in ("object_manager.py", "sheets.py", "report_manager.py", "synthetic_cleanup.py")
-        ]
-        offenders = set()
-        for path in candidate_files:
-            hits = _calls_touching_sheet_key(path, READ_FUNC_NAMES, "object_registry")
-            if hits:
-                offenders.add(path.name)
-        unexpected = offenders - self._KNOWN_DEBT_FILES
-        self.assertEqual(
-            unexpected, set(),
-            f"New raw OBJECT_REGISTRY reader(s) found beyond the known Phase 30D debt list: {unexpected}",
-        )
-
-    def test_no_new_raw_object_registry_writers_beyond_known_debt(self):
-        candidate_files = [
-            p for p in BUSINESS_CORE.glob("*.py")
-            if p.name not in ("object_manager.py", "sheets.py")
+            if p.name != "object_manager.py" and p.name not in self._APPROVED_EXCEPTION_FILES
         ]
         offenders = set()
         for path in candidate_files:
             hits = _calls_touching_sheet_key(path, WRITE_FUNC_NAMES, "object_registry")
             if hits:
                 offenders.add(path.name)
-        unexpected = offenders - self._KNOWN_DEBT_FILES
         self.assertEqual(
-            unexpected, set(),
-            f"New raw OBJECT_REGISTRY writer(s) found beyond the known Phase 30D debt list: {unexpected}",
+            offenders, set(),
+            f"OBJECT_REGISTRY must be written only by object_manager.py, found: {offenders}",
         )
+
+    def test_no_raw_object_registry_readers_anywhere(self):
+        candidate_files = [
+            p for p in BUSINESS_CORE.glob("*.py")
+            if p.name != "object_manager.py" and p.name not in self._APPROVED_EXCEPTION_FILES
+        ]
+        offenders = set()
+        for path in candidate_files:
+            hits = _calls_touching_sheet_key(path, READ_FUNC_NAMES, "object_registry")
+            if hits:
+                offenders.add(path.name)
+        self.assertEqual(
+            offenders, set(),
+            f"OBJECT_REGISTRY must not be read raw outside object_manager.py, found: {offenders}",
+        )
+
+    def test_telegram_handlers_no_direct_object_registry_access(self):
+        hits = (
+            _calls_touching_sheet_key(BUSINESS_CORE / "telegram_handlers.py", WRITE_FUNC_NAMES, "object_registry")
+            + _calls_touching_sheet_key(BUSINESS_CORE / "telegram_handlers.py", READ_FUNC_NAMES, "object_registry")
+        )
+        self.assertEqual(hits, [], f"telegram_handlers.py must not touch OBJECT_REGISTRY directly: {hits}")
+
+    def test_business_builder_no_direct_object_registry_access(self):
+        hits = (
+            _calls_touching_sheet_key(BUSINESS_CORE / "business_builder.py", WRITE_FUNC_NAMES, "object_registry")
+            + _calls_touching_sheet_key(BUSINESS_CORE / "business_builder.py", READ_FUNC_NAMES, "object_registry")
+        )
+        self.assertEqual(hits, [], f"business_builder.py must not touch OBJECT_REGISTRY directly: {hits}")
+
+    def test_extension_modules_no_raw_object_registry_read(self):
+        for name in ("document_registry_manager.py", "document_requirements_query.py"):
+            hits = _calls_touching_sheet_key(BUSINESS_CORE / name, READ_FUNC_NAMES, "object_registry")
+            self.assertEqual(hits, [], f"{name} must use object_manager.find_object_by_id, not raw reads: {hits}")
 
     def test_report_manager_remains_read_only_approved_exception(self):
         hits = _calls_touching_sheet_key(
@@ -281,6 +304,60 @@ class TestObjectCreationDuplicateSafeAndIdempotent(unittest.TestCase):
         self.assertTrue(result["object_reused"])
         self.assertEqual(result["object_id"], "OBJ-900")
         mock_append.assert_not_called()
+
+
+class TestRoadmapRequiresExistingAllowedObject(unittest.TestCase):
+    """ROADMAP_CREATION_REQUIRES_EXISTING_ALLOWED_OBJECT = YES —
+    behavioral, mock-only (no live Sheets)."""
+
+    def _fresh_bb(self):
+        import sys
+        for key in list(sys.modules.keys()):
+            if "business_core" in key:
+                del sys.modules[key]
+        import business_core.business_builder as bb
+        return bb
+
+    def test_missing_object_rejected_no_writes(self):
+        from unittest.mock import patch
+        bb = self._fresh_bb()
+        with patch("business_core.object_manager.find_object_by_id", return_value=None), \
+             patch("business_core.roadmap_manager.create_roadmap_record") as mock_create, \
+             patch("business_core.sheets.append_business_row") as mock_append:
+            result = bb.create_roadmap_for_object(
+                obj_id="OBJ-NOT-EXIST", biz_id="BIZ-001", client_id="PRS-001", service_id="SVC-001",
+            )
+        self.assertFalse(result["ok"])
+        mock_create.assert_not_called()
+        mock_append.assert_not_called()
+
+    def test_completed_object_rejected(self):
+        from unittest.mock import patch
+        bb = self._fresh_bb()
+        with patch("business_core.object_manager.find_object_by_id",
+                   return_value={"object_id": "OBJ-001", "status": "completed"}), \
+             patch("business_core.roadmap_manager.create_roadmap_record") as mock_create:
+            result = bb.create_roadmap_for_object(
+                obj_id="OBJ-001", biz_id="BIZ-001", client_id="PRS-001", service_id="SVC-001",
+            )
+        self.assertFalse(result["ok"])
+        mock_create.assert_not_called()
+
+    def test_active_object_allowed(self):
+        from unittest.mock import patch
+        bb = self._fresh_bb()
+        with patch("business_core.object_manager.find_object_by_id",
+                   return_value={"object_id": "OBJ-001", "status": "active"}), \
+             patch("business_core.service_manager.find_service_by_id",
+                   return_value={"service_id": "SVC-001", "status": "active"}), \
+             patch("business_core.roadmap_manager.find_active_roadmap_for_object", return_value=None), \
+             patch("business_core.roadmap_manager.create_roadmap_record",
+                   return_value={"ok": True, "roadmap_id": "RM-999", "roadmap": {}, "error": None}), \
+             patch("business_core.roadmap_template_manager.find_template_stages", return_value=[]):
+            result = bb.create_roadmap_for_object(
+                obj_id="OBJ-001", biz_id="BIZ-001", client_id="PRS-001", service_id="SVC-001",
+            )
+        self.assertTrue(result["ok"])
 
 
 if __name__ == "__main__":

@@ -1352,17 +1352,15 @@ async def editobject_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
         return ConversationHandler.END
 
-    from business_core.sheets import find_row_by_id
-    found = find_row_by_id("object_registry", obj_id)
-    if not found:
+    from business_core.object_manager import find_object_by_id
+    obj = find_object_by_id(obj_id)
+    if not obj:
         await update.message.reply_text(f"❌ Объект {obj_id} не найден.")
         return ConversationHandler.END
 
-    row_number, row = found
     context.user_data["eo"] = {
         "obj_id": obj_id,
-        "row_number": row_number,
-        "current": row,
+        "current": obj,
     }
     context.user_data.pop("eo_confirmed_snapshot", None)
 
@@ -1370,9 +1368,9 @@ async def editobject_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         "✏️ Редактирование объекта",
         "",
         f"OBJ ID: {obj_id}",
-        f"Адрес: {row.get('Address', '')}",
-        f"Тип объекта: {row.get('Object Type', '')}",
-        f"Комментарий: {row.get('Notes', '')}",
+        f"Адрес: {obj.get('address', '')}",
+        f"Тип объекта: {obj.get('object_type', '')}",
+        f"Комментарий: {obj.get('notes', '')}",
         "",
         "Выбери поле для изменения:",
     ]
@@ -1386,9 +1384,9 @@ async def editobject_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 def _editobject_current_display(current: dict, field_key: str) -> str:
     return {
-        "address": current.get("Address", ""),
-        "object_type": current.get("Object Type", ""),
-        "notes": current.get("Notes", ""),
+        "address": current.get("address", ""),
+        "object_type": current.get("object_type", ""),
+        "notes": current.get("notes", ""),
     }[field_key]
 
 
@@ -1471,49 +1469,35 @@ async def editobject_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return ConversationHandler.END
 
     try:
-        from business_core.sheets import find_row_by_id, get_business_sheet
-        from datetime import datetime as _dt
+        from business_core.object_manager import find_object_by_id, update_object_fields
 
         obj_id = snap["obj_id"]
         field_key = snap["field"]
 
-        found = find_row_by_id("object_registry", obj_id)
-        if not found:
+        obj = find_object_by_id(obj_id)
+        if not obj:
             await update.message.reply_text(
                 f"❌ Объект {obj_id} больше не найден — изменение не выполнено.",
                 reply_markup=ReplyKeyboardRemove(),
             )
         else:
-            row_number, _live_row = found
-            sheet = get_business_sheet("object_registry")
-            headers = sheet.row_values(1)
-
-            def _col(name):
-                return headers.index(name) + 1 if name in headers else None
-
-            field_to_column = {
-                "address": "Address",
-                "object_type": "Object Type",
-                "notes": "Notes",
-            }
-            col = _col(field_to_column[field_key])
-            if col:
-                sheet.update_cell(row_number, col, snap["new_value"])
-
-            last_updated_col = _col("Last Updated")
-            if last_updated_col:
-                sheet.update_cell(row_number, last_updated_col, _dt.now().strftime("%Y-%m-%d"))
-
-            field_labels = {v: k for k, v in EDITOBJECT_FIELDS.items()}
-            extra = "\n⚠️ Имя Drive-папки осталось прежним." if field_key == "address" else ""
-            await update.message.reply_text(
-                f"✅ Объект {obj_id} обновлён\n\n"
-                f"Поле: {field_labels[field_key]}\n"
-                f"Было: {snap['old_value_display'] or '—'}\n"
-                f"Стало: {snap['new_value_display'] or '—'}"
-                f"{extra}",
-                reply_markup=ReplyKeyboardRemove(),
-            )
+            result = update_object_fields(obj_id, {field_key: snap["new_value"]})
+            if not result["ok"]:
+                await update.message.reply_text(
+                    f"❌ Ошибка сохранения: {result['error']}",
+                    reply_markup=ReplyKeyboardRemove(),
+                )
+            else:
+                field_labels = {v: k for k, v in EDITOBJECT_FIELDS.items()}
+                extra = "\n⚠️ Имя Drive-папки осталось прежним." if field_key == "address" else ""
+                await update.message.reply_text(
+                    f"✅ Объект {obj_id} обновлён\n\n"
+                    f"Поле: {field_labels[field_key]}\n"
+                    f"Было: {snap['old_value_display'] or '—'}\n"
+                    f"Стало: {snap['new_value_display'] or '—'}"
+                    f"{extra}",
+                    reply_markup=ReplyKeyboardRemove(),
+                )
 
     except Exception as e:
         log.error(f"editobject_confirm error: {e}")
@@ -2040,6 +2024,17 @@ async def newobject_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             find_existing_person,
         )
 
+        # Проверяем что бизнес существует (Phase 30D, Part 5 — тот же
+        # canonical primitive, что уже используется во всех остальных
+        # местах Business Core для проверки biz_id: business_builder.py,
+        # organization_manager.py, person_manager.py, newservice_cmd).
+        # Business Domain ещё не имеет отдельного owner-модуля.
+        from business_core.sheets import find_row_by_id
+        biz_row = find_row_by_id("biz_registry", biz_id)
+        if biz_row is None:
+            await _reply(update, f"❌ Бизнес `{biz_id}` не найден в BIZ_REGISTRY")
+            return
+
         # Проверяем что клиент существует и связан с бизнесом
         from business_core.person_manager import find_person_by_id
         person = find_person_by_id(client_id)
@@ -2055,7 +2050,7 @@ async def newobject_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         except Exception:
             pass
 
-        # Создаём объект в OBJECT_REGISTRY
+        # Создаём (или конвергентно переиспользуем) объект в OBJECT_REGISTRY
         res = create_object_record(
             client_id=client_id,
             biz_id=biz_id,
@@ -2073,8 +2068,12 @@ async def newobject_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             return
 
         obj_id = res["obj_id"]
+        was_reused = res.get("object_reused", False)
+        warnings = res.get("warnings") or []
 
-        # Drive (безопасно, не ломает создание объекта)
+        # Drive (безопасно, не ломает создание/переиспользование объекта;
+        # provision_object_drive само по себе retry-safe — не создаёт
+        # вторую папку, если Drive Folder ID уже установлен, Phase 30D Part 6)
         drive_msg = ""
         try:
             drive_res = provision_object_drive(
@@ -2085,8 +2084,11 @@ async def newobject_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 address=address,
                 object_type=object_type,
             )
-            if drive_res["ok"]:
-                drive_msg = f"\n📁 [Drive папка]({drive_res['folder_url']})"
+            if drive_res["ok"] and drive_res.get("folder_url"):
+                if drive_res.get("drive_reused"):
+                    drive_msg = f"\n📁 [Drive папка]({drive_res['folder_url']}) (уже существовала)"
+                else:
+                    drive_msg = f"\n📁 [Drive папка]({drive_res['folder_url']})"
             elif drive_res.get("error") and "не задан" not in drive_res["error"] and "not configured" not in drive_res["error"]:
                 drive_msg = f"\n⚠️ Drive папка не создана: {drive_res['error'][:60]}"
         except Exception as e:
@@ -2096,9 +2098,15 @@ async def newobject_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         type_line = f"\nТип: {object_type}" if object_type else ""
         cadr_line = f"\nКадастр: {cadastral}" if cadastral else ""
         area_line = f"\nПлощадь: {area} м²" if area else ""
+        warnings_msg = ""
+        if was_reused and warnings:
+            warnings_lines = "\n".join(f"  • {w}" for w in warnings)
+            warnings_msg = f"\n\n⚠️ Отличия от уже сохранённых данных (не перезаписаны):\n{warnings_lines}"
+
+        title = "✅ *Объект уже существовал*" if was_reused else "✅ *Объект создан*"
 
         await update.message.reply_text(
-            f"✅ *Объект создан*\n\n"
+            f"{title}\n\n"
             f"🆔 OBJ ID: `{obj_id}`\n"
             f"👤 Клиент: `{client_id}`\n"
             f"🏢 Бизнес: `{biz_id}`\n"
@@ -2106,7 +2114,8 @@ async def newobject_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             f"🏠 Адрес: {address}"
             f"{type_line}{cadr_line}{area_line}\n"
             f"📊 Статус: new"
-            f"{drive_msg}\n\n"
+            f"{drive_msg}"
+            f"{warnings_msg}\n\n"
             f"/objects client\\_id={client_id} — объекты клиента",
             parse_mode="Markdown",
             reply_markup=ReplyKeyboardRemove(),
@@ -2143,66 +2152,20 @@ async def objects_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             client_id = first
 
     try:
-        from business_core.business_builder import find_objects_by_client
-        from business_core.sheets import get_business_sheet
+        from business_core.object_manager import (
+            find_objects_by_client,
+            find_objects_by_biz,
+            list_objects,
+        )
 
-        # Получаем объекты
+        # Получаем объекты — все чтения через object_manager (owner API),
+        # без raw registry reads (Phase 30D, Part 2).
         if client_id:
             objects = find_objects_by_client(client_id, biz_id=biz_id or None)
         elif biz_id:
-            # Все объекты по бизнесу — читаем лист напрямую
-            sheet     = get_business_sheet("object_registry")
-            all_vals  = sheet.get_all_values()
-            objects   = []
-            if len(all_vals) > 1:
-                headers = all_vals[0]
-                def _col(h):
-                    return headers.index(h) if h in headers else None
-                def _get(row, h):
-                    c = _col(h)
-                    return row[c].strip() if c is not None and c < len(row) else ""
-                for row in all_vals[1:]:
-                    if not row or not row[0]:
-                        continue
-                    if _get(row, "Biz ID") != biz_id:
-                        continue
-                    objects.append({
-                        "obj_id":        _get(row, "OBJ ID"),
-                        "client_id":     _get(row, "Client ID"),
-                        "biz_id":        _get(row, "Biz ID"),
-                        "city":          _get(row, "City"),
-                        "address":       _get(row, "Address"),
-                        "object_type":   _get(row, "Object Type"),
-                        "object_status": _get(row, "Object Status"),
-                        "roadmap_id":    _get(row, "Roadmap ID"),
-                        "google_drive":  _get(row, "Google Drive"),
-                    })
+            objects = find_objects_by_biz(biz_id)
         else:
-            # Все объекты
-            sheet    = get_business_sheet("object_registry")
-            all_vals = sheet.get_all_values()
-            objects  = []
-            if len(all_vals) > 1:
-                headers = all_vals[0]
-                def _col(h):
-                    return headers.index(h) if h in headers else None
-                def _get(row, h):
-                    c = _col(h)
-                    return row[c].strip() if c is not None and c < len(row) else ""
-                for row in all_vals[1:]:
-                    if not row or not row[0]:
-                        continue
-                    objects.append({
-                        "obj_id":        _get(row, "OBJ ID"),
-                        "client_id":     _get(row, "Client ID"),
-                        "biz_id":        _get(row, "Biz ID"),
-                        "city":          _get(row, "City"),
-                        "address":       _get(row, "Address"),
-                        "object_type":   _get(row, "Object Type"),
-                        "object_status": _get(row, "Object Status"),
-                        "roadmap_id":    _get(row, "Roadmap ID"),
-                        "google_drive":  _get(row, "Google Drive"),
-                    })
+            objects = list_objects()
 
         if not objects:
             filter_desc = ""
@@ -2215,10 +2178,10 @@ async def objects_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         lines = [f"🏠 *Объекты* ({len(objects)} шт.):\n"]
         for obj in objects[:MAX_SHOW]:
             rm    = f" · 🗺 `{obj['roadmap_id']}`" if obj.get("roadmap_id") else ""
-            drive = f" · [📁]({obj['google_drive']})" if obj.get("google_drive") else ""
+            drive = f" · [📁]({obj['drive_url']})" if obj.get("drive_url") else ""
             lines.append(
-                f"• `{obj['obj_id']}` | {obj.get('city','')} | {obj.get('address','')[:30]}"
-                f"\n  [{obj.get('object_type','—')}] {obj.get('object_status','—')}"
+                f"• `{obj['object_id']}` | {obj.get('city','')} | {obj.get('address','')[:30]}"
+                f"\n  [{obj.get('object_type','—')}] {obj.get('status','—')}"
                 f" · 👤`{obj.get('client_id','')}`{rm}{drive}"
             )
         if len(objects) > MAX_SHOW:

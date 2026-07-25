@@ -51,14 +51,23 @@ class ScopeEvaluationResult:
 
 
 def scope_exists(scope_type: str, scope_id: str) -> bool:
-    """Read-only existence check via the existing find_row_by_id() helper
-    — the same primitive already used throughout Business Core, never a
-    bespoke Sheets read."""
-    from business_core.sheets import find_row_by_id
+    """Read-only existence check.
 
-    sheet_key = _EXISTENCE_SHEET_KEY.get(scope_type)
-    if sheet_key is None or not scope_id:
+    "object" scope goes through business_core.object_manager.find_object_by_id
+    (Phase 30D — object_manager is now OBJECT_REGISTRY's owner, no raw
+    read/find_row_by_id against it from Extension modules). "stage"/
+    "roadmap" remain on the existing find_row_by_id() primitive, the
+    same one already used throughout Business Core for those registries
+    — unrelated to this phase's Object Domain migration."""
+    if scope_type not in _EXISTENCE_SHEET_KEY or not scope_id:
         return False
+
+    if scope_type == "object":
+        from business_core.object_manager import find_object_by_id
+        return find_object_by_id(scope_id) is not None
+
+    from business_core.sheets import find_row_by_id
+    sheet_key = _EXISTENCE_SHEET_KEY[scope_type]
     return find_row_by_id(sheet_key, scope_id) is not None
 
 
