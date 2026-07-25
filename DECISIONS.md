@@ -1418,3 +1418,450 @@ transactional writer'ом; проблема — в конкурирующей id
 
 Утверждено для реализации (Phase 31C/31D/31E). Ничего не
 реализовано в рамках этого ADR — только архитектурное решение.
+
+---
+
+## ADR-016 — Roadmap Cross-Domain Validation (Phase 33B)
+
+Контекст:
+
+Phase 33A (Roadmap Domain Architecture Audit, read-only) подтвердила,
+что owner-слой Roadmap Domain (roadmap_manager.py — единственный
+transactional writer ROADMAPS/ROADMAP_STAGES, идентичность,
+идемпотентная материализация Stages, отсутствие циклов) остаётся
+корректно закрытым — эта область НЕ пересматривается этим ADR.
+Аудит подтвердил и уточнил унаследованную из Phase 32A (Service
+Domain re-audit) находку: business_builder.create_roadmap_for_object()
+проверяет существование и статус Object и Service, но НЕ проверяет
+Business вообще, НЕ проверяет Client (существование/статус/роль/
+привязку к Business), НЕ проверяет согласованность Object↔Business,
+Object↔Client, Service↔Business, и НЕ проверяет совместимость
+Object Type/Client Type услуги с реальным типом Object. Сегодня это
+не эксплуатируется, так как единственный вызывающий (/startroadmap)
+берёт biz_id/client_id из самого Object, а не из независимого
+пользовательского ввода — но сама функция create_roadmap_for_object
+не имеет defense-in-depth и не защищена от будущего вызывающего кода
+без этой же дисциплины.
+
+Дополнительно, при подготовке этого ADR (read-only проверка
+production-данных, без записи) обнаружено критически важное для
+решения по Object Type несоответствие: SERVICE_CATALOG.Object Type
+хранит машинные английские slug-значения (например
+"private_house_izhs"), тогда как OBJECT_REGISTRY.Object Type
+реального объекта OBJ-001 хранит свободный русский текст ("жилой
+дом") — два поля живут в совершенно разных, никак не связанных
+словарях. Простое точное сравнение после нормализации (NFKC/trim/
+casefold) между ними НИКОГДА не совпадёт ни для одной существующей
+или новой записи, введённой через текущий UX /newobject. Это прямо
+меняет рекомендованную по умолчанию политику "hard rejection" — её
+буквальное применение сегодня заблокировало бы Roadmap-совместимую
+работу для всех 7 Service с непустым Object Type, у которых пока
+физически не может быть ни одного Object с совпадающим по словарю
+значением.
+
+Аналогично для Client Type: единственное встречающеея в проде
+значение — "physical_person" (все 7 записей с непустым Client Type),
+что не позволяет установить, действительно ли это стабильная,
+различающая категория (a не случайно единообразное значение,
+введённое один раз при сидировании каталога) — недостаточно
+доказательств для канонического статуса поля.
+
+Также обнаружено: BIZ_REGISTRY.Статус — не канонический словарь
+(в проде встречаются "test" (36 строк), "active" (4), "hold" (1)), и
+у Business Domain до сих пор нет собственного owner-модуля или
+архитектурного решения о статус-модели (тот же вывод уже
+зафиксирован в Object/Client ADR как "Business Domain ещё не имеет
+отдельного owner-модуля"). Изобретать канонический статус-словарь
+Business здесь, попутно, при решении по Roadmap — было бы
+самовольным расширением scope в недорешённый домен.
+
+Решение:
+
+1. Canonical validation owner.
+
+   business_builder.create_roadmap_for_object() остаётся единственной
+   orchestration-границей, ответственной за все cross-domain
+   валидации, ДО вызова roadmap_manager.py. roadmap_manager.py
+   остаётся ответственным ТОЛЬКО за persistence, identity,
+   deduplication (Object ID, Service ID), статус/progress Roadmap и
+   идемпотентную материализацию Stages — ничего из этого не
+   пересматривается.
+
+   roadmap_manager.py НЕ должен импортировать: person_manager,
+   object_manager, service_manager, любой Business-owner-модуль,
+   telegram_handlers, business_builder. Подтверждено: сегодня так и
+   есть (Phase 33A, AST-проверка) — фиксируется как обязывающий
+   инвариант, а не как желаемое состояние.
+
+   Целевое направление зависимостей:
+   ```
+   telegram_handlers
+     → business_builder
+         → business/person/object/service/template owners
+         → roadmap_manager
+   ```
+   Обратных импортов и циклов нет.
+
+2. Business validation.
+
+   Требуется: biz_id непустой; Business существует в BIZ_REGISTRY
+   (find_row_by_id("biz_registry", biz_id) не None) — HARD GATE,
+   безопасно определимо уже сегодня.
+
+   Требование "Business активен/eligible для новой работы" —
+   ОТКЛАДЫВАЕТСЯ. BIZ_REGISTRY.Статус не является канонической
+   валидированной моделью (36 строк "test", 4 "active", 1 "hold", нет
+   owner-модуля, нет ADR о статус-словаре Business Domain).
+   Устанавливать здесь строгий gate на нестабильном, недорешённом
+   поле означало бы либо заблокировать почти весь текущий каталог
+   бизнесов ("test" ≠ "active"), либо изобрести на месте канонический
+   статус-словарь для домена, у которого ещё нет собственного
+   архитектурного решения. Это прямо запрещено инструкцией "Do not
+   silently repair or auto-link inconsistent data" в применении к
+   более широкому принципу — не изобретать канон для чужого домена.
+
+   Требуется (новое, добавляется в Phase 33C): Object.Biz ID == biz_id
+   параметр (OBJECT_BUSINESS_MISMATCH, HARD GATE); Service.Бизнес ID
+   == biz_id параметр (SERVICE_BUSINESS_MISMATCH, HARD GATE). Оба уже
+   тривиально проверяемы через существующие Object/Service reader'ы,
+   без изобретения нового canonical поля.
+
+   Требование "Client Person привязан к тому же Business" — см.
+   пункт 3 (Client validation) — это отдельная, но связанная
+   проверка, HARD GATE.
+
+   Требование "Template принадлежит Service, связанному с тем же
+   Business" — покрывается транзитивно через Service↔Business
+   (пункт 5) и Template↔Service (пункт 8): отдельной прямой проверки
+   Template↔Business не вводится, так как Template не хранит
+   собственного Business ID — его Business-принадлежность целиком
+   определяется через Service, который его использует.
+
+3. Client validation.
+
+   Client Person должен: существовать (CLIENT_NOT_FOUND, HARD GATE);
+   не быть archived (CLIENT_ARCHIVED, HARD GATE, без автоматической
+   реактивации); иметь точную нормализованную Client-роль через
+   person_manager.is_client_person() (CLIENT_ROLE_REQUIRED, HARD GATE,
+   без автоматического добавления роли); быть привязан к выбранному
+   Business через person_manager.has_person_business_link()
+   (CLIENT_NOT_LINKED_TO_BUSINESS, HARD GATE, без автоматического
+   линковки); совпадать с Client, на которого ссылается сам Object
+   (Object.Client ID == client_id параметр — OBJECT_CLIENT_MISMATCH,
+   HARD GATE).
+
+   Неоднозначные/legacy Client-ссылки (например Object.Client ID
+   пустой или ссылается на несуществующего Person) — трактуются как
+   OBJECT_NOT_ELIGIBLE/OBJECT_CLIENT_MISMATCH соответствующим кодом,
+   без попытки угадать или восстановить связь.
+
+   Ничего из этого не переоткрывает Client Domain ownership (ADR-015)
+   — используются исключительно уже существующие public API
+   person_manager (is_person_archived, is_client_person,
+   has_person_business_link, find_person_by_id).
+
+4. Object validation.
+
+   Eligible-статусы для старта Roadmap остаются как в Phase 30D/33A:
+   new, active, on_hold (ROADMAP_ALLOWED_OBJECT_STATUSES в
+   object_manager.py, не пересматривается — completed/cancelled
+   остаются НЕ eligible). on_hold ОСТАЁТСЯ eligible: временная
+   приостановка объекта — не то же самое, что его недействительность;
+   это уже было сознательным решением Object Domain (ADR-014/Phase
+   30D), и этот ADR его не пересматривает.
+
+   Требуется: Object существует (OBJECT_NOT_FOUND); Object не
+   archived (в текущей модели Object Domain "archived" как отдельный
+   статус не введён — статус, не входящий в OBJECT_STATUSES вообще,
+   уже сегодня отклоняется как unknown, HARD GATE); Object.status ∈
+   ROADMAP_ALLOWED_OBJECT_STATUSES (OBJECT_NOT_ELIGIBLE, уже
+   реализовано); Object.Biz ID == biz_id параметр
+   (OBJECT_BUSINESS_MISMATCH, новое); Object.Client ID == client_id
+   параметр (OBJECT_CLIENT_MISMATCH, новое). Object ID остаётся
+   неизменяемым после создания Roadmap — Roadmap creation никогда не
+   пишет ничего в OBJECT_REGISTRY, кроме уже существующего отдельного
+   вызова update_object_roadmap_id() (Roadmap ID back-reference,
+   Phase 28C, не пересматривается и не расширяется).
+
+5. Service validation.
+
+   Service должен: существовать (SERVICE_NOT_FOUND, уже есть);
+   иметь статус active (SERVICE_INACTIVE, уже есть); принадлежать
+   тому же Business, что и Object (Service.Бизнес ID == biz_id
+   параметр — SERVICE_BUSINESS_MISMATCH, новое). Service выбирается
+   ИСКЛЮЧИТЕЛЬНО по точному Service ID на границе orchestration —
+   arbitrary first-name-match НЕ допускается на этой границе (legacy
+   /newroadmap's find_services_by_name остаётся отдельным,
+   already-audited, unreachable legacy UX-путём, не используемым
+   create_roadmap_for_object). Никакого автоматического создания
+   Service или переназначения его Business не вводится.
+
+6. Object Type compatibility.
+
+   Политика: **WARNING (мягкое предупреждение), НЕ hard gate** — это
+   осознанное отступление от рекомендованного по умолчанию "hard
+   rejection", обоснованное конкретными production-данными,
+   обнаруженными при подготовке этого ADR (см. Контекст выше):
+   SERVICE_CATALOG.Object Type хранит английские machine-slug
+   значения ("private_house_izhs"), а реальный OBJECT_REGISTRY.Object
+   Type — свободный русский текст ("жилой дом"). Между этими двумя
+   словарями сегодня нет никакого канонического alias-отображения.
+   Введение hard gate до появления такого отображения немедленно
+   заблокировало бы Roadmap-старт для всех Service с непустым Object
+   Type против любого реального сегодняшнего Object — это было бы не
+   исправлением найденного архитектурного пробела, а внесением
+   нового, более серьёзного функционального регресса.
+
+   Нормализация (для использования в WARNING-сравнении и для будущего
+   alias-отображения): NFKC → trim → схлопывание пробелов → casefold.
+   Точное сравнение после нормализации, без substring/fuzzy/семантического
+   вывода. Явный alias-словарь МОЖЕТ быть введён в Phase 33C только
+   если он уже поддерживается существующими каноническими данными
+   Object Type (а не изобретается здесь) — сегодня такого
+   отображения нет, поэтому alias-словарь в Phase 33C НЕ вводится
+   автоматически; это отдельно фиксируется как deferred schema/
+   mapping work (см. пункт 23).
+
+   Поведение: Service.Object Type пустой → сравнение не выполняется
+   (WARNING не показывается); Object.Object Type пустой → сравнение
+   не выполняется; оба непустые, но нормализованные значения не
+   совпадают → OBJECT_SERVICE_TYPE_MISMATCH возвращается как
+   non-blocking warning (видимый пользователю, не блокирующий
+   создание Roadmap). Поддержка одним Service нескольких Object Type
+   сегодня не представима без новой relation-таблицы/схемы —
+   явно откладывается (пункт 23), никакой encoded-list формат не
+   изобретается взамен.
+
+7. Client Type compatibility.
+
+   Политика: **DEFERRED** — явно откладывается, канонический смысл
+   SERVICE_CATALOG.Client Type не установлен. В проде встречается
+   единственное значение ("physical_person") во всех 7 непустых
+   строках — недостаточно данных, чтобы отличить "это стабильная
+   категория с несколькими реальными значениями" от "это
+   единообразное значение, введённое один раз при сидировании
+   каталога и никогда не варьировавшееся". Hard gate или даже
+   warning на поле без установленной канонической семантики создал
+   бы ложное ощущение валидации там, где её предмет не определён.
+
+   Явно различается: CLIENT_ROLE_VALIDATION (пункт 3 — Person
+   реально является Client, через is_client_person()) и
+   SERVICE_CLIENT_TYPE_COMPATIBILITY (этот пункт — соответствует ли
+   Client некоторой декларируемой Service категории клиента) — это
+   разные инварианты; первый утверждается этим ADR как HARD GATE,
+   второй — как DEFERRED.
+
+8. Template validation.
+
+   Explicit (явно переданный) Template ID: существует и принадлежит
+   выбранному Service — HARD REJECTION (TEMPLATE_NOT_FOUND /
+   TEMPLATE_SERVICE_MISMATCH), уже реализовано на Telegram-границе
+   (startroadmap_cmd), фиксируется как обязывающее поведение
+   canonical orchestration API, а не только UX-слоя.
+
+   Auto-selected Template ID (Service.Default Roadmap Template ID,
+   либо первый результат find_roadmap_templates_by_service): ДОЛЖЕН
+   быть повторно провалидирован на существование в
+   create_roadmap_for_object() перед использованием — сегодня это
+   не так (Phase 33A finding), фиксируется как обязательное
+   исправление в Phase 33C. Stale/несуществующий auto-selected
+   Template ID → HARD REJECTION с понятной ошибкой (TEMPLATE_NOT_FOUND),
+   а не молчаливая деградация до нуля Stages.
+
+   Service без Template вообще (Default Roadmap Template ID пуст, и
+   find_roadmap_templates_by_service тоже пуст): Roadmap создаётся БЕЗ
+   Stages из шаблона; встроенный fallback ROADMAP_TEMPLATES (по
+   case_type) остаётся ОДОБРЕННЫМ, но LEGACY-ONLY поведением — не
+   расширяется, не считается частью canonical Template-модели,
+   кандидат на будущее устаревание отдельной фазой (не в scope этого
+   ADR).
+
+   Несколько Template, связанных с одним Service, без explicit/default
+   выбора: НЕ выбирается первый молча — MULTIPLE_TEMPLATES_REQUIRE_SELECTION
+   возвращается как структурный результат (уже частично реализовано
+   как user-facing hint на Telegram-границе; фиксируется как
+   обязывающее поведение canonical API, не только UX-подсказка).
+
+   Template существует, но имеет ноль Stages: не является ошибкой —
+   Roadmap создаётся с нулём Stages из этого источника, ровно как при
+   пустом Template (симметрично, без спецкейса).
+
+9. Duplicate active Roadmaps / open-Roadmap policy.
+
+   Business key остаётся (Object ID, Service ID). Open-статусы для
+   цели дедупликации: **active И on_hold** — оба считаются "открытым"
+   Roadmap и блокируют создание второго для той же пары. completed и
+   cancelled НЕ блокируют — можно начать новый Roadmap для той же
+   пары Object+Service после того, как предыдущий завершён или
+   отменён.
+
+   Если найдено >1 открытых (active/on_hold) Roadmap для одной пары —
+   это НЕ разрешается выбором первого: MULTIPLE_OPEN_ROADMAPS_INTEGRITY_ERROR
+   возвращается как блокирующая ошибка, перечисляющая все конфликтующие
+   Roadmap ID, без записи. Это ужесточение по сравнению с текущим
+   поведением (сегодня — non-blocking warning с использованием
+   первого) и фиксируется как обязательное изменение для Phase 33C.
+
+10. Existing Roadmap reuse and retry.
+
+    Если найден ровно один открытый (active/on_hold) Roadmap для
+    пары — используется его Roadmap ID; immutable-поля (пункт 12) не
+    перезаписываются; Template ID существующей записи не заменяется
+    новым/другим запрошенным (текущая "existing wins" политика
+    сохраняется без изменений); идемпотентная материализация Stages
+    повторяется только для отсутствующих Order; результат явно
+    сообщает, была ли запись создана/переиспользована, и сколько
+    Stages создано/уже существовало.
+
+    Все cross-domain валидации (пункты 2–8) выполняются ДО решения о
+    reuse — нет исторического исключения: даже при reuse существующего
+    Roadmap, Business/Client/Object/Service/Template должны заново
+    пройти проверку на момент retry (защита от того, что состояние
+    могло измениться между вызовами — например Client был архивирован
+    после создания первого Roadmap).
+
+11. Stage materialization.
+
+    ROADMAP_STAGE_CREATION_IS_IDEMPOTENT = YES и
+    ROADMAP_PARTIAL_FAILURE_IS_RECOVERABLE = YES сохраняются без
+    изменений — этот ADR не вводит cross-registry атомарность, которую
+    Google Sheets API не может гарантировать.
+
+    Принятая транзакционная модель: (1) выполнить все cross-domain
+    валидации (пункты 2–8) без единой записи; (2) создать или
+    переиспользовать Roadmap; (3) идемпотентно материализовать
+    отсутствующие Stages; (4) вернуть структурированный результат,
+    включая частичный сбой Stage-материализации, если он произошёл;
+    (5) повторный вызов сходится (converges) без дублей на любом шаге.
+    Никакого отката через hard-delete Roadmap/Stage строки не
+    вводится и не допускается.
+
+12. Historical immutability.
+
+    Неизменяемые после создания поля Roadmap: Roadmap ID, Business ID,
+    Client ID, Object ID, Service ID, Template ID, Created timestamp.
+    Retry не должен молчаливо менять ни одно из них. Проверено в
+    Phase 33A: текущий код НЕ содержит ни одного writer'а, который бы
+    перезаписывал любое из этих полей после создания — инвариант уже
+    выполняется фактически, фиксируется здесь как обязывающий на
+    будущее (а не как найденное нарушение, требующее исправления в
+    Phase 33C).
+
+13. Lifecycle boundary.
+
+    Этот ADR НЕ проектирует полный lifecycle API Roadmap. Для целей
+    валидации дедупликации вводятся только категории:
+    Open = {active, on_hold}; Closed = {completed, cancelled}.
+    Универсальные команды cancel/hold/restore остаются отложенными в
+    отдельную будущую lifecycle-фазу (тот же паттерн, что уже принят
+    для Service Domain). Hard delete остаётся запрещённым.
+
+14. Error contract.
+
+    Канонический orchestration-слой (create_roadmap_for_object)
+    возвращает один из структурных кодов (без языковой локализации на
+    этом уровне — Telegram-специфичный русский текст остаётся в
+    telegram_handlers.py, транслирующем код в сообщение):
+
+    ```
+    BUSINESS_NOT_FOUND
+    CLIENT_NOT_FOUND
+    CLIENT_ARCHIVED
+    CLIENT_ROLE_REQUIRED
+    CLIENT_NOT_LINKED_TO_BUSINESS
+    OBJECT_NOT_FOUND
+    OBJECT_NOT_ELIGIBLE
+    OBJECT_BUSINESS_MISMATCH
+    OBJECT_CLIENT_MISMATCH
+    SERVICE_NOT_FOUND
+    SERVICE_INACTIVE
+    SERVICE_BUSINESS_MISMATCH
+    OBJECT_SERVICE_TYPE_MISMATCH        (non-blocking warning code)
+    CLIENT_TYPE_VALIDATION_DEFERRED     (informational only, never blocks)
+    TEMPLATE_NOT_FOUND
+    TEMPLATE_SERVICE_MISMATCH
+    MULTIPLE_TEMPLATES_REQUIRE_SELECTION
+    MULTIPLE_OPEN_ROADMAPS_INTEGRITY_ERROR
+    ROADMAP_REUSED
+    ROADMAP_CREATED
+    STAGE_MATERIALIZATION_PARTIAL_FAILURE
+    ```
+
+    BUSINESS_NOT_ELIGIBLE сознательно НЕ включён в этот цикл (пункт 2
+    — Business-статус валидация отложена).
+
+15. Compatibility wrappers.
+
+    Ни один текущий вызывающий не требует compatibility wrapper —
+    create_roadmap_for_object уже единственная orchestration-точка
+    входа (Phase 28C), единственный вызывающий (startroadmap_cmd) уже
+    делегирует ей полностью. Никакая вторая реализация валидации не
+    вводится; никакая логика сопоставления/нормализации не
+    дублируется в telegram_handlers.py — весь новый код валидации
+    (Phase 33C) добавляется исключительно внутри
+    create_roadmap_for_object(), используя уже существующие public
+    API (object_manager, service_manager, person_manager,
+    roadmap_template_manager), без создания новых модулей.
+
+16. Test isolation requirements.
+
+    Обязательно для Phase 33C, до начала любой реализации: hard
+    socket-block для ВСЕХ Roadmap/Stage тестовых файлов (все 20+ файлов,
+    перечисленных в Phase 33A, включая test_service_ownership_migration.py,
+    где Phase 32A уже нашла замаскированный live-вызов); никакого
+    обращения к живым Google Sheets/Drive/Telegram/Railway; никакой
+    опоры на перехваченные сетевые исключения как признак "безопасности";
+    все Business/Person/Object/Service/Template owner'ы замоканы именно
+    на реальных call sites ПОСЛЕ изменения (не на устаревших целях);
+    статическая/AST-проверка полноты моков (по образцу
+    test_client_newclient_mock_completeness.py); production snapshot —
+    только read-only проверка; ноль тестовых записей в production.
+
+    Инцидент PRS-003 (Phase 31D: тест с устаревшим mock target записал
+    реальную строку в PEOPLE_REGISTRY) зафиксирован как постоянный,
+    обязывающий прецедент, по которому оценивается достаточность
+    изоляции тестов Phase 33C — не разовый инцидент, а стандарт
+    проверки для любой будущей Roadmap-фазы.
+
+17. Production migration policy.
+
+    Схема НЕ меняется, массовый rewrite данных НЕ требуется.
+    Существующие Roadmap остаются историческими записями как есть.
+    RM-002 остаётся нетронутым как исторический cancelled-артефакт с
+    пустым Service ID — не переинтерпретируется, не исправляется, не
+    удаляется. Изменяется только поведение БУДУЩЕГО создания/retry
+    Roadmap (Phase 33C), задним числом ничего не проверяется и не
+    перезаписывается.
+
+18. Scope exclusions.
+
+    Явно исключены из этого ADR и Phase 33C: редизайн Service
+    lifecycle; Roadmap lifecycle-команды (cancel/hold/restore);
+    редизайн Stage Domain; Payment Domain; Relation Domain; Document
+    Domain; миграция схемы; hard delete; автоматический repair
+    данных; изменения GTD.
+
+Причина:
+
+Тот же архитектурный принцип defense-in-depth на границе
+orchestration, что уже применён к Object Domain (ADR-014, проверка
+Business/Client при создании Object) и к Client Domain (ADR-015,
+проверка Client role/Business link при создании Object), теперь
+применяется к границе создания Roadmap — самой глубокой точке
+cross-domain пересечения в системе (Business → Client → Object →
+Service → Template → Roadmap → Stages). В отличие от предыдущих
+доменных ADR, часть решений здесь сознательно ОТКЛОНЯЕТСЯ от
+предложенного по умолчанию более строгого варианта (Object Type —
+WARNING вместо HARD GATE; Business status — DEFERRED вместо
+required), потому что конкретные production-данные, проверенные при
+подготовке этого ADR, показали, что буквальное применение
+предложенного по умолчанию сегодня создало бы новый функциональный
+регресс, а не устранило существующий архитектурный пробел. Это
+задокументировано как осознанное, evidence-based решение, а не как
+отступление от процесса.
+
+Статус:
+
+Утверждено для реализации (Phase 33C). Ничего не реализовано в
+рамках этого ADR — только архитектурное решение. Ни один
+production-caller не мигрирован, ни один код не изменён.
