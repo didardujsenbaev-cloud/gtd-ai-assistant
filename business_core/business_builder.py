@@ -2131,3 +2131,419 @@ def update_object_roadmap_id(obj_id: str, roadmap_id: str) -> dict:
     """
     from business_core.object_manager import update_object_roadmap_id as _update_object_roadmap_id
     return _update_object_roadmap_id(obj_id, roadmap_id, only_if_empty=True)
+
+
+# ─────────────────────────────────────────────────────────────
+# Phase 34C (ADR-017): Stage transition orchestration boundary.
+#
+# roadmap_manager.py remains the sole ROADMAP_STAGES/ROADMAPS
+# persistence owner (update_stage_status_in_sheet, update_stage_fields,
+# recalculate_roadmap_progress, maybe_complete_roadmap — all unchanged
+# low-level primitives). Everything that crosses from "one Stage" to
+# "its parent Roadmap's own eligibility" lives here instead — exactly
+# the same boundary principle ADR-016 already applied to Roadmap
+# creation (create_roadmap_for_object). No second implementation of
+# this policy exists anywhere else (see
+# test_roadmap_architecture_guards.py's Stage-domain guards).
+# ─────────────────────────────────────────────────────────────
+
+# Ordinary (non-reopen) transitions allowed from each canonical status,
+# including the identity/self-loop transition (ADR-017 Decision 6).
+# done/skipped only ever map to themselves here — any other requested
+# target from those two sources is an explicit-reopen attempt, handled
+# separately (see transition_stage_status), never silently permitted.
+_STAGE_ORDINARY_TRANSITIONS: dict[str, tuple[str, ...]] = {
+    "pending":     ("pending", "in_progress", "blocked", "skipped"),
+    "in_progress": ("in_progress", "pending", "blocked", "done", "skipped"),
+    "blocked":     ("blocked", "pending", "in_progress", "skipped"),
+    "done":        ("done",),
+    "skipped":     ("skipped",),
+}
+
+# Statuses from which an ordinary (non-explicit-reopen) transition
+# request must never leave — a "done"/"skipped" Stage can only ever be
+# read as needing STAGE_REOPEN_REQUIRES_EXPLICIT_ACTION for any
+# different target (ADR-017 Decision 6/12). The explicit-reopen
+# mechanism itself is out of scope for Phase 34C (ADR-017 Decision 8).
+_STAGE_REOPEN_GATED_STATUSES = frozenset({"done", "skipped"})
+
+
+def _stage_transition_result(
+    *, ok: bool, code: str, error: str | None, stage_id: str, roadmap_id: str = "",
+    previous_status: str = "", requested_status: str = "", final_status: str = "",
+    changed: bool = False, partial_success: bool = False, written_fields: tuple = (),
+    warnings: tuple = (), downstream_failures: tuple = (),
+    progress_before: int | None = None, progress_after: int | None = None,
+    roadmap_status_before: str = "", roadmap_status_after: str = "",
+    retry_safe: bool = True,
+) -> dict:
+    """
+    Shared result-builder for transition_stage_status() and
+    update_stage_admin_fields() (ADR-017 Decision 12) — the stable,
+    structured contract every caller (Telegram or otherwise) reads
+    instead of a bare exception or ad-hoc dict shape.
+    """
+    return {
+        "ok": ok,
+        "code": code,
+        "error": error,
+        "stage_id": stage_id,
+        "roadmap_id": roadmap_id,
+        "previous_status": previous_status,
+        "requested_status": requested_status,
+        "final_status": final_status,
+        "changed": changed,
+        "partial_success": partial_success,
+        "written_fields": tuple(written_fields),
+        "warnings": tuple(warnings),
+        "downstream_failures": tuple(downstream_failures),
+        "progress_before": progress_before,
+        "progress_after": progress_after,
+        "roadmap_status_before": roadmap_status_before,
+        "roadmap_status_after": roadmap_status_after,
+        "retry_safe": retry_safe,
+    }
+
+
+def _roadmap_eligibility_code_for_stage_update(roadmap_status: str) -> str | None:
+    """
+    ADR-017 Decision 7: returns the blocking code for a Stage
+    execution-status update given the parent Roadmap's own (normalized)
+    status, or None if updates are allowed. "active" is the only
+    status that allows Stage execution-status updates. Any status
+    outside the four canonical ROADMAP_STATUSES (active/on_hold/
+    completed/cancelled — guaranteed by ADR-016 at Roadmap-creation
+    time) falls back to the most conservative code, ROADMAP_CANCELLED,
+    since no legitimate fifth value is expected to ever occur in
+    practice (defense-in-depth only, not an evidenced production case).
+    """
+    if roadmap_status == "active":
+        return None
+    if roadmap_status == "on_hold":
+        return "ROADMAP_ON_HOLD"
+    if roadmap_status == "completed":
+        return "ROADMAP_COMPLETED"
+    if roadmap_status == "cancelled":
+        return "ROADMAP_CANCELLED"
+    return "ROADMAP_CANCELLED"
+
+
+def transition_stage_status(
+    stage_id: str,
+    target_status: str,
+    notes: Optional[str] = None,
+    admin_fields: Optional[dict] = None,
+) -> dict:
+    """
+    Phase 34C (ADR-017): the sole canonical Stage-transition
+    orchestration boundary. /updatestage, /blockstage, and
+    /unblockstage all call this — never roadmap_manager.
+    update_stage_status_in_sheet() directly — so Roadmap-eligibility
+    and transition-matrix policy is enforced exactly once, in exactly
+    one place.
+
+    Validation order (ADR-017 §6, all before any write):
+      A. required stage_id
+      B. Stage exists (STAGE_NOT_FOUND)
+      C. parent Roadmap exists (ROADMAP_NOT_FOUND)
+      D. Roadmap eligibility (ROADMAP_ON_HOLD / ROADMAP_COMPLETED /
+         ROADMAP_CANCELLED) — "active" is the only status that allows
+         a Stage execution-status update
+      E. target status normalization/validation against
+         roadmap_manager.STAGE_STATUS_CANONICAL (INVALID_STAGE_STATUS)
+      F. current->target transition validation
+         (STAGE_REOPEN_REQUIRES_EXPLICIT_ACTION for an ordinary attempt
+         to leave done/skipped; INVALID_STAGE_TRANSITION for any other
+         disallowed pair)
+      G. persist Stage status (roadmap_manager.update_stage_status_in_sheet),
+         plus any admin_fields (Blocking Reason, for /blockstage/
+         /unblockstage's coupled write) via roadmap_manager.
+         update_stage_fields — gated behind the SAME eligibility check
+         above, never a second, independent one
+      H. recalculate Roadmap progress, only if Status actually changed
+      I. maybe auto-complete Roadmap, only after a successful recalculation
+      J. return the structured result (ADR-017 §12)
+
+    Explicit reopen (done/skipped -> anything else) is deliberately NOT
+    implemented here — Phase 34C enforces only the block
+    (STAGE_REOPEN_REQUIRES_EXPLICIT_ACTION); the reopen mechanism
+    itself is out of scope (ADR-017 Decision 8/24).
+
+    A downstream failure (progress recalculation or auto-completion)
+    never rolls back the already-confirmed Stage Status write — visible
+    via partial_success=True and downstream_failures, exactly the same
+    principle ADR-016 already applies to Roadmap-creation's Stage
+    materialization.
+
+    Args:
+        stage_id:      STAGE-... to transition
+        target_status: one of roadmap_manager.STAGE_STATUS_CANONICAL
+        notes:         optional Notes column update (passed through to
+                       update_stage_status_in_sheet unchanged)
+        admin_fields:  optional dict of additional ROADMAP_STAGES admin
+                       columns (e.g. {"Blocking Reason": "..."})  to
+                       write in the same call, under the same
+                       eligibility gate — used by /blockstage (sets
+                       Blocking Reason + Status="blocked" together) and
+                       /unblockstage (clears Blocking Reason + Status
+                       back to "pending" together), so neither can bypass
+                       Roadmap eligibility by splitting the two writes
+                       across separate calls.
+
+    Returns:
+        See _stage_transition_result() for the full field list.
+    """
+    from business_core.roadmap_manager import (
+        STAGE_STATUS_CANONICAL, find_stage_by_id, find_roadmap_by_id,
+        update_stage_status_in_sheet, update_stage_fields,
+        recalculate_roadmap_progress, maybe_complete_roadmap,
+        normalize_roadmap_status,
+    )
+
+    # A. Required identifier.
+    if not stage_id:
+        return _stage_transition_result(
+            ok=False, code="STAGE_NOT_FOUND", error="stage_id обязателен",
+            stage_id=stage_id, retry_safe=True,
+        )
+
+    # B. Stage existence.
+    stage = find_stage_by_id(stage_id)
+    if stage is None:
+        return _stage_transition_result(
+            ok=False, code="STAGE_NOT_FOUND", error=f"Этап {stage_id} не найден",
+            stage_id=stage_id, retry_safe=True,
+        )
+
+    roadmap_id = stage.get("roadmap_id", "")
+    previous_status = stage.get("status", "")
+
+    # C. Parent Roadmap existence.
+    roadmap = find_roadmap_by_id(roadmap_id) if roadmap_id else None
+    if roadmap is None:
+        return _stage_transition_result(
+            ok=False, code="ROADMAP_NOT_FOUND",
+            error=f"Roadmap {roadmap_id or '(пусто)'} для этапа {stage_id} не найден",
+            stage_id=stage_id, roadmap_id=roadmap_id,
+            previous_status=previous_status, requested_status=target_status,
+            final_status=previous_status, retry_safe=True,
+        )
+
+    roadmap_status_before = normalize_roadmap_status(roadmap.get("status", ""))
+
+    # D. Roadmap eligibility — "active" is the only status that allows
+    # a Stage execution-status update (ADR-017 §7).
+    eligibility_code = _roadmap_eligibility_code_for_stage_update(roadmap_status_before)
+    if eligibility_code is not None:
+        return _stage_transition_result(
+            ok=False, code=eligibility_code,
+            error=(
+                f"Roadmap {roadmap_id} имеет статус '{roadmap_status_before}' — "
+                f"изменение статуса этапа не разрешено"
+            ),
+            stage_id=stage_id, roadmap_id=roadmap_id,
+            previous_status=previous_status, requested_status=target_status,
+            final_status=previous_status,
+            roadmap_status_before=roadmap_status_before,
+            roadmap_status_after=roadmap_status_before,
+            retry_safe=True,
+        )
+
+    # E. Target status validation.
+    if target_status not in STAGE_STATUS_CANONICAL:
+        return _stage_transition_result(
+            ok=False, code="INVALID_STAGE_STATUS",
+            error=(
+                f"Недопустимый статус '{target_status}'. "
+                f"Допустимые значения: {', '.join(STAGE_STATUS_CANONICAL)}"
+            ),
+            stage_id=stage_id, roadmap_id=roadmap_id,
+            previous_status=previous_status, requested_status=target_status,
+            final_status=previous_status,
+            roadmap_status_before=roadmap_status_before,
+            roadmap_status_after=roadmap_status_before,
+            retry_safe=True,
+        )
+
+    # F. Current -> target transition validation.
+    if previous_status in _STAGE_REOPEN_GATED_STATUSES and target_status != previous_status:
+        return _stage_transition_result(
+            ok=False, code="STAGE_REOPEN_REQUIRES_EXPLICIT_ACTION",
+            error=(
+                f"Этап {stage_id} имеет статус '{previous_status}' — обычное "
+                f"обновление не может вернуть его в '{target_status}'. "
+                f"Требуется отдельное явное действие reopen (не реализовано)."
+            ),
+            stage_id=stage_id, roadmap_id=roadmap_id,
+            previous_status=previous_status, requested_status=target_status,
+            final_status=previous_status,
+            roadmap_status_before=roadmap_status_before,
+            roadmap_status_after=roadmap_status_before,
+            retry_safe=True,
+        )
+
+    allowed_targets = _STAGE_ORDINARY_TRANSITIONS.get(previous_status, (previous_status,))
+    if target_status not in allowed_targets:
+        return _stage_transition_result(
+            ok=False, code="INVALID_STAGE_TRANSITION",
+            error=f"Переход '{previous_status}' → '{target_status}' не разрешён",
+            stage_id=stage_id, roadmap_id=roadmap_id,
+            previous_status=previous_status, requested_status=target_status,
+            final_status=previous_status,
+            roadmap_status_before=roadmap_status_before,
+            roadmap_status_after=roadmap_status_before,
+            retry_safe=True,
+        )
+
+    # G. Persist Stage status (+ any coupled admin_fields).
+    write_result = update_stage_status_in_sheet(stage_id, target_status, notes=notes)
+    if not write_result["ok"]:
+        return _stage_transition_result(
+            ok=False, code="STAGE_WRITE_PARTIAL_FAILURE",
+            error=write_result.get("error"),
+            stage_id=stage_id, roadmap_id=roadmap_id,
+            previous_status=previous_status, requested_status=target_status,
+            final_status=write_result.get("final_status", previous_status),
+            roadmap_status_before=roadmap_status_before,
+            roadmap_status_after=roadmap_status_before,
+            retry_safe=True,
+        )
+
+    final_status = write_result["final_status"]
+    changed = write_result["changed"]
+    written_fields = list(write_result.get("updated_fields", ()))
+    warnings = list(write_result.get("warnings", ()))
+    downstream_failures: list[str] = []
+    partial_success = bool(write_result.get("partial_success"))
+
+    if admin_fields:
+        admin_result = update_stage_fields(stage_id, admin_fields)
+        if admin_result["ok"]:
+            written_fields.extend(admin_result.get("written_fields", ()))
+        else:
+            partial_success = True
+            downstream_failures.append(f"Не удалось обновить дополнительные поля: {admin_result.get('error')}")
+
+    progress_before = None
+    progress_after = None
+    roadmap_status_after = roadmap_status_before
+
+    code = "STAGE_STATUS_UPDATED" if changed else "STAGE_STATUS_UNCHANGED"
+
+    # H. Progress recalculation — only if Status actually changed.
+    if changed:
+        progress_result = recalculate_roadmap_progress(roadmap_id)
+        if progress_result["ok"]:
+            progress_after = progress_result["new_progress"]
+            try:
+                progress_before = int(progress_result.get("old_progress") or 0)
+            except (TypeError, ValueError):
+                progress_before = None
+
+            # I. Maybe auto-complete Roadmap — only after a successful
+            # recalculation.
+            completion_result = maybe_complete_roadmap(roadmap_id, progress_pct=progress_after)
+            if completion_result["ok"]:
+                roadmap_status_after = normalize_roadmap_status(completion_result.get("new_status", roadmap_status_before))
+            else:
+                partial_success = True
+                downstream_failures.append(f"Не удалось проверить завершение Roadmap: {completion_result.get('error')}")
+                code = "ROADMAP_AUTO_COMPLETION_FAILED"
+        else:
+            partial_success = True
+            downstream_failures.append(f"Не удалось пересчитать прогресс: {progress_result.get('error')}")
+            code = "PROGRESS_RECALCULATION_FAILED"
+
+    return _stage_transition_result(
+        ok=True, code=code, error=None,
+        stage_id=stage_id, roadmap_id=roadmap_id,
+        previous_status=previous_status, requested_status=target_status,
+        final_status=final_status, changed=changed,
+        partial_success=partial_success, written_fields=tuple(written_fields),
+        warnings=tuple(warnings), downstream_failures=tuple(downstream_failures),
+        progress_before=progress_before, progress_after=progress_after,
+        roadmap_status_before=roadmap_status_before, roadmap_status_after=roadmap_status_after,
+        retry_safe=True,
+    )
+
+
+def update_stage_admin_fields(stage_id: str, writes: dict) -> dict:
+    """
+    Phase 34C (ADR-017 Decision 13/19/20): canonical orchestration
+    boundary for Stage ADMINISTRATIVE field edits (Responsible, Notes,
+    Due Date, Priority, Blocking Reason) — used by /assignstage,
+    /duedate, /priority. Never accepts a "Status" key (that always goes
+    through transition_stage_status(); roadmap_manager.
+    update_stage_fields() itself now rejects "Status" outright as a
+    second line of defense).
+
+    Roadmap eligibility for admin-only edits (ADR-017 §13/19, distinct
+    and looser than execution-status eligibility in transition_stage_status):
+      active:    allowed
+      on_hold:   allowed (administrative fields do not advance execution)
+      completed: blocked (ROADMAP_COMPLETED) — a completed Roadmap is a
+                 historical snapshot, no edits at all
+      cancelled: blocked (ROADMAP_CANCELLED) — same reasoning
+
+    Does not duplicate the transition matrix or reopen policy — this
+    function never touches Status.
+
+    Returns:
+        Same structured shape as _stage_transition_result(), with
+        requested_status/previous_status/final_status left blank
+        (not applicable to an admin-only edit).
+    """
+    from business_core.roadmap_manager import find_stage_by_id, find_roadmap_by_id, update_stage_fields, normalize_roadmap_status
+
+    if not stage_id:
+        return _stage_transition_result(
+            ok=False, code="STAGE_NOT_FOUND", error="stage_id обязателен", stage_id=stage_id,
+        )
+
+    stage = find_stage_by_id(stage_id)
+    if stage is None:
+        return _stage_transition_result(
+            ok=False, code="STAGE_NOT_FOUND", error=f"Этап {stage_id} не найден", stage_id=stage_id,
+        )
+
+    roadmap_id = stage.get("roadmap_id", "")
+    roadmap = find_roadmap_by_id(roadmap_id) if roadmap_id else None
+    if roadmap is None:
+        return _stage_transition_result(
+            ok=False, code="ROADMAP_NOT_FOUND",
+            error=f"Roadmap {roadmap_id or '(пусто)'} для этапа {stage_id} не найден",
+            stage_id=stage_id, roadmap_id=roadmap_id,
+        )
+
+    roadmap_status = normalize_roadmap_status(roadmap.get("status", ""))
+
+    if roadmap_status == "completed":
+        return _stage_transition_result(
+            ok=False, code="ROADMAP_COMPLETED",
+            error=f"Roadmap {roadmap_id} завершён — изменение полей этапа не разрешено",
+            stage_id=stage_id, roadmap_id=roadmap_id,
+            roadmap_status_before=roadmap_status, roadmap_status_after=roadmap_status,
+        )
+    if roadmap_status == "cancelled":
+        return _stage_transition_result(
+            ok=False, code="ROADMAP_CANCELLED",
+            error=f"Roadmap {roadmap_id} отменён — изменение полей этапа не разрешено",
+            stage_id=stage_id, roadmap_id=roadmap_id,
+            roadmap_status_before=roadmap_status, roadmap_status_after=roadmap_status,
+        )
+    # active / on_hold: administrative edits allowed.
+
+    write_result = update_stage_fields(stage_id, writes)
+    if not write_result["ok"]:
+        return _stage_transition_result(
+            ok=False, code="STAGE_WRITE_PARTIAL_FAILURE", error=write_result.get("error"),
+            stage_id=stage_id, roadmap_id=roadmap_id,
+            roadmap_status_before=roadmap_status, roadmap_status_after=roadmap_status,
+        )
+
+    return _stage_transition_result(
+        ok=True, code="STAGE_STATUS_UNCHANGED", error=None,
+        stage_id=stage_id, roadmap_id=roadmap_id,
+        written_fields=tuple(write_result.get("written_fields", ())),
+        roadmap_status_before=roadmap_status, roadmap_status_after=roadmap_status,
+    )

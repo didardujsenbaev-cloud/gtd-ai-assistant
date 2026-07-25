@@ -234,21 +234,30 @@ class TestUpdateStageUntouched(unittest.TestCase):
         self.assertEqual(src.count('CommandHandler("updatestage"'), 1)
 
     def test_updatestage_calls_recalculate_only_on_success(self):
-        """Phase 9E.1: /updatestage теперь вызывает recalculate_roadmap_progress,
-        но только после успешного (валидный статус, существующий этап)
-        обновления — не при ошибках. Полное покрытие в test_updatestage_progress.py."""
+        """Phase 9E.1: /updatestage вызывает recalculate_roadmap_progress
+        только после успешного (валидный статус, существующий этап)
+        обновления — не при ошибках.
+
+        Phase 34C (ADR-017) update: this call now lives entirely inside
+        business_builder.transition_stage_status() (the canonical Stage-
+        transition orchestration boundary — see test_stage_transition_
+        foundation.py for full coverage of that internal ordering, and
+        test_stage_architecture_guards.py for the guard confirming
+        updatestage_cmd itself no longer calls recalculate_roadmap_progress
+        directly). This test now only confirms updatestage_cmd calls the
+        canonical orchestration function and checks its "ok" result before
+        rendering, rather than asserting a literal low-level call site
+        that no longer exists in this function's own body."""
         src = (WORKSPACE / "business_core" / "telegram_handlers.py").read_text(encoding="utf-8")
         import re
         match = re.search(
             r"async def updatestage_cmd.*?(?=\nasync def |\Z)", src, re.DOTALL)
         self.assertIsNotNone(match)
         body = match.group(0)
-        self.assertIn("recalculate_roadmap_progress", body)
-        # вызов должен идти строго после проверки result["ok"] (после return
-        # на ошибке), а не до неё
+        self.assertIn("transition_stage_status", body)
+        idx_call = body.index("transition_stage_status(")
         idx_error_check = body.index('if not result["ok"]')
-        idx_recalc_call = body.index("recalculate_roadmap_progress(roadmap_id)")
-        self.assertLess(idx_error_check, idx_recalc_call)
+        self.assertLess(idx_call, idx_error_check)
 
 
 # ────────────────────────────────────────────────────────────

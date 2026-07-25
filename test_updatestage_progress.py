@@ -143,6 +143,28 @@ def _make_sheet_dispatcher(stage_row, roadmaps_row, stage_row_num=2, roadmaps_ro
 # Основной контракт: вызов recalculate только при успехе
 # ────────────────────────────────────────────────────────────
 
+def _transition_result(**overrides):
+    """Phase 34C: updatestage_cmd now calls the single canonical
+    business_builder.transition_stage_status() — progress recalculation
+    and Roadmap auto-completion are internal to it (see
+    test_stage_transition_foundation.py for call-count/argument-level
+    coverage of that internal orchestration). Handler-level tests here
+    mock this one boundary directly instead of the low-level
+    roadmap_manager functions transition_stage_status() calls internally."""
+    base = {
+        "ok": True, "code": "STAGE_STATUS_UPDATED", "error": None,
+        "stage_id": "STAGE-001", "roadmap_id": "RM-001",
+        "previous_status": "pending", "requested_status": "done", "final_status": "done",
+        "changed": True, "partial_success": False, "written_fields": ("Status",),
+        "warnings": (), "downstream_failures": (),
+        "progress_before": None, "progress_after": None,
+        "roadmap_status_before": "active", "roadmap_status_after": "active",
+        "retry_safe": True,
+    }
+    base.update(overrides)
+    return base
+
+
 class TestRecalculateCalledOnlyOnSuccess(unittest.TestCase):
 
     def test_status_changed_calls_recalculate_once_with_correct_roadmap_id(self):
@@ -151,29 +173,16 @@ class TestRecalculateCalledOnlyOnSuccess(unittest.TestCase):
             "/updatestage stage_id=STAGE-001 status=done",
             ["stage_id=STAGE-001", "status=done"],
         )
-        calls = []
-
-        def fake_recalc(roadmap_id):
-            calls.append(roadmap_id)
-            return {"ok": True, "error": None, "roadmap_id": roadmap_id,
-                    "old_progress": "33", "new_progress": 67,
-                    "done_count": 2, "total_count": 3, "changed": True}
 
         async def run():
             with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
-                 patch("business_core.roadmap_manager.update_stage_status_in_sheet",
-                       return_value={"ok": True, "error": None, "stage_id": "STAGE-001",
-                                     "roadmap_id": "RM-001", "old_status": "pending",
-                                     "new_status": "done", "changed": True}), \
-                 patch("business_core.roadmap_manager.recalculate_roadmap_progress",
-                       side_effect=fake_recalc), \
-                 patch("business_core.roadmap_manager.maybe_complete_roadmap",
-                       return_value={"ok": True, "error": None, "roadmap_id": "RM-001",
-                                     "old_status": "active", "new_status": "active", "changed": False}):
+                 patch("business_core.business_builder.transition_stage_status",
+                       return_value=_transition_result(progress_before=33, progress_after=67)):
                 await th.updatestage_cmd(upd, ctx)
 
         _run(run())
-        self.assertEqual(calls, ["RM-001"])
+        reply = upd.message.reply_text.call_args[0][0]
+        self.assertIn("RM-001", reply)
 
     def test_invalid_status_does_not_call_recalculate(self):
         th = _fresh_th()
@@ -184,14 +193,14 @@ class TestRecalculateCalledOnlyOnSuccess(unittest.TestCase):
 
         async def run():
             with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
-                 patch("business_core.roadmap_manager.update_stage_status_in_sheet",
-                       return_value={"ok": False, "error": "Недопустимый статус 'bogus'. "
-                                     "Допустимые значения: pending, in_progress, blocked, done, skipped",
-                                     "stage_id": "STAGE-001", "roadmap_id": "",
-                                     "old_status": "", "new_status": "bogus", "changed": False}), \
-                 patch("business_core.roadmap_manager.recalculate_roadmap_progress") as mock_recalc:
+                 patch("business_core.business_builder.transition_stage_status",
+                       return_value=_transition_result(
+                           ok=False, code="INVALID_STAGE_STATUS",
+                           error="Недопустимый статус 'bogus'. "
+                                 "Допустимые значения: pending, in_progress, blocked, done, skipped",
+                           requested_status="bogus", final_status="pending", changed=False, roadmap_id="",
+                       )):
                 await th.updatestage_cmd(upd, ctx)
-                mock_recalc.assert_not_called()
 
         _run(run())
 
@@ -204,49 +213,36 @@ class TestRecalculateCalledOnlyOnSuccess(unittest.TestCase):
 
         async def run():
             with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
-                 patch("business_core.roadmap_manager.update_stage_status_in_sheet",
-                       return_value={"ok": False, "error": "Этап 'STAGE-UNKNOWN' не найден",
-                                     "stage_id": "STAGE-UNKNOWN", "roadmap_id": "",
-                                     "old_status": "", "new_status": "done", "changed": False}), \
-                 patch("business_core.roadmap_manager.recalculate_roadmap_progress") as mock_recalc:
+                 patch("business_core.business_builder.transition_stage_status",
+                       return_value=_transition_result(
+                           ok=False, code="STAGE_NOT_FOUND", error="Этап STAGE-UNKNOWN не найден",
+                           stage_id="STAGE-UNKNOWN", final_status="", changed=False, roadmap_id="",
+                       )):
                 await th.updatestage_cmd(upd, ctx)
-                mock_recalc.assert_not_called()
 
         _run(run())
 
     def test_idempotent_status_still_calls_recalculate(self):
         """Повторная установка того же статуса всё равно валидна и успешна —
-        recalculate вызывается и возвращает текущий Progress (changed=False)."""
+        текущий Progress показывается (changed=False)."""
         th = _fresh_th()
         upd, ctx = _make_update(
             "/updatestage stage_id=STAGE-001 status=done",
             ["stage_id=STAGE-001", "status=done"],
         )
-        calls = []
-
-        def fake_recalc(roadmap_id):
-            calls.append(roadmap_id)
-            return {"ok": True, "error": None, "roadmap_id": roadmap_id,
-                    "old_progress": "67", "new_progress": 67,
-                    "done_count": 2, "total_count": 3, "changed": False}
 
         async def run():
             with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
-                 patch("business_core.roadmap_manager.update_stage_status_in_sheet",
-                       return_value={"ok": True, "error": None, "stage_id": "STAGE-001",
-                                     "roadmap_id": "RM-001", "old_status": "done",
-                                     "new_status": "done", "changed": False}), \
-                 patch("business_core.roadmap_manager.recalculate_roadmap_progress",
-                       side_effect=fake_recalc), \
-                 patch("business_core.roadmap_manager.maybe_complete_roadmap",
-                       return_value={"ok": True, "error": None, "roadmap_id": "RM-001",
-                                     "old_status": "active", "new_status": "active", "changed": False}):
+                 patch("business_core.business_builder.transition_stage_status",
+                       return_value=_transition_result(
+                           previous_status="done", requested_status="done", final_status="done",
+                           changed=False, written_fields=("Status",),
+                       )):
                 await th.updatestage_cmd(upd, ctx)
 
         _run(run())
-        self.assertEqual(calls, ["RM-001"])
         reply = upd.message.reply_text.call_args[0][0]
-        self.assertIn("уже 67%", reply)
+        self.assertIn("уже имел статус", reply)
 
 
 # ────────────────────────────────────────────────────────────
@@ -264,17 +260,8 @@ class TestReplyFormat(unittest.TestCase):
 
         async def run():
             with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
-                 patch("business_core.roadmap_manager.update_stage_status_in_sheet",
-                       return_value={"ok": True, "error": None, "stage_id": "STAGE-001",
-                                     "roadmap_id": "RM-001", "old_status": "pending",
-                                     "new_status": "done", "changed": True}), \
-                 patch("business_core.roadmap_manager.recalculate_roadmap_progress",
-                       return_value={"ok": True, "error": None, "roadmap_id": "RM-001",
-                                     "old_progress": "33", "new_progress": 67,
-                                     "done_count": 2, "total_count": 3, "changed": True}), \
-                 patch("business_core.roadmap_manager.maybe_complete_roadmap",
-                       return_value={"ok": True, "error": None, "roadmap_id": "RM-001",
-                                     "old_status": "active", "new_status": "active", "changed": False}):
+                 patch("business_core.business_builder.transition_stage_status",
+                       return_value=_transition_result(progress_before=33, progress_after=67)):
                 await th.updatestage_cmd(upd, ctx)
 
         _run(run())
@@ -296,25 +283,18 @@ class TestReplyFormat(unittest.TestCase):
 
         async def run():
             with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
-                 patch("business_core.roadmap_manager.update_stage_status_in_sheet",
-                       return_value={"ok": True, "error": None, "stage_id": "STAGE-001",
-                                     "roadmap_id": "RM-001", "old_status": "done",
-                                     "new_status": "done", "changed": False}), \
-                 patch("business_core.roadmap_manager.recalculate_roadmap_progress",
-                       return_value={"ok": True, "error": None, "roadmap_id": "RM-001",
-                                     "old_progress": "67", "new_progress": 67,
-                                     "done_count": 2, "total_count": 3, "changed": False}), \
-                 patch("business_core.roadmap_manager.maybe_complete_roadmap",
-                       return_value={"ok": True, "error": None, "roadmap_id": "RM-001",
-                                     "old_status": "active", "new_status": "active", "changed": False}):
+                 patch("business_core.business_builder.transition_stage_status",
+                       return_value=_transition_result(
+                           previous_status="done", requested_status="done", final_status="done",
+                           changed=False,
+                       )):
                 await th.updatestage_cmd(upd, ctx)
 
         _run(run())
         reply = upd.message.reply_text.call_args[0][0]
         self.assertEqual(
             reply,
-            "ℹ️ Этап `STAGE-001` уже имел статус `done` (изменений нет, повтор безопасен).\n"
-            "Прогресс roadmap `RM-001` уже 67%",
+            "ℹ️ Этап `STAGE-001` уже имел статус `done` (изменений нет, повтор безопасен).",
         )
 
     def test_notes_plus_status_progress_all_present_notes_not_lost(self):
@@ -326,17 +306,11 @@ class TestReplyFormat(unittest.TestCase):
 
         async def run():
             with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
-                 patch("business_core.roadmap_manager.update_stage_status_in_sheet",
-                       return_value={"ok": True, "error": None, "stage_id": "STAGE-001",
-                                     "roadmap_id": "RM-001", "old_status": "pending",
-                                     "new_status": "blocked", "changed": True}), \
-                 patch("business_core.roadmap_manager.recalculate_roadmap_progress",
-                       return_value={"ok": True, "error": None, "roadmap_id": "RM-001",
-                                     "old_progress": "0", "new_progress": 0,
-                                     "done_count": 0, "total_count": 3, "changed": False}), \
-                 patch("business_core.roadmap_manager.maybe_complete_roadmap",
-                       return_value={"ok": True, "error": None, "roadmap_id": "RM-001",
-                                     "old_status": "active", "new_status": "active", "changed": False}):
+                 patch("business_core.business_builder.transition_stage_status",
+                       return_value=_transition_result(
+                           requested_status="blocked", final_status="blocked",
+                           progress_before=0, progress_after=0,
+                       )):
                 await th.updatestage_cmd(upd, ctx)
 
         _run(run())
@@ -420,7 +394,8 @@ class TestEndToEndSheetsIntegration(unittest.TestCase):
              "", "", "", "", ""],
         ]
         upd, stages_sheet, roadmaps_sheet = self._run_full_command(
-            status="done", stage_statuses=stage_statuses, roadmaps_progress="0",
+            status="done", stage_row_status="in_progress",
+            stage_statuses=stage_statuses, roadmaps_progress="0",
         )
 
         # roadmaps_sheet.update_cell должен быть вызван один раз — только Progress %
@@ -430,7 +405,10 @@ class TestEndToEndSheetsIntegration(unittest.TestCase):
         self.assertEqual(value, "33")  # 1 из 3 done -> round-half-up 33%
 
     def test_status_column_of_roadmap_not_touched(self):
-        upd, stages_sheet, roadmaps_sheet = self._run_full_command(status="done")
+        upd, stages_sheet, roadmaps_sheet = self._run_full_command(
+            status="done", stage_row_status="in_progress",
+        )
+        self.assertGreater(roadmaps_sheet.update_cell.call_count, 0)
         written_cols = [c.args[1] for c in roadmaps_sheet.update_cell.call_args_list]
         self.assertNotIn(ROADMAPS_HEADERS.index("Status") + 1, written_cols)
 
@@ -438,7 +416,9 @@ class TestEndToEndSheetsIntegration(unittest.TestCase):
         """После update_stage_status_in_sheet (пишет Status, и для 'done'
         дополнительно Completed At — Phase 14A) recalculate_roadmap_progress
         не должен ничего ЕЩЁ писать в ROADMAP_STAGES."""
-        upd, stages_sheet, roadmaps_sheet = self._run_full_command(status="done")
+        upd, stages_sheet, roadmaps_sheet = self._run_full_command(
+            status="done", stage_row_status="in_progress",
+        )
         # update_stage_status_in_sheet пишет Status + Completed At для 'done'
         # (notes не передан) — recalculate_roadmap_progress не добавляет
         # ничего сверху.
@@ -449,8 +429,9 @@ class TestEndToEndSheetsIntegration(unittest.TestCase):
 
     def test_only_target_roadmap_row_written(self):
         upd, stages_sheet, roadmaps_sheet = self._run_full_command(
-            status="done", roadmaps_row_num=42,
+            status="done", stage_row_status="in_progress", roadmaps_row_num=42,
         )
+        self.assertGreater(roadmaps_sheet.update_cell.call_count, 0)
         for call in roadmaps_sheet.update_cell.call_args_list:
             self.assertEqual(call.args[0], 42)
 

@@ -85,6 +85,14 @@ _ROADMAP_DOMAIN_TEST_FILES = frozenset({
     "test_service_architecture_guards.py",
     "test_roadmap_cross_domain_validation.py",
     "test_roadmap_caller_ux.py",
+    # Phase 34C (ADR-017 §22): Phase 34A found these three Stage/
+    # Progress/Milestone-related files missing from this registry —
+    # closed here, plus the new Stage-transition test file.
+    "test_recalcprogress.py",
+    "test_seed_izhs_commercial_milestones.py",
+    "test_seed_izhs_commercial_milestones_sop.py",
+    "test_stage_transition_foundation.py",
+    "test_stage_architecture_guards.py",
 })
 
 # Phase 32A (Service Domain re-audit) found a masked live-network call

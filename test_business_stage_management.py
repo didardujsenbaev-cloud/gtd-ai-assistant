@@ -465,6 +465,32 @@ class TestPriority(unittest.TestCase):
         self.assertEqual(sheet._updates, {})
 
 
+def _run_confirm_with_active_roadmap(th, confirm_fn, context, sheet, text="✅ Подтвердить", row=None):
+    """
+    Phase 34C: blockstage/unblockstage's confirm step now goes through
+    business_builder.transition_stage_status(), which also resolves the
+    parent Roadmap (via roadmap_manager.find_roadmap_by_id) to check
+    eligibility. _run_start/_run_confirm's single shared-sheet mock has
+    no real ROADMAPS row to return, so find_roadmap_by_id is patched
+    directly here to a plain active Roadmap — this test is about the
+    Stage-field write, not Roadmap-eligibility policy (covered
+    separately in test_stage_transition_foundation.py).
+    """
+    update = _upd(text)
+
+    async def run():
+        with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
+             patch("business_core.sheets.get_business_sheet", return_value=sheet), \
+             patch("business_core.sheets.find_row_by_id",
+                   return_value=(2, dict(zip(STAGE_HEADERS, row or _row())))), \
+             patch("business_core.roadmap_manager.find_roadmap_by_id",
+                   return_value={"roadmap_id": "RM-001", "status": "active"}):
+            await confirm_fn(update, context)
+
+    asyncio.run(run())
+    return update
+
+
 class TestBlockUnblockStage(unittest.TestCase):
     def test_blockstage_sets_reason_and_status(self):
         th = _fresh_th()
@@ -472,7 +498,7 @@ class TestBlockUnblockStage(unittest.TestCase):
         _, _, context, sheet = _run_start(
             th, th.blockstage_start,
             '/blockstage stage_id=STAGE-001 reason="ждём документы"', row=row)
-        _run_confirm(th, th.blockstage_confirm, context, sheet, row=row)
+        _run_confirm_with_active_roadmap(th, th.blockstage_confirm, context, sheet, row=row)
 
         reason_col = STAGE_HEADERS.index("Blocking Reason") + 1
         status_col = STAGE_HEADERS.index("Status") + 1
@@ -497,7 +523,7 @@ class TestBlockUnblockStage(unittest.TestCase):
         row = _row(status="blocked", blocking_reason="ждём документы")
         _, _, context, sheet = _run_start(
             th, th.unblockstage_start, "/unblockstage stage_id=STAGE-001", row=row)
-        _run_confirm(th, th.unblockstage_confirm, context, sheet, row=row)
+        _run_confirm_with_active_roadmap(th, th.unblockstage_confirm, context, sheet, row=row)
 
         reason_col = STAGE_HEADERS.index("Blocking Reason") + 1
         status_col = STAGE_HEADERS.index("Status") + 1

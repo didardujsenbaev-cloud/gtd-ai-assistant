@@ -2188,35 +2188,37 @@ def ensure_roadmap_stages(
 
 
 _STAGE_FIELD_UPDATE_ALLOWED_COLUMNS = {
-    "Responsible", "Due Date", "Priority", "Blocking Reason", "Status",
+    "Responsible", "Due Date", "Priority", "Blocking Reason",
 }
 
 
 def update_stage_fields(stage_id: str, writes: dict) -> dict:
     """
     Phase 28D: canonical point-write of one or more ROADMAP_STAGES
-    field(s) other than the full Status-transition flow (see
-    update_stage_status_in_sheet() for that) — the shared write
-    primitive behind /assignstage, /duedate, /priority, /blockstage,
-    /unblockstage, replacing telegram_handlers._stage_edit_execute's
-    former direct Sheets access.
+    administrative field(s) — the shared write primitive behind
+    /assignstage, /duedate, /priority, and the admin-field half of
+    /blockstage, /unblockstage, replacing telegram_handlers.
+    _stage_edit_execute's former direct Sheets access.
 
     Restricted to a fixed column allowlist (Responsible, Due Date,
-    Priority, Blocking Reason, Status) — the same Phase 14A Stage
-    Management Core columns this write path has always been scoped to;
-    any other key in `writes` is silently ignored, exactly matching
-    the prior behavior.
+    Priority, Blocking Reason) — the same Phase 14A Stage Management
+    Core columns this write path has always been scoped to; any other
+    key in `writes` is silently ignored, exactly matching the prior
+    behavior for non-Status keys.
+
+    Phase 34C (ADR-017 §13/§20): "Status" is no longer part of this
+    function's editable set at all — it used to accept a validated
+    Status value directly, but that made this the second place (besides
+    update_stage_status_in_sheet) capable of changing a Stage's Status,
+    with zero Roadmap-eligibility or transition-matrix awareness. A
+    "Status" key in `writes` is now REJECTED outright (ok=False, before
+    touching Sheets), regardless of value — Status changes must go
+    through business_core.business_builder.transition_stage_status(),
+    the sole canonical transition-orchestration boundary (ADR-017 §2/§6).
 
     Re-reads the row via find_row_by_id() immediately before writing
     (staleness guard — Read-before-Write, ENGINEERING_STANDARDS.md),
     header-mapped, never a positional column assumption.
-
-    Phase 28H: if `writes` includes a "Status" key, its value is
-    validated against STAGE_STATUS_CANONICAL — a legacy value (e.g.
-    "not_started") is rejected with a clear error rather than written,
-    and NOTHING in `writes` is written for that call (all-or-nothing,
-    so a rejected Status never leaves other fields silently applied
-    while Status itself was skipped).
 
     Returns:
         {"ok": bool, "stage_id": str, "written_fields": tuple, "error": str | None}
@@ -2224,13 +2226,12 @@ def update_stage_fields(stage_id: str, writes: dict) -> dict:
     if not stage_id:
         return {"ok": False, "stage_id": stage_id, "written_fields": (), "error": "stage_id обязателен"}
 
-    requested_status = (writes or {}).get("Status")
-    if requested_status is not None and requested_status not in STAGE_STATUS_CANONICAL:
+    if "Status" in (writes or {}):
         return {
             "ok": False, "stage_id": stage_id, "written_fields": (),
             "error": (
-                f"Недопустимый статус '{requested_status}'. "
-                f"Допустимые значения: {', '.join(STAGE_STATUS_CANONICAL)}"
+                "Status нельзя изменить через update_stage_fields — "
+                "используйте business_builder.transition_stage_status()."
             ),
         }
 

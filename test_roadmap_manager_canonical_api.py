@@ -584,10 +584,10 @@ class TestUpdateStageFields(unittest.TestCase):
         with patch("business_core.sheets.find_row_by_id", return_value=(3, {})), \
              patch("business_core.sheets.get_business_sheet", return_value=sheet):
             result = rm.update_stage_fields("STAGE-001", {
-                "Blocking Reason": "нет доступа", "Status": "blocked",
+                "Blocking Reason": "нет доступа", "Priority": "high",
             })
         self.assertTrue(result["ok"])
-        self.assertEqual(set(result["written_fields"]), {"Blocking Reason", "Status"})
+        self.assertEqual(set(result["written_fields"]), {"Blocking Reason", "Priority"})
         self.assertEqual(sheet.update_cell.call_count, 2)
         for c in sheet.update_cell.call_args_list:
             self.assertEqual(c.args[0], 3)
@@ -602,32 +602,35 @@ class TestUpdateStageFields(unittest.TestCase):
             rm.update_stage_fields("STAGE-001", {"Priority": "high"})
         mock_find.assert_called_once_with("roadmap_stages", "STAGE-001")
 
-    def test_rejects_legacy_status_on_write(self):
-        """Phase 28H requirement 8: update_stage_fields must never write
-        a legacy status value like 'not_started'."""
+    def test_rejects_any_status_key_on_write(self):
+        """Phase 34C (ADR-017 §13/§20): update_stage_fields no longer
+        accepts a "Status" key AT ALL, regardless of value — Status
+        changes must go through business_builder.transition_stage_status(),
+        the sole canonical transition-orchestration boundary. This
+        supersedes the old Phase 28H behavior (which validated Status's
+        VALUE here); now the mere presence of the key is rejected."""
         rm = _fresh_rm()
         result = rm.update_stage_fields("STAGE-001", {"Status": "not_started"})
         self.assertFalse(result["ok"])
-        self.assertIn("not_started", result["error"])
+        self.assertIn("transition_stage_status", result["error"])
 
     def test_rejects_status_before_touching_sheets(self):
-        """An invalid Status must be rejected before any Sheets access —
+        """A "Status" key must be rejected before any Sheets access —
         including the other fields in the same call, all-or-nothing."""
         rm = _fresh_rm()
         with patch("business_core.sheets.find_row_by_id") as mock_find:
-            result = rm.update_stage_fields("STAGE-001", {"Status": "waiting", "Responsible": "Иван"})
+            result = rm.update_stage_fields("STAGE-001", {"Status": "pending", "Responsible": "Иван"})
         self.assertFalse(result["ok"])
         mock_find.assert_not_called()
 
-    def test_accepts_every_canonical_stage_status(self):
+    def test_rejects_every_canonical_stage_status_too(self):
+        """Phase 34C: even a VALID canonical Status value is rejected
+        here — this function no longer writes Status under any
+        circumstance."""
         rm = _fresh_rm()
-        sheet = MagicMock()
-        sheet.row_values.return_value = STAGES_HEADERS
-        with patch("business_core.sheets.find_row_by_id", return_value=(2, {})), \
-             patch("business_core.sheets.get_business_sheet", return_value=sheet):
-            for status in rm.STAGE_STATUS_CANONICAL:
-                result = rm.update_stage_fields("STAGE-001", {"Status": status})
-                self.assertTrue(result["ok"], f"status {status!r} should be accepted")
+        for status in rm.STAGE_STATUS_CANONICAL:
+            result = rm.update_stage_fields("STAGE-001", {"Status": status})
+            self.assertFalse(result["ok"], f"status {status!r} must be rejected by update_stage_fields")
 
     def test_unrelated_field_update_does_not_touch_status(self):
         """Phase 28H requirement 9: updating an unrelated field (e.g.

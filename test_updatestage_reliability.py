@@ -376,28 +376,23 @@ class TestNoCouplingToDocumentsOrRelationsOrGTD(unittest.TestCase):
 
 
 class TestTelegramResponses(unittest.TestCase):
+    """Phase 34C: updatestage_cmd now calls the single canonical
+    business_builder.transition_stage_status() — every scenario below
+    mocks that one boundary directly instead of the low-level
+    roadmap_manager functions it now calls internally (see
+    test_stage_transition_foundation.py for coverage of those internals)."""
 
-    def _update_result(self, **overrides):
+    def _transition_result(self, **overrides):
         base = {
-            "ok": True, "partial_success": False, "stage_id": "STAGE-001",
-            "roadmap_id": "RM-001", "previous_status": "pending",
-            "requested_status": "done", "final_status": "done", "changed": True,
-            "updated_fields": ("Status", "Completed At"), "warnings": (), "errors": (),
-            "error": None, "old_status": "pending", "new_status": "done",
+            "ok": True, "code": "STAGE_STATUS_UPDATED", "error": None,
+            "stage_id": "STAGE-001", "roadmap_id": "RM-001",
+            "previous_status": "pending", "requested_status": "done", "final_status": "done",
+            "changed": True, "partial_success": False, "written_fields": ("Status", "Completed At"),
+            "warnings": (), "downstream_failures": (),
+            "progress_before": 33, "progress_after": 67,
+            "roadmap_status_before": "active", "roadmap_status_after": "active",
+            "retry_safe": True,
         }
-        base.update(overrides)
-        return base
-
-    def _progress_result(self, **overrides):
-        base = {"ok": True, "error": None, "roadmap_id": "RM-001",
-                "old_progress": "33", "new_progress": 67,
-                "done_count": 2, "total_count": 3, "changed": True}
-        base.update(overrides)
-        return base
-
-    def _completion_result(self, **overrides):
-        base = {"ok": True, "error": None, "roadmap_id": "RM-001",
-                "old_status": "active", "new_status": "active", "changed": False}
         base.update(overrides)
         return base
 
@@ -410,9 +405,10 @@ class TestTelegramResponses(unittest.TestCase):
 
         async def run():
             with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
-                 patch("business_core.roadmap_manager.update_stage_status_in_sheet",
-                       return_value=self._update_result(
-                           ok=False, changed=False, final_status="pending",
+                 patch("business_core.business_builder.transition_stage_status",
+                       return_value=self._transition_result(
+                           ok=False, code="STAGE_WRITE_PARTIAL_FAILURE",
+                           changed=False, final_status="pending",
                            error="Не удалось записать Status: timeout")):
                 await th.updatestage_cmd(upd, ctx)
 
@@ -431,14 +427,10 @@ class TestTelegramResponses(unittest.TestCase):
 
         async def run():
             with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
-                 patch("business_core.roadmap_manager.update_stage_status_in_sheet",
-                       return_value=self._update_result(
+                 patch("business_core.business_builder.transition_stage_status",
+                       return_value=self._transition_result(
                            partial_success=True,
-                           warnings=("Не удалось обновить Completed At: timeout",))), \
-                 patch("business_core.roadmap_manager.recalculate_roadmap_progress",
-                       return_value=self._progress_result()), \
-                 patch("business_core.roadmap_manager.maybe_complete_roadmap",
-                       return_value=self._completion_result()):
+                           downstream_failures=("Не удалось обновить Completed At: timeout",))):
                 await th.updatestage_cmd(upd, ctx)
 
         _run(run())
@@ -460,10 +452,11 @@ class TestTelegramResponses(unittest.TestCase):
 
         async def run():
             with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
-                 patch("business_core.roadmap_manager.update_stage_status_in_sheet",
-                       return_value=self._update_result()), \
-                 patch("business_core.roadmap_manager.recalculate_roadmap_progress",
-                       return_value=self._progress_result(ok=False, error="429 quota")):
+                 patch("business_core.business_builder.transition_stage_status",
+                       return_value=self._transition_result(
+                           code="PROGRESS_RECALCULATION_FAILED", partial_success=True,
+                           progress_before=None, progress_after=None,
+                           downstream_failures=("Не удалось пересчитать прогресс: 429 quota",))):
                 await th.updatestage_cmd(upd, ctx)
 
         _run(run())
@@ -480,18 +473,17 @@ class TestTelegramResponses(unittest.TestCase):
 
         async def run():
             with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
-                 patch("business_core.roadmap_manager.update_stage_status_in_sheet",
-                       return_value=self._update_result()), \
-                 patch("business_core.roadmap_manager.recalculate_roadmap_progress",
-                       return_value=self._progress_result(new_progress=100)), \
-                 patch("business_core.roadmap_manager.maybe_complete_roadmap",
-                       return_value=self._completion_result(ok=False, error="429 quota")):
+                 patch("business_core.business_builder.transition_stage_status",
+                       return_value=self._transition_result(
+                           code="ROADMAP_AUTO_COMPLETION_FAILED", partial_success=True,
+                           progress_before=33, progress_after=100,
+                           downstream_failures=("Не удалось проверить завершение Roadmap: 429 quota",))):
                 await th.updatestage_cmd(upd, ctx)
 
         _run(run())
         reply = upd.message.reply_text.call_args[0][0]
         self.assertIn("⚠️", reply)
-        self.assertIn("Завершение roadmap", reply)
+        self.assertIn("завершение Roadmap", reply)
 
     def test_full_success_response_unchanged_shape(self):
         th = _fresh_th()
@@ -502,12 +494,8 @@ class TestTelegramResponses(unittest.TestCase):
 
         async def run():
             with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
-                 patch("business_core.roadmap_manager.update_stage_status_in_sheet",
-                       return_value=self._update_result()), \
-                 patch("business_core.roadmap_manager.recalculate_roadmap_progress",
-                       return_value=self._progress_result()), \
-                 patch("business_core.roadmap_manager.maybe_complete_roadmap",
-                       return_value=self._completion_result()):
+                 patch("business_core.business_builder.transition_stage_status",
+                       return_value=self._transition_result()):
                 await th.updatestage_cmd(upd, ctx)
 
         _run(run())
@@ -525,12 +513,8 @@ class TestTelegramResponses(unittest.TestCase):
 
         async def run():
             with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
-                 patch("business_core.roadmap_manager.update_stage_status_in_sheet",
-                       return_value=self._update_result()), \
-                 patch("business_core.roadmap_manager.recalculate_roadmap_progress",
-                       return_value=self._progress_result(old_progress="33", new_progress=67)), \
-                 patch("business_core.roadmap_manager.maybe_complete_roadmap",
-                       return_value=self._completion_result()):
+                 patch("business_core.business_builder.transition_stage_status",
+                       return_value=self._transition_result(progress_before=33, progress_after=67)):
                 await th.updatestage_cmd(upd, ctx)
 
         _run(run())
@@ -546,13 +530,10 @@ class TestTelegramResponses(unittest.TestCase):
 
         async def run():
             with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
-                 patch("business_core.roadmap_manager.update_stage_status_in_sheet",
-                       return_value=self._update_result()), \
-                 patch("business_core.roadmap_manager.recalculate_roadmap_progress",
-                       return_value=self._progress_result(new_progress=100)), \
-                 patch("business_core.roadmap_manager.maybe_complete_roadmap",
-                       return_value=self._completion_result(
-                           changed=True, old_status="active", new_status="completed")):
+                 patch("business_core.business_builder.transition_stage_status",
+                       return_value=self._transition_result(
+                           progress_before=67, progress_after=100,
+                           roadmap_status_before="active", roadmap_status_after="completed")):
                 await th.updatestage_cmd(upd, ctx)
 
         _run(run())

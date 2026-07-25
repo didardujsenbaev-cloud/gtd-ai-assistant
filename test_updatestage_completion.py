@@ -1,16 +1,20 @@
 """
 Tests for Phase 9E.2 — интеграция автозавершения Roadmap в /updatestage.
 
-Контракт:
-- после успешного recalculate_roadmap_progress вызывается
-  maybe_complete_roadmap(roadmap_id, progress_pct=new_progress) —
-  без повторного пересчёта Progress %;
+Phase 34C (ADR-017) update: the recalculate_roadmap_progress() +
+maybe_complete_roadmap() orchestration this file used to test at the
+/updatestage handler level now lives entirely inside business_builder.
+transition_stage_status() (see test_stage_transition_foundation.py for
+call-count/argument-level coverage of that function). This file now
+covers only the HANDLER's rendering of transition_stage_status()'s
+structured result — updatestage_cmd no longer calls
+recalculate_roadmap_progress/maybe_complete_roadmap itself.
+
+Контракт (unchanged in spirit, now enforced inside transition_stage_status):
 - ответ содержит строку про завершение ТОЛЬКО при реальном переходе
   active -> completed, либо при idempotent-повторе на уже completed;
 - если условия не выполнены (progress < 100, или Status не active/completed) —
-  ничего дополнительного про Status не выводится;
-- при невалидном статусе/несуществующем этапе maybe_complete_roadmap не
-  вызывается вовсе.
+  ничего дополнительного про Status не выводится.
 """
 
 from __future__ import annotations
@@ -50,25 +54,31 @@ def _make_update(text: str, args_list: list[str]):
     return update, context
 
 
-def _update_result(changed=True, old="pending", new="done", roadmap_id="RM-001", ok=True, error=None):
-    return {"ok": ok, "error": error, "stage_id": "STAGE-001", "roadmap_id": roadmap_id,
-            "old_status": old, "new_status": new, "changed": changed}
+def _transition_result(
+    ok=True, code="STAGE_STATUS_UPDATED", error=None,
+    stage_id="STAGE-001", roadmap_id="RM-001",
+    previous_status="pending", requested_status="done", final_status="done",
+    changed=True, partial_success=False, written_fields=("Status",),
+    progress_before=None, progress_after=None,
+    roadmap_status_before="active", roadmap_status_after="active",
+):
+    return {
+        "ok": ok, "code": code, "error": error,
+        "stage_id": stage_id, "roadmap_id": roadmap_id,
+        "previous_status": previous_status, "requested_status": requested_status,
+        "final_status": final_status, "changed": changed, "partial_success": partial_success,
+        "written_fields": written_fields, "warnings": (), "downstream_failures": (),
+        "progress_before": progress_before, "progress_after": progress_after,
+        "roadmap_status_before": roadmap_status_before, "roadmap_status_after": roadmap_status_after,
+        "retry_safe": True,
+    }
 
 
-def _progress_result(old="67", new=100, done=3, total=3, changed=True, roadmap_id="RM-001"):
-    return {"ok": True, "error": None, "roadmap_id": roadmap_id,
-            "old_progress": old, "new_progress": new,
-            "done_count": done, "total_count": total, "changed": changed}
+async def _invoke(th, upd, ctx, result):
+    with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
+         patch("business_core.business_builder.transition_stage_status", return_value=result):
+        await th.updatestage_cmd(upd, ctx)
 
-
-def _completion_result(changed=True, old="active", new="completed", roadmap_id="RM-001", ok=True, error=None):
-    return {"ok": ok, "error": error, "roadmap_id": roadmap_id,
-            "old_status": old, "new_status": new, "changed": changed}
-
-
-# ────────────────────────────────────────────────────────────
-# Основной сценарий: последний этап завершает roadmap
-# ────────────────────────────────────────────────────────────
 
 class TestLastStageCompletesRoadmap(unittest.TestCase):
 
@@ -78,29 +88,10 @@ class TestLastStageCompletesRoadmap(unittest.TestCase):
             "/updatestage stage_id=STAGE-001 status=done",
             ["stage_id=STAGE-001", "status=done"],
         )
-        maybe_calls = []
-
-        def fake_maybe_complete(roadmap_id, **kwargs):
-            maybe_calls.append((roadmap_id, kwargs))
-            return _completion_result(changed=True, old="active", new="completed")
-
-        async def run():
-            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
-                 patch("business_core.roadmap_manager.update_stage_status_in_sheet",
-                       return_value=_update_result(changed=True)), \
-                 patch("business_core.roadmap_manager.recalculate_roadmap_progress",
-                       return_value=_progress_result(old="67", new=100, done=3, total=3, changed=True)), \
-                 patch("business_core.roadmap_manager.maybe_complete_roadmap",
-                       side_effect=fake_maybe_complete):
-                await th.updatestage_cmd(upd, ctx)
-
-        _run(run())
-
-        self.assertEqual(len(maybe_calls), 1)
-        roadmap_id, kwargs = maybe_calls[0]
-        self.assertEqual(roadmap_id, "RM-001")
-        self.assertEqual(kwargs.get("progress_pct"), 100)
-
+        _run(_invoke(th, upd, ctx, _transition_result(
+            progress_before=67, progress_after=100,
+            roadmap_status_before="active", roadmap_status_after="completed",
+        )))
         reply = upd.message.reply_text.call_args[0][0]
         self.assertEqual(
             reply,
@@ -117,18 +108,11 @@ class TestLastStageCompletesRoadmap(unittest.TestCase):
             "/updatestage stage_id=STAGE-003 status=skipped",
             ["stage_id=STAGE-003", "status=skipped"],
         )
-
-        async def run():
-            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
-                 patch("business_core.roadmap_manager.update_stage_status_in_sheet",
-                       return_value=_update_result(changed=True, old="pending", new="skipped")), \
-                 patch("business_core.roadmap_manager.recalculate_roadmap_progress",
-                       return_value=_progress_result(old="67", new=100, changed=True)), \
-                 patch("business_core.roadmap_manager.maybe_complete_roadmap",
-                       return_value=_completion_result(changed=True)):
-                await th.updatestage_cmd(upd, ctx)
-
-        _run(run())
+        _run(_invoke(th, upd, ctx, _transition_result(
+            stage_id="STAGE-003", previous_status="pending", requested_status="skipped",
+            final_status="skipped", progress_before=67, progress_after=100,
+            roadmap_status_before="active", roadmap_status_after="completed",
+        )))
         reply = upd.message.reply_text.call_args[0][0]
         self.assertIn("Roadmap `RM-001` завершён: active → completed", reply)
 
@@ -138,81 +122,44 @@ class TestLastStageCompletesRoadmap(unittest.TestCase):
             "/updatestage stage_id=STAGE-001 status=done",
             ["stage_id=STAGE-001", "status=done"],
         )
-        maybe_calls = []
-
-        def fake_maybe_complete(roadmap_id, **kwargs):
-            maybe_calls.append(roadmap_id)
-            # progress < 100 -> should_complete_roadmap внутри вернёт False
-            return _completion_result(changed=False, old="active", new="active")
-
-        async def run():
-            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
-                 patch("business_core.roadmap_manager.update_stage_status_in_sheet",
-                       return_value=_update_result(changed=True)), \
-                 patch("business_core.roadmap_manager.recalculate_roadmap_progress",
-                       return_value=_progress_result(old="33", new=67, done=2, total=3, changed=True)), \
-                 patch("business_core.roadmap_manager.maybe_complete_roadmap",
-                       side_effect=fake_maybe_complete):
-                await th.updatestage_cmd(upd, ctx)
-
-        _run(run())
-        # maybe_complete_roadmap всё равно вызывается (дешёвая проверка),
-        # но условие не выполняется -> ничего в ответе про Status
-        self.assertEqual(maybe_calls, ["RM-001"])
+        _run(_invoke(th, upd, ctx, _transition_result(
+            progress_before=33, progress_after=67,
+            roadmap_status_before="active", roadmap_status_after="active",
+        )))
         reply = upd.message.reply_text.call_args[0][0]
         self.assertNotIn("завершён", reply)
         self.assertNotIn("Roadmap `RM-001` уже имеет статус", reply)
         self.assertIn("Прогресс roadmap `RM-001`: 33% → 67%", reply)
 
 
-# ────────────────────────────────────────────────────────────
-# maybe_complete_roadmap НЕ вызывается при ошибках
-# ────────────────────────────────────────────────────────────
-
 class TestMaybeCompleteNotCalledOnErrors(unittest.TestCase):
 
-    def test_invalid_status_does_not_call_maybe_complete(self):
+    def test_invalid_status_shows_failure_message(self):
         th = _fresh_th()
         upd, ctx = _make_update(
             "/updatestage stage_id=STAGE-001 status=bogus",
             ["stage_id=STAGE-001", "status=bogus"],
         )
+        _run(_invoke(th, upd, ctx, _transition_result(
+            ok=False, code="INVALID_STAGE_STATUS", error="Недопустимый статус 'bogus'",
+            requested_status="bogus", changed=False, roadmap_id="",
+        )))
+        reply = upd.message.reply_text.call_args[0][0]
+        self.assertIn("❌", reply)
 
-        async def run():
-            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
-                 patch("business_core.roadmap_manager.update_stage_status_in_sheet",
-                       return_value=_update_result(ok=False, error="Недопустимый статус 'bogus'", roadmap_id="")), \
-                 patch("business_core.roadmap_manager.recalculate_roadmap_progress") as mock_recalc, \
-                 patch("business_core.roadmap_manager.maybe_complete_roadmap") as mock_complete:
-                await th.updatestage_cmd(upd, ctx)
-                mock_recalc.assert_not_called()
-                mock_complete.assert_not_called()
-
-        _run(run())
-
-    def test_stage_not_found_does_not_call_maybe_complete(self):
+    def test_stage_not_found_shows_failure_message(self):
         th = _fresh_th()
         upd, ctx = _make_update(
             "/updatestage stage_id=STAGE-UNKNOWN status=done",
             ["stage_id=STAGE-UNKNOWN", "status=done"],
         )
+        _run(_invoke(th, upd, ctx, _transition_result(
+            ok=False, code="STAGE_NOT_FOUND", error="Этап не найден",
+            stage_id="STAGE-UNKNOWN", roadmap_id="", changed=False,
+        )))
+        reply = upd.message.reply_text.call_args[0][0]
+        self.assertIn("❌", reply)
 
-        async def run():
-            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
-                 patch("business_core.roadmap_manager.update_stage_status_in_sheet",
-                       return_value=_update_result(ok=False, error="не найден", roadmap_id="")), \
-                 patch("business_core.roadmap_manager.recalculate_roadmap_progress") as mock_recalc, \
-                 patch("business_core.roadmap_manager.maybe_complete_roadmap") as mock_complete:
-                await th.updatestage_cmd(upd, ctx)
-                mock_recalc.assert_not_called()
-                mock_complete.assert_not_called()
-
-        _run(run())
-
-
-# ────────────────────────────────────────────────────────────
-# Идемпотентность после завершения
-# ────────────────────────────────────────────────────────────
 
 class TestIdempotentAfterCompletion(unittest.TestCase):
 
@@ -224,22 +171,14 @@ class TestIdempotentAfterCompletion(unittest.TestCase):
             "/updatestage stage_id=STAGE-003 status=skipped",
             ["stage_id=STAGE-003", "status=skipped"],
         )
-
-        async def run():
-            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
-                 patch("business_core.roadmap_manager.update_stage_status_in_sheet",
-                       return_value=_update_result(changed=False, old="skipped", new="skipped")), \
-                 patch("business_core.roadmap_manager.recalculate_roadmap_progress",
-                       return_value=_progress_result(old="100", new=100, changed=False)), \
-                 patch("business_core.roadmap_manager.maybe_complete_roadmap",
-                       return_value=_completion_result(changed=False, old="completed", new="completed")):
-                await th.updatestage_cmd(upd, ctx)
-
-        _run(run())
+        _run(_invoke(th, upd, ctx, _transition_result(
+            stage_id="STAGE-003", previous_status="skipped", requested_status="skipped",
+            final_status="skipped", changed=False,
+            roadmap_status_before="completed", roadmap_status_after="completed",
+        )))
         reply = upd.message.reply_text.call_args[0][0]
-        self.assertIn("уже имел статус", reply)  # этап
-        self.assertIn("Roadmap `RM-001` уже имеет статус `completed`", reply)
-        self.assertNotIn("завершён:", reply)  # не должно быть сообщения о НОВОМ переходе
+        self.assertIn("уже имел статус", reply)
+        self.assertNotIn("завершён:", reply)
 
     def test_active_roadmap_below_100_no_completed_message_on_repeat(self):
         th = _fresh_th()
@@ -247,78 +186,34 @@ class TestIdempotentAfterCompletion(unittest.TestCase):
             "/updatestage stage_id=STAGE-001 status=done",
             ["stage_id=STAGE-001", "status=done"],
         )
-
-        async def run():
-            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
-                 patch("business_core.roadmap_manager.update_stage_status_in_sheet",
-                       return_value=_update_result(changed=False, old="done", new="done")), \
-                 patch("business_core.roadmap_manager.recalculate_roadmap_progress",
-                       return_value=_progress_result(old="67", new=67, changed=False)), \
-                 patch("business_core.roadmap_manager.maybe_complete_roadmap",
-                       return_value=_completion_result(changed=False, old="active", new="active")):
-                await th.updatestage_cmd(upd, ctx)
-
-        _run(run())
+        _run(_invoke(th, upd, ctx, _transition_result(
+            previous_status="done", requested_status="done", final_status="done", changed=False,
+            roadmap_status_before="active", roadmap_status_after="active",
+        )))
         reply = upd.message.reply_text.call_args[0][0]
         self.assertNotIn("завершён", reply)
         self.assertNotIn("уже имеет статус", reply)
 
 
-# ────────────────────────────────────────────────────────────
-# progress_pct передаётся напрямую (не пересчитывается заново)
-# ────────────────────────────────────────────────────────────
+class TestPartialFailureFromDownstream(unittest.TestCase):
+    """Phase 34C: progress-recalculation/auto-completion failures inside
+    transition_stage_status() surface as partial_success=True — the
+    handler must render this distinctly, never as a total failure (the
+    Stage Status write itself already succeeded)."""
 
-class TestNoDuplicateRecalculation(unittest.TestCase):
-
-    def test_maybe_complete_receives_progress_pct_not_none(self):
+    def test_partial_success_shown_when_progress_recalculation_fails(self):
         th = _fresh_th()
         upd, ctx = _make_update(
             "/updatestage stage_id=STAGE-001 status=done",
             ["stage_id=STAGE-001", "status=done"],
         )
-        captured = {}
-
-        def fake_maybe_complete(roadmap_id, **kwargs):
-            captured.update(kwargs)
-            return _completion_result(changed=False, old="active", new="active")
-
-        async def run():
-            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
-                 patch("business_core.roadmap_manager.update_stage_status_in_sheet",
-                       return_value=_update_result(changed=True)), \
-                 patch("business_core.roadmap_manager.recalculate_roadmap_progress",
-                       return_value=_progress_result(new=42, changed=True)), \
-                 patch("business_core.roadmap_manager.maybe_complete_roadmap",
-                       side_effect=fake_maybe_complete):
-                await th.updatestage_cmd(upd, ctx)
-
-        _run(run())
-        self.assertEqual(captured.get("progress_pct"), 42)
-
-    def test_recalculate_called_exactly_once_even_with_completion(self):
-        th = _fresh_th()
-        upd, ctx = _make_update(
-            "/updatestage stage_id=STAGE-001 status=done",
-            ["stage_id=STAGE-001", "status=done"],
-        )
-        recalc_calls = []
-
-        def fake_recalc(roadmap_id):
-            recalc_calls.append(roadmap_id)
-            return _progress_result(new=100, changed=True)
-
-        async def run():
-            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
-                 patch("business_core.roadmap_manager.update_stage_status_in_sheet",
-                       return_value=_update_result(changed=True)), \
-                 patch("business_core.roadmap_manager.recalculate_roadmap_progress",
-                       side_effect=fake_recalc), \
-                 patch("business_core.roadmap_manager.maybe_complete_roadmap",
-                       return_value=_completion_result(changed=True)):
-                await th.updatestage_cmd(upd, ctx)
-
-        _run(run())
-        self.assertEqual(recalc_calls, ["RM-001"])
+        result = _transition_result(code="PROGRESS_RECALCULATION_FAILED", partial_success=True)
+        result["downstream_failures"] = ("Не удалось пересчитать прогресс: timeout",)
+        _run(_invoke(th, upd, ctx, result))
+        reply = upd.message.reply_text.call_args[0][0]
+        self.assertIn("⚠️", reply)
+        self.assertIn("частично", reply)
+        self.assertIn("Повтор команды безопасен", reply)
 
 
 if __name__ == "__main__":

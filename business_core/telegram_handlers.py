@@ -2687,6 +2687,110 @@ async def stages_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 # /updatestage — обновить статус этапа (Phase 9B)
 # ─────────────────────────────────────────────────────────────
 
+# Phase 34C (ADR-017 §12): centralized error_code -> Russian message
+# mapping for business_builder.transition_stage_status()'s structured
+# result. Presentation only — every branch here reacts to a field the
+# orchestration function already computed; none of them re-validate
+# anything, mirroring the Phase 33D Roadmap-creation UX pattern.
+_STAGE_TRANSITION_ERROR_MESSAGES: dict[str, str] = {
+    "STAGE_NOT_FOUND": "Этап не найден.",
+    "ROADMAP_NOT_FOUND": "Roadmap для этапа не найден.",
+    "INVALID_STAGE_STATUS": "Недопустимый статус.",
+    "INVALID_STAGE_TRANSITION": "Такой переход статуса не разрешён.",
+    "STAGE_REOPEN_REQUIRES_EXPLICIT_ACTION": (
+        "Этап уже завершён/пропущен — обычное обновление не может вернуть "
+        "его в предыдущий статус. Требуется отдельное явное действие "
+        "reopen (пока не реализовано)."
+    ),
+    "ROADMAP_ON_HOLD": "Roadmap приостановлен (on_hold) — изменение статуса этапа не разрешено.",
+    "ROADMAP_COMPLETED": "Roadmap завершён — изменение статуса этапа не разрешено.",
+    "ROADMAP_CANCELLED": "Roadmap отменён — изменение статуса этапа не разрешено.",
+    "STAGE_WRITE_PARTIAL_FAILURE": "Не удалось подтверждённо записать статус этапа.",
+}
+
+
+def _stage_transition_failure_message(result: dict, stage_id: str, status: str) -> str:
+    """
+    Render a failed transition_stage_status() result (ok=False) into a
+    single Russian Telegram message. Never exposes a raw stack trace or
+    Python object — an unmapped code gets a safe generic fallback and a
+    logged warning for triage.
+    """
+    code = result.get("code", "")
+    known_message = _STAGE_TRANSITION_ERROR_MESSAGES.get(code)
+    if known_message:
+        return "\n".join([
+            "❌ Не удалось обновить этап",
+            f"Этап: `{stage_id}`",
+            f"Текущий подтверждённый статус: `{result.get('final_status') or '—'}`",
+            f"Причина: {result.get('error') or known_message}",
+        ])
+    if code:
+        log.warning(
+            "updatestage_cmd: unmapped code=%r for stage_id=%s requested_status=%s",
+            code, stage_id, status,
+        )
+        return "❌ Не удалось обновить этап из-за ошибки проверки данных. Попробуй ещё раз позже."
+    return f"❌ Не удалось обновить этап: {result.get('error') or 'неизвестная ошибка'}"
+
+
+def _stage_transition_success_lines(result: dict, stage_id: str, notes: Optional[str]) -> list[str]:
+    """
+    Render a successful transition_stage_status() result (ok=True) into
+    the list of message lines — which may still carry a downstream
+    partial-failure notice (progress recalculation or Roadmap
+    auto-completion). Presentation only.
+    """
+    changed = result.get("changed")
+    previous_status = result.get("previous_status")
+    final_status = result.get("final_status")
+    roadmap_id = result.get("roadmap_id") or ""
+    downstream_failures = list(result.get("downstream_failures", ()))
+    partial_success = bool(result.get("partial_success"))
+
+    if partial_success:
+        lines = [
+            "⚠️ Статус этапа обновлён частично",
+            f"Этап: `{stage_id}`",
+            f"Статус подтверждён: {previous_status} → {final_status}" if changed
+            else f"Статус подтверждён: `{final_status}` (без изменений)",
+        ]
+        if downstream_failures:
+            lines.append("Не удалось обновить:")
+            for item in downstream_failures:
+                lines.append(f"- {item}")
+        lines.append("Повтор команды безопасен.")
+    elif changed:
+        lines = ["✅ Этап обновлён", f"Этап: `{stage_id}`",
+                 f"Статус: {previous_status} → {final_status}"]
+    else:
+        lines = [
+            f"ℹ️ Этап `{stage_id}` уже имел статус `{final_status}` "
+            "(изменений нет, повтор безопасен).",
+        ]
+
+    if changed and roadmap_id:
+        progress_before = result.get("progress_before")
+        progress_after = result.get("progress_after")
+        if progress_after is not None:
+            if progress_before is not None and progress_before != progress_after:
+                lines.append(f"Прогресс roadmap `{roadmap_id}`: {progress_before}% → {progress_after}%")
+            else:
+                lines.append(f"Прогресс roadmap `{roadmap_id}` уже {progress_after}%")
+
+        roadmap_status_before = result.get("roadmap_status_before")
+        roadmap_status_after = result.get("roadmap_status_after")
+        if roadmap_status_after and roadmap_status_after != roadmap_status_before:
+            lines.append(f"✅ Roadmap `{roadmap_id}` завершён: {roadmap_status_before} → {roadmap_status_after}")
+        elif roadmap_status_after == "completed":
+            lines.append(f"ℹ️ Roadmap `{roadmap_id}` уже имеет статус `completed`")
+
+    if notes is not None:
+        lines.append(f"Notes обновлены: {notes}")
+
+    return lines
+
+
 async def updatestage_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Обновить статус этапа дорожной карты.
@@ -2734,115 +2838,38 @@ async def updatestage_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     try:
-        from business_core.roadmap_manager import (
-            update_stage_status_in_sheet,
-            recalculate_roadmap_progress,
-            maybe_complete_roadmap,
+        from business_core.business_builder import transition_stage_status
+
+        # Phase 34C (ADR-017): transition_stage_status() is the sole
+        # canonical orchestration boundary — it resolves the Stage, the
+        # parent Roadmap, checks Roadmap eligibility (active/on_hold/
+        # completed/cancelled), validates the current→target transition
+        # (including the done/skipped explicit-reopen block), persists
+        # Status, recalculates Progress %, and maybe auto-completes the
+        # Roadmap. This handler only parses input and renders the
+        # structured result — it no longer calls update_stage_status_in_sheet,
+        # recalculate_roadmap_progress, or maybe_complete_roadmap itself.
+        result = transition_stage_status(stage_id, status, notes=notes)
+
+        log.info(
+            "updatestage_cmd result: ok=%s code=%s stage_id=%s roadmap_id=%s "
+            "previous_status=%s requested_status=%s final_status=%s changed=%s "
+            "partial_success=%s downstream_failures=%s",
+            result.get("ok"), result.get("code"), stage_id, result.get("roadmap_id") or "",
+            result.get("previous_status"), result.get("requested_status"),
+            result.get("final_status"), result.get("changed"),
+            result.get("partial_success"), result.get("downstream_failures") or (),
         )
 
-        result = update_stage_status_in_sheet(stage_id, status, notes=notes)
-
-        # Phase 19B-1: ok=False means the requested Status was NOT
-        # confirmed committed — this is the only case that gets the
-        # "total failure" response. final_status still reflects the
-        # best honestly-known current state (never a guess).
         if not result["ok"]:
-            await _reply(update, "\n".join([
-                "❌ Не удалось обновить этап",
-                f"Этап: `{stage_id}`",
-                f"Текущий подтверждённый статус: `{result.get('final_status') or '—'}`",
-                f"Причина: {result['error']}",
-            ]))
+            await _reply(update, _stage_transition_failure_message(result, stage_id, status))
             return
 
-        # Downstream (Progress %, roadmap auto-completion) failures are
-        # collected separately — they NEVER flip the already-confirmed
-        # Status result back to a failure (Part D: stage_update_ok,
-        # progress warning/error, and roadmap-completion warning/error
-        # are three independent signals, never conflated).
-        downstream_failures: list[str] = []
-
-        roadmap_id = result.get("roadmap_id", "")
-        progress_line = None
-        completion_line = None
-        if roadmap_id:
-            progress = recalculate_roadmap_progress(roadmap_id)
-            if progress["ok"]:
-                if progress["changed"]:
-                    progress_line = (
-                        f"Прогресс roadmap `{roadmap_id}`: "
-                        f"{progress['old_progress']}% → {progress['new_progress']}%"
-                    )
-                else:
-                    progress_line = f"Прогресс roadmap `{roadmap_id}` уже {progress['new_progress']}%"
-
-                # Phase 9E.2: автозавершение — только если Progress %
-                # реально пересчитан.
-                completion = maybe_complete_roadmap(roadmap_id, progress_pct=progress["new_progress"])
-                if completion["ok"]:
-                    if completion["changed"]:
-                        completion_line = (
-                            f"✅ Roadmap `{roadmap_id}` завершён: "
-                            f"{completion['old_status']} → {completion['new_status']}"
-                        )
-                    elif completion["old_status"] == "completed":
-                        completion_line = f"ℹ️ Roadmap `{roadmap_id}` уже имеет статус `completed`"
-                else:
-                    downstream_failures.append(f"Завершение roadmap: {completion['error']}")
-            else:
-                downstream_failures.append(f"Прогресс roadmap: {progress['error']}")
-                downstream_failures.append(
-                    "Прогресс roadmap может требовать пересчёта — повтори "
-                    f"`/updatestage stage_id={stage_id} status={status}` при необходимости."
-                )
-
-        stage_field_failures = [
-            w for w in result.get("warnings", ())
-        ]
-        is_partial = bool(result.get("partial_success")) or bool(downstream_failures)
-
-        if is_partial:
-            lines = [
-                "⚠️ Статус этапа обновлён частично",
-                f"Этап: `{stage_id}`",
-                f"Статус подтверждён: {result['old_status']} → {result['new_status']}"
-                if result["changed"] else
-                f"Статус подтверждён: `{result['new_status']}` (без изменений)",
-            ]
-            failed_items = stage_field_failures + downstream_failures
-            if failed_items:
-                lines.append("Не удалось обновить:")
-                for item in failed_items:
-                    lines.append(f"- {item}")
-            lines.append("Повтор команды безопасен.")
-            if progress_line:
-                lines.append(progress_line)
-            if completion_line:
-                lines.append(completion_line)
-            await _reply(update, "\n".join(lines))
-            return
-
-        if result["changed"]:
-            lines = ["✅ Этап обновлён", f"Этап: `{stage_id}`",
-                     f"Статус: {result['old_status']} → {result['new_status']}"]
-        else:
-            lines = [
-                f"ℹ️ Этап `{stage_id}` уже имел статус `{result['new_status']}` "
-                "(изменений нет, повтор безопасен).",
-            ]
-
-        if progress_line:
-            lines.append(progress_line)
-        if completion_line:
-            lines.append(completion_line)
-        if notes is not None:
-            lines.append(f"Notes обновлены: {notes}")
-
-        await _reply(update, "\n".join(lines))
+        await _reply(update, "\n".join(_stage_transition_success_lines(result, stage_id, notes)))
 
     except Exception as e:
         log.error(f"updatestage_cmd error: {e}")
-        await _reply(update, f"❌ Ошибка: {e}")
+        await _reply(update, "❌ Не удалось обработать команду из-за внутренней ошибки. Попробуй ещё раз позже.")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -2978,14 +3005,25 @@ async def _stage_edit_execute(update: Update, context: ContextTypes.DEFAULT_TYPE
         return ConversationHandler.END
 
     try:
-        from business_core.roadmap_manager import update_stage_fields
+        from business_core.business_builder import transition_stage_status, update_stage_admin_fields
 
         stage_id = snap["stage_id"]
-        # Phase 28D: point-write now goes through roadmap_manager's
-        # canonical field-update primitive (staleness re-read + header-
-        # mapped write + column allowlist all now live there) instead of
-        # this handler touching Sheets directly.
-        result = update_stage_fields(stage_id, snap["writes"])
+        writes = dict(snap["writes"])
+
+        # Phase 34C (ADR-017): a "Status" key (only /blockstage and
+        # /unblockstage's writes ever carry one) must go through the
+        # canonical transition-orchestration boundary, never
+        # roadmap_manager.update_stage_fields directly — otherwise this
+        # shared confirm step would be a second place capable of
+        # changing Stage Status with zero Roadmap-eligibility check.
+        # Every other admin-only field (Responsible/Due Date/Priority/
+        # Blocking Reason alone) goes through update_stage_admin_fields,
+        # which enforces the looser admin-field eligibility instead.
+        target_status = writes.pop("Status", None)
+        if target_status is not None:
+            result = transition_stage_status(stage_id, target_status, admin_fields=writes or None)
+        else:
+            result = update_stage_admin_fields(stage_id, writes)
 
         if not result["ok"]:
             await update.message.reply_text(

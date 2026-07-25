@@ -416,6 +416,9 @@ class TestUpdateStageCommand(unittest.TestCase):
         self.assertTrue(hasattr(th, "updatestage_cmd"))
 
     def test_happy_path_status_only(self):
+        """Phase 34C: updatestage_cmd now calls business_builder.
+        transition_stage_status() — the sole orchestration boundary —
+        instead of the low-level roadmap_manager functions directly."""
         th = _fresh_th()
         upd, ctx = _make_update(
             "/updatestage stage_id=STAGE-001-01 status=done",
@@ -424,9 +427,17 @@ class TestUpdateStageCommand(unittest.TestCase):
 
         async def run():
             with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
-                 patch("business_core.roadmap_manager.update_stage_status_in_sheet",
-                       return_value={"ok": True, "error": None, "stage_id": "STAGE-001-01",
-                                     "old_status": "pending", "new_status": "done", "changed": True}):
+                 patch("business_core.business_builder.transition_stage_status",
+                       return_value={
+                           "ok": True, "code": "STAGE_STATUS_UPDATED", "error": None,
+                           "stage_id": "STAGE-001-01", "roadmap_id": "RM-001",
+                           "previous_status": "pending", "requested_status": "done",
+                           "final_status": "done", "changed": True, "partial_success": False,
+                           "written_fields": ("Status", "Completed At"), "warnings": (),
+                           "downstream_failures": (), "progress_before": 0, "progress_after": 13,
+                           "roadmap_status_before": "active", "roadmap_status_after": "active",
+                           "retry_safe": True,
+                       }):
                 await th.updatestage_cmd(upd, ctx)
 
         _run(run())
@@ -443,15 +454,23 @@ class TestUpdateStageCommand(unittest.TestCase):
         )
         captured = {}
 
-        def fake_update(stage_id, status, notes=None):
+        def fake_transition(stage_id, target_status, notes=None, admin_fields=None):
             captured["notes"] = notes
-            return {"ok": True, "error": None, "stage_id": stage_id,
-                    "old_status": "pending", "new_status": status, "changed": True}
+            return {
+                "ok": True, "code": "STAGE_STATUS_UPDATED", "error": None,
+                "stage_id": stage_id, "roadmap_id": "RM-001",
+                "previous_status": "pending", "requested_status": target_status,
+                "final_status": target_status, "changed": True, "partial_success": False,
+                "written_fields": ("Status", "Notes"), "warnings": (), "downstream_failures": (),
+                "progress_before": 0, "progress_after": 0,
+                "roadmap_status_before": "active", "roadmap_status_after": "active",
+                "retry_safe": True,
+            }
 
         async def run():
             with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
-                 patch("business_core.roadmap_manager.update_stage_status_in_sheet",
-                       side_effect=fake_update):
+                 patch("business_core.business_builder.transition_stage_status",
+                       side_effect=fake_transition):
                 await th.updatestage_cmd(upd, ctx)
 
         _run(run())
@@ -493,10 +512,17 @@ class TestUpdateStageCommand(unittest.TestCase):
 
         async def run():
             with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
-                 patch("business_core.roadmap_manager.update_stage_status_in_sheet",
-                       return_value={"ok": False, "error": "Этап 'STAGE-UNKNOWN' не найден",
-                                     "stage_id": "STAGE-UNKNOWN", "old_status": "", "new_status": "done",
-                                     "changed": False}):
+                 patch("business_core.business_builder.transition_stage_status",
+                       return_value={
+                           "ok": False, "code": "STAGE_NOT_FOUND",
+                           "error": "Этап STAGE-UNKNOWN не найден",
+                           "stage_id": "STAGE-UNKNOWN", "roadmap_id": "",
+                           "previous_status": "", "requested_status": "done", "final_status": "",
+                           "changed": False, "partial_success": False, "written_fields": (),
+                           "warnings": (), "downstream_failures": (),
+                           "progress_before": None, "progress_after": None,
+                           "roadmap_status_before": "", "roadmap_status_after": "", "retry_safe": True,
+                       }):
                 await th.updatestage_cmd(upd, ctx)
 
         _run(run())
@@ -513,11 +539,18 @@ class TestUpdateStageCommand(unittest.TestCase):
 
         async def run():
             with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
-                 patch("business_core.roadmap_manager.update_stage_status_in_sheet",
-                       return_value={"ok": False, "error": "Недопустимый статус 'bogus'. "
-                                     "Допустимые значения: pending, in_progress, blocked, done, skipped",
-                                     "stage_id": "STAGE-001-01", "old_status": "", "new_status": "bogus",
-                                     "changed": False}):
+                 patch("business_core.business_builder.transition_stage_status",
+                       return_value={
+                           "ok": False, "code": "INVALID_STAGE_STATUS",
+                           "error": "Недопустимый статус 'bogus'. "
+                                    "Допустимые значения: pending, in_progress, blocked, done, skipped",
+                           "stage_id": "STAGE-001-01", "roadmap_id": "RM-001",
+                           "previous_status": "pending", "requested_status": "bogus", "final_status": "pending",
+                           "changed": False, "partial_success": False, "written_fields": (),
+                           "warnings": (), "downstream_failures": (),
+                           "progress_before": None, "progress_after": None,
+                           "roadmap_status_before": "active", "roadmap_status_after": "active", "retry_safe": True,
+                       }):
                 await th.updatestage_cmd(upd, ctx)
 
         _run(run())
@@ -534,9 +567,16 @@ class TestUpdateStageCommand(unittest.TestCase):
 
         async def run():
             with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
-                 patch("business_core.roadmap_manager.update_stage_status_in_sheet",
-                       return_value={"ok": True, "error": None, "stage_id": "STAGE-001-01",
-                                     "old_status": "done", "new_status": "done", "changed": False}):
+                 patch("business_core.business_builder.transition_stage_status",
+                       return_value={
+                           "ok": True, "code": "STAGE_STATUS_UNCHANGED", "error": None,
+                           "stage_id": "STAGE-001-01", "roadmap_id": "RM-001",
+                           "previous_status": "done", "requested_status": "done", "final_status": "done",
+                           "changed": False, "partial_success": False, "written_fields": ("Status",),
+                           "warnings": (), "downstream_failures": (),
+                           "progress_before": None, "progress_after": None,
+                           "roadmap_status_before": "active", "roadmap_status_after": "active", "retry_safe": True,
+                       }):
                 await th.updatestage_cmd(upd, ctx)
 
         _run(run())
@@ -552,9 +592,9 @@ class TestUpdateStageCommand(unittest.TestCase):
 
         async def run():
             with patch("business_core.telegram_handlers._is_bc_enabled", return_value=False), \
-                 patch("business_core.roadmap_manager.update_stage_status_in_sheet") as mock_update:
+                 patch("business_core.business_builder.transition_stage_status") as mock_transition:
                 await th.updatestage_cmd(upd, ctx)
-                mock_update.assert_not_called()
+                mock_transition.assert_not_called()
 
         _run(run())
 
