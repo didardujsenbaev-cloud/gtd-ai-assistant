@@ -162,7 +162,9 @@ class TestCreateRoadmapWritesByActualHeaders(unittest.TestCase):
         sheet = MagicMock()
         sheet.row_values.return_value = headers
 
-        with patch("business_core.sheets.get_business_sheet", return_value=sheet), \
+        with patch("business_core.service_manager.find_service_by_id",
+                   return_value={"service_id": "SVC-IZH-001", "status": "active"}), \
+             patch("business_core.sheets.get_business_sheet", return_value=sheet), \
              patch("business_core.sheets.append_business_row",
                    side_effect=lambda k, r: rows.append((k, r))), \
              patch.object(bb, "generate_roadmap_id", return_value="RM-600"):

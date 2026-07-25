@@ -290,14 +290,16 @@ class TestServiceHeaderSafeIdAndDateGeneration(unittest.TestCase):
         mock_gen.assert_called_once()
         self.assertEqual(result["service_id"], "SVC-555")
 
-    def test_status_normalization_unchanged(self):
+    def test_unknown_status_rejected_no_write(self):
+        """Phase 29CD, Decision 6: unknown status is rejected on the
+        write path (validate_service_status), not silently folded into
+        'active' the way normalize_service_status (read/display path)
+        still does."""
         sheet = _make_service_sheet(STANDARD_HEADERS)
         result, sheet = _run_create(sheet, status="unknown_status")
-        self.assertTrue(result["ok"])
-        kwargs = sheet.update.call_args.kwargs
-        values = kwargs["values"][0]
-        idx = {h: i for i, h in enumerate(STANDARD_HEADERS)}
-        self.assertEqual(values[idx["Статус"]], "active")  # normalize_service_status fallback
+        self.assertFalse(result["ok"])
+        self.assertIn("unknown_status", result["error"])
+        sheet.update.assert_not_called()
 
 
 class TestServiceHeaderSafeLegacyAnomalousSchemaRegression(unittest.TestCase):

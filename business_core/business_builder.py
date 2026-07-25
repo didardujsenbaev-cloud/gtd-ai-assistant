@@ -1498,6 +1498,28 @@ def create_roadmap_for_object(
     if not service_id or not service_id.strip():
         return _empty_roadmap_creation_result("service_id обязателен")
 
+    # Phase 29CD, Decision 7: Roadmap может быть создан только для
+    # существующего Service со статусом active. Проверка находится
+    # здесь (orchestration), а не в roadmap_manager.create_roadmap_record
+    # — existence/status validation не относится к persistence owner.
+    # Выполняется до find_active_roadmap_for_object(), до
+    # create_roadmap_record(), до ensure_roadmap_stages(), до Extension
+    # operations — без production writes при отказе.
+    from business_core.service_manager import find_service_by_id, SERVICE_STATUSES
+    service = find_service_by_id(service_id)
+    if service is None:
+        return _empty_roadmap_creation_result(f"Service {service_id} не найден")
+    service_status = (service.get("status") or "").strip().lower()
+    if service_status not in SERVICE_STATUSES:
+        return _empty_roadmap_creation_result(
+            f"Service {service_id}: неизвестный статус '{service_status}' — Roadmap не создан"
+        )
+    if service_status != "active":
+        return _empty_roadmap_creation_result(
+            f"Service {service_id} имеет статус '{service_status}' — "
+            f"Roadmap можно создать только для Service со статусом active"
+        )
+
     if not title:
         title = f"Roadmap {obj_id}" + (f" / {service_id}" if service_id else "")
 

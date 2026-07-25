@@ -522,16 +522,17 @@ async def newroadmap_service(update: Update, context: ContextTypes.DEFAULT_TYPE)
     text = update.message.text.strip()
     context.user_data["nr"]["service_name"] = text
 
-    # Находим service_id
+    # Находим service_id (Phase 29CD, Part 6: owner API вместо raw
+    # read_business_sheet("service_catalog")). Ambiguity policy:
+    # 0 совпадений — не найдено (service_id не выставляется, как и
+    # раньше); 1 совпадение — выбрать; >1 совпадений — не выбирать
+    # первое молча (раньше выбирался первый по порядку в листе).
     try:
-        from business_core.sheets import read_business_sheet
-        rows = read_business_sheet("service_catalog")
+        from business_core.service_manager import find_services_by_name
         biz_id = context.user_data["nr"].get("business_id", "")
-        for r in rows:
-            if text.lower() in r.get("Название", "").lower():
-                if not biz_id or r.get("Бизнес ID", "") == biz_id:
-                    context.user_data["nr"]["service_id"] = r.get("ID", "")
-                    break
+        matches = find_services_by_name(text, biz_id=biz_id or None, active_only=True)
+        if len(matches) == 1:
+            context.user_data["nr"]["service_id"] = matches[0].get("service_id", "")
     except Exception:
         pass
 
@@ -1603,29 +1604,44 @@ async def init_bc(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             ("Стратегическая сессия",              "BIZ-003", "Онлайн", "50000",  "150000", "7"),
         ]
 
-        existing_svc = read_business_sheet("service_catalog")
-        existing_svc_names = {r.get("Название", "").lower() for r in existing_svc}
+        # Phase 29CD: /initbc больше не пишет service_catalog напрямую
+        # (append_business_row + собственная генерация ID/slug) — оба
+        # шага теперь принадлежат владельцу, business_core.service_manager
+        # .create_service_record(), которая идемпотентна по duplicate key
+        # (Business ID, normalized Service Name) — повторный /initbc
+        # безопасен и переиспользует уже созданные услуги вместо
+        # собственной name-based проверки, которая раньше это делала.
+        from business_core.service_manager import create_service_record
         added_svc = 0
+        reused_svc = 0
+        svc_errors: list[str] = []
 
         for (name, biz_id, city, price_min, price_max, days) in default_services:
-            if name.lower() in existing_svc_names:
+            svc_result = create_service_record(
+                biz_id=biz_id,
+                service_name=name,
+                city=city,
+                price_from=price_min,
+                price_to=price_max,
+                estimated_duration=days,
+            )
+            if not svc_result["ok"]:
+                svc_errors.append(f"{name}: {svc_result['error']}")
                 continue
-            svc_id = generate_next_id("service_catalog", "SVC")
-            row = [
-                svc_id, biz_id, name,
-                name.lower().replace(" ", "-"),
-                "active", city, price_min, price_max, days,
-                "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "",
-            ]
-            append_business_row("service_catalog", row)
-            existing_svc_names.add(name.lower())
-            added_svc += 1
+            if svc_result["service_created"]:
+                added_svc += 1
+            elif svc_result["service_reused"]:
+                reused_svc += 1
 
         lines = [
             "✅ *Business Core инициализирован!*",
             "",
             f"🏢 Бизнесов добавлено: {added_biz} (пропущено: {skipped_biz})",
             f"🛠 Услуг добавлено: {added_svc}",
+        ]
+        if svc_errors:
+            lines.append(f"⚠️ Ошибки услуг: {len(svc_errors)}")
+        lines += [
             "",
             "Теперь попробуй:",
             "/bc — дашборд",
@@ -4817,9 +4833,14 @@ async def services_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     filter_status      = args.get("status",       "")
 
     try:
-        from business_core.service_manager import _load_services, normalize_service_status
+        from business_core.service_manager import list_services, normalize_service_status
 
-        rows, _ = _load_services()
+        # Phase 29CD, Part 5: public list_services() вместо приватного
+        # helper-загрузчика service_manager'а — статус здесь намеренно
+        # не фильтруется по умолчанию (список всех статусов), чтобы
+        # сохранить прежний UX /services; filter_status ниже фильтрует
+        # явно, если задан.
+        rows = list_services()
 
         if filter_biz_id:
             rows = [r for r in rows if r.get("biz_id") == filter_biz_id]

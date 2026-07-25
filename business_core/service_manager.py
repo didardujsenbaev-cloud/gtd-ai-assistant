@@ -101,10 +101,18 @@ def generate_service_id() -> str:
 
 def normalize_service_status(status: str) -> str:
     """
-    Нормализовать статус услуги.
+    Нормализовать статус услуги для READ/display-пути (например,
+    иконки в /services, /service — легаси-строки в проде не должны
+    ломать отображение).
 
     Допустимые: active, inactive, draft.
     Неизвестные значения → active.
+
+    Phase 29CD: для WRITE-пути (create_service_record) эта функция
+    больше НЕ используется — см. validate_service_status(), которая
+    отклоняет неизвестные значения вместо молчаливого fallback.
+    Обе функции сознательно сосуществуют: read-side остаётся
+    терпимым к историческим данным, write-side — строгим.
     """
     if not status:
         return "active"
@@ -112,9 +120,122 @@ def normalize_service_status(status: str) -> str:
     return s if s in SERVICE_STATUSES else "active"
 
 
+def validate_service_status(status: Optional[str]) -> str:
+    """
+    Строго провалидировать статус услуги для WRITE-пути (Phase 29CD,
+    Decision 6).
+
+    status is None или "" (аргумент не передан / передан пустым) →
+    documented default "active".
+    status передан непустым, но не входит в SERVICE_STATUSES →
+    ValueError с понятным текстом (никогда не сворачивается в
+    "active" молча).
+
+    Returns:
+        нормализованное (trim + lower) каноническое значение статуса.
+
+    Raises:
+        ValueError: если status передан, но не входит в vocabulary.
+    """
+    if status is None:
+        return "active"
+    s = status.strip().lower()
+    if not s:
+        return "active"
+    if s not in SERVICE_STATUSES:
+        raise ValueError(
+            f"Неизвестный статус услуги: '{status}'. "
+            f"Допустимые значения: {', '.join(sorted(SERVICE_STATUSES))}"
+        )
+    return s
+
+
+def normalize_service_name(value: str) -> str:
+    """
+    Нормализовать название услуги для duplicate-key сравнения
+    (Phase 29CD, Decision 2/Decision "Part 1").
+
+    trim → схлопнуть повторные пробелы → Unicode NFKC normalization →
+    casefold. Используется ТОЛЬКО для сравнения ключей — display-имя
+    (колонки "Название"/"Service Name" самой строки) не переписывается.
+
+    Возвращает "" если исходное значение пустое/состоит только из
+    пробелов — вызывающий код (create_service_record) сам решает,
+    считать ли это ошибкой.
+    """
+    import re
+    import unicodedata
+    v = unicodedata.normalize("NFKC", value or "")
+    v = re.sub(r"\s+", " ", v.strip())
+    return v.casefold()
+
+
 # ═══════════════════════════════════════════════════════════════
 # CRUD
 # ═══════════════════════════════════════════════════════════════
+
+def _service_result(
+    ok:              bool,
+    service_id:      str = "",
+    error:           Optional[str] = None,
+    service_created: bool = False,
+    service_reused:  bool = False,
+    warnings:        Optional[list[str]] = None,
+) -> dict:
+    """Единая return-shape helper для create_service_record (Phase 29CD) —
+    старые поля (ok/service_id/error) сохранены для существующих
+    вызывающих кодов, новые (service_created/service_reused/warnings)
+    добавлены аддитивно и присутствуют во всех ветках."""
+    return {
+        "ok":              ok,
+        "service_id":      service_id,
+        "error":           error,
+        "service_created": service_created,
+        "service_reused":  service_reused,
+        "warnings":        list(warnings or []),
+    }
+
+
+# Поля запроса create_service_record, для которых проверяется
+# mismatch с уже существующей (reused) записью при повторном вызове
+# с тем же duplicate key. Каждая пара — (имя параметра функции,
+# канонический ключ в _row_to_dict/_COL_ALIASES).
+_MISMATCH_CHECK_FIELDS = (
+    ("service_category",           "service_category"),
+    ("city",                       "city"),
+    ("object_type",                "object_type"),
+    ("client_type",                "client_type"),
+    ("price_from",                 "price_from"),
+    ("price_to",                   "price_to"),
+    ("estimated_duration",         "duration"),
+    ("default_roadmap_template_id", "default_roadmap_template_id"),
+    ("description",                "description"),
+)
+
+
+def _diff_mismatch_fields(existing: dict, requested: dict, resolved_status: str, status_explicit: bool) -> list[str]:
+    """Сравнить только ЯВНО переданные (непустые) поля запроса с уже
+    сохранённой (reused) записью. Поля, которые вызывающий не указал
+    (значение по умолчанию "" / status не передан), не считаются
+    mismatch — вызывающий не просил их менять."""
+    warnings: list[str] = []
+    for param_name, row_key in _MISMATCH_CHECK_FIELDS:
+        requested_value = str(requested.get(param_name, "") or "").strip()
+        if not requested_value:
+            continue
+        existing_value = str(existing.get(row_key, "") or "").strip()
+        if requested_value != existing_value:
+            warnings.append(
+                f"{param_name}: запрошено '{requested_value}', в существующей записи '{existing_value}'"
+            )
+    if status_explicit:
+        existing_status = str(existing.get("status", "") or "").strip().lower()
+        if resolved_status != existing_status:
+            warnings.append(
+                f"status: запрошено '{resolved_status}', в существующей записи '{existing_status}'"
+            )
+    return warnings
+
 
 def create_service_record(
     biz_id:                     str,
@@ -135,11 +256,23 @@ def create_service_record(
     risks:                      str = "",
     contractors_needed:         str = "",
     materials_ids:              str = "",
-    status:                     str = "active",
+    status:                     Optional[str] = None,
     notes:                      str = "",
 ) -> dict:
     """
-    Создать новую запись в SERVICE_CATALOG.
+    Создать (или конвергентно переиспользовать) запись в SERVICE_CATALOG.
+
+    Phase 29CD, Decision 2/3: duplicate-safe/idempotent create.
+    Duplicate key = (Business ID, normalized Service Name) — см.
+    normalize_service_name(). Повторный вызов с тем же ключом НЕ
+    создаёт вторую строку: возвращает существующий Service
+    (service_reused=True), при этом существующие поля НИКОГДА не
+    перезаписываются молча — расхождения возвращаются как warnings.
+
+    status: None/не передан → documented default "active". Передан,
+    но не входит в SERVICE_STATUSES → ValueError-текст в error,
+    ничего не записывается (Decision 6 — раньше неизвестный статус
+    молча превращался в "active").
 
     Args:
         biz_id:        BIZ-ID бизнеса (обязательный)
@@ -147,16 +280,63 @@ def create_service_record(
 
     Returns:
         {
-            "ok":         bool,
-            "service_id": str,
-            "error":      str | None,
+            "ok":              bool,
+            "service_id":      str,
+            "error":           str | None,
+            "service_created": bool,  # True только если создана новая строка
+            "service_reused":  bool,  # True если найден существующий Service по duplicate key
+            "warnings":        list[str],  # mismatch-поля при reuse, или integrity-детали
         }
     """
-    if not biz_id or not service_name:
-        return {
-            "ok": False, "service_id": "",
-            "error": "Обязательные поля: biz_id, service_name",
+    if not biz_id or not (service_name or "").strip():
+        return _service_result(False, error="Обязательные поля: biz_id, service_name")
+
+    normalized_name = normalize_service_name(service_name)
+    if not normalized_name:
+        return _service_result(False, error="service_name пустой после нормализации")
+
+    try:
+        resolved_status = validate_service_status(status)
+    except ValueError as exc:
+        return _service_result(False, error=str(exc))
+
+    try:
+        rows, _ = _load_services()
+        existing_matches = [
+            r for r in rows
+            if r.get("biz_id") == biz_id
+            and normalize_service_name(r.get("service_name", "")) == normalized_name
+        ]
+    except Exception as exc:
+        return _service_result(False, error=str(exc))
+
+    if len(existing_matches) > 1:
+        ids = [m.get("service_id", "") for m in existing_matches]
+        return _service_result(
+            False,
+            error=(
+                f"integrity: найдено {len(existing_matches)} существующих Service "
+                f"по duplicate key (biz_id={biz_id!r}, name={service_name!r}): {ids}. "
+                f"Новая запись не создана."
+            ),
+            warnings=[f"duplicate key matches: {ids}"],
+        )
+
+    if len(existing_matches) == 1:
+        existing = existing_matches[0]
+        requested = {
+            "service_category": service_category, "city": city,
+            "object_type": object_type, "client_type": client_type,
+            "price_from": price_from, "price_to": price_to,
+            "estimated_duration": estimated_duration,
+            "default_roadmap_template_id": default_roadmap_template_id,
+            "description": description,
         }
+        warnings = _diff_mismatch_fields(existing, requested, resolved_status, status is not None)
+        return _service_result(
+            True, service_id=existing.get("service_id", ""),
+            service_created=False, service_reused=True, warnings=warnings,
+        )
 
     try:
         from business_core.sheets import (
@@ -166,7 +346,7 @@ def create_service_record(
         )
         now        = datetime.now().strftime("%Y-%m-%d")
         service_id = generate_service_id()
-        status     = normalize_service_status(status)
+        status     = resolved_status
         if not currency:
             currency = "KZT"
         slug = _make_slug(service_name)
@@ -246,11 +426,11 @@ def create_service_record(
         })
         append_business_row("service_catalog", row)
         log.info(f"create_service_record: {service_id} / {biz_id} / {service_name}")
-        return {"ok": True, "service_id": service_id, "error": None}
+        return _service_result(True, service_id=service_id, service_created=True, service_reused=False)
 
     except Exception as exc:
         log.error(f"create_service_record error: {exc}")
-        return {"ok": False, "service_id": "", "error": str(exc)}
+        return _service_result(False, error=str(exc))
 
 
 def _make_slug(name: str) -> str:
@@ -339,6 +519,74 @@ def list_active_services(biz_id: str = "") -> list[dict]:
         return results
     except Exception as exc:
         log.warning(f"list_active_services error: {exc}")
+        return []
+
+
+def list_services(biz_id: str = "") -> list[dict]:
+    """
+    Список ВСЕХ услуг (любого статуса), опционально фильтруя по
+    бизнесу — public-обёртка над _load_services() (Phase 29CD, Part 5),
+    чтобы вызывающий код (например /services со своими собственными
+    object_type/city/status фильтрами) не обращался к private
+    _load_services() напрямую. В отличие от list_active_services()
+    статус не фильтруется — сохраняет прежнее поведение /services
+    (по умолчанию показывает услуги любого статуса).
+    """
+    try:
+        rows, _ = _load_services()
+        if biz_id:
+            rows = [r for r in rows if r.get("biz_id") == biz_id]
+        return rows
+    except Exception as exc:
+        log.warning(f"list_services error: {exc}")
+        return []
+
+
+def find_services_by_name(
+    query:       str,
+    biz_id:      Optional[str] = None,
+    active_only: bool = True,
+) -> list[dict]:
+    """
+    Найти услуги по подстроке в названии — owner-level read API
+    (Phase 29CD, Part 3/Decision 8), заменяет прежний прямой
+    read_business_sheet("service_catalog") вызов из легаси
+    /newroadmap-хендлера (newroadmap_service).
+
+    Сравнение case-insensitive и whitespace-normalized (через
+    normalize_service_name) — substring-поведение сохранено, т.к.
+    именно так работал прежний UX (частичное совпадение по названию).
+
+    Args:
+        query:       подстрока для поиска в названии (обязательна)
+        biz_id:      опционально ограничить одним бизнесом
+        active_only: по умолчанию True — inactive/draft не возвращаются
+                     (легаси /newroadmap не должен предлагать неактивные
+                     услуги)
+
+    Returns:
+        list[dict] в порядке следования строк листа (deterministic).
+        Пустой/пробельный query → [] (без ошибки — вызывающий сам
+        решает, как реагировать на пустой ввод).
+    """
+    needle = normalize_service_name(query)
+    if not needle:
+        return []
+    try:
+        rows, _ = _load_services()
+        results = []
+        for r in rows:
+            hay = normalize_service_name(r.get("service_name", ""))
+            if not hay or needle not in hay:
+                continue
+            if biz_id and r.get("biz_id") != biz_id:
+                continue
+            if active_only and normalize_service_status(r.get("status", "")) != "active":
+                continue
+            results.append(r)
+        return results
+    except Exception as exc:
+        log.warning(f"find_services_by_name({query}) error: {exc}")
         return []
 
 

@@ -159,7 +159,9 @@ class TestCreateRoadmapForObject(unittest.TestCase):
         # модулей сотрёт патч, и create_roadmap_for_object уйдёт в реальный
         # Google Sheets API (тот же паттерн, что уже использовался ниже
         # для append_business_row/generate_next_id).
-        with patch("business_core.sheets.get_business_sheet",
+        with patch("business_core.service_manager.find_service_by_id",
+                   return_value={"service_id": "SVC-001", "status": "active"}), \
+             patch("business_core.sheets.get_business_sheet",
                    return_value=_make_roadmaps_sheet()), \
              patch("business_core.sheets.append_business_row") as mock_ap, \
              patch("business_core.sheets.generate_next_id", return_value="RM-001"):
@@ -180,7 +182,9 @@ class TestCreateRoadmapForObject(unittest.TestCase):
         """D: create_roadmap_for_object сохраняет biz_id, client_id, service_id."""
         bb = self._reload_bb()
 
-        with patch("business_core.sheets.get_business_sheet",
+        with patch("business_core.service_manager.find_service_by_id",
+                   return_value={"service_id": "SVC-002", "status": "active"}), \
+             patch("business_core.sheets.get_business_sheet",
                    return_value=_make_roadmaps_sheet()), \
              patch("business_core.sheets.append_business_row") as mock_ap, \
              patch("business_core.sheets.generate_next_id", return_value="RM-001"):
@@ -238,7 +242,9 @@ class TestCreateRoadmapForObjectExtensionOrchestration(unittest.TestCase):
 
     def test_calls_roadmap_manager_create_roadmap_record_not_raw_sheets(self):
         bb = self._reload_bb()
-        with patch("business_core.roadmap_manager.create_roadmap_record",
+        with patch("business_core.service_manager.find_service_by_id",
+                   return_value={"service_id": "SVC-001", "status": "active"}), \
+             patch("business_core.roadmap_manager.create_roadmap_record",
                    return_value={"ok": True, "roadmap_id": "RM-900", "roadmap": {}, "error": None}) as mock_create, \
              patch("business_core.roadmap_template_manager.find_template_stages", return_value=[]), \
              patch("business_core.sheets.append_business_row") as mock_append:
@@ -260,7 +266,9 @@ class TestCreateRoadmapForObjectExtensionOrchestration(unittest.TestCase):
         def failing_copy(template_stage_id, stage_id):
             raise RuntimeError("simulated transient relation-copy failure")
 
-        with patch("business_core.roadmap_manager.create_roadmap_record",
+        with patch("business_core.service_manager.find_service_by_id",
+                   return_value={"service_id": "SVC-001", "status": "active"}), \
+             patch("business_core.roadmap_manager.create_roadmap_record",
                    return_value={"ok": True, "roadmap_id": "RM-901", "roadmap": {}, "error": None}), \
              patch("business_core.roadmap_template_manager.find_template_stages",
                    return_value=self._template_rows()), \
@@ -296,7 +304,9 @@ class TestCreateRoadmapForObjectExtensionOrchestration(unittest.TestCase):
         def ok_copy(template_stage_id, stage_id):
             return CopyRelationsResult(template_stage_id=template_stage_id, stage_id=stage_id, created=())
 
-        with patch("business_core.roadmap_manager.create_roadmap_record",
+        with patch("business_core.service_manager.find_service_by_id",
+                   return_value={"service_id": "SVC-001", "status": "active"}), \
+             patch("business_core.roadmap_manager.create_roadmap_record",
                    return_value={"ok": True, "roadmap_id": "RM-902", "roadmap": {}, "error": None}), \
              patch("business_core.roadmap_template_manager.find_template_stages",
                    return_value=self._template_rows()), \
@@ -332,7 +342,9 @@ class TestCreateRoadmapForObjectExtensionOrchestration(unittest.TestCase):
         own idempotency guarantee."""
         bb = self._reload_bb()
 
-        with patch("business_core.roadmap_manager.create_roadmap_record",
+        with patch("business_core.service_manager.find_service_by_id",
+                   return_value={"service_id": "SVC-001", "status": "active"}), \
+             patch("business_core.roadmap_manager.create_roadmap_record",
                    return_value={"ok": True, "roadmap_id": "RM-903", "roadmap": {}, "error": None}), \
              patch("business_core.roadmap_template_manager.find_template_stages",
                    return_value=self._template_rows()), \

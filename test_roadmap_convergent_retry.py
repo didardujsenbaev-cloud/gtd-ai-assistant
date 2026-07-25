@@ -52,7 +52,9 @@ class _OkCopy:
 class TestFirstRunCreatesRoadmapAndStages(unittest.TestCase):
     def test_first_call_creates_roadmap_and_all_stages(self):
         bb = _fresh_bb()
-        with patch("business_core.roadmap_manager.find_active_roadmap_for_object", return_value=None), \
+        with patch("business_core.service_manager.find_service_by_id",
+                   return_value={"service_id": "SVC-TEST", "status": "active"}), \
+             patch("business_core.roadmap_manager.find_active_roadmap_for_object", return_value=None), \
              patch("business_core.roadmap_manager.create_roadmap_record",
                    return_value={"ok": True, "roadmap_id": "RM-100", "roadmap": {}, "error": None}) as mock_create, \
              patch("business_core.roadmap_template_manager.find_template_stages", return_value=_template_rows(2)), \
@@ -80,7 +82,9 @@ class TestSecondIdenticalRunDoesNotDuplicate(unittest.TestCase):
             "roadmap_id": "RM-100", "object_id": "OBJ-100", "service_id": "SVC-100",
             "status": "active", "template_id": "RMT-001",
         }
-        with patch("business_core.roadmap_manager.find_active_roadmap_for_object", return_value=existing_roadmap), \
+        with patch("business_core.service_manager.find_service_by_id",
+                   return_value={"service_id": "SVC-TEST", "status": "active"}), \
+             patch("business_core.roadmap_manager.find_active_roadmap_for_object", return_value=existing_roadmap), \
              patch("business_core.roadmap_manager.list_roadmaps", return_value=[existing_roadmap]), \
              patch("business_core.roadmap_manager.create_roadmap_record") as mock_create, \
              patch("business_core.roadmap_template_manager.find_template_stages", return_value=_template_rows(2)), \
@@ -104,7 +108,9 @@ class TestSecondIdenticalRunDoesNotDuplicate(unittest.TestCase):
             "roadmap_id": "RM-100", "object_id": "OBJ-100", "service_id": "SVC-100",
             "status": "active", "template_id": "RMT-001",
         }
-        with patch("business_core.roadmap_manager.find_active_roadmap_for_object", return_value=existing_roadmap), \
+        with patch("business_core.service_manager.find_service_by_id",
+                   return_value={"service_id": "SVC-TEST", "status": "active"}), \
+             patch("business_core.roadmap_manager.find_active_roadmap_for_object", return_value=existing_roadmap), \
              patch("business_core.roadmap_manager.list_roadmaps", return_value=[existing_roadmap]), \
              patch("business_core.roadmap_template_manager.find_template_stages", return_value=_template_rows(2)), \
              patch("business_core.roadmap_manager.ensure_roadmap_stages",
@@ -127,7 +133,9 @@ class TestPartialCoreStateRecovery(unittest.TestCase):
             "roadmap_id": "RM-101", "object_id": "OBJ-101", "service_id": "SVC-101",
             "status": "active", "template_id": "RMT-001",
         }
-        with patch("business_core.roadmap_manager.find_active_roadmap_for_object", return_value=existing_roadmap), \
+        with patch("business_core.service_manager.find_service_by_id",
+                   return_value={"service_id": "SVC-TEST", "status": "active"}), \
+             patch("business_core.roadmap_manager.find_active_roadmap_for_object", return_value=existing_roadmap), \
              patch("business_core.roadmap_manager.list_roadmaps", return_value=[existing_roadmap]), \
              patch("business_core.roadmap_template_manager.find_template_stages", return_value=_template_rows(3)), \
              patch("business_core.roadmap_manager.ensure_roadmap_stages",
@@ -150,7 +158,9 @@ class TestPartialCoreStateRecovery(unittest.TestCase):
             "roadmap_id": "RM-102", "object_id": "OBJ-102", "service_id": "SVC-102",
             "status": "active", "template_id": "RMT-001",
         }
-        with patch("business_core.roadmap_manager.find_active_roadmap_for_object", return_value=existing_roadmap), \
+        with patch("business_core.service_manager.find_service_by_id",
+                   return_value={"service_id": "SVC-TEST", "status": "active"}), \
+             patch("business_core.roadmap_manager.find_active_roadmap_for_object", return_value=existing_roadmap), \
              patch("business_core.roadmap_manager.list_roadmaps", return_value=[existing_roadmap]), \
              patch("business_core.roadmap_template_manager.find_template_stages", return_value=_template_rows(3)), \
              patch("business_core.roadmap_manager.ensure_roadmap_stages",
@@ -174,7 +184,9 @@ class TestPartialCoreStateRecovery(unittest.TestCase):
             "roadmap_id": "RM-103", "object_id": "OBJ-103", "service_id": "SVC-103",
             "status": "active", "template_id": "RMT-001",
         }
-        with patch("business_core.roadmap_manager.find_active_roadmap_for_object", return_value=existing_roadmap), \
+        with patch("business_core.service_manager.find_service_by_id",
+                   return_value={"service_id": "SVC-TEST", "status": "active"}), \
+             patch("business_core.roadmap_manager.find_active_roadmap_for_object", return_value=existing_roadmap), \
              patch("business_core.roadmap_manager.list_roadmaps", return_value=[existing_roadmap]), \
              patch("business_core.roadmap_template_manager.find_template_stages", return_value=_template_rows(2)), \
              patch("business_core.roadmap_manager.ensure_roadmap_stages",
@@ -196,7 +208,9 @@ class TestExtensionIdempotencyAndPartialFailure(unittest.TestCase):
         def failing_copy(template_stage_id, stage_id):
             raise RuntimeError("simulated relation-copy failure")
 
-        with patch("business_core.roadmap_manager.find_active_roadmap_for_object", return_value=None), \
+        with patch("business_core.service_manager.find_service_by_id",
+                   return_value={"service_id": "SVC-TEST", "status": "active"}), \
+             patch("business_core.roadmap_manager.find_active_roadmap_for_object", return_value=None), \
              patch("business_core.roadmap_manager.create_roadmap_record",
                    return_value={"ok": True, "roadmap_id": "RM-104", "roadmap": {}, "error": None}), \
              patch("business_core.roadmap_template_manager.find_template_stages", return_value=_template_rows(1)), \
@@ -226,7 +240,9 @@ class TestExtensionIdempotencyAndPartialFailure(unittest.TestCase):
             "roadmap_id": "RM-105", "object_id": "OBJ-105", "service_id": "SVC-105",
             "status": "active", "template_id": "RMT-001",
         }
-        with patch("business_core.roadmap_manager.find_active_roadmap_for_object", return_value=existing_roadmap), \
+        with patch("business_core.service_manager.find_service_by_id",
+                   return_value={"service_id": "SVC-TEST", "status": "active"}), \
+             patch("business_core.roadmap_manager.find_active_roadmap_for_object", return_value=existing_roadmap), \
              patch("business_core.roadmap_manager.list_roadmaps", return_value=[existing_roadmap]), \
              patch("business_core.roadmap_template_manager.find_template_stages", return_value=_template_rows(1)), \
              patch("business_core.roadmap_manager.ensure_roadmap_stages",
@@ -250,7 +266,9 @@ class TestExtensionIdempotencyAndPartialFailure(unittest.TestCase):
             "roadmap_id": "RM-106", "object_id": "OBJ-106", "service_id": "SVC-106",
             "status": "active", "template_id": "RMT-001",
         }
-        with patch("business_core.roadmap_manager.find_active_roadmap_for_object", return_value=existing_roadmap), \
+        with patch("business_core.service_manager.find_service_by_id",
+                   return_value={"service_id": "SVC-TEST", "status": "active"}), \
+             patch("business_core.roadmap_manager.find_active_roadmap_for_object", return_value=existing_roadmap), \
              patch("business_core.roadmap_manager.list_roadmaps", return_value=[existing_roadmap]), \
              patch("business_core.roadmap_template_manager.find_template_stages", return_value=_template_rows(2)), \
              patch("business_core.roadmap_manager.ensure_roadmap_stages",
@@ -275,7 +293,9 @@ class TestTemplateMismatchPolicy(unittest.TestCase):
             "roadmap_id": "RM-107", "object_id": "OBJ-107", "service_id": "SVC-107",
             "status": "active", "template_id": "RMT-EXISTING-001",
         }
-        with patch("business_core.roadmap_manager.find_active_roadmap_for_object", return_value=existing_roadmap), \
+        with patch("business_core.service_manager.find_service_by_id",
+                   return_value={"service_id": "SVC-TEST", "status": "active"}), \
+             patch("business_core.roadmap_manager.find_active_roadmap_for_object", return_value=existing_roadmap), \
              patch("business_core.roadmap_manager.list_roadmaps", return_value=[existing_roadmap]), \
              patch("business_core.roadmap_template_manager.find_template_stages", return_value=[]) as mock_find_ts:
             result = bb.create_roadmap_for_object(
@@ -293,7 +313,9 @@ class TestTemplateMismatchPolicy(unittest.TestCase):
             "roadmap_id": "RM-108", "object_id": "OBJ-108", "service_id": "SVC-108",
             "status": "active", "template_id": "RMT-EXISTING-001",
         }
-        with patch("business_core.roadmap_manager.find_active_roadmap_for_object", return_value=existing_roadmap), \
+        with patch("business_core.service_manager.find_service_by_id",
+                   return_value={"service_id": "SVC-TEST", "status": "active"}), \
+             patch("business_core.roadmap_manager.find_active_roadmap_for_object", return_value=existing_roadmap), \
              patch("business_core.roadmap_manager.list_roadmaps", return_value=[existing_roadmap]), \
              patch("business_core.roadmap_template_manager.find_template_stages", return_value=[]):
             result = bb.create_roadmap_for_object(
@@ -318,7 +340,9 @@ class TestTemplateMismatchPolicy(unittest.TestCase):
             "roadmap_id": "RM-115", "object_id": "OBJ-115", "service_id": "SVC-115",
             "status": "active", "template_id": "RMT-EXISTING-001",
         }
-        with patch("business_core.roadmap_manager.find_active_roadmap_for_object", return_value=existing_roadmap), \
+        with patch("business_core.service_manager.find_service_by_id",
+                   return_value={"service_id": "SVC-TEST", "status": "active"}), \
+             patch("business_core.roadmap_manager.find_active_roadmap_for_object", return_value=existing_roadmap), \
              patch("business_core.roadmap_manager.list_roadmaps", return_value=[existing_roadmap]), \
              patch("business_core.roadmap_template_manager.find_template_stages", return_value=[]):
             result = bb.create_roadmap_for_object(
@@ -334,7 +358,9 @@ class TestTemplateMismatchPolicy(unittest.TestCase):
             "roadmap_id": "RM-109", "object_id": "OBJ-109", "service_id": "SVC-109",
             "status": "active", "template_id": "RMT-001",
         }
-        with patch("business_core.roadmap_manager.find_active_roadmap_for_object", return_value=existing_roadmap), \
+        with patch("business_core.service_manager.find_service_by_id",
+                   return_value={"service_id": "SVC-TEST", "status": "active"}), \
+             patch("business_core.roadmap_manager.find_active_roadmap_for_object", return_value=existing_roadmap), \
              patch("business_core.roadmap_manager.list_roadmaps", return_value=[existing_roadmap]), \
              patch("business_core.roadmap_template_manager.find_template_stages", return_value=[]):
             result = bb.create_roadmap_for_object(
@@ -350,7 +376,9 @@ class TestTemplateMismatchPolicy(unittest.TestCase):
             "roadmap_id": "RM-110", "object_id": "OBJ-110", "service_id": "SVC-110",
             "status": "active", "template_id": "",
         }
-        with patch("business_core.roadmap_manager.find_active_roadmap_for_object", return_value=existing_roadmap), \
+        with patch("business_core.service_manager.find_service_by_id",
+                   return_value={"service_id": "SVC-TEST", "status": "active"}), \
+             patch("business_core.roadmap_manager.find_active_roadmap_for_object", return_value=existing_roadmap), \
              patch("business_core.roadmap_manager.list_roadmaps", return_value=[existing_roadmap]), \
              patch("business_core.roadmap_template_manager.find_template_stages", return_value=[]) as mock_find_ts:
             result = bb.create_roadmap_for_object(
@@ -369,7 +397,9 @@ class TestActiveRoadmapUniquenessKey(unittest.TestCase):
         (obj_id, service_id) — no Client ID/Business ID/Template ID
         involved in the duplicate key."""
         bb = _fresh_bb()
-        with patch("business_core.roadmap_manager.find_active_roadmap_for_object",
+        with patch("business_core.service_manager.find_service_by_id",
+                   return_value={"service_id": "SVC-TEST", "status": "active"}), \
+             patch("business_core.roadmap_manager.find_active_roadmap_for_object",
                    return_value=None) as mock_find_active, \
              patch("business_core.roadmap_manager.create_roadmap_record",
                    return_value={"ok": True, "roadmap_id": "RM-111", "roadmap": {}, "error": None}), \
@@ -388,7 +418,9 @@ class TestActiveRoadmapUniquenessKey(unittest.TestCase):
         only existing Roadmap for this key is completed, allowing a new
         active one to be created."""
         bb = _fresh_bb()
-        with patch("business_core.roadmap_manager.find_active_roadmap_for_object",
+        with patch("business_core.service_manager.find_service_by_id",
+                   return_value={"service_id": "SVC-TEST", "status": "active"}), \
+             patch("business_core.roadmap_manager.find_active_roadmap_for_object",
                    return_value=None) as mock_find_active, \
              patch("business_core.roadmap_manager.create_roadmap_record",
                    return_value={"ok": True, "roadmap_id": "RM-112", "roadmap": {}, "error": None}) as mock_create, \
@@ -419,7 +451,9 @@ class TestDuplicateActiveRoadmapIntegrityVisibility(unittest.TestCase):
             "roadmap_id": "RM-114", "object_id": "OBJ-113", "service_id": "SVC-113",
             "status": "active", "template_id": "RMT-001",
         }
-        with patch("business_core.roadmap_manager.find_active_roadmap_for_object", return_value=first_match), \
+        with patch("business_core.service_manager.find_service_by_id",
+                   return_value={"service_id": "SVC-TEST", "status": "active"}), \
+             patch("business_core.roadmap_manager.find_active_roadmap_for_object", return_value=first_match), \
              patch("business_core.roadmap_manager.list_roadmaps", return_value=[first_match, second_match]), \
              patch("business_core.roadmap_template_manager.find_template_stages", return_value=[]):
             result = bb.create_roadmap_for_object(

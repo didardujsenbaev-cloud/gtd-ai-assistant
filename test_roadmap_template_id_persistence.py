@@ -102,7 +102,9 @@ class TestTemplateIdWrite(unittest.TestCase):
         rows = []
         sheet = self._fake_sheet(CANONICAL_ROADMAPS_HEADERS)
 
-        with patch("business_core.sheets.get_business_sheet", return_value=sheet), \
+        with patch("business_core.service_manager.find_service_by_id",
+                   return_value={"service_id": "SVC-IZH-001", "status": "active"}), \
+             patch("business_core.sheets.get_business_sheet", return_value=sheet), \
              patch("business_core.sheets.append_business_row",
                    side_effect=lambda k, r: rows.append((k, r))), \
              patch("business_core.sheets.generate_next_id", return_value="RM-500"):
@@ -142,7 +144,9 @@ class TestTemplateIdWrite(unittest.TestCase):
         ]
         sheet = self._fake_sheet(shuffled)
 
-        with patch("business_core.sheets.get_business_sheet", return_value=sheet), \
+        with patch("business_core.service_manager.find_service_by_id",
+                   return_value={"service_id": "SVC-IZH-001", "status": "active"}), \
+             patch("business_core.sheets.get_business_sheet", return_value=sheet), \
              patch("business_core.sheets.append_business_row",
                    side_effect=lambda k, r: rows.append((k, r))), \
              patch("business_core.sheets.generate_next_id", return_value="RM-503"):
@@ -166,7 +170,9 @@ class TestTemplateIdWrite(unittest.TestCase):
         rows = []
         sheet = self._fake_sheet(CANONICAL_ROADMAPS_HEADERS)
 
-        with patch("business_core.sheets.get_business_sheet", return_value=sheet), \
+        with patch("business_core.service_manager.find_service_by_id",
+                   return_value={"service_id": "SVC-IZH-001", "status": "active"}), \
+             patch("business_core.sheets.get_business_sheet", return_value=sheet), \
              patch("business_core.sheets.append_business_row",
                    side_effect=lambda k, r: rows.append((k, r))), \
              patch("business_core.sheets.generate_next_id", return_value="RM-501"):
@@ -189,7 +195,9 @@ class TestTemplateIdWrite(unittest.TestCase):
         old_headers = CANONICAL_ROADMAPS_HEADERS[:24]  # только до "Last Updated"
         sheet = self._fake_sheet(old_headers)
 
-        with patch("business_core.sheets.get_business_sheet", return_value=sheet), \
+        with patch("business_core.service_manager.find_service_by_id",
+                   return_value={"service_id": "SVC-IZH-001", "status": "active"}), \
+             patch("business_core.sheets.get_business_sheet", return_value=sheet), \
              patch("business_core.sheets.append_business_row",
                    side_effect=lambda k, r: rows.append((k, r))), \
              patch("business_core.sheets.generate_next_id", return_value="RM-504"):
