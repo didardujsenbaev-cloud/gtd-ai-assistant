@@ -1193,3 +1193,228 @@ Roadmap Object-валидация мигрированы на owner API; соз�
 retry-safe. Полный generic lifecycle/archive/delete API и
 синхронизация Current Service ID остаются отдельно отложенными (см.
 Phase 30E closeout report) — не входят в это ADR.
+
+## ADR-015 — Client Domain Ownership (Phase 31B)
+
+Контекст:
+
+Phase 31A (Client Domain Ownership Audit, read-only) показала, что
+Client не является отдельной сущностью — это Person из
+PEOPLE_REGISTRY с клиентским смыслом в свободном текстовом поле
+"Тип"; OBJECT_REGISTRY.Client ID хранит Person ID формата PRS-....
+Аудит нашёл три HIGH-проблемы: (1) в /newclient используются две
+разные duplicate-identity функции (find_existing_person и
+find_duplicate_person) с разными правилами совпадения и разной
+обработкой archived-строк; (2) telegram_handlers.py читает
+PEOPLE_REGISTRY напрямую в трёх местах (/clients, /bc dashboard,
+legacy /newroadmap client lookup), в обход owner API
+person_manager.py; (3) /newobject не требует существующей связи
+Person↔Business и молча добавляет Business ID к Person вместо
+отказа/подтверждения. Дополнительно: Client role — substring-match
+по свободному тексту без единого helper'а; multiple person matches
+разрешаются выбором первого совпадения без ambiguity-статуса;
+multi-business Drive folder policy не определена (single-slot
+Drive-ссылка на Person не может представить папку по каждому
+Business); Biz IDs/Primary Biz ID разрешены в generic update_person;
+Person↔Business link хранится как строка в одной ячейке, а не как
+relation-запись.
+
+Решение:
+
+1. Client entity model.
+
+   CLIENT_IS_SEPARATE_ENTITY = NO. CLIENT_IS_PERSON_ROLE = YES.
+   CLIENT_ID_EQUALS_PERSON_ID = YES. Отдельный client_manager.py и
+   отдельный CLIENT_REGISTRY не создаются. Client Domain закрывается
+   как специализация Person Domain. Canonical owner —
+   business_core/person_manager.py.
+
+2. Canonical Person identity policy.
+
+   Ввести единственную canonical identity API —
+   resolve_person_identity — вместо двух конкурирующих функций.
+   Иерархия: normalized phone и normalized email — сильные
+   идентификаторы (PHONE_OR_EMAIL_MATCH = strong match); normalized
+   full name — слабый идентификатор, сам по себе не подтверждает
+   identity (NAME_ONLY_MATCH = ambiguous candidate, не automatic
+   reuse). Resolver возвращает структурированный результат
+   {status: not_found|single_match|ambiguous|archived_match, person,
+   matches, matched_by, error} — никогда не выбирает первое
+   совпадение молча. MULTIPLE_PERSON_MATCHES_ARE_REJECTED = YES
+   (несколько сильных совпадений → ambiguous, а не первый результат).
+   find_existing_person и find_duplicate_person мигрируют на thin
+   wrappers над resolve_person_identity, без собственной identity
+   logic (PERSON_IDENTITY_HAS_SINGLE_IMPLEMENTATION = YES).
+
+3. Archived-person policy.
+
+   ARCHIVED_PERSON_CAN_BE_REUSED_AS_CLIENT = NO.
+   ARCHIVED_PERSON_CAN_OWN_NEW_OBJECT = NO. Совпадение только с
+   archived-строкой по сильному идентификатору возвращает отдельный
+   статус archived_match — без автосоздания дубликата и без
+   автореактивации; реактивация — отдельная будущая lifecycle-фаза.
+
+4. /newclient branch model.
+
+   Единый flow: /newclient → resolve_person_identity → NEW /
+   SAME_BIZ / OTHER_BIZ / AMBIGUOUS. AMBIGUOUS не производит никаких
+   записей (ни create_person, ни Business link, ни Drive folder) и
+   показывает список кандидатов или понятную ошибку вместо отказа
+   через raw exception.
+
+5. Client role policy.
+
+   Схема "Тип" не меняется в этом цикле (CLIENT_ROLE_STORAGE =
+   existing "Тип" field). Вводятся canonical helpers
+   is_client_person(person) и ensure_client_role(person_id) с точной
+   (не substring) проверкой распознанных значений ("клиент", "клиент
+   по узаконению" и т.п.): если поле уже содержит признанную
+   client-категорию — no-op; если поле пустое — установить "клиент";
+   если поле содержит другую непустую категорию — предупреждение без
+   молчаливой перезаписи. Полноценная multi-role модель откладывается.
+
+6. Client listing API.
+
+   Ввести list_clients(biz_id=None, query=None,
+   include_archived=False) в person_manager.py, использующий
+   is_client_person и возвращающий canonical Person dicts — без
+   substring-фильтрации в Telegram-хендлерах.
+
+7. Telegram reader migration.
+
+   /clients, /bc dashboard и legacy /newroadmap client lookup
+   мигрируют на person_manager public API.
+   TELEGRAM_HANDLERS_READ_PEOPLE_REGISTRY_DIRECTLY = NO.
+   TELEGRAM_HANDLERS_WRITE_PEOPLE_REGISTRY_DIRECTLY = NO. Единственное
+   утверждённое исключение — inbox_bridge.py (GTD-boundary файл, не
+   подлежит изменению в рамках Business Core фаз), scoped строго к
+   этому файлу, не blanket allowlist.
+
+8. Person↔Business relationship policy.
+
+   Модель "Biz IDs как multi-value cell + Primary Biz ID как
+   отдельное поле" сохраняется без relation-таблицы в этом цикле.
+   PERSON_BUSINESS_LINK_OWNER = person_manager.py.
+   PERSON_BUSINESS_LINK_MODE = ADD_ONLY. Biz IDs и Primary Biz ID
+   исключаются из allowlist generic update_person — изменения только
+   через append_person_biz_id/has_person_business_link/
+   list_person_business_ids. Удаление/переназначение Business link
+   откладывается.
+
+9. /newobject cross-business и client-role policy.
+
+   OBJECT_CREATION_REQUIRES_PERSON_LINKED_TO_OBJECT_BUSINESS = YES.
+   OBJECT_CREATION_REQUIRES_CLIENT_ROLE = YES.
+   OBJECT_CREATION_AUTO_LINKS_PERSON_TO_BUSINESS = NO. Если Person не
+   связан с Object Business или не является Client (is_client_person
+   == False) или archived — Object не создаётся, /newobject
+   отклоняет запрос с объяснением, что связь нужно оформить сначала
+   через /newclient. Никакой скрытой мутации Person со стороны
+   /newobject.
+
+10. Multi-business Client Drive policy.
+
+    Текущая single-slot Drive-ссылка на Person (Drive Folder ID/
+    Google Drive) не расширяется до per-Business модели в этом
+    цикле — переинтерпретируется как general/primary person folder
+    reference. Для OTHER_BIZ Person эта ссылка не показывается как
+    папка нового Business, и новая непредставимая Business-specific
+    папка не создаётся — вместо этого возвращается явный warning.
+    MULTI_BUSINESS_CLIENT_DRIVE_CREATES_NO_UNTRACKED_FOLDER = YES.
+    Полноценная relation-based Drive-модель откладывается до
+    отдельной фазы, требующей schema migration.
+
+11. Drive retry safety.
+
+    CLIENT_DRIVE_CREATION_IS_RETRY_SAFE = YES:
+    если Drive Folder ID/URL уже установлен — reuse без повторного
+    create; иначе — create once, persist через
+    person_manager.update_person_drive_info.
+    CLIENT_DRIVE_REFERENCE_WRITES_OWNED_BY_PERSON_MANAGER = YES.
+
+12. Lifecycle.
+
+    PERSON_HARD_DELETE_ALLOWED = NO. PERSON_MERGE_SUPPORTED = NO.
+    CLIENT_ROLE_REMOVAL_SUPPORTED = NO. Статус меняется только через
+    archive_person; Business link — только через
+    append_person_biz_id; Drive — только через
+    update_person_drive_info.
+
+13. Dependency direction.
+
+    person_manager.py импортирует только business_core.sheets (и
+    stdlib) — без обратных зависимостей на business_builder,
+    telegram_handlers, object_manager, Drive adapter или Extension-
+    модули. PERSON_MANAGER_DEPENDENCY_CYCLE_EXISTS = NO.
+    CLIENT_DOMAIN_HAS_REVERSE_DEPENDENCY = NO.
+
+14. Public API target.
+
+    normalize_person_name, normalize_phone, normalize_email,
+    resolve_person_identity, find_person_by_id, list_people,
+    list_people_by_business, list_clients, is_client_person,
+    create_person, update_person, archive_person, ensure_client_role,
+    list_person_business_ids, has_person_business_link,
+    append_person_biz_id, update_person_drive_info. Compatibility
+    wrappers допустимы, но не должны содержать отдельную business
+    logic.
+
+15. Required guards (для будущих фаз).
+
+    PEOPLE_REGISTRY_RUNTIME_WRITERS == {person_manager.py};
+    TELEGRAM_HANDLERS_WRITE_PEOPLE_REGISTRY_DIRECTLY = NO;
+    TELEGRAM_HANDLERS_READ_PEOPLE_REGISTRY_DIRECTLY = NO;
+    BUSINESS_BUILDER_WRITES_PEOPLE_REGISTRY_DIRECTLY = NO;
+    PERSON_IDENTITY_HAS_SINGLE_IMPLEMENTATION = YES;
+    PERSON_IDENTITY_NEVER_RETURNS_ARBITRARY_FIRST_MATCH = YES;
+    NAME_ONLY_MATCH_IS_NOT_AUTOMATIC_REUSE = YES;
+    CLIENT_LISTING_USES_CANONICAL_HELPER = YES;
+    PERSON_BUSINESS_LINK_MUTATION_IS_ADD_ONLY = YES;
+    OBJECT_CREATION_REQUIRES_CLIENT_ROLE = YES;
+    OBJECT_CREATION_REQUIRES_PERSON_LINKED_TO_OBJECT_BUSINESS = YES;
+    ARCHIVED_PERSON_CAN_OWN_NEW_OBJECT = NO;
+    MULTI_BUSINESS_CLIENT_DRIVE_CREATES_NO_UNTRACKED_FOLDER = YES;
+    PERSON_MANAGER_DEPENDENCY_CYCLE_EXISTS = NO. Утверждённое
+    исключение из read/write guards — inbox_bridge.py, scoped строго
+    к этому файлу.
+
+Implementation plan (не в этом ADR):
+
+Phase 31C — Canonical Identity and Client API Foundation
+(resolve_person_identity, normalize_email, is_client_person,
+list_clients, ensure_client_role, Business-link query API, исключение
+Biz IDs/Primary Biz ID из generic update_person, guards; без
+deployment, если production paths не меняются).
+
+Phase 31D — Caller Migration and Cross-domain Validation (/newclient
+на canonical resolver; /clients, /bc, legacy /newroadmap на
+person_manager API; /newobject — Client role + существующий Business
+link required, без silent auto-link, отказ для archived Person;
+безопасный Drive для OTHER_BIZ; тесты; deploy).
+
+Phase 31E — Client Domain Closeout Audit (ownership, identity, role
+behavior, Person↔Business, Object integration, Drive, production
+integrity, финальное закрытие домена).
+
+Deferred (явно откладывается, не блокирует Client Domain closeout при
+соблюдении временных политик выше): отдельный CLIENT_REGISTRY;
+relation-таблица Person↔Business; multi-role schema; per-Business
+Client Drive reference model; Person merge; Client role removal;
+Business-link removal; archived Person reactivation; schema migration.
+
+Причина:
+
+Тот же архитектурный принцип, что уже закрыл Roadmap/Service/Object
+Domain (единственный transactional owner на реестр, defense-in-depth
+валидация на границе orchestration, устранение прямых обходов реестра
+из Telegram-хендлеров) применяется к Client Domain — но в отличие от
+Object Domain, здесь не требуется новый manager, поскольку
+person_manager.py уже существует и уже является единственным
+transactional writer'ом; проблема — в конкурирующей identity-логике,
+в оставшихся raw readers и в отсутствующей cross-domain валидации на
+границе Object creation, а не в отсутствии owner API как таковой.
+
+Статус:
+
+Утверждено для реализации (Phase 31C/31D/31E). Ничего не
+реализовано в рамках этого ADR — только архитектурное решение.
