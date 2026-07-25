@@ -935,9 +935,10 @@ def generate_object_id() -> str:
     """
     Сгенерировать следующий OBJ ID из OBJECT_REGISTRY.
 
-    Phase 30C: thin compatibility wrapper — delegates to
-    object_manager.generate_object_id() (canonical owner). Migrate
-    callers onto object_manager directly in Phase 30D.
+    Thin compatibility wrapper — delegates to
+    object_manager.generate_object_id() (canonical owner). Kept for
+    callers that still import ID generation from business_builder;
+    new callers should import object_manager directly.
 
     Returns:
         str — следующий OBJ ID
@@ -963,20 +964,21 @@ def create_object_record(
     """
     Создать запись объекта недвижимости в OBJECT_REGISTRY.
 
-    Phase 30C: thin compatibility wrapper — delegates all persistence,
+    Thin compatibility wrapper — delegates all persistence,
     normalization, status validation and duplicate-safe logic to
     object_manager.create_object_record() (canonical owner). Preserves
-    this function's existing signature and "obj_id"-keyed return shape
-    for its current caller (telegram_handlers.newobject_cmd); migrate
-    that caller onto object_manager directly in Phase 30D. Additive
-    fields (object_created/object_reused/warnings) are passed through.
+    this function's original signature and "obj_id"-keyed return shape,
+    which telegram_handlers.newobject_cmd relies on (Phase 30D) — kept
+    permanently as the shape-translation point for that caller, not a
+    transitional stub. Additive fields (object_created/object_reused/
+    warnings) are passed through unchanged from object_manager.
 
     Returns:
         {
             "ok":     bool,
             "obj_id": str,
             "error":  str | None,
-            # additive (Phase 30C):
+            # additive:
             "object_created": bool,
             "object_reused":  bool,
             "warnings":       list[str],

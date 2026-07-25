@@ -1184,4 +1184,12 @@ Domain.
 
 Статус:
 
-Принято для реализации (Phase 30C/30D/30E). Реализация не начата.
+Реализовано (Phase 30C/30D) и закрыто (Phase 30E, Object Domain
+Closeout). object_manager.py — единственный runtime transactional
+owner OBJECT_REGISTRY; /editobject, /objects, Extension-читатели
+(document_registry_manager.py, document_requirements_query.py) и
+Roadmap Object-валидация мигрированы на owner API; создание Object
+идемпотентно по Tier 1/Tier 2 duplicate key; Drive provisioning
+retry-safe. Полный generic lifecycle/archive/delete API и
+синхронизация Current Service ID остаются отдельно отложенными (см.
+Phase 30E closeout report) — не входят в это ADR.

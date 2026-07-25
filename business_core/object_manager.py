@@ -17,10 +17,18 @@ service_manager, person_manager, google_drive_adapter, Extension-модули
 (ADR-014, Decision 16) — так же, как service_manager.py не импортирует
 Roadmap/orchestration/Telegram.
 
-Phase 30C — foundation only: this module is the canonical API, but
-production callers are NOT yet migrated onto it (see Phase 30D).
-business_core.business_builder's existing public Object functions
-remain thin compatibility wrappers delegating here.
+Phase 30C introduced this module as the canonical API; Phase 30D
+migrated every production caller onto it — telegram_handlers.py
+(/editobject, /objects, /newobject's Business/Client checks),
+document_registry_manager.py and document_requirements_query.py
+(Extension readers), and business_builder.create_roadmap_for_object
+(Object-existence/status validation) all call this module's public
+API directly. business_core.business_builder's original public Object
+functions (generate_object_id, create_object_record,
+find_objects_by_client, find_object_by_id, update_object_drive_info,
+update_object_roadmap_id) remain as thin compatibility wrappers
+delegating here, kept for callers that still import them from
+business_builder.
 """
 
 from __future__ import annotations
