@@ -27,6 +27,25 @@ Phase 23D audit) but has since been completed by later phases:
   (show_clients, the /bc dashboard client count, and the legacy
   /newroadmap client-lookup step) — a read-ownership gap this docstring
   update does not resolve, tracked for a future remediation phase.
+- Phase 31B (ADR-015, Client Domain Architecture Decision) approved
+  Client as a Person role (never a separate entity) and specified a
+  canonical identity resolver, Client-role helpers, and stricter
+  generic-update boundaries.
+- Phase 31C (Canonical Person Identity and Client API Foundation)
+  implements that decision: resolve_person_identity() is now the single
+  identity-matching implementation (phone/email = strong identifiers,
+  full name = weak/ambiguous-only, archived rows never silently reused);
+  find_existing_person()/find_duplicate_person() are thin compatibility
+  wrappers over it with no matching logic of their own; is_client_person()/
+  ensure_client_role()/list_clients() are the new canonical Client-role
+  API (still backed by the free-text "Тип" column — no schema change);
+  list_person_business_ids()/has_person_business_link() are read-only
+  Business-link helpers; update_person()'s editable-fields allowlist no
+  longer accepts "Biz IDs", "Primary Biz ID", or "Статус отношений" —
+  those are mutated only via append_person_biz_id()/archive_person().
+  Production callers (telegram_handlers.py's /newclient, /clients, /bc,
+  legacy /newroadmap, and business_builder.py's /newobject validation)
+  are NOT migrated onto this foundation yet — that is Phase 31D.
 
 No Google Sheets schema change. "Статус отношений" (the existing column)
 is reused as the Person status field — no new column introduced.
@@ -44,6 +63,7 @@ from __future__ import annotations
 
 import logging
 import re
+import unicodedata
 from typing import Optional
 
 log = logging.getLogger(__name__)
@@ -64,6 +84,14 @@ log = logging.getLogger(__name__)
 PERSON_STATUS = ("active", "archived")
 
 
+def is_person_archived(person: Optional[dict]) -> bool:
+    """Read-only. True iff person["status"] == "archived". Phase 31C
+    (ADR-015 Decision 5/13): the single place archived-ness is decided
+    from a canonical Person dict, used by resolve_person_identity(),
+    ensure_client_role(), and list_clients()."""
+    return bool(person) and person.get("status") == "archived"
+
+
 # ─────────────────────────────────────────────────────────────
 # Normalization helpers (relocated from business_builder.py, hardened
 # to guard blank/None inputs — a minor, safe improvement made during
@@ -71,20 +99,62 @@ PERSON_STATUS = ("active", "archived")
 # ─────────────────────────────────────────────────────────────
 
 def normalize_person_name(name: str) -> str:
-    """Trim + collapse internal whitespace + lowercase. Same recipe
-    used throughout this codebase for name-based duplicate detection."""
-    return re.sub(r"\s+", " ", (name or "").strip()).lower()
+    """Unicode NFKC + trim + collapse internal whitespace + casefold.
+    No fuzzy matching, no token reordering, no substring matching — a
+    name either normalizes to the same string or it doesn't (Phase 31C,
+    ADR-015 Decision 3). NFKC/casefold added in Phase 31C; the previous
+    trim+collapse+lower() recipe is unchanged in effect for existing
+    Cyrillic/ASCII production data (casefold() == lower() for those
+    alphabets), so this is additive robustness, not a behavior change
+    for current rows."""
+    normalized = unicodedata.normalize("NFKC", (name or "").strip())
+    return re.sub(r"\s+", " ", normalized).casefold()
 
 
 def normalize_phone(phone: str) -> str:
     """Strip everything except digits — comparable regardless of
     formatting ("+7 (777) 123-45-67" and "8 777 123 45 67" normalize
-    to the same digit string)."""
+    to the same digit string).
+
+    Deliberately does NOT canonicalize Kazakhstan's "8XXXXXXXXXX" vs
+    "+7XXXXXXXXXX" leading-digit convention (ADR-015 Decision 3 asks
+    for this, but test_business_person_manager.py's
+    test_normalize_phone locks in the current digit-strip-only
+    contract: normalize_phone("8 707 123 45 67") == "87071234567", not
+    "77071234567"). Changing this public function would silently
+    change find_duplicate_person()/create_person()'s existing
+    production duplicate-matching behavior, which Phase 31C is
+    forbidden from doing. The KZ 8/+7 equivalence is instead applied
+    only inside resolve_person_identity()'s strong-match comparison,
+    via _kz_phone_identity_key() below — additive, and scoped to the
+    new resolver only. See Phase 31C final report, Part 8, for the
+    explicit compatibility-vs-spec tradeoff this records."""
     return re.sub(r"\D", "", (phone or "").strip())
 
 
+def _kz_phone_identity_key(phone_digits: str) -> str:
+    """Kazakhstan-specific canonicalization used ONLY for
+    resolve_person_identity()'s strong phone-match comparison (never
+    by normalize_phone() itself — see its docstring). An 11-digit
+    number starting with the domestic trunk prefix "8" is treated as
+    identical to the same number in "+7" international form for
+    identity purposes; every other digit string (other countries,
+    short/invalid numbers) passes through unchanged."""
+    if len(phone_digits) == 11 and phone_digits[0] == "8":
+        return "7" + phone_digits[1:]
+    return phone_digits
+
+
+def normalize_email(email: str) -> str:
+    """Unicode NFKC + trim + casefold. No mailbox canonicalization
+    (dot-stripping, plus-addressing, etc.) — deliberately simple."""
+    return unicodedata.normalize("NFKC", (email or "").strip()).casefold()
+
+
 def _normalize_email(email: str) -> str:
-    return (email or "").strip().casefold()
+    """Backward-compatible private alias for normalize_email() (Phase
+    31C made the email normalizer public per ADR-015 Decision 3)."""
+    return normalize_email(email)
 
 
 def _normalize_biz_ids(value: str) -> list[str]:
@@ -279,6 +349,169 @@ def _list_people_raw() -> list[dict]:
         return []
 
 
+def _scan_people_with_row_num() -> list[dict]:
+    """Internal: same scan as _list_people_raw(), but keeps row_num —
+    needed by resolve_person_identity() so its compatibility wrappers
+    (find_existing_person/find_duplicate_person) can reconstruct their
+    legacy row_num-bearing return shape without a second sheet read.
+    Deliberately a separate, small duplication of the scan loop rather
+    than changing _list_people_raw()'s existing (row_num-stripped)
+    return shape, which list_people()/list_clients()/callers already
+    depend on."""
+    try:
+        from business_core.sheets import get_business_sheet, get_header_index_map
+
+        sheet = get_business_sheet("people_registry")
+        all_values = sheet.get_all_values()
+        if len(all_values) < 2:
+            return []
+
+        headers = all_values[0]
+        idx = get_header_index_map(headers)
+
+        def _g(row, h):
+            i = idx.get(h)
+            return row[i].strip() if (i is not None and i < len(row)) else ""
+
+        results = []
+        for row_num, row in enumerate(all_values[1:], start=2):
+            if not row or not row[0].strip():
+                continue
+            v = {h: _g(row, h) for h in _WANTED_PERSON_FIELDS}
+            results.append(_person_row_to_dict(row_num, v))
+        return results
+    except Exception as exc:
+        log.warning(f"_scan_people_with_row_num() error: {exc}")
+        return []
+
+
+def resolve_person_identity(
+    *,
+    name: Optional[str] = None,
+    phone: Optional[str] = None,
+    email: Optional[str] = None,
+    include_archived: bool = False,
+) -> dict:
+    """
+    Canonical Person identity resolver (Phase 31C, ADR-015 Decisions 2/4/5).
+    THE single implementation of "is this the same Person" — every other
+    identity-matching function in this module (find_existing_person,
+    find_duplicate_person) is a thin wrapper over this.
+
+    Strong identifiers: normalized phone (also matches the WhatsApp
+    column — a WhatsApp number is still a phone identifier for the same
+    person) and normalized email. A single strong match is enough to
+    resolve identity. Weak identifier: normalized full name — a name
+    match is NEVER treated as automatic reuse, even when it is the only
+    signal and there is exactly one candidate (status is always
+    "ambiguous" in that case).
+
+    Kazakhstan phone canonicalization ("8XXXXXXXXXX" == "+7XXXXXXXXXX")
+    is applied here (via _kz_phone_identity_key), not in the public
+    normalize_phone() — see that function's docstring for why.
+
+    Returns:
+        {
+            "status": "not_found" | "single_match" | "ambiguous" | "archived_match",
+            "person": dict | None,
+            "matches": list[dict],
+            "matched_by": list[str],   # subset of ["phone", "email", "name"], fixed order
+            "error": str | None,
+        }
+
+    Never picks an arbitrary first match: multiple strong matches, or
+    any active+archived strong-match collision, is reported as
+    "ambiguous" with all candidates in "matches" rather than resolved
+    silently. A strong match found ONLY among archived rows (with
+    include_archived=False) is reported as "archived_match" and is
+    never auto-reused or auto-reactivated by this function.
+    """
+    norm_name = normalize_person_name(name) if name else ""
+    norm_phone = normalize_phone(phone) if phone else ""
+    norm_email = normalize_email(email) if email else ""
+
+    empty_result = {"status": "not_found", "person": None, "matches": [], "matched_by": [], "error": None}
+    if not norm_name and not norm_phone and not norm_email:
+        return empty_result
+
+    phone_key = _kz_phone_identity_key(norm_phone) if norm_phone else ""
+
+    try:
+        people = _scan_people_with_row_num()
+    except Exception as exc:
+        log.warning(f"resolve_person_identity scan error: {exc}")
+        return {**empty_result, "error": str(exc)}
+
+    strong_active, strong_archived, weak_active, weak_archived = [], [], [], []
+
+    for person in people:
+        archived = is_person_archived(person)
+
+        p_phone_key = _kz_phone_identity_key(normalize_phone(person.get("phone", "")))
+        p_wa_key = _kz_phone_identity_key(normalize_phone(person.get("whatsapp", "")))
+        p_email = normalize_email(person.get("email", ""))
+        p_name = normalize_person_name(person.get("full_name", ""))
+
+        phone_strong = bool(phone_key and (p_phone_key == phone_key or p_wa_key == phone_key))
+        email_strong = bool(norm_email and p_email == norm_email)
+        name_weak = bool(norm_name and p_name == norm_name)
+
+        if not phone_strong and not email_strong and not name_weak:
+            continue
+
+        by = []
+        if phone_strong:
+            by.append("phone")
+        if email_strong:
+            by.append("email")
+        if name_weak:
+            by.append("name")
+
+        entry = {"person": person, "matched_by": by}
+        if phone_strong or email_strong:
+            (strong_archived if archived else strong_active).append(entry)
+        else:
+            (weak_archived if archived else weak_active).append(entry)
+
+    def _finalize(status: str, entries: list[dict], person: Optional[dict]) -> dict:
+        matched_by_union = []
+        for key in ("phone", "email", "name"):
+            if any(key in e["matched_by"] for e in entries):
+                matched_by_union.append(key)
+        return {
+            "status": status,
+            "person": person,
+            "matches": [e["person"] for e in entries],
+            "matched_by": matched_by_union,
+            "error": None,
+        }
+
+    if include_archived:
+        combined_strong = strong_active + strong_archived
+        combined_weak = weak_active + weak_archived
+        if combined_strong:
+            if len(combined_strong) == 1:
+                return _finalize("single_match", combined_strong, combined_strong[0]["person"])
+            return _finalize("ambiguous", combined_strong, None)
+        if combined_weak:
+            return _finalize("ambiguous", combined_weak, None)
+        return dict(empty_result)
+
+    # Default: archived rows never silently resolve identity on their own.
+    if strong_active and strong_archived:
+        return _finalize("ambiguous", strong_active + strong_archived, None)
+    if strong_active:
+        if len(strong_active) == 1:
+            return _finalize("single_match", strong_active, strong_active[0]["person"])
+        return _finalize("ambiguous", strong_active, None)
+    if strong_archived:
+        person = strong_archived[0]["person"] if len(strong_archived) == 1 else None
+        return _finalize("archived_match", strong_archived, person)
+    if weak_active:
+        return _finalize("ambiguous", weak_active, None)
+    return dict(empty_result)
+
+
 def list_people(business_id: str = "", person_type: str = "", status: str = "") -> list[dict]:
     """
     Список People, опционально отфильтрованный по Business ID
@@ -349,26 +582,31 @@ def find_existing_person(
     biz_id: Optional[str] = None,
 ) -> Optional[dict]:
     """
-    Read-only. Faithful port of business_builder.py's original
-    find_existing_person() — kept as a SEPARATE function from
-    find_person()/find_duplicate_person() (the new Phase 23D-1 public
-    API) because its callers (business_core.telegram_handlers.
+    Read-only. Phase 31C: COMPATIBILITY WRAPPER over
+    resolve_person_identity() — contains no matching logic of its own.
+    Kept as a SEPARATE function from find_person()/find_duplicate_person()
+    because its callers (business_core.telegram_handlers.
     newclient_confirm(), via business_builder.py's delegator) depend on
-    its EXACT existing return shape and semantics, which differ from
-    the new API in two ways this phase must not change:
+    its EXACT legacy return shape and two semantics resolve_person_identity()
+    does not itself express:
 
-      1. It does NOT exclude archived rows (find_duplicate_person()
-         does — they answer different questions: "does this contact
-         already exist at all" vs. "should a NEW create be blocked").
+      1. It does NOT exclude archived rows — achieved here by calling
+         resolve_person_identity(include_archived=True), so archived
+         and active candidates are resolved together exactly like the
+         legacy scan did.
       2. It returns "same_biz": False (rather than excluding the row)
-         when a business_id is given but doesn't match — used by
-         newclient_confirm() to distinguish "this is the same client,
-         different business" from "brand new contact", a distinction
-         find_duplicate_person() has no need for.
+         when biz_id is given but doesn't match the resolved Person's
+         Biz IDs — a business-relationship concern layered on top of
+         identity resolution, not an identity decision itself (the
+         legacy code's own biz_id check never actually excluded a
+         phone/name match either — same_biz only affects this field).
 
-    Search priority: normalized phone (+ WhatsApp) is a strong
-    identifier; normalized full name is a weaker one. If biz_id is not
-    given, matches on name/phone alone (a "weak search").
+    When resolve_person_identity() reports "ambiguous" (e.g. a
+    name-only match, or multiple strong matches), this wrapper
+    preserves the legacy "first match in sheet order wins" behavior by
+    taking matches[0] — a presentation-layer translation of the
+    canonical result, not a new identity decision. Callers relying on
+    this exact legacy shape are migrated in Phase 31D.
 
     Returns:
         {
@@ -387,127 +625,80 @@ def find_existing_person(
     if not name and not phone:
         return None
 
-    norm_name = normalize_person_name(name) if name else ""
-    norm_phone = normalize_phone(phone) if phone else ""
+    result = resolve_person_identity(name=name, phone=phone, email=None, include_archived=True)
+    if result["error"] is not None:
+        log.warning(f"find_existing_person error: {result['error']}")
+        return None
 
-    try:
-        from business_core.sheets import get_business_sheet
-        sheet = get_business_sheet("people_registry")
-        all_values = sheet.get_all_values()
-        if len(all_values) < 2:
-            return None
+    if result["status"] in ("single_match",):
+        person = result["person"]
+    elif result["status"] == "ambiguous":
+        person = result["matches"][0] if result["matches"] else None
+    else:  # not_found (archived_match cannot occur with include_archived=True)
+        person = None
 
-        headers = all_values[0]
+    if person is None:
+        return None
 
-        def _col(h):
-            return headers.index(h) if h in headers else None
+    biz_ids = person["biz_ids"]
+    same_biz = (biz_id in biz_ids) if biz_id else True
 
-        def _get(row, h, fallback=""):
-            c = _col(h)
-            return (row[c].strip() if c is not None and c < len(row) else "") or fallback
-
-        name_col = _col("ФИО") if _col("ФИО") is not None else 1
-        phone_col = _col("Телефон")
-        wa_col = _col("WhatsApp")
-        biz_ids_col = _col("Biz IDs")
-
-        def _person_biz_ids(row) -> list[str]:
-            if biz_ids_col is not None and biz_ids_col < len(row) and row[biz_ids_col].strip():
-                return _normalize_biz_ids(row[biz_ids_col])
-            return []
-
-        for i, row in enumerate(all_values[1:], start=2):
-            if not row or not row[0]:
-                continue
-
-            row_name = normalize_person_name(row[name_col] if name_col < len(row) else "")
-            row_phone = normalize_phone(row[phone_col] if phone_col is not None and phone_col < len(row) else "")
-            row_wa = normalize_phone(row[wa_col] if wa_col is not None and wa_col < len(row) else "")
-
-            phone_match = bool(
-                norm_phone and (
-                    (row_phone and row_phone == norm_phone) or
-                    (row_wa and row_wa == norm_phone)
-                )
-            )
-            name_match = bool(norm_name and row_name == norm_name)
-
-            if not phone_match and not name_match:
-                continue
-
-            person_biz_ids = _person_biz_ids(row)
-
-            if biz_id:
-                old_biz = _get(row, "Бизнесы")
-                biz_match = (
-                    biz_id in person_biz_ids or
-                    (not person_biz_ids and old_biz)
-                )
-                same_biz = biz_id in person_biz_ids
-            else:
-                biz_match = True
-                same_biz = True
-
-            if not biz_match and not phone_match and not name_match:
-                continue
-
-            return {
-                "row_num": i,
-                "prs_id": row[0],
-                "full_name": row[name_col] if name_col < len(row) else "",
-                "biz_ids": person_biz_ids,
-                "primary_biz_id": _get(row, "Primary Biz ID"),
-                "drive_url": _get(row, "Google Drive"),
-                "drive_folder_id": _get(row, "Drive Folder ID"),
-                "phone_raw": row[phone_col] if phone_col is not None and phone_col < len(row) else "",
-                "same_biz": same_biz,
-            }
-
-    except Exception as exc:
-        log.warning(f"find_existing_person error: {exc}")
-
-    return None
+    return {
+        "row_num": person["row_num"],
+        "prs_id": person["person_id"],
+        "full_name": person["full_name"],
+        "biz_ids": biz_ids,
+        "primary_biz_id": person["primary_biz_id"],
+        "drive_url": person["google_drive"],
+        "drive_folder_id": person["drive_folder_id"],
+        "phone_raw": person["phone"],
+        "same_biz": same_biz,
+    }
 
 
 def find_duplicate_person(
     full_name: str = "", phone: str = "", email: str = "", business_id: str = "",
 ) -> Optional[dict]:
     """
-    Read-only. The pre-create duplicate check (Phase 23D-1 §5):
-    identity is based on the real person — normalized phone, normalized
-    full name, and email (when available) — NEVER Person Type (an
-    attribute of the relationship, not the person's identity; see
-    ARCHITECTURE.md / Person Layer). Business ID narrows the match when
-    supplied (checked against the multi-valued Biz IDs column, not an
-    exact single-value match, since one Person can belong to several
-    businesses).
+    Read-only. Phase 31C: COMPATIBILITY WRAPPER over
+    resolve_person_identity() — contains no matching logic of its own.
+    The pre-create duplicate check (originally Phase 23D-1 §5): identity
+    is based on the real person — normalized phone, normalized full
+    name, and email — NEVER Person Type (an attribute of the
+    relationship, not the person's identity). business_id narrows the
+    match when supplied (checked against the multi-valued Biz IDs
+    column — a business-relationship filter, layered on top of identity
+    resolution here, same as resolve_person_identity()'s signature
+    intentionally omits biz filtering).
 
-    Archived People NEVER block a new create — only "active" rows are
-    considered, matching the same soft-delete-excluded-from-duplicate-
-    check convention already established for Department/Role
-    (Phase 23C).
+    Archived People NEVER block a new create: resolve_person_identity()
+    is called with include_archived=False (the default), so a
+    strong-only match against an archived row surfaces as
+    "archived_match" — deliberately treated as "no active duplicate"
+    below (never as a candidate), preserving the legacy guarantee
+    exactly.
+
+    Ambiguous results (multiple strong matches, or a name-only match)
+    resolve to the first candidate in sheet order, preserving this
+    function's legacy "return the first match" contract — a
+    presentation-layer choice, not a new identity decision.
     """
     if not full_name and not phone and not email:
         return None
 
-    norm_name = normalize_person_name(full_name) if full_name else ""
-    norm_phone = normalize_phone(phone) if phone else ""
-    norm_email = _normalize_email(email) if email else ""
+    result = resolve_person_identity(name=full_name, phone=phone, email=email, include_archived=False)
 
-    for person in _list_people_raw():
-        if person["status"] != "active":
-            continue
-        if business_id and business_id not in person["biz_ids"]:
-            continue
+    if result["status"] == "single_match":
+        candidates = [result["person"]]
+    elif result["status"] == "ambiguous":
+        candidates = list(result["matches"])
+    else:  # not_found, archived_match — archived never blocks a new create
+        candidates = []
 
-        phone_match = bool(norm_phone and normalize_phone(person["phone"]) == norm_phone)
-        name_match = bool(norm_name and normalize_person_name(person["full_name"]) == norm_name)
-        email_match = bool(norm_email and _normalize_email(person["email"]) == norm_email)
+    if business_id:
+        candidates = [p for p in candidates if business_id in p["biz_ids"]]
 
-        if phone_match or name_match or email_match:
-            return person
-
-    return None
+    return candidates[0] if candidates else None
 
 
 # ─────────────────────────────────────────────────────────────
@@ -614,10 +805,21 @@ def create_person(
 _PERSON_EDITABLE_FIELDS = (
     "ФИО", "Имя", "Телефон", "Телефон 2", "WhatsApp", "Telegram", "Email",
     "Город", "Компания", "Должность", "Тип", "Подтип", "Уровень доверия",
-    "Статус отношений", "Теплота", "Комментарий", "Бизнесы", "Biz IDs",
-    "Company ID", "Citizenship", "Passport / ID", "Primary Biz ID",
+    "Теплота", "Комментарий", "Бизнесы",
+    "Company ID", "Citizenship", "Passport / ID",
     "Дата последнего контакта",
 )
+# Phase 31C (ADR-015 Decision 9): "Biz IDs", "Primary Biz ID", and
+# "Статус отношений" were REMOVED from this allowlist. Business-link
+# mutation is add-only and goes through append_person_biz_id() only;
+# status changes go through archive_person() only (which now writes
+# the status cell directly via _archive_write_status(), bypassing this
+# allowlist entirely, since it is no longer editable here). "Бизнесы"
+# (the legacy free-text business-name column, distinct from the
+# structured "Biz IDs"/"Primary Biz ID" link) is NOT restricted — it is
+# still written by newclient_confirm() today (test_business_newclient_
+# headersafe.py's test_12) and Phase 31B's ADR only targeted the
+# structured link fields.
 
 
 def update_person(person_id: str, updates: dict) -> dict:
@@ -626,7 +828,9 @@ def update_person(person_id: str, updates: dict) -> dict:
     переданных колонок — по имени заголовка, только в найденную строку.
     "ID" и "Дата первого контакта" не редактируемы через эту функцию
     (ID — ключ записи; первый контакт устанавливается один раз при
-    создании).
+    создании). "Biz IDs"/"Primary Biz ID" (use append_person_biz_id())
+    and "Статус отношений" (use archive_person()) are likewise not
+    editable here as of Phase 31C — see _PERSON_EDITABLE_FIELDS.
 
     Returns:
         {"ok": bool, "changed": bool, "updated_fields": tuple, "error": str | None}
@@ -639,15 +843,6 @@ def update_person(person_id: str, updates: dict) -> dict:
         return {
             "ok": False, "changed": False, "updated_fields": (),
             "error": f"Недопустимые поля для обновления: {', '.join(unknown)}",
-        }
-
-    if "Статус отношений" in updates and updates["Статус отношений"] not in PERSON_STATUS:
-        return {
-            "ok": False, "changed": False, "updated_fields": (),
-            "error": (
-                f"Недопустимый статус '{updates['Статус отношений']}'. "
-                f"Допустимые значения: {', '.join(PERSON_STATUS)}"
-            ),
         }
 
     found = _find_person_row(person_id)
@@ -683,6 +878,44 @@ def update_person(person_id: str, updates: dict) -> dict:
         return {"ok": False, "changed": False, "updated_fields": (), "error": str(exc)}
 
 
+def _archive_write_status(person_id: str, status: str) -> dict:
+    """Internal: direct single-cell "Статус отношений" write, used only
+    by archive_person(). Phase 31C removed "Статус отношений" from
+    _PERSON_EDITABLE_FIELDS (status changes must go through
+    archive_person(), not generic update_person()) — this helper is
+    the dedicated, narrow write path that replaces the old
+    update_person()-mediated call, mirroring the same pattern already
+    used by append_person_biz_id()/update_person_drive_info() for
+    their own dedicated fields.
+
+    Returns:
+        {"ok": bool, "changed": bool, "error": str | None}
+    """
+    found = _find_person_row(person_id)
+    if not found:
+        return {"ok": False, "changed": False, "error": f"Person '{person_id}' не найден"}
+    row_num, current = found
+
+    try:
+        from business_core.sheets import get_business_sheet, get_header_index_map
+
+        sheet = get_business_sheet("people_registry")
+        headers = sheet.row_values(1)
+        idx = get_header_index_map(headers)
+        col = idx.get("Статус отношений")
+        if col is None:
+            return {"ok": False, "changed": False, "error": "Колонка 'Статус отношений' не найдена"}
+
+        if current.get("status") == status:
+            return {"ok": True, "changed": False, "error": None}
+
+        sheet.update_cell(row_num, col + 1, status)
+        return {"ok": True, "changed": True, "error": None}
+    except Exception as exc:
+        log.error(f"_archive_write_status({person_id}) error: {exc}")
+        return {"ok": False, "changed": False, "error": str(exc)}
+
+
 def archive_person(person_id: str) -> dict:
     """
     Soft-delete Person через "Статус отношений"=archived. Идемпотентна:
@@ -701,8 +934,7 @@ def archive_person(person_id: str) -> dict:
     if existing["status"] == "archived":
         return {"ok": True, "changed": False, "error": None}
 
-    result = update_person(person_id, {"Статус отношений": "archived"})
-    return {"ok": result["ok"], "changed": result["changed"], "error": result["error"]}
+    return _archive_write_status(person_id, "archived")
 
 
 def append_person_biz_id(person_id: str, biz_id: str) -> dict:
@@ -866,3 +1098,172 @@ def update_person_drive_info(person_id: str, folder_id: str = "", folder_url: st
     except Exception as exc:
         log.warning(f"update_person_drive_info({person_id}) error: {exc}")
         return {"ok": False, "changed": False, "updated_fields": (), "error": str(exc)}
+
+
+# ─────────────────────────────────────────────────────────────
+# Client role — Phase 31C (ADR-015 Decision 5). Client is NOT a
+# separate entity: it is a Person whose free-text "Тип" column holds a
+# recognized value. No schema change, no multi-role list — exact
+# normalized matching only, never substring.
+# ─────────────────────────────────────────────────────────────
+
+_RECOGNIZED_CLIENT_TYPES = frozenset({
+    "клиент",
+    "клиент по узаконению",
+})
+
+
+def is_client_person(person: Optional[dict]) -> bool:
+    """
+    Read-only. True iff person["person_type"], normalized (trim +
+    casefold — same recipe as normalize_person_name's casefold step,
+    but no NFKC/whitespace-collapse needed for these short recognized
+    values), exactly matches one of _RECOGNIZED_CLIENT_TYPES. Never a
+    substring check — "неклиент" and "потенциальный клиент" are both
+    False, since neither equals a recognized value.
+    """
+    if not person:
+        return False
+    normalized = (person.get("person_type") or "").strip().casefold()
+    return normalized in _RECOGNIZED_CLIENT_TYPES
+
+
+def ensure_client_role(person_id: str) -> dict:
+    """
+    Idempotently ensure a Person is recognized as a Client, WITHOUT
+    ever silently overwriting an existing, different, non-empty "Тип"
+    category (Phase 31C, ADR-015 Decision 5/12). Never touches an
+    archived Person (Decision 5: "archived Person не менять").
+
+    Policy:
+      - Person not found            → ok=False, error set.
+      - Person is archived          → ok=False, error set (no write).
+      - "Тип" already recognized    → no-op, already_client=True.
+      - "Тип" empty                 → set to "клиент".
+      - "Тип" non-empty, different  → NOT overwritten; ok=True (no
+        error — this is not a failure, just a decision this function
+        deliberately defers), manual_decision_required=True, warning set.
+
+    Returns:
+        {
+            "ok": bool, "person_id": str, "changed": bool,
+            "already_client": bool, "manual_decision_required": bool,
+            "warning": str | None, "error": str | None,
+        }
+    """
+    base = {
+        "ok": False, "person_id": person_id, "changed": False,
+        "already_client": False, "manual_decision_required": False,
+        "warning": None, "error": None,
+    }
+
+    person = find_person_by_id(person_id)
+    if not person:
+        return {**base, "error": f"Person '{person_id}' не найден"}
+
+    if is_person_archived(person):
+        return {**base, "error": f"Person '{person_id}' archived — client role не может быть установлена"}
+
+    if is_client_person(person):
+        return {**base, "ok": True, "already_client": True}
+
+    current_type = (person.get("person_type") or "").strip()
+    if not current_type:
+        result = update_person(person_id, {"Тип": "клиент"})
+        return {
+            **base,
+            "ok": result["ok"],
+            "changed": result["changed"],
+            "error": result["error"],
+        }
+
+    return {
+        **base,
+        "ok": True,
+        "manual_decision_required": True,
+        "warning": (
+            f"Тип='{current_type}' уже задан для {person_id} — client role "
+            f"не установлена автоматически, требуется явное решение"
+        ),
+    }
+
+
+def list_clients(
+    *,
+    biz_id: Optional[str] = None,
+    query: Optional[str] = None,
+    include_archived: bool = False,
+) -> list[dict]:
+    """
+    Read-only. Canonical Client listing (Phase 31C, ADR-015 Decision 6)
+    — replaces the substring "клиент" in Тип checks duplicated across
+    telegram_handlers.py (not migrated onto this yet; that is Phase
+    31D). Filters via is_client_person() (exact recognized values, not
+    substring). archived excluded by default. query matches (case-
+    insensitively) against person_id, full_name, phone, or email.
+    Deterministic ordering: by person_id.
+    """
+    results = []
+    for person in _list_people_raw():
+        if not is_client_person(person):
+            continue
+        if not include_archived and is_person_archived(person):
+            continue
+        if biz_id and biz_id not in person["biz_ids"]:
+            continue
+        if query:
+            q = query.strip().casefold()
+            haystack = " ".join([
+                person.get("person_id") or "",
+                person.get("full_name") or "",
+                person.get("phone") or "",
+                person.get("email") or "",
+            ]).casefold()
+            if q not in haystack:
+                continue
+        results.append(person)
+
+    results.sort(key=lambda p: p.get("person_id") or "")
+    return results
+
+
+# ─────────────────────────────────────────────────────────────
+# Person↔Business query APIs — Phase 31C (ADR-015 Decision 10). Read-
+# only; append_person_biz_id() remains the ONLY mutation path
+# (PERSON_BUSINESS_LINK_MUTATION_IS_ADD_ONLY).
+# ─────────────────────────────────────────────────────────────
+
+def list_person_business_ids(person_or_id) -> list[str]:
+    """
+    Read-only. Canonical, deduplicated, stable-ordered list of Business
+    IDs a Person belongs to — "Biz IDs" (parsed) plus "Primary Biz ID"
+    if it isn't already present in that list (a Person's primary
+    Business is always considered one of their linked Businesses, even
+    on an older row where "Biz IDs" wasn't populated with it). Accepts
+    either a canonical Person dict (as returned by find_person_by_id())
+    or a person_id string.
+    """
+    person = person_or_id if isinstance(person_or_id, dict) else find_person_by_id(person_or_id)
+    if not person:
+        return []
+
+    ids = list(person.get("biz_ids") or [])
+    primary = (person.get("primary_biz_id") or "").strip()
+    if primary and primary not in ids:
+        ids.append(primary)
+
+    seen = set()
+    ordered = []
+    for biz_id in ids:
+        if biz_id and biz_id not in seen:
+            seen.add(biz_id)
+            ordered.append(biz_id)
+    return ordered
+
+
+def has_person_business_link(person_or_id, biz_id: str) -> bool:
+    """Read-only. True iff biz_id is among the Person's linked
+    Business IDs (see list_person_business_ids())."""
+    if not biz_id:
+        return False
+    return biz_id in list_person_business_ids(person_or_id)
