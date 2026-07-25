@@ -84,6 +84,7 @@ _ROADMAP_DOMAIN_TEST_FILES = frozenset({
     "test_object_architecture_guards.py",
     "test_service_architecture_guards.py",
     "test_roadmap_cross_domain_validation.py",
+    "test_roadmap_caller_ux.py",
 })
 
 # Phase 32A (Service Domain re-audit) found a masked live-network call

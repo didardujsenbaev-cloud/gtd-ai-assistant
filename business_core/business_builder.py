@@ -2109,19 +2109,25 @@ def find_roadmaps_by_object(obj_id: str) -> list[dict]:
         return []
 
 
-def update_object_roadmap_id(obj_id: str, roadmap_id: str) -> bool:
+def update_object_roadmap_id(obj_id: str, roadmap_id: str) -> dict:
     """
     Записать Roadmap ID в OBJECT_REGISTRY для объекта.
 
     Phase 30C: thin compatibility wrapper — delegates to
     object_manager.update_object_roadmap_id() (only_if_empty=True,
     preserving current "update only if empty" production behavior —
-    see ADR-014 Decision 8), translated back to this function's
-    existing bool return shape.
+    see ADR-014 Decision 8).
+
+    Phase 33D: returns the full structured dict (was a collapsed bool)
+    — the caller-facing UX work needs to distinguish a genuine write
+    failure ("ok": False, e.g. Object not found or a Sheets error) from
+    the harmless "already set, not overwritten" no-op ("ok": True,
+    "updated": False), which a bare bool cannot represent. This dict is
+    truthy exactly like the old bool was for any caller that only did
+    `if update_object_roadmap_id(...):` — no behavior change for those.
 
     Returns:
-        True если обновлено
+        {"ok": bool, "object_id": str, "updated": bool, "error": str | None}
     """
     from business_core.object_manager import update_object_roadmap_id as _update_object_roadmap_id
-    result = _update_object_roadmap_id(obj_id, roadmap_id, only_if_empty=True)
-    return bool(result["ok"] and result["updated"])
+    return _update_object_roadmap_id(obj_id, roadmap_id, only_if_empty=True)

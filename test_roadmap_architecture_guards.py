@@ -752,6 +752,46 @@ class TestTelegramHandlersDoesNotDuplicateCrossDomainValidation(unittest.TestCas
                 f"business_builder.create_roadmap_for_object() (ADR-016 §1/§8).",
             )
 
+    def _roadmap_caller_ux_block(self) -> str:
+        """
+        Phase 33D: the full caller-facing UX block for /startroadmap —
+        the centralized error-code mapping, the success/failure message
+        renderers, and the handler itself. Wider than _handler_body()
+        (which only covers the async def itself) because the rendering
+        helpers now live just above it in the same file.
+        """
+        path = BUSINESS_CORE / "telegram_handlers.py"
+        src = path.read_text(encoding="utf-8")
+        start = src.index("_ROADMAP_ERROR_MESSAGES")
+        end = src.index("\nasync def stages_cmd")
+        return src[start:end]
+
+    def test_handler_block_does_not_implement_business_client_object_service_validation(self):
+        """Phase 33D §2: telegram_handlers.py must only collect
+        arguments, call create_roadmap_for_object(), and translate its
+        structured result — it must never itself call the canonical
+        Business/Client/Object/Service validation primitives that
+        create_roadmap_for_object() already owns (ADR-016)."""
+        block = self._roadmap_caller_ux_block()
+        forbidden_calls = (
+            "find_row_by_id(",             # Business existence lookup
+            "find_person_by_id(",           # Client existence
+            "is_person_archived(",          # Client archive check
+            "is_client_person(",            # Client role check
+            "has_person_business_link(",    # Client-Business link check
+            "object_manager.find_object_by_id(",  # canonical Object read (business_builder.find_object_by_id, the
+                                                    # legacy obj/biz/client-shape lookup, is a distinct, permitted call)
+            "_normalize_type_value(",       # Object Type normalization
+        )
+        for forbidden_call in forbidden_calls:
+            self.assertNotIn(
+                forbidden_call, block,
+                f"telegram_handlers.py's Roadmap caller UX must not call "
+                f"{forbidden_call.rstrip('(')} — this validation belongs "
+                f"solely inside business_builder.create_roadmap_for_object() "
+                f"(Phase 33D §2 / ADR-016 §1).",
+            )
+
 
 class TestNoArbitraryFirstPickSelection(unittest.TestCase):
     """Phase 33C (ADR-016 §8/§9): neither Template resolution nor

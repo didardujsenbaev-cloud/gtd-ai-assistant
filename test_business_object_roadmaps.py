@@ -480,7 +480,11 @@ class TestUpdateObjectRoadmapId(unittest.TestCase):
         bb = self._reload_bb()
         with patch("business_core.sheets.get_business_sheet", return_value=mock_ws):
             result = bb.update_object_roadmap_id("OBJ-001", "RM-001")
-        self.assertTrue(result)
+        # Phase 33D: this wrapper now returns the full structured dict
+        # (was a collapsed bool) so callers can distinguish a genuine
+        # write failure from the harmless "already set" no-op below.
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["updated"])
         mock_ws.update_cell.assert_called_once()
         args = mock_ws.update_cell.call_args[0]
         self.assertEqual(args[2], "RM-001")
@@ -497,7 +501,11 @@ class TestUpdateObjectRoadmapId(unittest.TestCase):
         bb = self._reload_bb()
         with patch("business_core.sheets.get_business_sheet", return_value=mock_ws):
             result = bb.update_object_roadmap_id("OBJ-001", "RM-NEW")
-        self.assertFalse(result)
+        # "ok": True (the call itself succeeded), "updated": False (a
+        # legitimate no-op, not a failure) — this is exactly the
+        # distinction a bare bool could not represent (Phase 33D).
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["updated"])
         mock_ws.update_cell.assert_not_called()
 
 
@@ -996,6 +1004,10 @@ class TestStartRoadmapConvergentRetryUX(unittest.TestCase):
         self.assertNotIn("уже существовал", reply)
 
     def test_reused_roadmap_with_new_stages_says_reused_and_added(self):
+        """Phase 33D: only two distinct success categories now
+        (ROADMAP_CREATED / ROADMAP_REUSED) rather than the old three-way
+        split — a reused Roadmap always says so explicitly, regardless
+        of how many missing Stages were filled in."""
         import asyncio
         reply = asyncio.run(self._run({
             "ok": True, "roadmap_id": "RM-201", "error": None,
@@ -1003,7 +1015,8 @@ class TestStartRoadmapConvergentRetryUX(unittest.TestCase):
             "stages_count": 2, "used_template": True, "template_id": "RMT-001",
             "template_warning": None, "warnings": (), "relation_copy_errors": (),
         }))
-        self.assertIn("уже существовал", reply)
+        self.assertIn("существующий Roadmap", reply)
+        self.assertIn("Новый Roadmap не создан", reply)
         self.assertIn("Добавлено отсутствующих этапов: 2", reply)
         self.assertNotIn("✅ *Roadmap создан*", reply)
 
@@ -1015,7 +1028,8 @@ class TestStartRoadmapConvergentRetryUX(unittest.TestCase):
             "stages_count": 0, "used_template": True, "template_id": "RMT-001",
             "template_warning": None, "warnings": (), "relation_copy_errors": (),
         }))
-        self.assertIn("полностью настроен", reply)
+        self.assertIn("существующий Roadmap", reply)
+        self.assertIn("Новый Roadmap не создан", reply)
         self.assertIn("Новых этапов не создано", reply)
         self.assertNotIn("Roadmap создан", reply)
 

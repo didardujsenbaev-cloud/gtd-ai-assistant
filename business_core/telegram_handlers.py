@@ -2285,6 +2285,207 @@ async def objects_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 # /startroadmap — создать Roadmap для объекта (Phase 7B)
 # ─────────────────────────────────────────────────────────────
 
+# Phase 33D (ADR-016 §14 caller-facing UX): a single, centralized
+# mapping from business_builder.create_roadmap_for_object()'s stable,
+# machine-readable error_code to Russian user-facing text. This module
+# performs presentation ONLY — it never re-derives *why* a code fired
+# (that decision was already made, once, inside create_roadmap_for_object
+# per ADR-016). Codes needing structured extra data (candidate lists,
+# conflicting IDs) are rendered by _roadmap_failure_message() below
+# instead of this flat table.
+_ROADMAP_ERROR_MESSAGES: dict[str, str] = {
+    "BUSINESS_NOT_FOUND": "Бизнес не найден.",
+    "CLIENT_NOT_FOUND": "Клиент не найден.",
+    "CLIENT_ARCHIVED": "Клиент архивирован — Roadmap не создан.",
+    "CLIENT_ROLE_REQUIRED": "У клиента нет роли «клиент».",
+    "CLIENT_NOT_LINKED_TO_BUSINESS": "Клиент не привязан к этому бизнесу.",
+    "OBJECT_NOT_FOUND": "Объект не найден.",
+    "OBJECT_NOT_ELIGIBLE": "Статус объекта не позволяет создать Roadmap.",
+    "OBJECT_BUSINESS_MISMATCH": "Объект принадлежит другому бизнесу.",
+    "OBJECT_CLIENT_MISMATCH": "Объект привязан к другому клиенту.",
+    "SERVICE_NOT_FOUND": "Услуга не найдена.",
+    "SERVICE_INACTIVE": "Услуга не активна.",
+    "SERVICE_BUSINESS_MISMATCH": "Услуга принадлежит другому бизнесу.",
+    "TEMPLATE_NOT_FOUND": "Указанный или связанный шаблон не найден либо недоступен.",
+    "TEMPLATE_SERVICE_MISMATCH": "Шаблон принадлежит другой услуге.",
+    # Actual stable code emitted by create_roadmap_for_object (ADR-016
+    # §12/§13) — the Phase 33D spec's "ROADMAP_IMMUTABLE_IDENTITY_CONFLICT"
+    # name does not exist in the Phase 33C implementation; this maps the
+    # real code instead of inventing a parallel alias.
+    "ROADMAP_IMMUTABLE_FIELD_CONFLICT": (
+        "Найден существующий Roadmap с другими Business/Client — "
+        "новый Roadmap не создан, существующий не изменён."
+    ),
+}
+
+
+def _roadmap_failure_message(rm_result: dict, obj_id: str, service_id: str) -> str:
+    """
+    Render rm_result (ok=False) into a single Russian Telegram message.
+    Presentation only — every branch here reacts to a structured field
+    already computed by create_roadmap_for_object(); none of them
+    re-validate anything.
+    """
+    error_code = rm_result.get("error_code", "")
+
+    if error_code == "MULTIPLE_TEMPLATES_REQUIRE_SELECTION":
+        candidates = rm_result.get("candidate_template_ids", [])
+        lines = ["❌ Найдено несколько подходящих шаблонов — нужен явный выбор.\n"]
+        for tid in candidates:
+            lines.append(f"• `{tid}`")
+        lines.append(
+            f"\nПовтори команду с явным шаблоном:\n"
+            f"`/startroadmap obj_id={obj_id} service_id={service_id} "
+            f"template_id=RMT-...`"
+        )
+        return "\n".join(lines)
+
+    if error_code == "MULTIPLE_OPEN_ROADMAPS_INTEGRITY_ERROR":
+        conflicting = rm_result.get("conflicting_roadmap_ids", [])
+        return (
+            f"❌ Найдено {len(conflicting)} открытых Roadmap для этого объекта и услуги — "
+            f"новый Roadmap не создан.\n\n"
+            f"Конфликтующие Roadmap: {', '.join(f'`{r}`' for r in conflicting)}\n\n"
+            f"Это конфликт данных, требующий проверки вручную — ни один из них "
+            f"не выбран и не изменён автоматически."
+        )
+
+    if error_code in _ROADMAP_ERROR_MESSAGES:
+        # The centralized table above is the authoritative statement of
+        # what each code MEANS; create_roadmap_for_object's own "error"
+        # text is already safe, specific, human-readable Russian
+        # (includes the concrete IDs involved) — preferred when present
+        # so the user sees exactly which Business/Client/Object/Service/
+        # Template ID triggered the code, falling back to the generic
+        # category text only if "error" is somehow empty.
+        return f"❌ {rm_result.get('error') or _ROADMAP_ERROR_MESSAGES[error_code]}"
+
+    if error_code:
+        # Unknown/unmapped code: safe generic fallback — never expose
+        # the raw structured result or a stack trace to Telegram, but
+        # log it (structured, non-secret) so it can be triaged.
+        log.warning(
+            "startroadmap_cmd: unmapped error_code=%r for obj_id=%s service_id=%s",
+            error_code, obj_id, service_id,
+        )
+        return "❌ Не удалось создать Roadmap из-за ошибки проверки данных. Попробуй ещё раз позже."
+
+    # No error_code at all (identifier-level rejections from steps A,
+    # which predate the structured contract) — the human-readable
+    # "error" string is already safe, static text written by
+    # create_roadmap_for_object itself, never raw exception content.
+    return f"❌ Не удалось создать Roadmap: {rm_result.get('error') or 'неизвестная ошибка'}"
+
+
+def _roadmap_success_lines(rm_result: dict, obj_id: str, service_id: str, case_type: str) -> list[str]:
+    """
+    Render rm_result (ok=True) into the list of message lines shown for
+    a successful call — which may still carry non-blocking warnings or
+    a partial-failure notice. Presentation only.
+    """
+    from business_core.roadmap_manager import ROADMAP_TEMPLATES
+
+    roadmap_id      = rm_result["roadmap_id"]
+    used_template   = rm_result.get("used_template", False)
+    roadmap_created = rm_result.get("roadmap_created", True)
+    roadmap_reused  = rm_result.get("roadmap_reused", False)
+    stages_created  = rm_result.get("stages_count", 0)
+    stages_reused   = rm_result.get("stages_reused", False)
+    existing_stage_count = rm_result.get("existing_stage_count", 0)
+    effective_template_id = rm_result.get("selected_template_id") or rm_result.get("template_id", "")
+
+    if roadmap_created:
+        lines = ["✅ *Roadmap создан*\n", f"Roadmap ID: `{roadmap_id}`"]
+    else:
+        # ROADMAP_REUSED — never phrased as "создан" for a reused Roadmap.
+        lines = [
+            "ℹ️ *Найден существующий Roadmap — используется он*\n",
+            f"Roadmap ID: `{roadmap_id}`",
+            "Новый Roadmap не создан — переиспользован существующий.",
+        ]
+
+    lines += [
+        f"Object ID:  `{obj_id}`",
+        f"Service ID: `{service_id or '—'}`",
+    ]
+    if effective_template_id and used_template:
+        lines.append(f"Шаблон: `{effective_template_id}`")
+    elif case_type and case_type != "general":
+        lines.append(f"Case Type: `{case_type}`")
+
+    # template_warning is also present in "warnings" (API completeness
+    # for other callers) — shown once, via its own dedicated line below,
+    # so it is excluded from the generic warnings list here.
+    template_warning = rm_result.get("template_warning")
+    other_warnings = [w for w in rm_result.get("warnings", ()) if w != template_warning]
+
+    # Phase 28G/33D: distinguish new-Roadmap / reused-with-additions /
+    # already-fully-converged stage outcomes — never say "создан" for a
+    # reused Roadmap's stages either.
+    if roadmap_created:
+        lines.append(f"Этапов создано: {stages_created}")
+    elif stages_created:
+        lines.append(f"Добавлено отсутствующих этапов: {stages_created}")
+    elif stages_reused or existing_stage_count:
+        lines.append("Новых этапов не создано — все уже существовали.")
+    else:
+        lines.append("Новых этапов не создано.")
+
+    # Показать первые 5 названий built-in шаблона — только для НОВОГО
+    # Roadmap, использующего case_type-fallback (у переиспользуемого
+    # Roadmap этапы уже существуют, показывать нечего).
+    if roadmap_created and not used_template:
+        stage_names = ROADMAP_TEMPLATES.get(case_type, [])
+        if stage_names:
+            lines.append("\n*Следующие шаги:*")
+            for i, name in enumerate(stage_names[:5], start=1):
+                lines.append(f"{i}. {name}")
+            if len(stage_names) > 5:
+                lines.append(f"   ... (+{len(stage_names) - 5} этапов)")
+
+    if template_warning:
+        lines.append(f"\n⚠️ {template_warning}")
+
+    for w in other_warnings:
+        lines.append(f"\n⚠️ {w}")
+
+    # Phase 33C (ADR-016 §6): Object Type compatibility is a non-blocking
+    # warning only — shown, never rejected. Client Type validation
+    # remains explicitly deferred (ADR-016 §7) and never produces a
+    # user-facing message here.
+    type_warning = rm_result.get("type_compatibility_warning")
+    if type_warning and type_warning.get("status") == "mismatch":
+        lines.append(
+            "\n⚠️ Дорожная карта создана, но тип объекта и тип услуги отличаются. "
+            "Проверьте правильность выбранной услуги.\n"
+            f"Тип объекта: `{type_warning.get('object_type') or '—'}`\n"
+            f"Тип объекта услуги: `{type_warning.get('service_object_type') or '—'}`"
+        )
+    elif type_warning and type_warning.get("status") == "unavailable":
+        lines.append("\n⚠️ Не удалось проверить совместимость типа объекта с услугой.")
+
+    # Phase 33C: a Stage-materialization failure is now a structural
+    # field (error_code + partial_failure), not just a warning string —
+    # the Roadmap itself is retained, safe to retry.
+    if rm_result.get("error_code") == "STAGE_MATERIALIZATION_PARTIAL_FAILURE":
+        lines.append(
+            f"\n⚠️ Roadmap `{roadmap_id}` создан, но не все этапы удалось создать. "
+            f"Повторить команду безопасно — новый Roadmap создан не будет."
+        )
+
+    # Extension (relation-copy) failures never roll back an already-
+    # committed Roadmap/Stages.
+    if rm_result.get("relation_copy_errors"):
+        lines.append(
+            f"\n⚠️ Часть связей документов не скопирована для "
+            f"{len(rm_result['relation_copy_errors'])} этап(ов). "
+            f"Этапы созданы корректно; связи можно досоздать позже."
+        )
+
+    lines.append(f"\nПросмотр этапов: `/stages roadmap_id={roadmap_id}`")
+    return lines
+
+
 async def startroadmap_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Создать roadmap для объекта по услуге и типу кейса.
@@ -2333,12 +2534,7 @@ async def startroadmap_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
 
     try:
-        from business_core.business_builder import (
-            find_object_by_id,
-            create_roadmap_for_object,
-            update_object_roadmap_id,
-        )
-        from business_core.roadmap_manager import ROADMAP_TEMPLATES
+        from business_core.business_builder import find_object_by_id, create_roadmap_for_object
 
         obj = find_object_by_id(obj_id)
         if not obj:
@@ -2351,21 +2547,13 @@ async def startroadmap_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         explicit_template_id = args.get("template_id", "").strip()
 
         # ── Создать roadmap + этапы ─────────────────────────────
-        # Phase 28C: create_roadmap_for_object теперь единственная
-        # orchestration-точка входа — сама создаёт Roadmap, читает
-        # Template Stage rows, создаёт Stages и выполняет Extension-copy
-        # (Stage Entity Relations), с fallback на встроенные
-        # ROADMAP_TEMPLATES по case_type, если шаблон не дал этапов.
-        #
-        # Phase 33C (ADR-016 §11/§15): Template resolution (explicit ->
-        # Service default -> linked templates) and validation now happen
-        # entirely INSIDE create_roadmap_for_object() — this handler no
-        # longer pre-resolves or pre-validates a template itself (that
-        # used to duplicate the same lookup/validation logic here and in
-        # the orchestration layer). All cross-domain validation
-        # (Business/Client/Object/Service/Object Type/Template/duplicate
-        # Roadmap) also happens inside create_roadmap_for_object() now —
-        # see ADR-016 for the full contract.
+        # Phase 33C (ADR-016): create_roadmap_for_object() is the sole
+        # cross-domain validation boundary (Business/Client/Object/
+        # Service/Object Type/Template/duplicate Roadmap). This handler
+        # (Phase 33D) does not re-implement or duplicate any of that —
+        # it only collects arguments, calls this one function, and
+        # translates its structured result into a Telegram message via
+        # _roadmap_failure_message()/_roadmap_success_lines() above.
         rm_result = create_roadmap_for_object(
             obj_id=obj_id,
             biz_id=biz_id,
@@ -2376,116 +2564,50 @@ async def startroadmap_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             notes=notes,
             template_id=explicit_template_id,
         )
+
+        log.info(
+            "startroadmap_cmd result: ok=%s error_code=%s roadmap_id=%s "
+            "roadmap_created=%s roadmap_reused=%s partial_failure=%s "
+            "conflicting_roadmap_ids=%s candidate_template_ids=%s "
+            "type_warning_status=%s",
+            rm_result.get("ok"), rm_result.get("error_code") or "",
+            rm_result.get("roadmap_id") or "", rm_result.get("roadmap_created"),
+            rm_result.get("roadmap_reused"), rm_result.get("partial_failure"),
+            rm_result.get("conflicting_roadmap_ids") or [],
+            rm_result.get("candidate_template_ids") or [],
+            (rm_result.get("type_compatibility_warning") or {}).get("status"),
+        )
+
         if not rm_result["ok"]:
-            error_code = rm_result.get("error_code", "")
-            if error_code == "MULTIPLE_TEMPLATES_REQUIRE_SELECTION":
-                candidates = rm_result.get("candidate_template_ids", [])
-                hint_lines = [f"❌ {rm_result['error']}\n"]
-                for tid in candidates:
-                    hint_lines.append(f"• `{tid}`")
-                hint_lines.append(
-                    f"\nУкажи конкретный шаблон:\n"
-                    f"`/startroadmap obj_id={obj_id} service_id={service_id} "
-                    f"template_id=RMT-...`"
-                )
-                await _reply(update, "\n".join(hint_lines))
-            elif error_code == "MULTIPLE_OPEN_ROADMAPS_INTEGRITY_ERROR":
-                conflicting = rm_result.get("conflicting_roadmap_ids", [])
-                await _reply(update,
-                    f"❌ {rm_result['error']}\n\n"
-                    f"Конфликтующие Roadmap: {', '.join(f'`{r}`' for r in conflicting)}"
-                )
-            else:
-                await _reply(update, f"❌ Не удалось создать roadmap: {rm_result['error']}")
+            await _reply(update, _roadmap_failure_message(rm_result, obj_id, service_id))
             return
 
-        roadmap_id      = rm_result["roadmap_id"]
-        used_template   = rm_result.get("used_template", False)
-        roadmap_created = rm_result.get("roadmap_created", True)
-        roadmap_reused  = rm_result.get("roadmap_reused", False)
-        effective_template_id = rm_result.get("selected_template_id") or rm_result.get("template_id", "")
+        roadmap_id = rm_result["roadmap_id"]
+        lines = _roadmap_success_lines(rm_result, obj_id, service_id, case_type)
 
-        update_object_roadmap_id(obj_id, roadmap_id)
-
-        # ── Ответ ──────────────────────────────────────────────
-        # Phase 28G: distinguish new-Roadmap / reused-with-additions /
-        # already-fully-converged — never say "создан" for a reused one.
-        count = rm_result.get("stages_count", 0)
-        if roadmap_created:
-            header = "✅ *Roadmap создан*\n"
-        elif count > 0:
-            header = "ℹ️ *Roadmap уже существовал*\n"
-        else:
-            header = "ℹ️ *Roadmap уже существует и полностью настроен*\n"
-
-        lines = [
-            header,
-            f"Roadmap ID: `{roadmap_id}`",
-            f"Object ID:  `{obj_id}`",
-            f"Service ID: `{service_id or '—'}`",
-        ]
-        if effective_template_id and used_template:
-            lines.append(f"Шаблон: `{effective_template_id}`")
-        elif case_type and case_type != "general":
-            lines.append(f"Case Type: `{case_type}`")
-
-        # Phase 28G: template_warning is also present in "warnings" (for
-        # API completeness — other callers may only look at "warnings"),
-        # but is displayed via its own dedicated line below — exclude it
-        # here to avoid showing the same message twice.
-        template_warning = rm_result.get("template_warning")
-        other_warnings = [w for w in rm_result.get("warnings", ()) if w != template_warning]
-        if count == 0 and other_warnings:
-            lines.append(f"\n⚠️ {other_warnings[0]}")
-        elif roadmap_created:
-            lines.append(f"Этапов создано: {count}")
-        elif count > 0:
-            lines.append(f"Добавлено отсутствующих этапов: {count}")
-        else:
-            lines.append("Новых этапов не создано — все уже существовали.")
-
-        # Показать первые 5 названий built-in шаблона — только для
-        # НОВОГО Roadmap, использующего case_type-fallback (на reused
-        # Roadmap этапы уже существуют, показывать нечего).
-        if roadmap_created and not used_template:
-            stage_names = ROADMAP_TEMPLATES.get(case_type, [])
-            if stage_names:
-                lines.append("\n*Следующие шаги:*")
-                for i, name in enumerate(stage_names[:5], start=1):
-                    lines.append(f"{i}. {name}")
-                if len(stage_names) > 5:
-                    lines.append(f"   ... (+{len(stage_names) - 5} этапов)")
-
-        if template_warning:
-            lines.append(f"\n⚠️ {template_warning}")
-
-        lines.append(f"\nПросмотр этапов: `/stages roadmap_id={roadmap_id}`")
-
-        # Phase 18C-3/28C: этапы уже созданы независимо от этого — ошибка
-        # копирования relation-строк (теперь выполняемого в
-        # create_roadmap_for_object, а не внутри roadmap_template_manager)
-        # не меняет ничего выше, только добавляет отдельное предупреждение.
-        if rm_result.get("relation_copy_errors"):
-            lines.append(
-                f"\n⚠️ Часть связей документов не скопирована для "
-                f"{len(rm_result['relation_copy_errors'])} этап(ов). "
-                f"Этапы созданы корректно; связи можно досоздать позже."
+        # Object -> Roadmap reference update (Phase 30D/ADR-014 Decision 8:
+        # "update only if empty" — a compatibility field, never blocks
+        # anything above). Phase 33D surfaces a genuine write failure
+        # (not the harmless "already set" no-op) as a visible, non-fatal
+        # partial-failure notice — the Roadmap above is never hidden or
+        # rolled back because of it.
+        from business_core.business_builder import update_object_roadmap_id
+        obj_ref_result = update_object_roadmap_id(obj_id, roadmap_id)
+        if isinstance(obj_ref_result, dict) and obj_ref_result.get("ok") is False:
+            log.warning(
+                "startroadmap_cmd: object reference update failed for obj_id=%s roadmap_id=%s",
+                obj_id, roadmap_id,
             )
-
-        # Phase 33C (ADR-016 §6): Object Type compatibility is a
-        # non-blocking warning only — shown, never rejected.
-        type_warning = rm_result.get("type_compatibility_warning")
-        if type_warning and type_warning.get("status") == "mismatch":
             lines.append(
-                f"\n⚠️ Тип объекта ({type_warning.get('object_type') or '—'}) не совпадает "
-                f"с типом объекта услуги ({type_warning.get('service_object_type') or '—'})."
+                f"\n⚠️ Roadmap `{roadmap_id}` создан, но не удалось обновить ссылку "
+                f"на него в объекте `{obj_id}`. Повторить команду безопасно."
             )
 
         await _reply(update, "\n".join(lines))
 
     except Exception as e:
         log.error(f"startroadmap_cmd error: {e}")
-        await _reply(update, f"❌ Ошибка: {e}")
+        await _reply(update, "❌ Не удалось обработать команду из-за внутренней ошибки. Попробуй ещё раз позже.")
 
 
 # ─────────────────────────────────────────────────────────────
