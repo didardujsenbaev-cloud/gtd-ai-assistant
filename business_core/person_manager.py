@@ -7,16 +7,26 @@ service_manager.py: one domain per module, depends only on
 business_core.sheets, honest {ok, ...} write contracts, soft-delete via
 Status, duplicate detection before ID generation and before any write.
 
-This is a foundation-only phase (see ARCHITECTURE.md / Phase 23D audit):
-- /newclient is NOT refactored yet — it still writes PEOPLE_REGISTRY
-  directly from business_core.telegram_handlers.newclient_confirm(),
-  unchanged. That refactor is Phase 23D-2.
+This module started as a foundation-only phase (see ARCHITECTURE.md /
+Phase 23D audit) but has since been completed by later phases:
+- /newclient (business_core.telegram_handlers.newclient_confirm()) was
+  refactored in Phase 23D-2 — it now calls create_person()/update_person()
+  directly for its NEW-Person path, and append_person_biz_id()/
+  update_person_drive_info() (via business_builder.py's thin delegators)
+  for the SAME_BIZ/OTHER_BIZ paths. It no longer writes PEOPLE_REGISTRY
+  directly.
 - Person-specific logic previously living in business_core.business_builder
   (normalize_person_name, normalize_phone, find_existing_person,
   get_person_biz_ids) has been RELOCATED here. business_builder.py keeps
   the same function names as thin delegators, for full backward
-  compatibility with its own existing callers (including
-  newclient_confirm(), which is explicitly NOT touched by this phase).
+  compatibility with its own existing callers.
+- Phase 31A (Client Domain Ownership Audit) found that this docstring's
+  original "not yet refactored" claim was stale relative to the actual
+  code and corrected it here; that same audit also found telegram_handlers.py
+  still reads PEOPLE_REGISTRY raw (read_business_sheet) in three places
+  (show_clients, the /bc dashboard client count, and the legacy
+  /newroadmap client-lookup step) — a read-ownership gap this docstring
+  update does not resolve, tracked for a future remediation phase.
 
 No Google Sheets schema change. "Статус отношений" (the existing column)
 is reused as the Person status field — no new column introduced.
