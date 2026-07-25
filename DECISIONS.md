@@ -1865,3 +1865,410 @@ required), потому что конкретные production-данные, п�
 Утверждено для реализации (Phase 33C). Ничего не реализовано в
 рамках этого ADR — только архитектурное решение. Ни один
 production-caller не мигрирован, ни один код не изменён.
+
+## ADR-017 — Stage Domain Transition & Lifecycle Boundary (Phase 34B)
+
+Контекст:
+
+Phase 34A (Stage Domain Architecture Audit, read-only) подтвердила,
+что persistence-слой Stage Domain (roadmap_manager.py — единственный
+transactional writer ROADMAP_STAGES, идентичность Stage ID +
+(Roadmap ID, Order), идемпотентная материализация из Template,
+структурированные результаты записи, отсутствие циклов зависимостей)
+остаётся корректным и НЕ пересматривается этим ADR. Аудит нашёл
+единственную HIGH-находку: ни update_stage_status_in_sheet, ни
+update_stage_fields, ни вызывающий их /updatestage НИКОГДА не
+проверяют собственный статус родительского Roadmap — этап
+`cancelled` или `completed` Roadmap сегодня можно менять точно так
+же, как этап `active` Roadmap, и явный "reopen" уже `done`/`skipped`
+этапа технически ничем не отличается от обычного перехода статуса.
+Это может оставить Roadmap с Status=`completed`, чьи Stages больше
+не удовлетворяют условию завершённости (should_complete_roadmap),
+без какого-либо механизма обнаружения или исправления. Production
+на момент подготовки ADR не содержит такого рассогласования (RM-001
+active/8 pending, RM-002 cancelled/0 stages) — находка носит
+структурный, а не инцидентный характер, и разрешается здесь тем же
+процессом, что и предыдущие доменные ADR (013–016): решение
+принимается ДО реализации, а не постфактум.
+
+Решения:
+
+1. Канонический владелец persistence.
+
+   roadmap_manager.py остаётся единственным transactional-владельцем
+   чтения и записи ROADMAP_STAGES: идентичность Stage, материализация
+   из Template, персистентность статуса, расчёт Progress %,
+   персистентность авто-завершения Roadmap. telegram_handlers.py и
+   business_builder.py не обращаются к ROADMAP_STAGES напрямую —
+   это уже так сегодня (Phase 34A подтвердила ноль нарушений) и
+   этим ADR не меняется.
+
+2. Канонический владелец transition-политики.
+
+   Вариант B принят: новая orchestration-функция в business_builder.py
+   (рабочее имя `transition_stage_status()`, точное имя решает Phase
+   34C) становится единственной точкой, где проверяется статус
+   родительского Roadmap ПЕРЕД вызовом
+   roadmap_manager.update_stage_status_in_sheet(). Сам
+   update_stage_status_in_sheet() остаётся низкоуровневой
+   persistence-функцией без доступа к Roadmap-статусу — она не
+   импортирует ничего о Roadmap eligibility и не станет второй
+   реализацией transition-политики. telegram_handlers.py (/updatestage)
+   вызывает ТОЛЬКО эту orchestration-функцию, не
+   update_stage_status_in_sheet напрямую — зеркально тому, как
+   ADR-016 уже сделало create_roadmap_for_object() единственной
+   точкой cross-domain проверки для Roadmap-создания. Второй
+   реализации transition-политики не создаётся нигде.
+
+3. Идентичность Stage.
+
+   Stage ID, Roadmap ID, Order подтверждены неизменяемыми полями.
+   Канонический business key — (Roadmap ID, Order), как и было.
+   Ни один существующий или будущий update-API не переписывает эти
+   три поля. Stage ID остаётся глобально уникальным (generate_next_ids).
+
+4. Created timestamp.
+
+   Вариант B принят: колонка Created для ROADMAP_STAGES желательна,
+   но откладывается до отдельной schema-миграции — она не нужна для
+   реализации transition/lifecycle-исправления (Phase 34C) и не
+   меняется в этом ADR. Схема ROADMAP_STAGES не меняется.
+
+5. Канонический словарь статусов.
+
+   ADR-009 сохраняется без изменений: pending, in_progress, blocked,
+   done, skipped. Legacy read-alias not_started → pending сохраняется.
+   Неизвестные значения остаются незаписываемыми (уже так сегодня).
+   Новые статусы этим ADR не вводятся.
+
+6. Transition-политика.
+
+   Вариант C принят (минимальные ограничения) — со следующей
+   явной матрицей:
+
+     pending      → pending, in_progress, blocked, skipped
+     in_progress  → in_progress, pending, blocked, done, skipped
+     blocked      → blocked, pending, in_progress, skipped
+     done         → done (без reopen через обычный transition)
+     skipped      → skipped (без reopen через обычный transition)
+
+   Явный reopen policy: обычный /updatestage (и его orchestration-
+   функция из решения 2) НЕ может неявно перевести done/skipped
+   обратно в pending/in_progress/blocked. Любая такая попытка
+   отклоняется с кодом STAGE_REOPEN_REQUIRES_EXPLICIT_ACTION. Полная
+   команда/флаг явного reopen НЕ проектируется в этом ADR и НЕ
+   реализуется в Phase 34C — фиксируется только инвариант "reopen
+   требует отдельного явного намерения" и структурированный код
+   ошибки для обычного пути. Любой другой переход между pending/
+   in_progress/blocked разрешён в обе стороны без ограничений —
+   это НЕ полноценная state machine, а минимальный, явно
+   документированный набор запретов (запрет неявного reopen), как и
+   рекомендовано.
+
+7. Eligibility родительского Roadmap.
+
+   active:     Stage status update разрешён без ограничений.
+   on_hold:    Stage status update (execution-переход статуса)
+               ЗАБЛОКИРОВАН, код ROADMAP_ON_HOLD; административные
+               поля (Responsible/Notes/Priority/Blocking Reason/
+               Due Date через update_stage_fields) разрешены (см.
+               решение 19).
+   completed:  Stage status update ЗАБЛОКИРОВАН, код
+               ROADMAP_COMPLETED — включая попытку reopen (см.
+               решение 8).
+   cancelled:  Stage status update ЗАБЛОКИРОВАН НАВСЕГДА, код
+               ROADMAP_CANCELLED — административные поля тоже
+               блокируются (см. решение 19), кроме, возможно, Notes
+               как отдельного audit-механизма — не проектируется в
+               этом ADR.
+
+   Никакая мутация статуса Roadmap не происходит неявно как побочный
+   эффект Stage-transition проверки — только чтение текущего статуса
+   Roadmap перед принятием решения.
+
+8. Согласованность completed Roadmap.
+
+   Вариант B принят: reopen Stage, принадлежащего Roadmap со
+   статусом completed, БЛОКИРУЕТСЯ (код ROADMAP_COMPLETED) до тех
+   пор, пока Roadmap явно не переведён в другое состояние отдельной
+   будущей Roadmap lifecycle-командой (cancel/hold/restore — вне
+   scope этого ADR и Phase 34C). Phase 34C реализует только блок,
+   не создаёт lifecycle-команды. Completed Roadmap не может стать
+   рассогласованным СИЛЕНТНО — теперь для этого требуется явное
+   действие, которого пока не существует, то есть на практике
+   рассогласование становится НЕВОЗМОЖНЫМ до появления lifecycle-
+   команд в будущей фазе.
+
+9. Авто-завершение Roadmap.
+
+   Однонаправленное поведение active → completed сохраняется
+   (ADR-011). Подтверждено:
+     - on_hold Roadmap НЕ авто-завершается (maybe_complete_roadmap
+       уже сегодня действует только на статусе active — сохраняется);
+     - cancelled Roadmap НИКОГДА не авто-завершается (уже так);
+     - completed Roadmap остаётся completed (уже так, идемпотентно);
+     - zero-stage Roadmap не авто-завершается (should_complete_roadmap
+       уже возвращает False при пустом списке этапов — сохраняется).
+   maybe_complete_roadmap ДОЛЖНА проверять текущий статус Roadmap
+   непосредственно перед записью (уже делает это сегодня — читает
+   строку заново, а не использует кэшированное значение) — это
+   поведение подтверждается как обязательное, не переизобретается.
+
+10. Пересчёт Progress %.
+
+    Формула ADR-010 сохраняется без изменений: (done + skipped) /
+    total, round-half-up. Подтверждено:
+      - Progress пересчитывается после каждого успешного изменения
+        статуса Stage;
+      - Progress НЕ меняется при edits только Notes/Responsible через
+        update_stage_fields (эти edits не затрагивают Status);
+      - сбой пересчёта Progress — структурированный downstream
+        partial failure, не превращает успешную запись Status в
+        ok=False;
+      - retry безопасен (recalculate_roadmap_progress уже
+        идемпотентна);
+      - ROADMAPS.Progress % остаётся кэшированной read-model колонкой,
+        хранилище прогресса не редизайнится.
+
+11. Transition transaction model.
+
+    Утверждена следующая последовательность для orchestration-функции
+    из решения 2:
+      1. resolve Stage (find_stage_by_id);
+      2. resolve родительский Roadmap (find_roadmap_by_id);
+      3. проверить Roadmap eligibility (решение 7) — ROADMAP_NOT_FOUND/
+         ROADMAP_ON_HOLD/ROADMAP_COMPLETED/ROADMAP_CANCELLED блокируют
+         здесь, до любой записи;
+      4. проверить current→target Stage transition (решение 6) —
+         INVALID_STAGE_TRANSITION/STAGE_REOPEN_REQUIRES_EXPLICIT_ACTION
+         блокируют здесь, до любой записи;
+      5. персистентность Stage status (update_stage_status_in_sheet);
+      6. побочные эффекты Start Date/Completed At (уже часть шага 5,
+         не выносятся отдельно);
+      7. пересчёт Progress Roadmap (recalculate_roadmap_progress);
+      8. возможное авто-завершение Roadmap (maybe_complete_roadmap);
+      9. вернуть структурированный результат (решение 12).
+    Cross-sheet атомарность НЕ требуется (как и во всём Roadmap
+    Domain — ADR-016 уже принял тот же принцип). Partial success
+    должен быть видимым, не скрытым. Hard-delete rollback не
+    существует и не вводится.
+
+12. Структурированный контракт результата.
+
+    Новая orchestration-функция возвращает как минимум:
+    ok, code, error, stage_id, roadmap_id, previous_status,
+    requested_status, final_status, changed, partial_success,
+    written_fields, warnings, downstream_failures, progress_before,
+    progress_after, roadmap_status_before, roadmap_status_after,
+    retry_safe.
+
+    Машиночитаемые коды (минимум): STAGE_NOT_FOUND, ROADMAP_NOT_FOUND,
+    INVALID_STAGE_STATUS, INVALID_STAGE_TRANSITION,
+    STAGE_REOPEN_REQUIRES_EXPLICIT_ACTION, ROADMAP_ON_HOLD,
+    ROADMAP_COMPLETED, ROADMAP_CANCELLED, STAGE_STATUS_UPDATED,
+    STAGE_STATUS_UNCHANGED, STAGE_WRITE_PARTIAL_FAILURE,
+    PROGRESS_RECALCULATION_FAILED, ROADMAP_AUTO_COMPLETION_FAILED.
+
+    Русский пользовательский текст остаётся ИСКЛЮЧИТЕЛЬНО в
+    telegram_handlers.py (централизованный error_code → текст маппинг,
+    тот же паттерн, что Phase 33D уже применила для Roadmap-создания)
+    — persistence- и orchestration-слои никогда не формируют
+    пользовательский текст напрямую.
+
+13. Поведение дат этапа.
+
+    На основе текущего, уже проверенного тестами поведения
+    update_stage_status_in_sheet:
+      - Start Date выставляется один раз, при первом входе в
+        in_progress; повторный вход в in_progress НЕ перезаписывает
+        уже существующее значение (уже так сегодня — сохраняется);
+      - Completed At выставляется при входе в done (уже так сегодня —
+        сохраняется); поведение при skipped НЕ меняется относительно
+        текущей реализации (сегодня Completed At выставляется только
+        веткой new_status == "done" — skipped его не трогает; это
+        сохраняется без изменений, не вводится новая семантика);
+      - reopen (когда он появится в будущей фазе как отдельное явное
+        действие) НЕ стирает исторические Start Date/Completed At
+        автоматически — эти поля остаются honest историческими
+        отметками первого прохождения, а не текущим состоянием;
+        точный механизм "очистки при reopen", если он вообще
+        понадобится, — решение будущей фазы, не этого ADR.
+
+14. Порядок и зависимости этапов.
+
+    Вариант A + C приняты: Order остаётся display/identity-полем,
+    НЕ зависимостью. Параллельное и out-of-order выполнение этапов
+    остаётся разрешённым и осознанным, не ошибкой. Prerequisite/
+    dependency-граф явно откладывается в будущий Workflow/Task Domain
+    (вне scope Stage Domain и этого ADR). Зависимости НЕ выводятся из
+    числового Order неявно ни в этом ADR, ни в Phase 34C.
+
+15. Конкурентность материализации.
+
+    TOCTOU-риск в ensure_roadmap_stages, найденный в Phase 34A,
+    принимается и документируется как НЕБЛОКИРУЮЩИЙ технический долг:
+    последовательная retry-идемпотентность признаётся достаточной на
+    сегодня; истинная конкурентная материализация НЕ является
+    одобренным паттерном использования; distributed locking НЕ
+    добавляется в Phase 34C без отдельного явного одобрения; guard
+    от дублирования по (Roadmap ID, Order) остаётся обязательным и
+    уже существует.
+
+16. Семантика поля Responsible.
+
+    Responsible остаётся информационным свободным текстом в Stage
+    Domain и НЕ валидируется против PEOPLE_REGISTRY. Канонический
+    Person/Role assignment остаётся исключительно в
+    work_assignment_manager.py и STAGE_ENTITY_RELATIONS (Phase 22B/
+    22D-механизм) — это разделение, найденное Phase 34A уже здоровым
+    и намеренным, этим ADR не трогается. Будущий Organization/
+    Assignment UX не должен перегружать это поле как Person ID.
+
+17. Documents/checklists/materials/SOP/FAQ.
+
+    Comma-list поля (Docs Required, SOP IDs, Checklist IDs, Materials
+    IDs, Document Template IDs, FAQ IDs) остаются информационными
+    снимками, скопированными из Template при материализации. Stage
+    completion НЕ блокируется этими полями в Stage Domain. Document
+    enforcement — будущая забота Document/Relation Domain; checklist
+    execution — будущая забота Checklist/Task Domain; Materials IDs
+    остаются reserved/deferred (materials_manager.py не существует).
+    SOP/FAQ остаются read-only knowledge-ссылками.
+    document_requirements.py НЕ подключается к transition-orchestration
+    в Phase 34C — этот ADR явно НЕ одобряет hard completion gate.
+
+18. Milestones.
+
+    Расчёт коммерческих milestones остаётся read-only и внешним по
+    отношению к Stage persistence (COMMERCIAL_MILESTONES_MAP —
+    статический, вычисляется на чтение). Stage status update не
+    создаёт записи об оплате. Отсутствие маппинга для template_id
+    остаётся неблокирующим (уже так — подтверждено живым smoke-тестом
+    /milestones roadmap_id=RM-001 в Phase 33D). Трактовка skipped/done
+    в milestone-контексте остаётся только display/enrichment-
+    поведением. Payment Domain не редизайнится.
+
+19. Generic field updates (update_stage_fields).
+
+    active:     Responsible/Notes/Priority/Blocking Reason/Due Date —
+                разрешены без ограничений.
+    on_hold:    Responsible/Notes/Due Date/Blocking Reason —
+                разрешены; Priority разрешён как административное
+                поле (не влияет на execution-статус); ИЗМЕНЕНИЕ
+                Status через update_stage_fields блокируется тем же
+                кодом ROADMAP_ON_HOLD, что и через orchestration-
+                функцию (решение 20) — единой политики, не два пути.
+    completed:  ВСЕ edits через update_stage_fields блокируются
+                (включая Notes) — явное решение этого ADR, не
+                оставлено на усмотрение реализации: completed Roadmap
+                — исторический снимок, административные "уточнения"
+                после завершения не считаются безопасными без
+                отдельного audit-механизма, который не проектируется
+                здесь.
+    cancelled:  ВСЕ edits блокируются без исключений, включая Notes —
+                cancelled Roadmap — не редактируемый исторический
+                артефакт (см. RM-002).
+
+    Generic field updates НЕ могут обходить Roadmap eligibility
+    policy решения 7 — update_stage_fields должна проверять тот же
+    Roadmap-статус, что и orchestration-функция, прежде чем писать
+    любое из перечисленных полей.
+
+20. Политика совместимости (compatibility wrappers).
+
+    update_stage_status_in_sheet() остаётся низкоуровневой
+    persistence-функцией (без доступа к Roadmap-статусу, без
+    transition-валидации) — не становится compatibility wrapper, а
+    остаётся тем, чем она является сегодня: точечная запись Status
+    (+ автозаполнение дат/Notes), ничего сверх этого. Новая
+    orchestration-функция (решение 2) становится КАНОНИЧЕСКИМ путём
+    для transition — /updatestage обязана вызывать её, а не
+    update_stage_status_in_sheet напрямую. update_stage_fields()
+    остаётся канонической функцией для административных полей, но
+    приобретает ту же Roadmap-eligibility-проверку (решение 19) —
+    она не становится вторым местом, где transition-правила
+    реализованы заново; она лишь проверяет Roadmap-статус тем же
+    способом. Никакая state machine не дублируется в
+    telegram_handlers.py — Phase 34C обязана добавить AST-guard,
+    подтверждающий это (см. решение 22).
+
+21. Направление зависимостей.
+
+    Утверждено:
+      telegram_handlers.py
+        → orchestration-функция (business_builder.py)
+            → roadmap_manager.py
+                → sheets.py
+
+    roadmap_manager.py по-прежнему не импортирует telegram_handlers,
+    business_builder, person_manager, organization_manager, модули
+    Document/Task-доменов — как и подтверждено Phase 34A (единственное
+    документированное исключение — legacy service_manager fallback
+    внутри _resolve_template_id, не расширяется этим ADR). Поскольку
+    business_builder уже вызывает roadmap_manager (однонаправленно,
+    ADR-016), выбор business_builder как orchestration-владельца
+    (решение 2) не создаёт обратного цикла — сохраняется тот же
+    порядок слоёв Business → Client → Service → Object → Roadmap →
+    Stage, что и везде в проекте.
+
+22. Test safety.
+
+    Обязательно до начала Phase 34C:
+      - test_recalcprogress.py, test_seed_izhs_commercial_milestones.py,
+        test_seed_izhs_commercial_milestones_sop.py добавляются в
+        hard socket-block реестр conftest.py (закрывает находку
+        Phase 34A);
+      - все новые Stage-transition тесты — под hard socket-block;
+      - никакого обращения к живым Google/Drive/Telegram/Railway/
+        HTTP/сокетам;
+      - моки должны соответствовать РЕАЛЬНЫМ call site'ам после
+        изменений (mock-completeness), а не устаревшим сигнатурам;
+      - AST-guard, подтверждающий отсутствие второй реализации
+        transition-политики в telegram_handlers.py;
+      - production-снимок до и после запуска тестов идентичен;
+      - ноль тестовых записей в production.
+    Инцидент PRS-003 остаётся постоянным прецедентом, обосновывающим
+    обязательность этой дисциплины для каждого нового Stage-теста.
+
+23. Production migration.
+
+    PRODUCTION_SCHEMA_MIGRATION_REQUIRED = NO
+    PRODUCTION_DATA_REWRITE_REQUIRED = NO
+
+    RM-001 и его 8 pending Stages остаются без изменений. RM-002
+    остаётся нетронутым. Изменяется только поведение БУДУЩИХ
+    вызовов transition/generic-field-update (Phase 34C) — задним
+    числом ничего не проверяется и не переписывается.
+
+24. Явно отложено (Deferred).
+
+    Roadmap lifecycle-команды (cancel/hold/restore/явный reopen);
+    Task-дедлайны и напоминания; employee work queues; Organization
+    permissions; dependency-графы между этапами; document completion
+    gates; исполняемые checklists; создание платёжных записей;
+    schema-миграция для Created timestamp; concurrency-locking для
+    материализации; обнаружение ручных правок в Sheets.
+
+Причина:
+
+Тот же архитектурный принцип, применённый ADR-013/014/015/016 к
+границам Business/Client/Object/Service/Roadmap-создания, здесь
+применяется к границе Stage-transition — единственной оставшейся
+незакрытой границе в уже иначе корректно устроенном Stage Domain.
+Phase 34A не нашла нарушений владения или циклов зависимостей;
+единственная реальная проблема — отсутствие любой проверки
+Roadmap-eligibility перед Stage-transition, что структурно допускает
+рассогласование Roadmap.Status и фактического состояния его Stages.
+Решение здесь сознательно МИНИМАЛЬНО: не вводится новая state
+machine, не вводится schema-миграция, не создаются lifecycle-команды
+— добавляется только одна проверка (Roadmap eligibility) и один
+явный запрет (implicit reopen), оба оформленные как структурированные,
+машиночитаемые коды, а не как молчаливая деградация или новая
+неявная политика.
+
+Статус:
+
+Утверждено для реализации (Phase 34C). Ничего не реализовано в
+рамках этого ADR — только архитектурное решение. Ни один
+production-caller не мигрирован, ни один код не изменён, схема
+ROADMAP_STAGES не менялась.
