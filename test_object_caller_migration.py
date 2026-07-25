@@ -191,7 +191,10 @@ class TestNewObjectIdempotentUx(unittest.TestCase):
         with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
              patch("business_core.sheets.find_row_by_id", return_value=biz_row), \
              patch("business_core.person_manager.find_person_by_id",
-                   return_value={"biz_ids": ["BIZ-001"], "full_name": "Клиент"}), \
+                   return_value={
+                       "biz_ids": ["BIZ-001"], "primary_biz_id": "", "full_name": "Клиент",
+                       "person_type": "клиент", "status": "active",
+                   }), \
              patch("business_core.business_builder.add_biz_id_to_person"), \
              patch("business_core.business_builder.create_object_record", return_value=create_result), \
              patch("business_core.business_builder.provision_object_drive",

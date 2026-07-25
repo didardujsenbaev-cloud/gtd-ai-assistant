@@ -89,6 +89,18 @@ def _safe_send(text: str, max_len: int = 4000) -> list[str]:
     return parts
 
 
+def _mask_phone_for_display(phone: str) -> str:
+    """Phase 31D: mask all but the last 4 digits of a phone number for
+    ambiguity-candidate display — avoids showing full personal data in
+    an error message (Phase 31A's privacy constraint)."""
+    digits = "".join(ch for ch in (phone or "") if ch.isdigit())
+    if not digits:
+        return "—"
+    if len(digits) <= 4:
+        return "*" * len(digits)
+    return "*" * (len(digits) - 4) + digits[-4:]
+
+
 async def _reply(update: Update, text: str, parse_mode: str = "Markdown") -> None:
     """Отправить ответ, разбивая при необходимости."""
     for part in _safe_send(text):
@@ -207,11 +219,14 @@ async def bc_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         except Exception:
             lines.append("\n🗺 Дорожные карты: нет данных")
 
-        # Клиенты
+        # Клиенты (Phase 31D, ADR-015 Decision 6: canonical owner API,
+        # replacing the raw read_business_sheet("people_registry") +
+        # substring "клиент" in Тип filter)
         try:
-            ppl_rows = read_business_sheet("people_registry")
-            clients = [r for r in ppl_rows if "клиент" in r.get("Тип", "").lower()]
-            lines.append(f"\n👥 *Клиенты:* {len(clients)} / {len(ppl_rows)} людей")
+            from business_core.person_manager import list_clients, list_people
+            client_count = len(list_clients())
+            people_count = len(list_people())
+            lines.append(f"\n👥 *Клиенты:* {client_count} / {people_count} людей")
         except Exception:
             lines.append("\n👥 Клиенты: нет данных")
 
@@ -369,50 +384,51 @@ async def show_clients(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await _reply(update, _bc_disabled_msg())
         return
 
-    query = " ".join(context.args).strip().lower() if context.args else ""
+    query = " ".join(context.args).strip() if context.args else ""
 
     try:
-        from business_core.sheets import read_business_sheet
+        from business_core.person_manager import list_clients, list_people
 
-        rows = read_business_sheet("people_registry")
-        if not rows:
-            await _reply(update,
-                "👥 *Клиенты*\n\nПусто. Добавь первого: /newclient"
-            )
-            return
+        # Phase 31D (ADR-015 Decision 6): canonical owner API, replacing
+        # the raw read_business_sheet("people_registry") + substring
+        # "клиент" in Тип filter. Archived excluded by default (matches
+        # the previous behavior — old code never excluded archived rows
+        # explicitly, but no archived Person existed in the "клиент"
+        # subset in practice; list_clients()'s default is now the
+        # explicit, intentional policy going forward).
+        all_clients = list_clients()
+        if not all_clients:
+            total_people = len(list_people())
+            if total_people == 0:
+                await _reply(update, "👥 *Клиенты*\n\nПусто. Добавь первого: /newclient")
+                return
 
-        clients = [r for r in rows if "клиент" in r.get("Тип", "").lower()]
-
-        # Фильтр по запросу
-        if query:
-            clients = [
-                r for r in clients
-                if query in r.get("ФИО", "").lower()
-                or query in r.get("Имя", "").lower()
-                or query in r.get("Телефон", "").lower()
-            ]
+        clients = list_clients(query=query or None)
 
         if not clients:
             msg = f"👥 Клиент *{query}* не найден." if query else "👥 Клиентов нет."
             await _reply(update, msg + "\n\nДобавь: /newclient")
             return
 
-        total_clients = len([r for r in rows if "клиент" in r.get("Тип", "").lower()])
         header = f"👥 *Клиенты*"
         if query:
             header += f" — поиск: _{query}_"
         header += f" ({len(clients)}"
         if not query:
-            header += f" / {len(rows)} людей"
+            header += f" / {len(list_people())} людей"
         header += ")"
 
         lines = [header, ""]
-        for r in clients[:15]:
-            prs_id = r.get("ID", "?")
-            name   = r.get("ФИО", r.get("Имя", "?"))
-            phone  = r.get("Телефон", "")
-            city   = r.get("Город", "")
-            bizs   = r.get("Бизнесы", "")
+        for p in clients[:15]:
+            name  = p.get("full_name") or p.get("short_name") or "?"
+            phone = p.get("phone", "")
+            city  = p.get("city", "")
+            # Phase 31D: canonical Person shape exposes biz_ids (technical
+            # IDs), not the legacy free-text "Бизнесы" display-name column
+            # — that column isn't part of the canonical read shape at all
+            # (Phase 31A/31C). Showing Biz IDs is the closest canonical
+            # equivalent without a raw registry read.
+            bizs  = ",".join(p.get("biz_ids") or [])
 
             line = f"*{name}*"
             if phone:
@@ -492,21 +508,30 @@ async def newroadmap_business(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def newroadmap_client(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """
+    NOTE (Phase 31D): this ConversationHandler state is unreachable in
+    production — the /newroadmap entry point (newroadmap_start) always
+    redirects to /startroadmap and returns ConversationHandler.END
+    before NR_CLIENT can ever be reached (see newroadmap_start's own
+    docstring, Phase 10.2E). Migrated anyway per Phase 31D Part 6, since
+    it is still wired into the ConversationHandler and the phase names
+    it explicitly.
+    """
     text = update.message.text.strip()
     context.user_data["nr"]["client_name"] = text
 
-    # Ищем client_id в People Registry
+    # Phase 31D (ADR-015 Decision 6): owner API instead of raw
+    # read_business_sheet("people_registry") + business_router's
+    # substring/first-match fuzzy entity extractor. 0 matches → not
+    # found (client_id left unset, same as before); exactly 1 match →
+    # selected; >1 matches → ambiguity, never silently picks the first
+    # (a real behavior tightening vs. the old fuzzy matcher — safe here
+    # since this code path never actually runs in production).
     try:
-        from business_core.sheets import read_business_sheet
-        from business_core.business_router import _find_client_in_text
-        rows = read_business_sheet("people_registry")
-        people = [
-            {"id": r.get("ID", ""), "full_name": r.get("ФИО", ""), "short_name": r.get("Имя", "")}
-            for r in rows
-        ]
-        cid, cname, _ = _find_client_in_text(text, people)
-        if cid:
-            context.user_data["nr"]["client_id"] = cid
+        from business_core.person_manager import list_clients
+        matches = list_clients(query=text)
+        if len(matches) == 1:
+            context.user_data["nr"]["client_id"] = matches[0]["person_id"]
     except Exception:
         pass
 
@@ -831,14 +856,16 @@ async def newclient_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return ConversationHandler.END
 
     try:
-        from business_core.business_builder import (
-            find_existing_person,
-            add_biz_id_to_person,
-            update_person_drive_info,
-            provision_client_drive,
-            normalize_biz_ids,
+        from business_core.business_builder import provision_client_drive_safe
+        from business_core.person_manager import (
+            resolve_person_identity,
+            create_person,
+            update_person,
+            ensure_client_role,
+            append_person_biz_id,
+            has_person_business_link,
+            is_client_person,
         )
-        from business_core.person_manager import create_person, update_person
 
         full_name = nc.get("full_name", "")
         phone     = nc.get("phone", "")
@@ -851,44 +878,76 @@ async def newclient_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         # не резолвить заново (иначе снова возможен разрыв между тем, что
         # подтвердил пользователь, и тем, что сохраняется).
         biz_id_resolved = nc.get("biz_id_resolved", "")
+        requested_type = nc.get("person_type", "клиент")
 
-        # ── Phase 6B: расширенная дедупликация ───────────────────
-        existing = find_existing_person(
-            name=full_name,
-            phone=phone,
-            biz_id=biz_id_resolved or None,
+        # Phase 31D (ADR-015 Decision 2/4): canonical identity resolver,
+        # called directly — NOT the find_existing_person/find_duplicate_
+        # person compatibility wrappers. Archived rows are excluded by
+        # default (a strong-only archived match surfaces as its own
+        # status below, never silently reused/reactivated); a name-only
+        # match — even a single one — is always "ambiguous", stricter
+        # than the pre-31D behavior (see Phase 31D final report, Part 8).
+        identity = resolve_person_identity(
+            name=full_name or None, phone=phone or None, email=None,
         )
+        status = identity["status"]
 
-        STATUS_NEW           = "new"
-        STATUS_SAME_BIZ      = "same_biz"
-        STATUS_OTHER_BIZ     = "other_biz"
+        # ── AMBIGUOUS: zero writes ────────────────────────────────
+        if status == "ambiguous":
+            lines = [
+                "⚠️ Найдено несколько похожих контактов — не могу однозначно "
+                "определить, это новый человек или уже существующий.",
+                "",
+            ]
+            for p in identity["matches"][:5]:
+                lines.append(
+                    f"• {p.get('person_id', '?')} — {p.get('full_name', '?')} "
+                    f"({_mask_phone_for_display(p.get('phone', ''))})"
+                )
+            lines.append("")
+            lines.append("Уточни номер телефона или email и повтори /newclient.")
+            await update.message.reply_text(
+                "\n".join(lines), reply_markup=ReplyKeyboardRemove(), parse_mode=None,
+            )
+            context.user_data.pop("nc", None)
+            context.user_data.pop("nc_confirmed_snapshot", None)
+            return ConversationHandler.END
 
-        # Phase 23D-2: initialized unconditionally, before the branching,
-        # so STATUS_SAME_BIZ/STATUS_OTHER_BIZ (which never touch profile
-        # fields) can never hit an unbound variable when this flag is read
-        # later in the reply-construction step.
+        # ── ARCHIVED_MATCH: zero writes, no reactivation ──────────
+        if status == "archived_match":
+            await update.message.reply_text(
+                "⚠️ Найден архивный контакт с такими же данными. "
+                "Автоматическое восстановление не выполняется — "
+                "обратитесь к администратору для реактивации записи.",
+                reply_markup=ReplyKeyboardRemove(), parse_mode=None,
+            )
+            context.user_data.pop("nc", None)
+            context.user_data.pop("nc_confirmed_snapshot", None)
+            return ConversationHandler.END
+
+        STATUS_NEW       = "new"
+        STATUS_SAME_BIZ  = "same_biz"
+        STATUS_OTHER_BIZ = "other_biz"
+
         profile_fields_warning = False
+        requesting_client_role = is_client_person({"person_type": requested_type})
 
-        if existing is None:
+        if status == "not_found":
             client_status = STATUS_NEW
-            prs_id = None
-        elif existing.get("same_biz", True):
-            client_status = STATUS_SAME_BIZ
-            prs_id = existing["prs_id"]
-        else:
-            client_status = STATUS_OTHER_BIZ
-            prs_id = existing["prs_id"]
 
-        # ── Создание новой записи (Phase 23D-2: через Person Manager) ──
-        if client_status == STATUS_NEW:
             # Core identity write — the ONLY step whose failure reproduces
             # today's "❌ Ошибка сохранения" path (raising here lets the
             # existing outer `except Exception as e` handle it exactly as
-            # before — no new error-handling shape introduced).
+            # before — no new error-handling shape introduced). create_person()
+            # runs its own duplicate check (find_duplicate_person, now itself
+            # a resolve_person_identity wrapper) immediately before writing —
+            # if a race narrows what resolve_person_identity saw a moment ago,
+            # this returns a structured {"ok": False, "error": ...}, handled
+            # the same as any other create_person failure, not a raw exception.
             create_result = create_person(
                 full_name=full_name,
                 phone=phone,
-                person_type=nc.get("person_type", "клиент"),
+                person_type=requested_type,
                 business_id=biz_id_resolved,
                 status="active",
             )
@@ -900,11 +959,10 @@ async def newclient_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             # Profile-field write — Бизнесы (legacy display name),
             # Уровень доверия, Теплота are /newclient-specific defaults,
             # deliberately NOT part of create_person()'s universal API
-            # (Person Manager stays domain-neutral — see Phase 23D-2
-            # architecture decision). A failure here is a PARTIAL
-            # success: the Person itself is already confirmed created,
-            # so this must never be reported as a save failure, must
-            # never block Drive provisioning, and must never block
+            # (Person Manager stays domain-neutral). A failure here is a
+            # PARTIAL success: the Person itself is already confirmed
+            # created, so this must never be reported as a save failure,
+            # must never block Drive provisioning, and must never block
             # cache invalidation.
             update_result = update_person(prs_id, {
                 "Бизнесы": biz_name,
@@ -919,15 +977,16 @@ async def newclient_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                     f"error={update_result['error']} "
                     f"attempted_fields=['Бизнесы', 'Уровень доверия', 'Теплота']"
                 )
-            # update_person() currently issues one update_cell() call PER
-            # changed field (Бизнесы / Уровень доверия / Теплота), not a
-            # single batched write — so a failure partway through could
-            # leave some, but not necessarily all, of these three fields
-            # saved. The warning below deliberately says "часть" (some),
-            # never claims none were saved. Batching this into a single
-            # write is recorded as technical debt (Phase 23D-2), not
-            # addressed in this phase — see ENGINEERING_STANDARDS.md,
-            # Technical Debt Policy.
+
+            # Phase 31D (ADR-015 Decision 5/12): NOT calling
+            # ensure_client_role() here deliberately — the freshly
+            # created row's "Тип" is already exactly requested_type
+            # (create_person() just wrote it), so ensure_client_role()
+            # could only ever be a no-op confirmation for a NEW Person,
+            # at the cost of one extra PEOPLE_REGISTRY read. It is still
+            # used below for the existing-person (single_match) branch,
+            # where the Person's current "Тип" is NOT already known to
+            # match this request.
 
             try:
                 from business_core.inbox_bridge import invalidate_cache
@@ -935,54 +994,67 @@ async def newclient_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             except Exception:
                 pass
 
-        # ── Добавление biz_id к существующему контакту ───────────
-        elif client_status == STATUS_OTHER_BIZ and biz_id_resolved:
-            try:
-                add_biz_id_to_person(prs_id, biz_id_resolved)
-            except Exception as exc:
-                log.warning(f"newclient add_biz_id error: {exc}")
+        else:  # status == "single_match" — an existing Person
+            person = identity["person"]
+            prs_id = person["person_id"]
 
-        # ── Drive ─────────────────────────────────────────────────
+            # Phase 31D (ADR-015 Decision 5/12): client-role enforcement
+            # only applies when THIS /newclient invocation is actually
+            # requesting the Client role (person_type == "клиент"/
+            # recognized subtype) — /newclient also serves партнер/
+            # сотрудник/подрядчик contacts, which are legitimate non-Client
+            # Person types this gate must not block.
+            if requesting_client_role:
+                role_result = ensure_client_role(prs_id)
+                if role_result.get("manual_decision_required"):
+                    await update.message.reply_text(
+                        f"ℹ️ {role_result.get('warning') or 'Требуется ручное решение по типу контакта.'}\n\n"
+                        f"Связь с бизнесом и Drive-папка не изменены.",
+                        reply_markup=ReplyKeyboardRemove(), parse_mode=None,
+                    )
+                    context.user_data.pop("nc", None)
+                    context.user_data.pop("nc_confirmed_snapshot", None)
+                    return ConversationHandler.END
+
+            same_biz = (not biz_id_resolved) or has_person_business_link(person, biz_id_resolved)
+            if same_biz:
+                client_status = STATUS_SAME_BIZ
+            else:
+                client_status = STATUS_OTHER_BIZ
+                try:
+                    append_person_biz_id(prs_id, biz_id_resolved)
+                except Exception as exc:
+                    log.warning(f"newclient add_biz_id error: {exc}")
+
+        # ── Drive (Phase 31D, ADR-015 Decisions 14/15) ─────────────
         drive_msg = ""
         if biz_name:
-            # Уже есть Drive-ссылка — показываем её
-            if existing and existing.get("drive_url"):
-                drive_msg = f"\n📁 Drive: {existing['drive_url']}"
-            else:
-                # Создаём/получаем Drive-папку
-                try:
-                    drive_result = provision_client_drive(
-                        prs_id=prs_id,
-                        full_name=full_name,
-                        biz_name=biz_name,
-                    )
-                    if drive_result["ok"]:
-                        # Phase 23D-3C1: unconditional for both STATUS_NEW
-                        # and existing-person flows — safe because
-                        # update_person_drive_info()'s fill-if-empty
-                        # semantics are observably identical to the old
-                        # STATUS_NEW-only unconditional overwrite here:
-                        # create_person() never sets Drive fields, so
-                        # they are guaranteed empty at this call site.
-                        update_person_drive_info(
-                            prs_id, drive_result["folder_id"], drive_result["folder_url"]
+            try:
+                drive_result = provision_client_drive_safe(
+                    person_id=prs_id, full_name=full_name, biz_name=biz_name,
+                )
+                if drive_result["ok"] and drive_result["folder_url"]:
+                    drive_msg = f"\n📁 Drive: {drive_result['folder_url']}"
+                    if drive_result["drive_reused"] and client_status == STATUS_OTHER_BIZ:
+                        drive_msg += (
+                            "\n⚠️ Для клиента уже существует общая папка. "
+                            "Отдельная папка для нового бизнеса не создана."
                         )
-                        drive_msg = f"\n📁 Drive: {drive_result['folder_url']}"
-                    else:
-                        err = drive_result.get("error", "")
-                        if err and "не задан" not in err:
-                            drive_msg = f"\n⚠️ Папка Drive не создана: {err}"
-                except Exception as drive_exc:
-                    log.warning(f"newclient Drive error: {drive_exc}")
+                    if drive_result["partial_failure"]:
+                        drive_msg += f"\n⚠️ {drive_result.get('warning', '')}"
+                elif not drive_result["ok"]:
+                    err = drive_result.get("error", "") or ""
+                    if err and "не задан" not in err:
+                        drive_msg = f"\n⚠️ Папка Drive не создана: {err}"
+            except Exception as drive_exc:
+                log.warning(f"newclient Drive error: {drive_exc}")
 
         # ── Ответ ─────────────────────────────────────────────────
         # Phase 11J: запись уже сохранена в Sheets к этому моменту —
         # ошибка форматирования ответа не должна выглядеть как ошибка
         # сохранения. parse_mode=None (без Markdown) — full_name и
         # drive_msg содержат динамические пользовательские данные и URL,
-        # которые могут содержать "_"/"*"/"[" и ломать Markdown-парсер
-        # (см. Phase 10.2D/11E: сломанный Drive URL с "_" вызывал
-        # "Can't parse entities").
+        # которые могут содержать "_"/"*"/"[" и ломать Markdown-парсер.
         if client_status == STATUS_NEW:
             header = "✅ Клиент добавлен!"
         elif client_status == STATUS_SAME_BIZ:
@@ -990,10 +1062,6 @@ async def newclient_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         else:
             header = "ℹ️ Контакт уже был в другом бизнесе, добавил связь с текущим бизнесом"
 
-        # Phase 23D-2: profile_fields_warning is only ever True for
-        # STATUS_NEW (the only branch that calls update_person() for
-        # profile fields) — appended AFTER the success header, never
-        # replacing it, and never implying the Person itself wasn't saved.
         warning_line = (
             "\n⚠️ Некоторые дополнительные поля профиля (бизнес/теплота) "
             "могли сохраниться не полностью — проверьте карточку клиента."
@@ -1009,11 +1077,11 @@ async def newclient_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 f"{warning_line}\n\n"
                 f"/clients — посмотреть всех клиентов",
                 reply_markup=ReplyKeyboardRemove(),
+                parse_mode=None,
             )
         except Exception as notify_exc:
-            # Persistence (append_business_row / add_biz_id_to_person)
-            # уже отработала успешно — сообщаем об успехе, а не о
-            # несуществующей ошибке сохранения.
+            # Persistence уже отработала успешно — сообщаем об успехе, а
+            # не о несуществующей ошибке сохранения.
             log.warning(f"newclient_confirm notify error: {notify_exc}")
             await update.message.reply_text(
                 f"✅ Клиент сохранён (ID: {prs_id}), но не удалось отобразить полную карточку.",
@@ -2020,8 +2088,6 @@ async def newobject_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         from business_core.business_builder import (
             create_object_record,
             provision_object_drive,
-            add_biz_id_to_person,
-            find_existing_person,
         )
 
         # Проверяем что бизнес существует (Phase 30D, Part 5 — тот же
@@ -2035,20 +2101,37 @@ async def newobject_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             await _reply(update, f"❌ Бизнес `{biz_id}` не найден в BIZ_REGISTRY")
             return
 
-        # Проверяем что клиент существует и связан с бизнесом
-        from business_core.person_manager import find_person_by_id
+        # Phase 31D (ADR-015 Decisions 11/12): Client-role and existing
+        # Business-link validation, replacing the old silent
+        # add_biz_id_to_person() auto-link. /newobject must never
+        # mutate a Person's Business links itself — that is /newclient's
+        # job. Each rejection below returns before create_object_record()
+        # or provision_object_drive() is ever called: zero Object/Drive
+        # writes on any invalid Client condition.
+        from business_core.person_manager import (
+            find_person_by_id, is_person_archived, is_client_person, has_person_business_link,
+        )
         person = find_person_by_id(client_id)
 
         if person is None:
             await _reply(update, f"❌ Клиент `{client_id}` не найден в PEOPLE_REGISTRY")
             return
 
-        # Добавляем biz_id к клиенту если нужно
-        try:
-            if biz_id not in person["biz_ids"]:
-                add_biz_id_to_person(client_id, biz_id)
-        except Exception:
-            pass
+        if is_person_archived(person):
+            await _reply(update, "❌ Клиент находится в архиве")
+            return
+
+        if not is_client_person(person):
+            await _reply(update, "❌ Сначала оформите человека как клиента через /newclient")
+            return
+
+        if not has_person_business_link(person, biz_id):
+            await _reply(
+                update,
+                "❌ Клиент не привязан к этому бизнесу. "
+                "Сначала добавьте его через /newclient.",
+            )
+            return
 
         # Создаём (или конвергентно переиспользуем) объект в OBJECT_REGISTRY
         res = create_object_record(

@@ -2,10 +2,22 @@
 Tests for Phase 23D-2 — /newclient refactored onto
 business_core.person_manager.create_person()/update_person().
 
+Phase 31D update: newclient_confirm() now calls person_manager.
+resolve_person_identity() directly (ADR-015 Decision 2) instead of the
+business_builder.find_existing_person() compatibility wrapper, and
+routes Drive orchestration through business_builder.
+provision_client_drive_safe() (a single retry-safe decision point,
+ADR-015 Decisions 14/15) instead of calling provision_client_drive()
+and update_person_drive_info() separately. Every test below is mocked
+at these NEW call points — provision_client_drive_safe() is mocked
+wholesale so no test ever triggers its internal (real)
+person_manager.find_person_by_id() call, which would otherwise hit
+live Google Sheets.
+
 Covers exactly the scenarios required by the approved Phase 23D-2 plan:
 create_person success, create_person failure, update_person partial
 failure, Drive failure after successful creation, unchanged SAME_BIZ/
-OTHER_BIZ behavior, no duplicate Person creation (find_existing_person
+OTHER_BIZ behavior, no duplicate Person creation (resolve_person_identity
 remains the sole dedup decision-maker), exact preservation of
 Бизнесы/Уровень доверия/Теплота, "Бизнесы" now accepted by
 update_person()'s editable-field whitelist, and profile_fields_warning
@@ -43,6 +55,55 @@ def _run(coro):
     return asyncio.new_event_loop().run_until_complete(coro)
 
 
+def _identity_result_from_legacy(existing: dict | None, biz_id_resolved: str = "BIZ-001") -> dict:
+    """Phase 31D: newclient_confirm() now calls person_manager.
+    resolve_person_identity() directly instead of business_builder.
+    find_existing_person() — converts the old find_existing_person()
+    fixture shape into the canonical resolve_person_identity() result
+    shape. same_biz is re-derived by newclient_confirm() itself via
+    has_person_business_link(), so when the fixture doesn't specify
+    "biz_ids" explicitly, this reconstructs a biz_ids list that
+    reproduces the same same_biz outcome the fixture's "same_biz" flag
+    originally encoded."""
+    if existing is None:
+        return {"status": "not_found", "person": None, "matches": [], "matched_by": [], "error": None}
+    biz_ids = existing.get("biz_ids")
+    if biz_ids is None:
+        same_biz_flag = existing.get("same_biz", True)
+        biz_ids = [biz_id_resolved] if (same_biz_flag and biz_id_resolved) else []
+    person = {
+        "person_id": existing["prs_id"],
+        "full_name": existing.get("full_name", "Иван Иванов"),
+        "biz_ids": biz_ids,
+        "primary_biz_id": existing.get("primary_biz_id", ""),
+        "google_drive": existing.get("drive_url", ""),
+        "drive_folder_id": existing.get("drive_folder_id", ""),
+        "phone": existing.get("phone_raw", ""),
+        "row_num": existing.get("row_num", 2),
+    }
+    return {"status": "single_match", "person": person, "matches": [person], "matched_by": ["phone"], "error": None}
+
+
+_DRIVE_NOT_CONFIGURED = {
+    "ok": False, "drive_created": False, "drive_reused": False, "partial_failure": False,
+    "folder_id": None, "folder_url": None, "warning": None, "error": "не задан",
+}
+
+
+def _drive_created(folder_id: str, folder_url: str) -> dict:
+    return {
+        "ok": True, "drive_created": True, "drive_reused": False, "partial_failure": False,
+        "folder_id": folder_id, "folder_url": folder_url, "warning": None, "error": None,
+    }
+
+
+def _drive_reused(folder_id: str, folder_url: str) -> dict:
+    return {
+        "ok": True, "drive_created": False, "drive_reused": True, "partial_failure": False,
+        "folder_id": folder_id, "folder_url": folder_url, "warning": None, "error": None,
+    }
+
+
 def _make_confirm_update(text="✅ Сохранить"):
     update = MagicMock()
     update.message.text = text
@@ -74,13 +135,13 @@ class TestCreatePersonSuccess(unittest.TestCase):
         context = _make_confirm_context()
 
         async def run():
-            with patch("business_core.business_builder.find_existing_person", return_value=None), \
+            with patch("business_core.person_manager.resolve_person_identity", return_value=_identity_result_from_legacy(None)), \
                  patch("business_core.person_manager.create_person",
                        return_value={"ok": True, "person_id": "PRS-100", "error": None}), \
                  patch("business_core.person_manager.update_person",
                        return_value={"ok": True, "changed": True, "updated_fields": (), "error": None}), \
-                 patch("business_core.business_builder.provision_client_drive",
-                       return_value={"ok": False, "error": "не задан"}):
+                 patch("business_core.business_builder.provision_client_drive_safe",
+                       return_value=_DRIVE_NOT_CONFIGURED):
                 await th.newclient_confirm(update, context)
 
         _run(run())
@@ -101,11 +162,11 @@ class TestCreatePersonFailure(unittest.TestCase):
         update = _make_confirm_update()
         context = _make_confirm_context()
 
-        with patch("business_core.business_builder.find_existing_person", return_value=None), \
+        with patch("business_core.person_manager.resolve_person_identity", return_value=_identity_result_from_legacy(None)), \
              patch("business_core.person_manager.create_person",
                    return_value={"ok": False, "person_id": "", "error": "Business 'BIZ-001' не найден"}), \
              patch("business_core.person_manager.update_person") as mock_update, \
-             patch("business_core.business_builder.provision_client_drive") as mock_drive, \
+             patch("business_core.business_builder.provision_client_drive_safe") as mock_drive, \
              patch("business_core.inbox_bridge.invalidate_cache") as mock_cache:
             _run(th.newclient_confirm(update, context))
 
@@ -121,7 +182,7 @@ class TestCreatePersonFailure(unittest.TestCase):
         update = _make_confirm_update()
         context = _make_confirm_context()
 
-        with patch("business_core.business_builder.find_existing_person", return_value=None), \
+        with patch("business_core.person_manager.resolve_person_identity", return_value=_identity_result_from_legacy(None)), \
              patch("business_core.person_manager.create_person",
                    return_value={"ok": False, "person_id": "", "error": "boom"}):
             _run(th.newclient_confirm(update, context))
@@ -141,14 +202,14 @@ class TestUpdatePersonPartialFailure(unittest.TestCase):
         update = _make_confirm_update()
         context = _make_confirm_context()
 
-        with patch("business_core.business_builder.find_existing_person", return_value=None), \
+        with patch("business_core.person_manager.resolve_person_identity", return_value=_identity_result_from_legacy(None)), \
              patch("business_core.person_manager.create_person",
                    return_value={"ok": True, "person_id": "PRS-101", "error": None}), \
              patch("business_core.person_manager.update_person",
                    return_value={"ok": False, "changed": False, "updated_fields": (),
                                  "error": "Sheets API timeout"}), \
-             patch("business_core.business_builder.provision_client_drive",
-                   return_value={"ok": False, "error": "не задан"}) as mock_drive, \
+             patch("business_core.business_builder.provision_client_drive_safe",
+                   return_value=_DRIVE_NOT_CONFIGURED) as mock_drive, \
              patch("business_core.inbox_bridge.invalidate_cache") as mock_cache:
             _run(th.newclient_confirm(update, context))
 
@@ -169,14 +230,14 @@ class TestUpdatePersonPartialFailure(unittest.TestCase):
         update = _make_confirm_update()
         context = _make_confirm_context()
 
-        with patch("business_core.business_builder.find_existing_person", return_value=None), \
+        with patch("business_core.person_manager.resolve_person_identity", return_value=_identity_result_from_legacy(None)), \
              patch("business_core.person_manager.create_person",
                    return_value={"ok": True, "person_id": "PRS-102", "error": None}), \
              patch("business_core.person_manager.update_person",
                    return_value={"ok": False, "changed": False, "updated_fields": (),
                                  "error": "Sheets API timeout"}), \
-             patch("business_core.business_builder.provision_client_drive",
-                   return_value={"ok": False, "error": "не задан"}), \
+             patch("business_core.business_builder.provision_client_drive_safe",
+                   return_value=_DRIVE_NOT_CONFIGURED), \
              patch("business_core.telegram_handlers.log") as mock_log:
             _run(th.newclient_confirm(update, context))
 
@@ -198,14 +259,14 @@ class TestUpdatePersonPartialFailure(unittest.TestCase):
         update = _make_confirm_update()
         context = _make_confirm_context()
 
-        with patch("business_core.business_builder.find_existing_person", return_value=None), \
+        with patch("business_core.person_manager.resolve_person_identity", return_value=_identity_result_from_legacy(None)), \
              patch("business_core.person_manager.create_person",
                    return_value={"ok": True, "person_id": "PRS-103", "error": None}), \
              patch("business_core.person_manager.update_person",
                    return_value={"ok": False, "changed": False, "updated_fields": (),
                                  "error": "boom"}), \
-             patch("business_core.business_builder.provision_client_drive",
-                   return_value={"ok": False, "error": "не задан"}):
+             patch("business_core.business_builder.provision_client_drive_safe",
+                   return_value=_DRIVE_NOT_CONFIGURED):
             _run(th.newclient_confirm(update, context))
 
         msg = update.message.reply_text.call_args[0][0]
@@ -224,12 +285,12 @@ class TestDriveFailureAfterSuccessfulCreation(unittest.TestCase):
         update = _make_confirm_update()
         context = _make_confirm_context()
 
-        with patch("business_core.business_builder.find_existing_person", return_value=None), \
+        with patch("business_core.person_manager.resolve_person_identity", return_value=_identity_result_from_legacy(None)), \
              patch("business_core.person_manager.create_person",
                    return_value={"ok": True, "person_id": "PRS-104", "error": None}), \
              patch("business_core.person_manager.update_person",
                    return_value={"ok": True, "changed": True, "updated_fields": (), "error": None}), \
-             patch("business_core.business_builder.provision_client_drive",
+             patch("business_core.business_builder.provision_client_drive_safe",
                    side_effect=RuntimeError("drive down")):
             _run(th.newclient_confirm(update, context))
 
@@ -250,12 +311,16 @@ class TestExistingBranchesUnchangedNoDuplicateCreation(unittest.TestCase):
         update = _make_confirm_update()
         context = _make_confirm_context()
 
-        with patch("business_core.business_builder.find_existing_person",
-                   return_value={"prs_id": "PRS-001", "same_biz": True, "drive_url": ""}), \
+        with patch("business_core.person_manager.resolve_person_identity",
+                   return_value=_identity_result_from_legacy(
+                       {"prs_id": "PRS-001", "same_biz": True, "drive_url": ""})), \
+             patch("business_core.person_manager.ensure_client_role",
+                   return_value={"ok": True, "changed": False, "already_client": True,
+                                 "manual_decision_required": False, "warning": None, "error": None}), \
              patch("business_core.person_manager.create_person") as mock_create, \
              patch("business_core.person_manager.update_person") as mock_update, \
-             patch("business_core.business_builder.provision_client_drive",
-                   return_value={"ok": False, "error": "не задан"}):
+             patch("business_core.business_builder.provision_client_drive_safe",
+                   return_value=_DRIVE_NOT_CONFIGURED):
             _run(th.newclient_confirm(update, context))
 
         mock_create.assert_not_called()
@@ -268,13 +333,17 @@ class TestExistingBranchesUnchangedNoDuplicateCreation(unittest.TestCase):
         update = _make_confirm_update()
         context = _make_confirm_context()
 
-        with patch("business_core.business_builder.find_existing_person",
-                   return_value={"prs_id": "PRS-002", "same_biz": False, "drive_url": ""}), \
-             patch("business_core.business_builder.add_biz_id_to_person") as mock_add_biz, \
+        with patch("business_core.person_manager.resolve_person_identity",
+                   return_value=_identity_result_from_legacy(
+                       {"prs_id": "PRS-002", "same_biz": False, "drive_url": ""})), \
+             patch("business_core.person_manager.ensure_client_role",
+                   return_value={"ok": True, "changed": False, "already_client": True,
+                                 "manual_decision_required": False, "warning": None, "error": None}), \
+             patch("business_core.person_manager.append_person_biz_id") as mock_add_biz, \
              patch("business_core.person_manager.create_person") as mock_create, \
              patch("business_core.person_manager.update_person") as mock_update, \
-             patch("business_core.business_builder.provision_client_drive",
-                   return_value={"ok": False, "error": "не задан"}):
+             patch("business_core.business_builder.provision_client_drive_safe",
+                   return_value=_DRIVE_NOT_CONFIGURED):
             _run(th.newclient_confirm(update, context))
 
         mock_create.assert_not_called()
@@ -295,13 +364,13 @@ class TestProfileFieldPreservation(unittest.TestCase):
         update = _make_confirm_update()
         context = _make_confirm_context(businesses="Узаконение недвижимости")
 
-        with patch("business_core.business_builder.find_existing_person", return_value=None), \
+        with patch("business_core.person_manager.resolve_person_identity", return_value=_identity_result_from_legacy(None)), \
              patch("business_core.person_manager.create_person",
                    return_value={"ok": True, "person_id": "PRS-105", "error": None}), \
              patch("business_core.person_manager.update_person",
                    return_value={"ok": True, "changed": True, "updated_fields": (), "error": None}) as mock_update, \
-             patch("business_core.business_builder.provision_client_drive",
-                   return_value={"ok": False, "error": "не задан"}):
+             patch("business_core.business_builder.provision_client_drive_safe",
+                   return_value=_DRIVE_NOT_CONFIGURED):
             _run(th.newclient_confirm(update, context))
 
         mock_update.assert_called_once_with("PRS-105", {
@@ -345,10 +414,14 @@ class TestProfileFieldsWarningInitialization(unittest.TestCase):
         update = _make_confirm_update()
         context = _make_confirm_context()
 
-        with patch("business_core.business_builder.find_existing_person",
-                   return_value={"prs_id": "PRS-001", "same_biz": True, "drive_url": ""}), \
-             patch("business_core.business_builder.provision_client_drive",
-                   return_value={"ok": False, "error": "не задан"}):
+        with patch("business_core.person_manager.resolve_person_identity",
+                   return_value=_identity_result_from_legacy(
+                       {"prs_id": "PRS-001", "same_biz": True, "drive_url": ""})), \
+             patch("business_core.person_manager.ensure_client_role",
+                   return_value={"ok": True, "changed": False, "already_client": True,
+                                 "manual_decision_required": False, "warning": None, "error": None}), \
+             patch("business_core.business_builder.provision_client_drive_safe",
+                   return_value=_DRIVE_NOT_CONFIGURED):
             _run(th.newclient_confirm(update, context))
 
         msg = update.message.reply_text.call_args[0][0]
@@ -360,11 +433,15 @@ class TestProfileFieldsWarningInitialization(unittest.TestCase):
         update = _make_confirm_update()
         context = _make_confirm_context()
 
-        with patch("business_core.business_builder.find_existing_person",
-                   return_value={"prs_id": "PRS-002", "same_biz": False, "drive_url": ""}), \
-             patch("business_core.business_builder.add_biz_id_to_person"), \
-             patch("business_core.business_builder.provision_client_drive",
-                   return_value={"ok": False, "error": "не задан"}):
+        with patch("business_core.person_manager.resolve_person_identity",
+                   return_value=_identity_result_from_legacy(
+                       {"prs_id": "PRS-002", "same_biz": False, "drive_url": ""})), \
+             patch("business_core.person_manager.append_person_biz_id"), \
+             patch("business_core.person_manager.ensure_client_role",
+                   return_value={"ok": True, "changed": False, "already_client": True,
+                                 "manual_decision_required": False, "warning": None, "error": None}), \
+             patch("business_core.business_builder.provision_client_drive_safe",
+                   return_value=_DRIVE_NOT_CONFIGURED):
             _run(th.newclient_confirm(update, context))
 
         msg = update.message.reply_text.call_args[0][0]
@@ -373,44 +450,44 @@ class TestProfileFieldsWarningInitialization(unittest.TestCase):
 
 
 # ─────────────────────────────────────────────────────────────
-# Phase 23D-3C1 — save_client_drive_to_sheets() bypass eliminated;
-# STATUS_NEW Drive branch now unconditionally uses
-# update_person_drive_info() (Person Manager-backed), same as the
-# existing-person branch already did.
+# Phase 31D — Drive orchestration routes through the single retry-safe
+# provision_client_drive_safe() decision point (ADR-015 Decisions 14/15)
+# instead of provision_client_drive() + update_person_drive_info()
+# called separately from newclient_confirm() itself.
 # ─────────────────────────────────────────────────────────────
 
 class TestStatusNewDriveUsesPersonManager(unittest.TestCase):
 
-    def test_status_new_drive_calls_update_person_drive_info_with_correct_args(self):
+    def test_status_new_drive_calls_provision_client_drive_safe_with_correct_args(self):
         th = _fresh_th()
         update = _make_confirm_update()
         context = _make_confirm_context()
 
-        with patch("business_core.business_builder.find_existing_person", return_value=None), \
+        with patch("business_core.person_manager.resolve_person_identity", return_value=_identity_result_from_legacy(None)), \
              patch("business_core.person_manager.create_person",
                    return_value={"ok": True, "person_id": "PRS-105", "error": None}), \
              patch("business_core.person_manager.update_person",
                    return_value={"ok": True, "changed": True, "updated_fields": (), "error": None}), \
-             patch("business_core.business_builder.provision_client_drive",
-                   return_value={"ok": True, "folder_id": "fid-105", "folder_url": "https://drive.google.com/fid-105"}), \
-             patch("business_core.business_builder.update_person_drive_info") as mock_upd_drive:
+             patch("business_core.business_builder.provision_client_drive_safe",
+                   return_value=_drive_created("fid-105", "https://drive.google.com/fid-105")) as mock_drive:
             _run(th.newclient_confirm(update, context))
 
-        mock_upd_drive.assert_called_once_with("PRS-105", "fid-105", "https://drive.google.com/fid-105")
+        mock_drive.assert_called_once_with(
+            person_id="PRS-105", full_name="Иван Иванов", biz_name="ТестБизнес",
+        )
 
     def test_status_new_drive_success_reply_unchanged(self):
         th = _fresh_th()
         update = _make_confirm_update()
         context = _make_confirm_context()
 
-        with patch("business_core.business_builder.find_existing_person", return_value=None), \
+        with patch("business_core.person_manager.resolve_person_identity", return_value=_identity_result_from_legacy(None)), \
              patch("business_core.person_manager.create_person",
                    return_value={"ok": True, "person_id": "PRS-107", "error": None}), \
              patch("business_core.person_manager.update_person",
                    return_value={"ok": True, "changed": True, "updated_fields": (), "error": None}), \
-             patch("business_core.business_builder.provision_client_drive",
-                   return_value={"ok": True, "folder_id": "fid-107", "folder_url": "https://drive.google.com/fid-107"}), \
-             patch("business_core.business_builder.update_person_drive_info"):
+             patch("business_core.business_builder.provision_client_drive_safe",
+                   return_value=_drive_created("fid-107", "https://drive.google.com/fid-107")):
             _run(th.newclient_confirm(update, context))
 
         msg = update.message.reply_text.call_args[0][0]
@@ -418,30 +495,40 @@ class TestStatusNewDriveUsesPersonManager(unittest.TestCase):
         self.assertIn("PRS-107", msg)
         self.assertIn("📁 Drive: https://drive.google.com/fid-107", msg)
 
-    def test_other_biz_drive_path_still_calls_update_person_drive_info(self):
-        """Existing-person (OTHER_BIZ) Drive path — unaffected by this
-        phase, still routes through the same wrapper as before."""
+    def test_other_biz_drive_path_reuses_existing_reference(self):
+        """Existing-person (OTHER_BIZ) Drive path — reuses via
+        provision_client_drive_safe()'s own reuse decision, and shows
+        the multi-business "shared folder" warning (ADR-015
+        Decision 14) since this is OTHER_BIZ with an existing reference."""
         th = _fresh_th()
         update = _make_confirm_update()
         context = _make_confirm_context()
 
-        with patch("business_core.business_builder.find_existing_person",
-                   return_value={"prs_id": "PRS-002", "same_biz": False, "drive_url": ""}), \
-             patch("business_core.business_builder.add_biz_id_to_person"), \
-             patch("business_core.business_builder.provision_client_drive",
-                   return_value={"ok": True, "folder_id": "fid-existing", "folder_url": "https://drive.google.com/fid-existing"}), \
-             patch("business_core.business_builder.update_person_drive_info") as mock_upd_drive:
+        with patch("business_core.person_manager.resolve_person_identity",
+                   return_value=_identity_result_from_legacy(
+                       {"prs_id": "PRS-002", "same_biz": False, "drive_url": "https://drive.google.com/fid-existing"})), \
+             patch("business_core.person_manager.append_person_biz_id"), \
+             patch("business_core.person_manager.ensure_client_role",
+                   return_value={"ok": True, "changed": False, "already_client": True,
+                                 "manual_decision_required": False, "warning": None, "error": None}), \
+             patch("business_core.business_builder.provision_client_drive_safe",
+                   return_value=_drive_reused("fid-existing", "https://drive.google.com/fid-existing")) as mock_drive:
             _run(th.newclient_confirm(update, context))
 
-        mock_upd_drive.assert_called_once_with("PRS-002", "fid-existing", "https://drive.google.com/fid-existing")
+        mock_drive.assert_called_once_with(
+            person_id="PRS-002", full_name="Иван Иванов", biz_name="ТестБизнес",
+        )
+        msg = update.message.reply_text.call_args[0][0]
+        self.assertIn("📁 Drive: https://drive.google.com/fid-existing", msg)
+        self.assertIn("уже существует общая папка", msg)
 
 
 class TestNewClientConfirmNoDirectRegistryWrite(unittest.TestCase):
     """Architecture guard: newclient_confirm() must contain no raw
     update_business_cell()/update_cell()/get_business_sheet()-for-write/
     save_client_drive_to_sheets() call — only the Person Manager-backed
-    wrappers (create_person, update_person, add_biz_id_to_person,
-    update_person_drive_info)."""
+    wrappers (create_person, update_person, append_person_biz_id via
+    person_manager, provision_client_drive_safe)."""
 
     def test_no_direct_registry_write_calls_remain(self):
         import ast

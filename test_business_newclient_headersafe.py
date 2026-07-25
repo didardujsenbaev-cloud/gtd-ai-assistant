@@ -162,10 +162,54 @@ def _fresh_import():
     return newclient_confirm
 
 
+def _identity_result_from_legacy(existing: dict | None, biz_id_resolved: str = "") -> dict:
+    """Phase 31D: newclient_confirm() now calls
+    person_manager.resolve_person_identity() directly instead of
+    business_builder.find_existing_person() — this converts the old
+    find_existing_person()-shaped test fixture into the canonical
+    resolve_person_identity() result shape, so existing test call
+    sites don't all need to be rewritten to build canonical Person
+    dicts by hand.
+
+    newclient_confirm() now re-derives same_biz itself via
+    has_person_business_link(person, biz_id_resolved), rather than
+    trusting a "same_biz" boolean handed to it directly (that field no
+    longer exists on resolve_person_identity()'s Person shape) — so
+    when the legacy fixture doesn't specify "biz_ids" explicitly, this
+    reconstructs a biz_ids list that reproduces the same same_biz
+    outcome the fixture's "same_biz" flag originally encoded.
+    """
+    if existing is None:
+        return {"status": "not_found", "person": None, "matches": [], "matched_by": [], "error": None}
+    biz_ids = existing.get("biz_ids")
+    if biz_ids is None:
+        same_biz_flag = existing.get("same_biz", True)
+        biz_ids = [biz_id_resolved] if (same_biz_flag and biz_id_resolved) else []
+    person = {
+        "person_id": existing["prs_id"],
+        "full_name": existing.get("full_name", "Иван Иванов"),
+        "biz_ids": biz_ids,
+        "primary_biz_id": existing.get("primary_biz_id", ""),
+        "google_drive": existing.get("drive_url", ""),
+        "drive_folder_id": existing.get("drive_folder_id", ""),
+        "phone": existing.get("phone_raw", ""),
+        "row_num": existing.get("row_num", 2),
+    }
+    return {"status": "single_match", "person": person, "matches": [person], "matched_by": ["phone"], "error": None}
+
+
 def _run_newclient_confirm(sheet, find_existing_return=None, biz_id_resolved="BIZ-001"):
     """
     Запустить newclient_confirm с полностью замоканными зависимостями.
     Возвращает (update, context, sheet) для дальнейших проверок.
+
+    Phase 31D: newclient_confirm() migrated onto person_manager.
+    resolve_person_identity()/append_person_biz_id()/
+    update_person_drive_info() directly (ADR-015 Decision 2) — the
+    mocks below target those, not the retired business_builder call
+    sites (find_existing_person()/add_biz_id_to_person()/
+    update_person_drive_info() remain as compatibility wrappers for
+    other callers, but /newclient no longer uses them).
     """
     biz_sheet = _make_biz_registry_sheet()
 
@@ -178,10 +222,10 @@ def _run_newclient_confirm(sheet, find_existing_return=None, biz_id_resolved="BI
 
         with patch("business_core.sheets.get_business_sheet", side_effect=fake_get_business_sheet), \
              patch("business_core.sheets.generate_next_id", return_value="PRS-999"), \
-             patch("business_core.business_builder.find_existing_person",
-                   return_value=find_existing_return), \
-             patch("business_core.business_builder.add_biz_id_to_person") as mock_add_biz, \
-             patch("business_core.business_builder.update_person_drive_info") as mock_upd_drive, \
+             patch("business_core.person_manager.resolve_person_identity",
+                   return_value=_identity_result_from_legacy(find_existing_return, biz_id_resolved)), \
+             patch("business_core.person_manager.append_person_biz_id") as mock_add_biz, \
+             patch("business_core.person_manager.update_person_drive_info") as mock_upd_drive, \
              patch("business_core.business_builder.provision_client_drive",
                    return_value={"ok": False, "error": "Drive не задан для этого бизнеса"}):
             await newclient_confirm(update, context)
@@ -280,9 +324,13 @@ class TestNewClientHeaderSafeStandardOrder(unittest.TestCase):
         # update_person() reads headers exactly twice after the append:
         # once inside _find_person_row() (to map the existing row back to
         # a dict) and once more inside update_person() itself (to resolve
-        # the column index for update_cell()) — both real, separate reads,
-        # not an artifact of the mock.
-        self.assertEqual(len(header_reads_for_update), 2)
+        # the column index for update_cell()). Phase 31D adds a THIRD
+        # read after the append: provision_client_drive_safe()'s own
+        # find_person_by_id() call, which re-checks PEOPLE_REGISTRY for
+        # an existing Drive reference before deciding whether to create
+        # a folder — this is the retry-safety check itself (ADR-015
+        # Decision 15), not an artifact of the mock.
+        self.assertEqual(len(header_reads_for_update), 3)
 
     def test_11_append_called_once(self):
         self.assertEqual(self.sheet.update.call_count, 1)

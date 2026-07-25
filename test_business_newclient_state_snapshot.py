@@ -199,9 +199,12 @@ class TestSnapshotUsedForSave(unittest.TestCase):
         async def run():
             with patch("business_core.sheets.get_business_sheet", side_effect=_sheet_router(sheet)), \
                  patch("business_core.sheets.generate_next_id", return_value="PRS-999"), \
-                 patch("business_core.business_builder.find_existing_person", return_value=None), \
-                 patch("business_core.business_builder.provision_client_drive",
-                       return_value={"ok": False, "error": "не задан"}), \
+                 patch("business_core.person_manager.resolve_person_identity",
+                 return_value={"status": "not_found", "person": None, "matches": [], "matched_by": [], "error": None}), \
+                 patch("business_core.business_builder.provision_client_drive_safe",
+                       return_value={"ok": False, "drive_created": False, "drive_reused": False,
+                                     "partial_failure": False, "folder_id": None, "folder_url": None,
+                                     "warning": None, "error": "не задан"}), \
                  patch("business_core.business_builder._get_biz_id_by_name",
                        return_value="BIZ-001"):
                 await handlers["confirm"](_upd(confirm_text), context)
@@ -253,9 +256,12 @@ class TestConfirmationTextNeverStored(unittest.TestCase):
         async def run():
             with patch("business_core.sheets.get_business_sheet", side_effect=_sheet_router(sheet)), \
                  patch("business_core.sheets.generate_next_id", return_value="PRS-999"), \
-                 patch("business_core.business_builder.find_existing_person", return_value=None), \
-                 patch("business_core.business_builder.provision_client_drive",
-                       return_value={"ok": False, "error": "не задан"}), \
+                 patch("business_core.person_manager.resolve_person_identity",
+                 return_value={"status": "not_found", "person": None, "matches": [], "matched_by": [], "error": None}), \
+                 patch("business_core.business_builder.provision_client_drive_safe",
+                       return_value={"ok": False, "drive_created": False, "drive_reused": False,
+                                     "partial_failure": False, "folder_id": None, "folder_url": None,
+                                     "warning": None, "error": "не задан"}), \
                  patch("business_core.business_builder._get_biz_id_by_name",
                        return_value="BIZ-001"):
                 await handlers["confirm"](_upd("правильно"), context)
@@ -317,9 +323,12 @@ class TestBizIdAcceptsDirectId(unittest.TestCase):
             with patch("business_core.sheets.get_business_sheet", side_effect=_sheet_router(sheet)), \
                  patch("business_core.sheets.generate_next_id", return_value="PRS-999"), \
                  patch("business_core.sheets.read_business_sheet", return_value=BIZ_ROWS), \
-                 patch("business_core.business_builder.find_existing_person", return_value=None), \
-                 patch("business_core.business_builder.provision_client_drive",
-                       return_value={"ok": False, "error": "не задан"}), \
+                 patch("business_core.person_manager.resolve_person_identity",
+                 return_value={"status": "not_found", "person": None, "matches": [], "matched_by": [], "error": None}), \
+                 patch("business_core.business_builder.provision_client_drive_safe",
+                       return_value={"ok": False, "drive_created": False, "drive_reused": False,
+                                     "partial_failure": False, "folder_id": None, "folder_url": None,
+                                     "warning": None, "error": "не задан"}), \
                  patch("business_core.business_builder._get_biz_id_by_name",
                        return_value="BIZ-001"):  # echoed back unchanged: input == output
                 await handlers["confirm"](_upd("✅ Сохранить"), context)
@@ -344,9 +353,12 @@ class TestFullNameCharacterPreserved(unittest.TestCase):
         async def run():
             with patch("business_core.sheets.get_business_sheet", side_effect=_sheet_router(sheet)), \
                  patch("business_core.sheets.generate_next_id", return_value="PRS-999"), \
-                 patch("business_core.business_builder.find_existing_person", return_value=None), \
-                 patch("business_core.business_builder.provision_client_drive",
-                       return_value={"ok": False, "error": "не задан"}), \
+                 patch("business_core.person_manager.resolve_person_identity",
+                 return_value={"status": "not_found", "person": None, "matches": [], "matched_by": [], "error": None}), \
+                 patch("business_core.business_builder.provision_client_drive_safe",
+                       return_value={"ok": False, "drive_created": False, "drive_reused": False,
+                                     "partial_failure": False, "folder_id": None, "folder_url": None,
+                                     "warning": None, "error": "не задан"}), \
                  patch("business_core.business_builder._get_biz_id_by_name",
                        return_value="BIZ-001"):
                 await handlers["confirm"](_upd("✅ Сохранить"), context)
@@ -374,9 +386,12 @@ class TestSuccessNotConfusedWithFormattingError(unittest.TestCase):
         async def run():
             with patch("business_core.sheets.get_business_sheet", side_effect=_sheet_router(sheet)), \
                  patch("business_core.sheets.generate_next_id", return_value="PRS-999"), \
-                 patch("business_core.business_builder.find_existing_person", return_value=None), \
-                 patch("business_core.business_builder.provision_client_drive",
-                       return_value={"ok": False, "error": "не задан"}), \
+                 patch("business_core.person_manager.resolve_person_identity",
+                 return_value={"status": "not_found", "person": None, "matches": [], "matched_by": [], "error": None}), \
+                 patch("business_core.business_builder.provision_client_drive_safe",
+                       return_value={"ok": False, "drive_created": False, "drive_reused": False,
+                                     "partial_failure": False, "folder_id": None, "folder_url": None,
+                                     "warning": None, "error": "не задан"}), \
                  patch("business_core.business_builder._get_biz_id_by_name",
                        return_value="BIZ-001"):
                 await handlers["confirm"](update, context)
@@ -401,11 +416,13 @@ class TestSuccessNotConfusedWithFormattingError(unittest.TestCase):
         async def run():
             with patch("business_core.sheets.get_business_sheet", side_effect=_sheet_router(sheet)), \
                  patch("business_core.sheets.generate_next_id", return_value="PRS-999"), \
-                 patch("business_core.business_builder.find_existing_person", return_value=None), \
-                 patch("business_core.business_builder.provision_client_drive",
-                       return_value={"ok": True, "folder_id": "fid_with_underscore",
-                                     "folder_url": "https://drive.google.com/drive/folders/fid_with_underscore"}), \
-                 patch("business_core.business_builder.update_person_drive_info"), \
+                 patch("business_core.person_manager.resolve_person_identity",
+                 return_value={"status": "not_found", "person": None, "matches": [], "matched_by": [], "error": None}), \
+                 patch("business_core.business_builder.provision_client_drive_safe",
+                       return_value={"ok": True, "drive_created": True, "drive_reused": False,
+                                     "partial_failure": False, "folder_id": "fid_with_underscore",
+                                     "folder_url": "https://drive.google.com/drive/folders/fid_with_underscore",
+                                     "warning": None, "error": None}), \
                  patch("business_core.business_builder._get_biz_id_by_name",
                        return_value="BIZ-001"):
                 await handlers["confirm"](update, context)
@@ -426,9 +443,12 @@ class TestUserDataCleanedAfterSuccess(unittest.TestCase):
         async def run():
             with patch("business_core.sheets.get_business_sheet", side_effect=_sheet_router(sheet)), \
                  patch("business_core.sheets.generate_next_id", return_value="PRS-999"), \
-                 patch("business_core.business_builder.find_existing_person", return_value=None), \
-                 patch("business_core.business_builder.provision_client_drive",
-                       return_value={"ok": False, "error": "не задан"}), \
+                 patch("business_core.person_manager.resolve_person_identity",
+                 return_value={"status": "not_found", "person": None, "matches": [], "matched_by": [], "error": None}), \
+                 patch("business_core.business_builder.provision_client_drive_safe",
+                       return_value={"ok": False, "drive_created": False, "drive_reused": False,
+                                     "partial_failure": False, "folder_id": None, "folder_url": None,
+                                     "warning": None, "error": "не задан"}), \
                  patch("business_core.business_builder._get_biz_id_by_name",
                        return_value="BIZ-001"):
                 await handlers["confirm"](_upd("✅ Сохранить"), context)

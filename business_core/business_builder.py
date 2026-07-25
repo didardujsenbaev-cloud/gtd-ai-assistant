@@ -909,6 +909,86 @@ def provision_client_drive(
         }
 
 
+def provision_client_drive_safe(
+    person_id: str,
+    full_name: str,
+    biz_name: str,
+    roadmap_id: Optional[str] = None,
+) -> dict:
+    """
+    Phase 31D (ADR-015 Decisions 14/15): retry-safe, multi-business-aware
+    Drive orchestration for a Client Person — the single decision point
+    for "reuse vs create once". Callers (newclient_confirm) must use
+    this instead of manually inspecting drive_url/drive_folder_id
+    themselves.
+
+    Unlike provision_client_drive() (a pure Drive-folder-creation
+    primitive with no PEOPLE_REGISTRY awareness), this function first
+    asks person_manager for an existing Drive reference and never calls
+    the Drive API at all if one is already set — a second call for the
+    same Person never creates a second folder, because it never even
+    asks Drive. The existing single Drive Folder ID/Google Drive slot
+    is treated as one general/primary Person folder reference (not
+    per-Business) — see ADR-015 Decision 14; callers needing the
+    OTHER_BIZ "this is a shared folder, not one for the new business"
+    warning must add that themselves based on drive_reused + their own
+    branch (NEW/SAME_BIZ/OTHER_BIZ), since that phrasing is /newclient
+    UX, not a generic Drive-orchestration concern.
+
+    Returns:
+        {
+            "ok": bool, "drive_created": bool, "drive_reused": bool,
+            "partial_failure": bool, "folder_id": str | None,
+            "folder_url": str | None, "warning": str | None, "error": str | None,
+        }
+    """
+    from business_core.person_manager import find_person_by_id, update_person_drive_info as pm_update_drive_info
+
+    person = find_person_by_id(person_id)
+    if not person:
+        return {
+            "ok": False, "drive_created": False, "drive_reused": False,
+            "partial_failure": False, "folder_id": None, "folder_url": None,
+            "warning": None, "error": f"Person '{person_id}' не найден",
+        }
+
+    existing_folder_id = person.get("drive_folder_id", "")
+    existing_url = person.get("google_drive", "")
+
+    if existing_folder_id or existing_url:
+        return {
+            "ok": True, "drive_created": False, "drive_reused": True,
+            "partial_failure": False,
+            "folder_id": existing_folder_id or None, "folder_url": existing_url or None,
+            "warning": None, "error": None,
+        }
+
+    result = provision_client_drive(prs_id=person_id, full_name=full_name, biz_name=biz_name, roadmap_id=roadmap_id)
+    if not result["ok"]:
+        return {
+            "ok": False, "drive_created": False, "drive_reused": False,
+            "partial_failure": False, "folder_id": None, "folder_url": None,
+            "warning": None, "error": result.get("error"),
+        }
+
+    persist = pm_update_drive_info(person_id, folder_id=result["folder_id"], folder_url=result["folder_url"])
+    if not persist["ok"]:
+        return {
+            "ok": True, "drive_created": True, "drive_reused": False,
+            "partial_failure": True,
+            "folder_id": result["folder_id"], "folder_url": result["folder_url"],
+            "warning": "Папка Drive создана, но не удалось сохранить ссылку в PEOPLE_REGISTRY.",
+            "error": persist.get("error"),
+        }
+
+    return {
+        "ok": True, "drive_created": True, "drive_reused": False,
+        "partial_failure": False,
+        "folder_id": result["folder_id"], "folder_url": result["folder_url"],
+        "warning": None, "error": None,
+    }
+
+
 def get_business_creation_status(result: dict) -> str:
     """Возвращает краткий статус создания бизнеса."""
     biz = result.get("business")
