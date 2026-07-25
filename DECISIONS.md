@@ -798,3 +798,390 @@ generic lifecycle/update API (rename/price/deactivate/archive/delete)
 и удаление мёртвого business_core/service_catalog.py остаются
 отдельно отложенными (см. Phase 29E closeout report) — не входят в
 это ADR.
+
+---
+
+## ADR-014 — Object Domain Ownership (Phase 30B)
+
+Контекст:
+
+Phase 30A (Object Domain Ownership Audit, read-only) показала, что
+
+Object-функции живут внутри business_builder.py вперемешку с
+
+orchestration-логикой, отдельного object_manager.py нет,
+
+/editobject пишет OBJECT_REGISTRY напрямую (raw update_cell, нет
+
+owner API для этого вообще), /editobject и /objects читают реестр
+
+напрямую в обход существующих find_object_by_id/
+
+find_objects_by_client, create_object_record не защищает от
+
+дублей, Roadmap можно создать для несуществующего Object, Business
+
+existence при создании Object не проверяется, Object status model
+
+отсутствует, Drive folder creation не полностью идемпотентно.
+
+Решение:
+
+1. Canonical owner.
+
+   Создать business_core/object_manager.py — единственный
+
+   transactional owner OBJECT_REGISTRY (чтение, создание,
+
+   narrow updates, duplicate lookup, status validation, Drive/
+
+   Roadmap reference persistence). business_builder.py после
+
+   миграции — orchestration only: проверка Business/Client,
+
+   вызов object_manager, Drive folder orchestration, Roadmap
+
+   orchestration, partial failure aggregation. (Реализация — Phase
+
+   30C/30D, не в этом ADR.)
+
+2. Technical identity.
+
+   Object ID остаётся уникальным неизменяемым техническим
+
+   идентификатором (формат OBJ-...), генерируется только
+
+   object_manager. Старые Object ID не мигрируются.
+
+3. Canonical duplicate key.
+
+   OBJECT_DUPLICATE_KEY_POLICY — двухуровневая:
+
+   Tier 1 (кадастровый номер заполнен): (Business ID, normalized
+
+   Cadastral Number) — сильный ключ.
+
+   Tier 2 (кадастрового номера нет): (Business ID, Client ID,
+
+   normalized City, normalized Address) — fallback.
+
+   Нормализация обоих уровней: trim, Unicode-нормализация,
+
+   casefold; для кадастрового номера дополнительно убираются
+
+   пробелы/разделители, если это безопасно для формата; для адреса —
+
+   схлопывание повторных пробелов, без fuzzy-исправления улиц/домов.
+
+   Object ID, голый Address, Roadmap ID, Drive Folder ID, Object
+
+   Type сами по себе НЕ являются duplicate key.
+
+4. Idempotent creation.
+
+   create_object_record переходит на convergent режим: повторный
+
+   вызов с тем же duplicate key не создаёт новую строку, возвращает
+
+   существующий Object (object_created=False, object_reused=True),
+
+   поля молча не перезаписываются — различия возвращаются как
+
+   warnings. Несколько существующих совпадений — integrity error,
+
+   без выбора первого и без записи.
+
+5. Required Business/Client.
+
+   OBJECT_REQUIRES_EXISTING_BUSINESS = YES,
+
+   OBJECT_REQUIRES_EXISTING_CLIENT = YES, проверка до записи.
+
+   Business existence: в кодовой базе нет отдельного Business
+
+   Manager — business_builder.py, organization_manager.py,
+
+   person_manager.py и telegram_handlers.py (newservice_cmd) уже
+
+   единообразно используют sheets.find_row_by_id("biz_registry",
+
+   biz_id) как de facto canonical primitive; /newobject должен
+
+   перейти на тот же вызов внутри business_builder (orchestration),
+
+   а не остаться непроверенным и не изобретать новый метод. Это не
+
+   Object-domain-специфичное нарушение — Business Domain ещё не
+
+   закрыт отдельной фазой (см. ограничение "не начинать Client/
+
+   Business audit"), поэтому здесь фиксируется только использование
+
+   уже существующего повсеместного паттерна, без изменения Business
+
+   Domain. Client existence — через person_manager.find_person_by_id
+
+   (уже фактический owner, без изменений).
+
+6. Object status model.
+
+   Минимальный vocabulary на этот цикл: new, active, on_hold,
+
+   completed, cancelled (archived отложен до lifecycle API).
+
+   OBJECT_STATUS_DEFAULT = new. ROADMAP_ALLOWED_OBJECT_STATUSES =
+
+   new / active / on_hold. ROADMAP_REJECTED_OBJECT_STATUSES =
+
+   completed / cancelled. Unknown status отклоняется на write,
+
+   никогда не считается active по умолчанию (то же разделение
+
+   read-side/write-side строгости, что уже применено к Service
+
+   Domain в Phase 29CD).
+
+7. Roadmap Object validation.
+
+   ROADMAP_CREATION_REQUIRES_EXISTING_ALLOWED_OBJECT = YES.
+
+   business_builder.create_roadmap_for_object обязан вызвать
+
+   object_manager.find_object_by_id, отклонить отсутствующий Object,
+
+   отклонить запрещённый/unknown статус, и только затем продолжить
+
+   уже существующую Service-валидацию (Phase 29CD) и convergent
+
+   Roadmap flow — до любых Roadmap/Stage/Object-reference/Extension
+
+   writes. Валидация остаётся в orchestration (business_builder),
+
+   не переносится в roadmap_manager — тот же принцип, что уже
+
+   применён к Service-валидации.
+
+8. Object Roadmap reference.
+
+   ROADMAPS остаётся source of truth для всех Roadmap объекта.
+
+   Object.Roadmap ID — compatibility/reference поле (может хранить
+
+   primary/current Roadmap), не единственный источник истины, не
+
+   блокирует создание второй Roadmap для другой Service. Текущая
+
+   политика "update only if empty" сохраняется на этот цикл; полная
+
+   модель Current/Primary Roadmap ID отложена. find_roadmaps_by_object
+
+   должен в будущем делегировать на roadmap_manager.list_roadmaps
+
+   (object_id=...) вместо собственного raw ROADMAPS-чтения.
+
+9. Current Service ID.
+
+   CURRENT_SERVICE_ID_SYNC = DEFERRED — это поле не становится
+
+   source of truth; Service для Roadmap берётся из ROADMAPS;
+
+   автоматическая синхронизация отложена до отдельной модели
+
+   "текущей услуги", чтобы не смешивать её с Object ownership.
+
+10. Public Object API (минимум для object_manager.py):
+
+    generate_object_id, normalize_object_address,
+
+    normalize_cadastral_number, validate_object_status,
+
+    create_object_record, find_object_by_id, find_objects_by_client,
+
+    find_objects_by_biz, list_objects, update_object_fields
+
+    (allowlist-based: только Address/Object Type/Notes в этом
+
+    цикле — Object ID/Client ID/Biz ID/Drive Folder ID/Roadmap ID/
+
+    Created At через generic update запрещены; Last Updated
+
+    обновляется автоматически), update_object_drive_info,
+
+    update_object_roadmap_id.
+
+11. /editobject → object_manager.find_object_by_id →
+
+    object_manager.update_object_fields. Handler не получает
+
+    worksheet, не вызывает update_cell, только парсит/форматирует,
+
+    UX сохраняется без изменений.
+
+12. /objects → object_manager.list_objects /
+
+    find_objects_by_biz / find_objects_by_client — без raw reads и
+
+    ручного парсинга headers в хендлере.
+
+13. Extension readers (document_registry_manager.py,
+
+    document_requirements_query.py) переводятся на
+
+    object_manager.find_object_by_id, включая existence-only lookup.
+
+    После появления object_manager прямые Extension-чтения реестра
+
+    больше не считаются допустимыми. report_manager.collect_snapshot
+
+    остаётся approved read-only reporting exception;
+
+    synthetic_cleanup.py остаётся file/function-scoped admin
+
+    exception — оба без изменений.
+
+14. Drive idempotency.
+
+    Flow: найти Object → если Drive Folder ID уже установлен —
+
+    переиспользовать ссылку, Drive create не вызывать → иначе
+
+    создать папку и сохранить Folder ID/URL. object_manager владеет
+
+    чтением/записью Drive-ссылки; business_builder оркестрирует сам
+
+    вызов Drive API; folder naming остаётся в orchestration/Drive
+
+    adapter, не в persistence owner. Partial failure остаётся видимым.
+
+15. Partial failure policy.
+
+    Если Object создан, а Drive упал: ok=true, partial_success=true,
+
+    drive_created=false, ошибка/warning видимы. Повторный вызов:
+
+    переиспользовать Object, пытаться создать Drive folder только
+
+    если Folder ID пуст, не создавать второй Object, не создавать
+
+    вторую папку при уже существующей ссылке.
+
+16. Dependency direction.
+
+    object_manager → business_core.sheets only. Запрещено:
+
+    object_manager → business_builder/telegram_handlers/
+
+    roadmap_manager/Drive adapter/Extension. Разрешено:
+
+    business_builder → object_manager; telegram_handlers →
+
+    object_manager/business_builder; roadmap orchestration →
+
+    object_manager; Extension-менеджеры → object_manager read API.
+
+17. Migration of existing functions (Phase 30C, не в этом ADR):
+
+    в object_manager.py переносятся generate_object_id,
+
+    create_object_record, find_objects_by_client, find_object_by_id,
+
+    update_object_drive_info, update_object_roadmap_id.
+
+    provision_object_drive остаётся в business_builder.py как
+
+    orchestration-wrapper (вызывает object_manager + Drive adapter).
+
+    find_roadmaps_by_object переводится на
+
+    roadmap_manager.list_roadmaps(object_id=...), дублирующая raw-
+
+    реализация в business_builder убирается. Если у старых public
+
+    функций business_builder есть внешние вызывающие, допустимы
+
+    тонкие delegating wrappers без persistence-логики внутри —
+
+    guards должны это гарантировать.
+
+18. FK immutability / delete policy.
+
+    OBJECT_HARD_DELETE_ALLOWED = NO. OBJECT_BUSINESS_ID_MUTABLE = NO.
+
+    OBJECT_CLIENT_ID_MUTABLE = NO. /editobject не получает доступ
+
+    к этим полям. Archive/lifecycle API отложены.
+
+Целевые инварианты (проверяются в Phase 30C/30D через architecture
+
+guards, по аналогии с Roadmap/Service Closeout):
+
+```
+ALL_TRANSACTIONAL_OBJECT_WRITES_OWNED_BY_OBJECT_MANAGER = YES
+ALL_TRANSACTIONAL_OBJECT_READS_USE_OBJECT_MANAGER_API = YES
+TELEGRAM_HANDLERS_WRITE_OBJECT_REGISTRY_DIRECTLY = NO
+TELEGRAM_HANDLERS_READ_OBJECT_REGISTRY_DIRECTLY = NO
+BUSINESS_BUILDER_WRITES_OBJECT_REGISTRY_DIRECTLY = NO
+ROADMAP_CREATION_REQUIRES_EXISTING_ALLOWED_OBJECT = YES
+OBJECT_CREATION_USES_CANONICAL_DUPLICATE_POLICY = YES
+OBJECT_CREATION_IS_IDEMPOTENT = YES
+OBJECT_DRIVE_CREATION_IS_RETRY_SAFE = YES
+EXTENSION_MODULES_READ_OBJECT_REGISTRY_DIRECTLY = NO
+OBJECT_MANAGER_DEPENDENCY_CYCLE_EXISTS = NO
+OBJECT_DOMAIN_HAS_REVERSE_DEPENDENCY = NO
+```
+
+Implementation plan:
+
+Phase 30C — Object Manager Foundation (создать object_manager.py,
+
+перенести canonical read/write primitives, normalization/status/
+
+duplicate-safe create, update_object_fields, guards, thin
+
+compatibility wrappers в business_builder при необходимости — без
+
+обязательной caller migration и без deploy, если production
+
+behavior не меняется).
+
+Phase 30D — Caller Migration + Validation (/editobject, /objects,
+
+Extension readers, Roadmap Object validation, Business validation в
+
+/newobject, Drive retry-safety, тесты, deploy). Допускается
+
+объединение 30C+30D, если diff остаётся контролируемым — предпочтение
+
+сначала сделать foundation отдельно, так как вводится новый manager.
+
+Phase 30E — Object Closeout Audit (ownership, readers/writers,
+
+duplicate/idempotency, Roadmap/Drive integration, data integrity,
+
+финальное закрытие домена).
+
+Причина:
+
+Тот же архитектурный принцип, что уже закрыл Roadmap Domain и
+
+Service Domain (единственный transactional owner на реестр,
+
+defense-in-depth валидация на границе orchestration, устранение
+
+прямых обходов реестра из Telegram-хендлеров и Extension-модулей)
+
+применяется к Object Domain. Phase 30A нашла структурно похожий, но
+
+более острый класс проблем — на этот раз включая write-side
+
+нарушение без вообще какого-либо owner API (/editobject), поэтому
+
+решение вводит новый выделенный object_manager.py, а не просто
+
+ужесточает существующий модуль, как это было достаточно для Service
+
+Domain.
+
+Статус:
+
+Принято для реализации (Phase 30C/30D/30E). Реализация не начата.
