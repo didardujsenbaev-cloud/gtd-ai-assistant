@@ -778,4 +778,11 @@ Phase 29A нашла структурно идентичный класс про
 
 Статус:
 
-Принято для реализации (Phase 29C/29D/29E). Реализация не начата.
+Реализовано (Phase 29CD) и закрыто (Phase 29E, Service Domain Closeout).
+service_manager.py — единственный runtime transactional owner
+SERVICE_CATALOG; /initbc, /services, /newroadmap мигрированы на owner
+API; Roadmap creation требует существующего active Service. Полный
+generic lifecycle/update API (rename/price/deactivate/archive/delete)
+и удаление мёртвого business_core/service_catalog.py остаются
+отдельно отложенными (см. Phase 29E closeout report) — не входят в
+это ADR.
