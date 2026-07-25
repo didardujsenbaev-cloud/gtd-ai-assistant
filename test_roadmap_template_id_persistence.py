@@ -103,9 +103,18 @@ class TestTemplateIdWrite(unittest.TestCase):
         sheet = self._fake_sheet(CANONICAL_ROADMAPS_HEADERS)
 
         with patch("business_core.object_manager.find_object_by_id",
-                   return_value={"object_id": "OBJ-TEST", "status": "new"}), \
+                   return_value={"object_id": "OBJ-TEST", "status": "new", "biz_id": "BIZ-001", "client_id": "PRS-001"}), \
              patch("business_core.service_manager.find_service_by_id",
-                   return_value={"service_id": "SVC-IZH-001", "status": "active"}), \
+                   return_value={"service_id": "SVC-IZH-001", "status": "active", "biz_id": "BIZ-001"}), \
+             patch("business_core.sheets.find_row_by_id", return_value=("2", {"ID": "BIZ-001"})), \
+             patch("business_core.person_manager.find_person_by_id",
+                   return_value={"person_id": "PRS-DEFAULT", "status": "active",
+                                 "person_type": "клиент", "biz_ids": [], "primary_biz_id": ""}), \
+             patch("business_core.person_manager.is_person_archived", return_value=False), \
+             patch("business_core.person_manager.is_client_person", return_value=True), \
+             patch("business_core.person_manager.has_person_business_link", return_value=True), \
+             patch("business_core.roadmap_template_manager.find_roadmap_template_by_id",
+                   return_value={"template_id": "RMT-IZH-ALM-STANDARD-002", "service_id": "SVC-IZH-001", "status": "active"}), \
              patch("business_core.sheets.get_business_sheet", return_value=sheet), \
              patch("business_core.sheets.append_business_row",
                    side_effect=lambda k, r: rows.append((k, r))), \
@@ -147,9 +156,18 @@ class TestTemplateIdWrite(unittest.TestCase):
         sheet = self._fake_sheet(shuffled)
 
         with patch("business_core.object_manager.find_object_by_id",
-                   return_value={"object_id": "OBJ-TEST", "status": "new"}), \
+                   return_value={"object_id": "OBJ-TEST", "status": "new", "biz_id": "BIZ-001", "client_id": "PRS-001"}), \
              patch("business_core.service_manager.find_service_by_id",
-                   return_value={"service_id": "SVC-IZH-001", "status": "active"}), \
+                   return_value={"service_id": "SVC-IZH-001", "status": "active", "biz_id": "BIZ-001"}), \
+             patch("business_core.sheets.find_row_by_id", return_value=("2", {"ID": "BIZ-001"})), \
+             patch("business_core.person_manager.find_person_by_id",
+                   return_value={"person_id": "PRS-DEFAULT", "status": "active",
+                                 "person_type": "клиент", "biz_ids": [], "primary_biz_id": ""}), \
+             patch("business_core.person_manager.is_person_archived", return_value=False), \
+             patch("business_core.person_manager.is_client_person", return_value=True), \
+             patch("business_core.person_manager.has_person_business_link", return_value=True), \
+             patch("business_core.roadmap_template_manager.find_roadmap_template_by_id",
+                   return_value={"template_id": "RMT-IZH-ALM-STANDARD-002", "service_id": "SVC-IZH-001", "status": "active"}), \
              patch("business_core.sheets.get_business_sheet", return_value=sheet), \
              patch("business_core.sheets.append_business_row",
                    side_effect=lambda k, r: rows.append((k, r))), \
@@ -175,9 +193,18 @@ class TestTemplateIdWrite(unittest.TestCase):
         sheet = self._fake_sheet(CANONICAL_ROADMAPS_HEADERS)
 
         with patch("business_core.object_manager.find_object_by_id",
-                   return_value={"object_id": "OBJ-TEST", "status": "new"}), \
+                   return_value={"object_id": "OBJ-TEST", "status": "new", "biz_id": "BIZ-001", "client_id": "PRS-001"}), \
              patch("business_core.service_manager.find_service_by_id",
-                   return_value={"service_id": "SVC-IZH-001", "status": "active"}), \
+                   return_value={"service_id": "SVC-IZH-001", "status": "active", "biz_id": "BIZ-001"}), \
+             patch("business_core.sheets.find_row_by_id", return_value=("2", {"ID": "BIZ-001"})), \
+             patch("business_core.person_manager.find_person_by_id",
+                   return_value={"person_id": "PRS-DEFAULT", "status": "active",
+                                 "person_type": "клиент", "biz_ids": [], "primary_biz_id": ""}), \
+             patch("business_core.person_manager.is_person_archived", return_value=False), \
+             patch("business_core.person_manager.is_client_person", return_value=True), \
+             patch("business_core.person_manager.has_person_business_link", return_value=True), \
+             patch("business_core.roadmap_template_manager.find_roadmap_template_by_id",
+                   return_value={"template_id": "RMT-IZH-ALM-STANDARD-002", "service_id": "SVC-IZH-001", "status": "active"}), \
              patch("business_core.sheets.get_business_sheet", return_value=sheet), \
              patch("business_core.sheets.append_business_row",
                    side_effect=lambda k, r: rows.append((k, r))), \
@@ -202,9 +229,18 @@ class TestTemplateIdWrite(unittest.TestCase):
         sheet = self._fake_sheet(old_headers)
 
         with patch("business_core.object_manager.find_object_by_id",
-                   return_value={"object_id": "OBJ-TEST", "status": "new"}), \
+                   return_value={"object_id": "OBJ-TEST", "status": "new", "biz_id": "BIZ-001", "client_id": "PRS-001"}), \
              patch("business_core.service_manager.find_service_by_id",
-                   return_value={"service_id": "SVC-IZH-001", "status": "active"}), \
+                   return_value={"service_id": "SVC-IZH-001", "status": "active", "biz_id": "BIZ-001"}), \
+             patch("business_core.sheets.find_row_by_id", return_value=("2", {"ID": "BIZ-001"})), \
+             patch("business_core.person_manager.find_person_by_id",
+                   return_value={"person_id": "PRS-DEFAULT", "status": "active",
+                                 "person_type": "клиент", "biz_ids": [], "primary_biz_id": ""}), \
+             patch("business_core.person_manager.is_person_archived", return_value=False), \
+             patch("business_core.person_manager.is_client_person", return_value=True), \
+             patch("business_core.person_manager.has_person_business_link", return_value=True), \
+             patch("business_core.roadmap_template_manager.find_roadmap_template_by_id",
+                   return_value={"template_id": "RMT-IZH-ALM-STANDARD-002", "service_id": "SVC-IZH-001", "status": "active"}), \
              patch("business_core.sheets.get_business_sheet", return_value=sheet), \
              patch("business_core.sheets.append_business_row",
                    side_effect=lambda k, r: rows.append((k, r))), \
@@ -303,6 +339,13 @@ class TestResolveTemplateIdPriority(unittest.TestCase):
         roadmap = {"template_id": "RMT-IZH-ALM-STANDARD-002", "service_id": "SVC-IZH-001", "notes": ""}
 
         with patch("business_core.service_manager.find_service_by_id", return_value=None), \
+             patch("business_core.sheets.find_row_by_id", return_value=("2", {"ID": "BIZ-001"})), \
+             patch("business_core.person_manager.find_person_by_id",
+                   return_value={"person_id": "PRS-DEFAULT", "status": "active",
+                                 "person_type": "клиент", "biz_ids": [], "primary_biz_id": ""}), \
+             patch("business_core.person_manager.is_person_archived", return_value=False), \
+             patch("business_core.person_manager.is_client_person", return_value=True), \
+             patch("business_core.person_manager.has_person_business_link", return_value=True), \
              patch("business_core.roadmap_template_manager.find_roadmap_templates_by_service",
                    return_value=[
                        {"template_id": "RMT-IZH-ALM-LEGALIZATION-001", "service_id": "SVC-IZH-001"},
@@ -368,6 +411,13 @@ class TestEndToEndStartroadmapToMilestones(unittest.TestCase):
 
         async def run_startroadmap():
             with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
+             patch("business_core.sheets.find_row_by_id", return_value=("2", {"ID": "BIZ-001"})), \
+             patch("business_core.person_manager.find_person_by_id",
+                   return_value={"person_id": "PRS-DEFAULT", "status": "active",
+                                 "person_type": "клиент", "biz_ids": [], "primary_biz_id": ""}), \
+             patch("business_core.person_manager.is_person_archived", return_value=False), \
+             patch("business_core.person_manager.is_client_person", return_value=True), \
+             patch("business_core.person_manager.has_person_business_link", return_value=True), \
                  patch("business_core.business_builder.find_object_by_id",
                        return_value={"obj_id": "OBJ-001", "biz_id": "BIZ-001", "client_id": "PRS-001"}), \
                  patch("business_core.business_builder.create_roadmap_for_object",
@@ -382,6 +432,13 @@ class TestEndToEndStartroadmapToMilestones(unittest.TestCase):
                  patch("business_core.service_manager.find_service_by_id",
                        return_value={"service_id": "SVC-IZH-001",
                                      "default_roadmap_template_id": "RMT-IZH-ALM-LEGALIZATION-001"}), \
+             patch("business_core.sheets.find_row_by_id", return_value=("2", {"ID": "BIZ-001"})), \
+             patch("business_core.person_manager.find_person_by_id",
+                   return_value={"person_id": "PRS-DEFAULT", "status": "active",
+                                 "person_type": "клиент", "biz_ids": [], "primary_biz_id": ""}), \
+             patch("business_core.person_manager.is_person_archived", return_value=False), \
+             patch("business_core.person_manager.is_client_person", return_value=True), \
+             patch("business_core.person_manager.has_person_business_link", return_value=True), \
                  patch("business_core.roadmap_manager.create_roadmap_stages_from_template",
                        return_value={"stages_count": 0}):
                 await th.startroadmap_cmd(upd, ctx)
@@ -453,9 +510,23 @@ class TestBackwardCompatibilityOldRoadmaps(unittest.TestCase):
         }
         with patch("business_core.roadmap_manager.find_roadmap_by_id",
                    return_value=old_roadmap), \
+             patch("business_core.sheets.find_row_by_id", return_value=("2", {"ID": "BIZ-001"})), \
+             patch("business_core.person_manager.find_person_by_id",
+                   return_value={"person_id": "PRS-DEFAULT", "status": "active",
+                                 "person_type": "клиент", "biz_ids": [], "primary_biz_id": ""}), \
+             patch("business_core.person_manager.is_person_archived", return_value=False), \
+             patch("business_core.person_manager.is_client_person", return_value=True), \
+             patch("business_core.person_manager.has_person_business_link", return_value=True), \
              patch("business_core.service_manager.find_service_by_id",
                    return_value={"service_id": "SVC-IZH-001",
                                  "default_roadmap_template_id": "RMT-IZH-ALM-LEGALIZATION-001"}), \
+             patch("business_core.sheets.find_row_by_id", return_value=("2", {"ID": "BIZ-001"})), \
+             patch("business_core.person_manager.find_person_by_id",
+                   return_value={"person_id": "PRS-DEFAULT", "status": "active",
+                                 "person_type": "клиент", "biz_ids": [], "primary_biz_id": ""}), \
+             patch("business_core.person_manager.is_person_archived", return_value=False), \
+             patch("business_core.person_manager.is_client_person", return_value=True), \
+             patch("business_core.person_manager.has_person_business_link", return_value=True), \
              patch("business_core.roadmap_manager.get_stages_for_roadmap", return_value=[]):
             data = rm.get_commercial_milestones_for_roadmap("RM-022")
 

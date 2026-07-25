@@ -318,12 +318,32 @@ class TestRoadmapRequiresExistingAllowedObject(unittest.TestCase):
         import business_core.business_builder as bb
         return bb
 
+    # Phase 33C (ADR-016): Business (B) and Client (C) validation now run
+    # before Object (D) validation — these two patches give every test in
+    # this class a valid Business/Client so the Object-status assertions
+    # below still isolate the Object step specifically.
+    def _biz_and_client_patches(self):
+        from unittest.mock import patch
+        return [
+            patch("business_core.sheets.find_row_by_id", return_value=("2", {"ID": "BIZ-001"})),
+            patch("business_core.person_manager.find_person_by_id",
+                  return_value={"person_id": "PRS-001", "status": "active",
+                                "person_type": "клиент", "biz_ids": ["BIZ-001"], "primary_biz_id": "BIZ-001"}),
+            patch("business_core.person_manager.is_person_archived", return_value=False),
+            patch("business_core.person_manager.is_client_person", return_value=True),
+            patch("business_core.person_manager.has_person_business_link", return_value=True),
+        ]
+
     def test_missing_object_rejected_no_writes(self):
+        from contextlib import ExitStack
         from unittest.mock import patch
         bb = self._fresh_bb()
-        with patch("business_core.object_manager.find_object_by_id", return_value=None), \
-             patch("business_core.roadmap_manager.create_roadmap_record") as mock_create, \
-             patch("business_core.sheets.append_business_row") as mock_append:
+        with ExitStack() as stack:
+            for p in self._biz_and_client_patches():
+                stack.enter_context(p)
+            stack.enter_context(patch("business_core.object_manager.find_object_by_id", return_value=None))
+            mock_create = stack.enter_context(patch("business_core.roadmap_manager.create_roadmap_record"))
+            mock_append = stack.enter_context(patch("business_core.sheets.append_business_row"))
             result = bb.create_roadmap_for_object(
                 obj_id="OBJ-NOT-EXIST", biz_id="BIZ-001", client_id="PRS-001", service_id="SVC-001",
             )
@@ -332,11 +352,16 @@ class TestRoadmapRequiresExistingAllowedObject(unittest.TestCase):
         mock_append.assert_not_called()
 
     def test_completed_object_rejected(self):
+        from contextlib import ExitStack
         from unittest.mock import patch
         bb = self._fresh_bb()
-        with patch("business_core.object_manager.find_object_by_id",
-                   return_value={"object_id": "OBJ-001", "status": "completed"}), \
-             patch("business_core.roadmap_manager.create_roadmap_record") as mock_create:
+        with ExitStack() as stack:
+            for p in self._biz_and_client_patches():
+                stack.enter_context(p)
+            stack.enter_context(patch("business_core.object_manager.find_object_by_id",
+                                      return_value={"object_id": "OBJ-001", "status": "completed",
+                                                    "biz_id": "BIZ-001", "client_id": "PRS-001"}))
+            mock_create = stack.enter_context(patch("business_core.roadmap_manager.create_roadmap_record"))
             result = bb.create_roadmap_for_object(
                 obj_id="OBJ-001", biz_id="BIZ-001", client_id="PRS-001", service_id="SVC-001",
             )
@@ -344,16 +369,23 @@ class TestRoadmapRequiresExistingAllowedObject(unittest.TestCase):
         mock_create.assert_not_called()
 
     def test_active_object_allowed(self):
+        from contextlib import ExitStack
         from unittest.mock import patch
         bb = self._fresh_bb()
-        with patch("business_core.object_manager.find_object_by_id",
-                   return_value={"object_id": "OBJ-001", "status": "active"}), \
-             patch("business_core.service_manager.find_service_by_id",
-                   return_value={"service_id": "SVC-001", "status": "active"}), \
-             patch("business_core.roadmap_manager.find_active_roadmap_for_object", return_value=None), \
-             patch("business_core.roadmap_manager.create_roadmap_record",
-                   return_value={"ok": True, "roadmap_id": "RM-999", "roadmap": {}, "error": None}), \
-             patch("business_core.roadmap_template_manager.find_template_stages", return_value=[]):
+        with ExitStack() as stack:
+            for p in self._biz_and_client_patches():
+                stack.enter_context(p)
+            stack.enter_context(patch("business_core.object_manager.find_object_by_id",
+                                      return_value={"object_id": "OBJ-001", "status": "active",
+                                                    "biz_id": "BIZ-001", "client_id": "PRS-001"}))
+            stack.enter_context(patch("business_core.service_manager.find_service_by_id",
+                                      return_value={"service_id": "SVC-001", "status": "active", "biz_id": "BIZ-001"}))
+            stack.enter_context(patch("business_core.roadmap_manager.find_open_roadmaps_for_object", return_value=[]))
+            stack.enter_context(patch("business_core.roadmap_manager.create_roadmap_record",
+                                      return_value={"ok": True, "roadmap_id": "RM-999", "roadmap": {}, "error": None}))
+            stack.enter_context(patch("business_core.roadmap_template_manager.find_roadmap_templates_by_service",
+                                      return_value=[]))
+            stack.enter_context(patch("business_core.roadmap_template_manager.find_template_stages", return_value=[]))
             result = bb.create_roadmap_for_object(
                 obj_id="OBJ-001", biz_id="BIZ-001", client_id="PRS-001", service_id="SVC-001",
             )

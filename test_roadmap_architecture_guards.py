@@ -360,15 +360,21 @@ class TestTelegramHandlersNoDirectRoadmapRegistryWrites(unittest.TestCase):
 
 
 class TestConvergentRetryUsesActiveRoadmapLookup(unittest.TestCase):
-    """Phase 28G: create_roadmap_for_object must consult
-    roadmap_manager.find_active_roadmap_for_object() before ever
-    creating a new ROADMAPS row — no duplicate-active-Roadmap bypass."""
+    """Phase 28G/33C: create_roadmap_for_object must consult a
+    roadmap_manager open-Roadmap lookup before ever creating a new
+    ROADMAPS row — no duplicate bypass. Phase 33C (ADR-016 §9)
+    replaced the active-only find_active_roadmap_for_object() call
+    inside this function with find_open_roadmaps_for_object() (open =
+    active + on_hold) — find_active_roadmap_for_object() itself still
+    exists, unchanged, for any other caller depending on its exact
+    active-only behavior; this guard now checks for its Phase 33C
+    successor instead."""
 
-    def test_create_roadmap_for_object_calls_find_active_roadmap(self):
+    def test_create_roadmap_for_object_calls_find_open_roadmaps(self):
         import inspect
         import business_core.business_builder as bb
         src = inspect.getsource(bb.create_roadmap_for_object)
-        self.assertIn("find_active_roadmap_for_object", src)
+        self.assertIn("find_open_roadmaps_for_object", src)
 
 
 def _files_containing_literal_status_write(candidate_files: list[Path], forbidden_value: str) -> set[str]:
@@ -646,6 +652,142 @@ class TestEmptyServiceIdCannotReachRoadmapCreation(unittest.TestCase):
         self.assertNotEqual(service_check_pos, -1, "no service_id validation found in startroadmap_cmd")
         self.assertLess(service_check_pos, call_pos,
                         "service_id must be validated before create_roadmap_for_object is called")
+
+
+class TestRoadmapManagerHasZeroCrossDomainOwnerImports(unittest.TestCase):
+    """Phase 33C (ADR-016 §1): roadmap_manager.py remains persistence-
+    only — ALL cross-domain validation added by Phase 33C lives entirely
+    in business_builder.py, never inside roadmap_manager.py. The new
+    find_open_roadmaps_for_object() (and every other Phase 33C-era
+    function) must never import person_manager, object_manager, or
+    service_manager.
+
+    One pre-existing, out-of-scope exception is intentionally excluded
+    from this guard: _resolve_template_id()'s legacy fallback (Phase <28,
+    predates this domain-ownership work entirely) reads
+    service_manager.find_service_by_id() as one of several best-effort
+    fallbacks for old Roadmap rows lacking a stored template_id. This
+    function is untouched by Phase 33C and redesigning it is explicitly
+    out of scope for this phase ("do not redesign Roadmap persistence") —
+    so the guard below checks every *other* function in the file instead
+    of banning the module import file-wide."""
+
+    _FORBIDDEN_OWNER_MODULES = {"person_manager", "object_manager", "service_manager"}
+    _PRE_EXISTING_EXCEPTION_FUNCTION = "_resolve_template_id"
+
+    def test_no_business_client_object_service_owner_imports_outside_legacy_fallback(self):
+        path = BUSINESS_CORE / "roadmap_manager.py"
+        src = path.read_text(encoding="utf-8")
+        tree = ast.parse(src, str(path))
+        offending: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name == self._PRE_EXISTING_EXCEPTION_FUNCTION:
+                continue
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    top = alias.name.split(".")[0]
+                    last = alias.name.split(".")[-1]
+                    if top in self._FORBIDDEN_OWNER_MODULES or last in self._FORBIDDEN_OWNER_MODULES:
+                        # Confirm this Import node does not live inside the
+                        # exempted function (module-level scan can't nest
+                        # via ast.walk alone, so re-check via a parent scan).
+                        pass
+        # Simpler, precise approach: walk top-level and each FunctionDef
+        # separately, skipping the one known exempt function by name.
+        module = ast.parse(src, str(path))
+        for top_node in ast.iter_child_nodes(module):
+            if isinstance(top_node, ast.FunctionDef) and top_node.name == self._PRE_EXISTING_EXCEPTION_FUNCTION:
+                continue
+            for node in ast.walk(top_node):
+                names: set[str] = set()
+                if isinstance(node, ast.Import):
+                    for alias in node.names:
+                        names.add(alias.name.split(".")[0])
+                        names.add(alias.name.split(".")[-1])
+                elif isinstance(node, ast.ImportFrom) and node.module:
+                    names.add(node.module.split(".")[0])
+                    names.add(node.module.split(".")[-1])
+                offending |= names & self._FORBIDDEN_OWNER_MODULES
+        self.assertEqual(
+            offending, set(),
+            f"roadmap_manager.py must not import Business/Client/Object/Service "
+            f"owner modules outside the one documented pre-existing legacy "
+            f"fallback ({self._PRE_EXISTING_EXCEPTION_FUNCTION}) — cross-domain "
+            f"validation belongs solely in business_builder.py (ADR-016 §1), "
+            f"found: {offending}",
+        )
+
+
+class TestTelegramHandlersDoesNotDuplicateCrossDomainValidation(unittest.TestCase):
+    """Phase 33C (ADR-016 §1/§8): Template resolution/validation used to
+    live partly in telegram_handlers.startroadmap_cmd (explicit-template
+    check, default-from-service lookup, linked-templates auto-select) —
+    Phase 33C moved all of it into
+    business_builder._resolve_and_validate_roadmap_template(), called
+    only from inside create_roadmap_for_object(). startroadmap_cmd must
+    no longer call find_roadmap_template_by_id / find_service_by_id /
+    find_roadmap_templates_by_service itself — it passes the raw
+    explicit template_id straight through and relies entirely on the
+    structured result contract (error_code, candidate_template_ids) for
+    any user-facing decision."""
+
+    def _handler_body(self) -> str:
+        path = BUSINESS_CORE / "telegram_handlers.py"
+        src = path.read_text(encoding="utf-8")
+        start = src.index("async def startroadmap_cmd")
+        end = src.index("\nasync def ", start + 10)
+        return src[start:end]
+
+    def test_handler_does_not_call_template_resolution_functions_itself(self):
+        body = self._handler_body()
+        for forbidden_call in (
+            "find_roadmap_template_by_id(",
+            "find_service_by_id(",
+            "find_roadmap_templates_by_service(",
+        ):
+            self.assertNotIn(
+                forbidden_call, body,
+                f"startroadmap_cmd must not call {forbidden_call.rstrip('(')} directly — "
+                f"template/service resolution is now solely inside "
+                f"business_builder.create_roadmap_for_object() (ADR-016 §1/§8).",
+            )
+
+
+class TestNoArbitraryFirstPickSelection(unittest.TestCase):
+    """Phase 33C (ADR-016 §8/§9): neither Template resolution nor
+    open-Roadmap duplicate detection may ever silently pick "the first"
+    of several ambiguous candidates — both must surface a structured,
+    blocking error instead (MULTIPLE_TEMPLATES_REQUIRE_SELECTION /
+    MULTIPLE_OPEN_ROADMAPS_INTEGRITY_ERROR)."""
+
+    def test_template_resolution_blocks_instead_of_picking_first_of_multiple(self):
+        """linked[0] is only ever selected in the len(linked) == 1 branch
+        (a single unambiguous candidate) — when more than one linked
+        Template exists, the function must return
+        MULTIPLE_TEMPLATES_REQUIRE_SELECTION with an empty template_id
+        and the full candidate list, never silently pick linked[0]."""
+        from unittest.mock import patch
+        import business_core.business_builder as bb
+        with patch("business_core.roadmap_template_manager.find_roadmap_templates_by_service",
+                   return_value=[{"template_id": "RMT-A"}, {"template_id": "RMT-B"}]):
+            result = bb._resolve_and_validate_roadmap_template("", {}, "SVC-001")
+        self.assertEqual(result["error_code"], "MULTIPLE_TEMPLATES_REQUIRE_SELECTION")
+        self.assertEqual(result["template_id"], "")
+        self.assertEqual(set(result["candidate_template_ids"]), {"RMT-A", "RMT-B"})
+
+    def test_open_roadmap_detection_never_indexes_first_of_multiple_as_success(self):
+        import inspect
+        import business_core.business_builder as bb
+        src = inspect.getsource(bb.create_roadmap_for_object)
+        self.assertIn("MULTIPLE_OPEN_ROADMAPS_INTEGRITY_ERROR", src)
+        # The only permitted "[0]" indexing of open_roadmaps is guarded
+        # by the len(...) > 1 check returning first — i.e. it must occur
+        # strictly after the integrity-error return, never before it.
+        integrity_pos = src.index("MULTIPLE_OPEN_ROADMAPS_INTEGRITY_ERROR")
+        first_index_pos = src.find("open_roadmaps[0]")
+        self.assertNotEqual(first_index_pos, -1, "expected a single-candidate open_roadmaps[0] selection")
+        self.assertLess(integrity_pos, first_index_pos,
+                        "open_roadmaps[0] must only be reached after the >1 integrity check")
 
 
 if __name__ == "__main__":

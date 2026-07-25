@@ -1857,6 +1857,41 @@ def find_active_roadmap_for_object(object_id: str, service_id: str) -> Optional[
     return matches[0] if matches else None
 
 
+def find_open_roadmaps_for_object(
+    object_id: str,
+    service_id: str,
+    open_statuses: tuple[str, ...] = ("active", "on_hold"),
+) -> list[dict]:
+    """
+    Read-only, parametrized duplicate-detection primitive (Phase 33C,
+    ADR-016 Decision 9): all Roadmaps for (Object ID, Service ID) whose
+    status is one of `open_statuses`.
+
+    Deliberately a pure read primitive, not a policy decision — WHICH
+    statuses count as "open" (blocking a second Roadmap for the same
+    key) is an orchestration-layer choice, made by the caller
+    (business_core.business_builder.create_roadmap_for_object()), not
+    by this module. The default of ("active", "on_hold") matches
+    ADR-016's approved default only for caller convenience; it is not
+    hardcoded policy here.
+
+    Unlike find_active_roadmap_for_object() (kept unchanged, still
+    "active"-only, for any existing caller depending on that exact
+    behavior), this function returns ALL matches rather than just the
+    first — so the caller can detect and reject >1 open Roadmaps for
+    the same key rather than silently using one.
+
+    Returns:
+        list[dict], same shape as find_roadmap_by_id(), in sheet order.
+        Empty list if object_id/service_id missing or no match.
+    """
+    if not object_id or not service_id:
+        return []
+
+    matches = list_roadmaps(object_id=object_id, service_id=service_id)
+    return [r for r in matches if r.get("status") in open_statuses]
+
+
 def create_roadmap_record(
     *,
     business_id: str,

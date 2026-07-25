@@ -163,9 +163,18 @@ class TestCreateRoadmapWritesByActualHeaders(unittest.TestCase):
         sheet.row_values.return_value = headers
 
         with patch("business_core.object_manager.find_object_by_id",
-                   return_value={"object_id": "OBJ-001", "status": "new"}), \
+                   return_value={"object_id": "OBJ-001", "status": "new", "biz_id": "BIZ-001", "client_id": "PRS-001"}), \
              patch("business_core.service_manager.find_service_by_id",
-                   return_value={"service_id": "SVC-IZH-001", "status": "active"}), \
+                   return_value={"service_id": "SVC-IZH-001", "status": "active", "biz_id": "BIZ-001"}), \
+             patch("business_core.sheets.find_row_by_id", return_value=("2", {"ID": "BIZ-001"})), \
+             patch("business_core.person_manager.find_person_by_id",
+                   return_value={"person_id": "PRS-DEFAULT", "status": "active",
+                                 "person_type": "клиент", "biz_ids": [], "primary_biz_id": ""}), \
+             patch("business_core.person_manager.is_person_archived", return_value=False), \
+             patch("business_core.person_manager.is_client_person", return_value=True), \
+             patch("business_core.person_manager.has_person_business_link", return_value=True), \
+             patch("business_core.roadmap_template_manager.find_roadmap_template_by_id",
+                   return_value={"template_id": "RMT-IZH-ALM-STANDARD-002", "service_id": "SVC-IZH-001", "status": "active"}), \
              patch("business_core.sheets.get_business_sheet", return_value=sheet), \
              patch("business_core.sheets.append_business_row",
                    side_effect=lambda k, r: rows.append((k, r))), \
@@ -557,6 +566,13 @@ class TestGTDAndEnvUntouched(unittest.TestCase):
         sheet = MagicMock()
         sheet.get_all_values.return_value = [LIVE_HEADERS_BEFORE_MIGRATION] + _live_data_rows()
         with patch("sys.argv", ["migrate_roadmaps_headers.py"]), \
+             patch("business_core.sheets.find_row_by_id", return_value=("2", {"ID": "BIZ-001"})), \
+             patch("business_core.person_manager.find_person_by_id",
+                   return_value={"person_id": "PRS-DEFAULT", "status": "active",
+                                 "person_type": "клиент", "biz_ids": [], "primary_biz_id": ""}), \
+             patch("business_core.person_manager.is_person_archived", return_value=False), \
+             patch("business_core.person_manager.is_client_person", return_value=True), \
+             patch("business_core.person_manager.has_person_business_link", return_value=True), \
              patch("business_core.sheets.get_business_sheet", return_value=sheet):
             m.main()
 

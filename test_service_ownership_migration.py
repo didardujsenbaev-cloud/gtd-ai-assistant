@@ -321,12 +321,34 @@ def _fresh_bb():
 
 class TestRoadmapServiceStatusValidation(unittest.TestCase):
 
+    # Phase 33C (ADR-016): Business/Client/Object validation (B/C/D) now
+    # run before Service (E) — these patches give every test in this
+    # class a valid Business/Client/Object so the Service-status
+    # assertions below still isolate the Service step specifically.
+    def _biz_client_object_patches(self):
+        return [
+            patch("business_core.sheets.find_row_by_id", return_value=("2", {"ID": "BIZ-001"})),
+            patch("business_core.person_manager.find_person_by_id",
+                  return_value={"person_id": "PRS-001", "status": "active",
+                                "person_type": "клиент", "biz_ids": ["BIZ-001"], "primary_biz_id": "BIZ-001"}),
+            patch("business_core.person_manager.is_person_archived", return_value=False),
+            patch("business_core.person_manager.is_client_person", return_value=True),
+            patch("business_core.person_manager.has_person_business_link", return_value=True),
+            patch("business_core.object_manager.find_object_by_id",
+                  return_value={"object_id": "OBJ-001", "status": "new",
+                                "biz_id": "BIZ-001", "client_id": "PRS-001"}),
+        ]
+
     def test_draft_service_rejected_no_writes(self):
+        from contextlib import ExitStack
         bb = _fresh_bb()
-        with patch("business_core.service_manager.find_service_by_id",
-                   return_value={"service_id": "SVC-001", "status": "draft"}), \
-             patch("business_core.roadmap_manager.create_roadmap_record") as mock_create, \
-             patch("business_core.sheets.append_business_row") as mock_append:
+        with ExitStack() as stack:
+            for p in self._biz_client_object_patches():
+                stack.enter_context(p)
+            stack.enter_context(patch("business_core.service_manager.find_service_by_id",
+                                      return_value={"service_id": "SVC-001", "status": "draft", "biz_id": "BIZ-001"}))
+            mock_create = stack.enter_context(patch("business_core.roadmap_manager.create_roadmap_record"))
+            mock_append = stack.enter_context(patch("business_core.sheets.append_business_row"))
             result = bb.create_roadmap_for_object(
                 obj_id="OBJ-001", biz_id="BIZ-001", client_id="PRS-001", service_id="SVC-001",
             )
@@ -335,10 +357,14 @@ class TestRoadmapServiceStatusValidation(unittest.TestCase):
         mock_append.assert_not_called()
 
     def test_unknown_status_in_existing_row_rejected(self):
+        from contextlib import ExitStack
         bb = _fresh_bb()
-        with patch("business_core.service_manager.find_service_by_id",
-                   return_value={"service_id": "SVC-001", "status": "paused"}), \
-             patch("business_core.roadmap_manager.create_roadmap_record") as mock_create:
+        with ExitStack() as stack:
+            for p in self._biz_client_object_patches():
+                stack.enter_context(p)
+            stack.enter_context(patch("business_core.service_manager.find_service_by_id",
+                                      return_value={"service_id": "SVC-001", "status": "paused", "biz_id": "BIZ-001"}))
+            mock_create = stack.enter_context(patch("business_core.roadmap_manager.create_roadmap_record"))
             result = bb.create_roadmap_for_object(
                 obj_id="OBJ-001", biz_id="BIZ-001", client_id="PRS-001", service_id="SVC-001",
             )
@@ -346,11 +372,16 @@ class TestRoadmapServiceStatusValidation(unittest.TestCase):
         mock_create.assert_not_called()
 
     def test_no_stage_or_extension_writes_on_validation_failure(self):
+        from contextlib import ExitStack
         bb = _fresh_bb()
-        with patch("business_core.service_manager.find_service_by_id", return_value=None), \
-             patch("business_core.roadmap_manager.create_roadmap_record") as mock_create, \
-             patch("business_core.roadmap_manager.ensure_roadmap_stages") as mock_stages, \
-             patch("business_core.stage_entity_relations.copy_template_relations_to_stage") as mock_copy:
+        with ExitStack() as stack:
+            for p in self._biz_client_object_patches():
+                stack.enter_context(p)
+            stack.enter_context(patch("business_core.service_manager.find_service_by_id", return_value=None))
+            mock_create = stack.enter_context(patch("business_core.roadmap_manager.create_roadmap_record"))
+            mock_stages = stack.enter_context(patch("business_core.roadmap_manager.ensure_roadmap_stages"))
+            mock_copy = stack.enter_context(
+                patch("business_core.stage_entity_relations.copy_template_relations_to_stage"))
             result = bb.create_roadmap_for_object(
                 obj_id="OBJ-001", biz_id="BIZ-001", client_id="PRS-001", service_id="SVC-GONE",
             )
@@ -361,17 +392,22 @@ class TestRoadmapServiceStatusValidation(unittest.TestCase):
 
     def test_active_service_preserves_convergent_retry(self):
         """Sanity check: with an active Service, the existing convergent-
-        retry behavior (reuse existing active Roadmap) is unchanged."""
+        retry behavior (reuse existing open Roadmap) is unchanged."""
+        from contextlib import ExitStack
         bb = _fresh_bb()
-        existing_roadmap = {"roadmap_id": "RM-950", "template_id": "", "status": "active"}
-        with patch("business_core.object_manager.find_object_by_id",
-                   return_value={"object_id": "OBJ-001", "status": "new"}), \
-             patch("business_core.service_manager.find_service_by_id",
-                   return_value={"service_id": "SVC-001", "status": "active"}), \
-             patch("business_core.roadmap_manager.find_active_roadmap_for_object",
-                   return_value=existing_roadmap), \
-             patch("business_core.roadmap_manager.list_roadmaps", return_value=[existing_roadmap]), \
-             patch("business_core.roadmap_template_manager.find_template_stages", return_value=[]):
+        existing_roadmap = {
+            "roadmap_id": "RM-950", "template_id": "", "status": "active",
+            "object_id": "OBJ-001", "service_id": "SVC-001",
+            "business_id": "BIZ-001", "client_id": "PRS-001",
+        }
+        with ExitStack() as stack:
+            for p in self._biz_client_object_patches():
+                stack.enter_context(p)
+            stack.enter_context(patch("business_core.service_manager.find_service_by_id",
+                                      return_value={"service_id": "SVC-001", "status": "active", "biz_id": "BIZ-001"}))
+            stack.enter_context(patch("business_core.roadmap_manager.find_open_roadmaps_for_object",
+                                      return_value=[existing_roadmap]))
+            stack.enter_context(patch("business_core.roadmap_template_manager.find_template_stages", return_value=[]))
             result = bb.create_roadmap_for_object(
                 obj_id="OBJ-001", biz_id="BIZ-001", client_id="PRS-001", service_id="SVC-001",
             )

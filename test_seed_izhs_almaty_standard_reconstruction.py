@@ -393,6 +393,9 @@ class TestStartRoadmapWithStandardTemplate(unittest.TestCase):
                            "stages_count": 15, "stage_ids": [], "used_template": True,
                            "relation_copy_errors": (), "relation_copy_created_count": 0,
                            "partial_success": False, "partial_failure": False, "warnings": (),
+                           "template_id": "RMT-IZH-ALM-STANDARD-001",
+                           "selected_template_id": "RMT-IZH-ALM-STANDARD-001",
+                           "type_compatibility_warning": None,
                        }), \
                  patch("business_core.business_builder.update_object_roadmap_id"), \
                  patch("business_core.roadmap_template_manager.find_roadmap_template_by_id",

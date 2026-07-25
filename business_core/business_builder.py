@@ -1339,9 +1339,20 @@ def generate_roadmap_id() -> str:
         return "RM-001"
 
 
-def _empty_roadmap_creation_result(error: str) -> dict:
+def _empty_roadmap_creation_result(error: str, error_code: str = "") -> dict:
+    """
+    Phase 33C (ADR-016 Decision 4): `error_code` is the stable,
+    machine-readable outcome (e.g. "BUSINESS_NOT_FOUND",
+    "CLIENT_ARCHIVED", "OBJECT_SERVICE_TYPE_MISMATCH" — see ADR-016
+    §14 for the full contract) — `error` remains the existing
+    human-readable (Russian) message field every current caller
+    already reads. Both are always present; `error_code` is "" only
+    for legacy call sites this phase doesn't assign a specific code to
+    (the two pre-existing "required fields missing" checks, unchanged
+    from before ADR-016).
+    """
     return {
-        "ok": False, "roadmap_id": "", "error": error,
+        "ok": False, "roadmap_id": "", "error": error, "error_code": error_code,
         "core_created": False, "stages_created": False,
         "stages_count": 0, "stage_ids": [], "used_template": False,
         "relation_copy_errors": (), "relation_copy_created_count": 0,
@@ -1351,6 +1362,108 @@ def _empty_roadmap_creation_result(error: str) -> dict:
         "existing_stage_ids": [], "existing_stage_count": 0, "total_stage_count": 0,
         "relations_result": {"created_count": 0, "errors": ()},
         "knowledge_result": {"merged_inline": False},
+        # Phase 33C additive fields (ADR-016 §4):
+        "stages_reused": False,
+        "conflicting_roadmap_ids": [],
+        "candidate_template_ids": [],
+        "selected_template_id": "",
+        "type_compatibility_warning": None,
+        "client_type_validation": "deferred",
+    }
+
+
+def _normalize_type_value(value: str) -> str:
+    """
+    Phase 33C (ADR-016 §6/§11 in the Phase 33B ADR; exact recipe
+    specified in the Phase 33C brief): Unicode NFKC -> trim -> collapse
+    internal whitespace -> casefold. Used ONLY for the non-blocking
+    Object Type comparison — no substring/fuzzy/semantic matching, no
+    alias map (none exists yet; see ADR-016 §6 for why one isn't
+    invented here).
+    """
+    import re
+    import unicodedata
+    v = unicodedata.normalize("NFKC", value or "")
+    v = re.sub(r"\s+", " ", v.strip())
+    return v.casefold()
+
+
+def _resolve_and_validate_roadmap_template(
+    template_id: str,
+    service: dict,
+    service_id: str,
+) -> dict:
+    """
+    Phase 33C (ADR-016 §11/13): single canonical Template resolution +
+    validation point, used by create_roadmap_for_object() for BOTH an
+    explicitly requested template_id and an auto-selected one — no
+    second implementation of this logic exists elsewhere (previously,
+    explicit-template validation lived only in telegram_handlers.
+    startroadmap_cmd(), duplicating what this function now does
+    authoritatively at the orchestration boundary; that Telegram-layer
+    validation is removed in this same phase to avoid two
+    implementations).
+
+    Order: explicit template_id (if given) -> Service's own stored
+    Default Roadmap Template ID (if non-empty) -> templates linked to
+    this Service via ROADMAP_TEMPLATE_REGISTRY. An explicit template_id
+    is validated even if it happens to equal the Service's default —
+    there is exactly one validation code path, not two.
+
+    Returns:
+        {
+            "template_id":  str,   # resolved+validated ID, or "" if none configured at all
+            "error_code":   str | None,
+            "error":        str | None,
+            "candidate_template_ids": list[str],  # only for MULTIPLE_TEMPLATES_REQUIRE_SELECTION
+        }
+    """
+    from business_core.roadmap_template_manager import (
+        find_roadmap_template_by_id, find_roadmap_templates_by_service,
+    )
+
+    def _validate_candidate(candidate_id: str, source_label: str) -> dict:
+        tmpl = find_roadmap_template_by_id(candidate_id)
+        if not tmpl:
+            return {
+                "template_id": "", "error_code": "TEMPLATE_NOT_FOUND",
+                "error": f"Шаблон {candidate_id} ({source_label}) не найден в ROADMAP_TEMPLATE_REGISTRY",
+                "candidate_template_ids": [],
+            }
+        tmpl_svc = (tmpl.get("service_id") or "").strip()
+        if tmpl_svc and tmpl_svc != service_id:
+            return {
+                "template_id": "", "error_code": "TEMPLATE_SERVICE_MISMATCH",
+                "error": f"Шаблон {candidate_id} принадлежит услуге {tmpl_svc}, а не {service_id}",
+                "candidate_template_ids": [],
+            }
+        tmpl_status = (tmpl.get("status") or "").strip().lower()
+        if tmpl_status and tmpl_status != "active":
+            return {
+                "template_id": "", "error_code": "TEMPLATE_NOT_FOUND",
+                "error": f"Шаблон {candidate_id} ({source_label}) имеет статус '{tmpl_status}' — недоступен",
+                "candidate_template_ids": [],
+            }
+        return {"template_id": candidate_id, "error_code": None, "error": None, "candidate_template_ids": []}
+
+    if template_id:
+        return _validate_candidate(template_id, "явно указан")
+
+    default_template_id = (service.get("default_roadmap_template_id") or "").strip()
+    if default_template_id:
+        return _validate_candidate(default_template_id, f"default для {service_id}")
+
+    linked = find_roadmap_templates_by_service(service_id)
+    if not linked:
+        return {"template_id": "", "error_code": None, "error": None, "candidate_template_ids": []}
+    if len(linked) == 1:
+        return _validate_candidate(linked[0].get("template_id", ""), f"единственный связанный с {service_id}")
+
+    candidate_ids = [t.get("template_id", "") for t in linked]
+    return {
+        "template_id": "", "error_code": "MULTIPLE_TEMPLATES_REQUIRE_SELECTION",
+        "error": f"Для услуги {service_id} найдено {len(linked)} шаблонов — требуется явный выбор",
+        "candidate_template_ids": candidate_ids,
     }
 
 
@@ -1367,60 +1480,73 @@ def create_roadmap_for_object(
     """
     Ensure/converge a Roadmap (+ Stages + Extension data) for this
     Object+Service — the single orchestration entry point for this
-    flow (Phase 28C/28D/28E/28G).
+    flow (Phase 28C/28D/28E/28G; cross-domain validation added Phase
+    33C per ADR-016).
 
-    Convergent-retry semantics (Phase 28G): calling this twice with the
-    same (obj_id, service_id) never creates a second Roadmap and never
-    duplicates Stages — the second call finds the existing active
-    Roadmap (duplicate key: (Object ID, Service ID), via
-    roadmap_manager.find_active_roadmap_for_object() — never Client ID/
-    Business ID/Template ID/title), reuses it, and only fills in
-    whatever Core/Extension state is still missing:
+    Validation order (ADR-016 §5, all before any write):
+      A. required identifiers (obj_id, biz_id, client_id, service_id)
+      B. Business exists (BUSINESS_NOT_FOUND)
+      C. Client exists / not archived / has Client role / linked to
+         Business (CLIENT_NOT_FOUND / CLIENT_ARCHIVED /
+         CLIENT_ROLE_REQUIRED / CLIENT_NOT_LINKED_TO_BUSINESS)
+      D. Object exists / eligible status / Business+Client consistency
+         (OBJECT_NOT_FOUND / OBJECT_NOT_ELIGIBLE /
+         OBJECT_BUSINESS_MISMATCH / OBJECT_CLIENT_MISMATCH)
+      E. Service exists / active / Business consistency
+         (SERVICE_NOT_FOUND / SERVICE_INACTIVE / SERVICE_BUSINESS_MISMATCH)
+      F. Object Type compatibility — non-blocking WARNING only
+         (OBJECT_SERVICE_TYPE_MISMATCH); Client Type compatibility
+         remains explicitly DEFERRED (ADR-016 §7) — never validated,
+         never blocks
+      G. Template resolution + validation (explicit -> Service default
+         -> linked templates), before any Roadmap row is written
+      H. Open-Roadmap duplicate detection — open = {active, on_hold}
+         (ADR-016 §9); >1 open Roadmap for (Object ID, Service ID) is a
+         blocking MULTIPLE_OPEN_ROADMAPS_INTEGRITY_ERROR, never an
+         arbitrary first pick
+      I. create or reuse the Roadmap row
+      J. materialize missing Stages idempotently
 
-      validate input
-      -> find_active_roadmap_for_object(obj_id, service_id)
-      -> if none: create_roadmap_record() (roadmap_created=True)
-      -> if found: reuse it (roadmap_reused=True) — its OWN stored
-         template_id (if any) wins over a newly-requested one (see
-         "Template mismatch policy" below)
-      -> read Template Stage rows (Core -> Core,
-         roadmap_template_manager.find_template_stages())
-      -> ensure_roadmap_stages() — idempotent, only creates missing
-         Stage Orders (roadmap_manager.py owns ROADMAP_STAGES)
-      -> Extension-copy (stage_entity_relations.copy_template_relations_to_stage())
-         only for NEWLY created stages this call — stages that already
-         existed were already copied on a prior call, and
-         copy_template_relations_to_stage() is itself idempotent
-         (find_active_duplicate_relation-gated), so retrying it is safe
-         even if this orchestration retries the same stage twice
-      -> built-in ROADMAP_TEMPLATES (case_type) fallback ONLY if this
-         Roadmap has zero Stages in total (never re-triggered just
-         because zero stages were created THIS call — that would
-         wrongly create a second, differently-IDed stage set on a pure
-         idempotent retry where everything already existed)
+    None of Business/Client/Object/Service/Template records are ever
+    mutated during validation — only read. Business status eligibility
+    is explicitly NOT enforced this phase (ADR-016 §2 — BIZ_REGISTRY
+    has no canonical status model/owner yet); only Business existence
+    is required.
 
-    Template mismatch policy (Phase 28G): if the existing (reused)
-    Roadmap already has a non-empty template_id, it is the source of
-    truth — a differently-requested template_id is never silently
-    applied; instead "template_warning" reports the mismatch and
-    "template_id" in the result reflects the one actually used (the
-    existing Roadmap's). If the existing Roadmap's template_id is
-    empty, the newly requested/resolved one is used for Stage creation
-    this call, but is NOT written back onto the existing ROADMAPS row
-    (no owner API exists yet for that narrow field update — deferred,
-    not silently improvised; see the Phase 28G report).
+    Convergent-retry semantics (Phase 28G, preserved): calling this
+    twice with the same (obj_id, service_id) never creates a second
+    Roadmap and never duplicates Stages. ALL validations (A-H) re-run
+    on every call, including a pure retry — there is no historical
+    exception (ADR-016 §10): if Business/Client/Object/Service state
+    changed between calls (e.g. Client archived after the first
+    Roadmap), the retry is rejected exactly like a first call would be.
+
+    Template mismatch policy (Phase 28G, preserved): if the existing
+    (reused) Roadmap already has a non-empty template_id, it is the
+    source of truth — a differently-requested template_id is never
+    silently applied; "template_warning" reports the mismatch and
+    "template_id"/"selected_template_id" reflect the one actually used.
+    If the existing Roadmap's template_id is empty, the newly
+    requested/resolved one is used for Stage creation this call, but is
+    NOT written back onto the existing ROADMAPS row (no owner API
+    exists yet for that narrow field update — deferred, not
+    improvised).
 
     Extension failure (relation-copy) never rolls back an already-
     committed Roadmap/Stages — visible via "partial_success"/
     "partial_failure"/"relation_copy_errors"; "ok" stays True whenever
-    Core (Roadmap + Stages) succeeded.
+    Core (Roadmap + Stages) succeeded. A Stage-materialization failure
+    itself (ensure_roadmap_stages returning ok=False) is now also
+    surfaced structurally via error_code="STAGE_MATERIALIZATION_PARTIAL_FAILURE"
+    and partial_failure=True (Phase 33C — previously only a warning
+    string, "ok" still stays True and the Roadmap row is retained,
+    never rolled back; safe to retry).
 
-    Data-integrity visibility: if more than one ACTIVE Roadmap already
-    exists for this (Object ID, Service ID) — a state this function
-    never itself creates, but could already exist in data predating
-    this guarantee — the first (sheet-order) one is used, exactly as
-    find_active_roadmap_for_object() already behaves, but a warning is
-    added making this visible rather than silently picking one.
+    Immutable-field integrity (ADR-016 §12/§13): on reuse, the existing
+    Roadmap's Business ID/Client ID are compared against the requested
+    context — an existing Roadmap's core is never rewritten, and a
+    genuine conflict is a blocking integrity error, not a silent
+    overwrite or a silent pick.
 
     Args:
         obj_id:      OBJ-ID объекта (обязательный)
@@ -1431,124 +1557,221 @@ def create_roadmap_for_object(
         title:       заголовок roadmap (автогенерируется если пустой,
                      используется только при создании нового Roadmap)
         notes:       примечания (используется только при создании)
-        template_id: RMT-... шаблон для создания этапов (requested;
-                     see Template mismatch policy above for what
-                     actually gets used on a reuse)
+        template_id: RMT-... шаблон для создания этапов, явно запрошенный
+                     (see Template resolution / mismatch policy above)
 
     Returns:
         {
             "ok":          bool,
             "roadmap_id":  str,
-            "error":       str | None,
+            "error":       str | None,        # human-readable (Russian)
+            "error_code":  str,                # stable machine code, "" on success (ADR-016 §14)
             # Phase 28C/28D/28E:
-            "core_created":                bool,   # Core state (Roadmap, whether new or reused) is present
-            "stages_created":              bool,   # at least one NEW Stage created this call
-            "stages_count":                int,    # NEW stages created this call
-            "stage_ids":                   list[str],  # NEW stage IDs created this call
+            "core_created":                bool,
+            "stages_created":              bool,
+            "stages_count":                int,
+            "stage_ids":                   list[str],
             "used_template":               bool,
             "relation_copy_errors":        tuple,
             "relation_copy_created_count": int,
             "partial_success":             bool,
             "partial_failure":             bool,
             "warnings":                    tuple,
-            # Phase 28G, additive:
-            "roadmap_created":    bool,  # True only if a brand-new ROADMAPS row was created this call
-            "roadmap_reused":     bool,  # True if an existing active Roadmap was found and reused
-            "template_id":        str,   # the template_id actually used for Stage creation this call
+            # Phase 28G:
+            "roadmap_created":    bool,
+            "roadmap_reused":     bool,
+            "template_id":        str,
             "template_warning":   str | None,
-            "existing_stage_ids": list[str],  # Stage IDs that already existed before this call
+            "existing_stage_ids": list[str],
             "existing_stage_count": int,
-            "total_stage_count":    int,  # existing + newly created this call
+            "total_stage_count":    int,
             "relations_result":  {"created_count": int, "errors": tuple},
-            "knowledge_result":  {"merged_inline": bool},  # knowledge-ID copying happens
-                                  # inline inside ensure_roadmap_stages() (same-registry
-                                  # field merge, not a separate Extension step) — this
-                                  # dict documents that, it is not a second write path
+            "knowledge_result":  {"merged_inline": bool},
+            # Phase 33C (ADR-016 §4), additive:
+            "stages_reused":              bool,   # True iff any Stage already existed before this call
+            "conflicting_roadmap_ids":    list[str],  # populated only for MULTIPLE_OPEN_ROADMAPS_INTEGRITY_ERROR
+            "candidate_template_ids":     list[str],  # populated only for MULTIPLE_TEMPLATES_REQUIRE_SELECTION
+            "selected_template_id":       str,    # alias of "template_id", for the new structured contract
+            "type_compatibility_warning": dict | None,  # {"status": "mismatch"|"unavailable", "object_type": str, "service_object_type": str}
+            "client_type_validation":     str,    # always "deferred" (ADR-016 §7) — never blocks, informational only
         }
     """
+    # A. Required identifiers.
     if not obj_id or not biz_id or not client_id:
         return _empty_roadmap_creation_result("Обязательные поля: obj_id, biz_id, client_id")
+    if not service_id or not service_id.strip():
+        # Closeout Remediation (finding #1) — defense-in-depth: service_id
+        # is part of the (Object ID, Service ID) duplicate key. A blank/
+        # whitespace-only service_id must never reach Roadmap creation —
+        # it previously bypassed the reuse lookup entirely and created a
+        # distinct, dedup-invisible Roadmap (the RM-002 incident).
+        return _empty_roadmap_creation_result("service_id обязателен")
 
-    # Phase 30D, ADR-014 Decision 7: Roadmap может быть создан только
-    # для существующего Object с разрешённым статусом (new/active/
-    # on_hold). Проверка — до Service-валидации, до find_active_roadmap_
-    # for_object(), до create_roadmap_record(), до ensure_roadmap_stages(),
-    # до update_object_roadmap_id(), до Extension operations — без
-    # production writes при отказе. Остаётся в orchestration
-    # (business_builder), не в roadmap_manager — тот же принцип, что уже
-    # применён к Service-валидации (Phase 29CD).
+    # B. Business existence (ADR-016 §2). No owner module exists for
+    # Business yet (same "Business Domain ещё не имеет отдельного
+    # owner-модуля" gap already noted in the Object/Client/Service ADRs)
+    # — find_row_by_id("biz_registry", ...) is the existing canonical
+    # primitive used identically elsewhere in this file (newobject_cmd,
+    # newservice_cmd) for exactly this check; not a new raw read.
+    # Business status eligibility is explicitly NOT enforced this phase
+    # (ADR-016 §2) — BIZ_REGISTRY.Статус is not a canonical, owned model.
+    from business_core.sheets import find_row_by_id
+    if find_row_by_id("biz_registry", biz_id) is None:
+        return _empty_roadmap_creation_result(f"Business {biz_id} не найден", error_code="BUSINESS_NOT_FOUND")
+
+    # C. Client validation (ADR-016 §3) — canonical person_manager API only.
+    from business_core.person_manager import (
+        find_person_by_id, is_person_archived, is_client_person, has_person_business_link,
+    )
+    person = find_person_by_id(client_id)
+    if person is None:
+        return _empty_roadmap_creation_result(f"Клиент {client_id} не найден", error_code="CLIENT_NOT_FOUND")
+    if is_person_archived(person):
+        return _empty_roadmap_creation_result(
+            f"Клиент {client_id} архивирован — Roadmap не создан", error_code="CLIENT_ARCHIVED",
+        )
+    if not is_client_person(person):
+        return _empty_roadmap_creation_result(
+            f"Клиент {client_id} не имеет роли клиента", error_code="CLIENT_ROLE_REQUIRED",
+        )
+    if not has_person_business_link(person, biz_id):
+        return _empty_roadmap_creation_result(
+            f"Клиент {client_id} не привязан к бизнесу {biz_id}", error_code="CLIENT_NOT_LINKED_TO_BUSINESS",
+        )
+
+    # D. Object validation (ADR-016 §4; existence/status unchanged from
+    # Phase 30D/ADR-014 Decision 7 — Business/Client consistency new
+    # this phase).
     from business_core.object_manager import find_object_by_id, OBJECT_STATUSES, ROADMAP_ALLOWED_OBJECT_STATUSES
     obj = find_object_by_id(obj_id)
     if obj is None:
-        return _empty_roadmap_creation_result(f"Object {obj_id} не найден")
+        return _empty_roadmap_creation_result(f"Object {obj_id} не найден", error_code="OBJECT_NOT_FOUND")
     object_status = (obj.get("status") or "").strip().lower()
     if object_status not in OBJECT_STATUSES:
         return _empty_roadmap_creation_result(
-            f"Object {obj_id}: неизвестный статус '{object_status}' — Roadmap не создан"
+            f"Object {obj_id}: неизвестный статус '{object_status}' — Roadmap не создан",
+            error_code="OBJECT_NOT_ELIGIBLE",
         )
     if object_status not in ROADMAP_ALLOWED_OBJECT_STATUSES:
         return _empty_roadmap_creation_result(
             f"Object {obj_id} имеет статус '{object_status}' — "
-            f"Roadmap можно создать только для Object со статусом {', '.join(ROADMAP_ALLOWED_OBJECT_STATUSES)}"
+            f"Roadmap можно создать только для Object со статусом {', '.join(ROADMAP_ALLOWED_OBJECT_STATUSES)}",
+            error_code="OBJECT_NOT_ELIGIBLE",
+        )
+    if (obj.get("biz_id") or "") != biz_id:
+        return _empty_roadmap_creation_result(
+            f"Object {obj_id} принадлежит бизнесу {obj.get('biz_id', '')!r}, а не {biz_id!r}",
+            error_code="OBJECT_BUSINESS_MISMATCH",
+        )
+    if (obj.get("client_id") or "") != client_id:
+        return _empty_roadmap_creation_result(
+            f"Object {obj_id} привязан к клиенту {obj.get('client_id', '')!r}, а не {client_id!r}",
+            error_code="OBJECT_CLIENT_MISMATCH",
         )
 
-    # Closeout Remediation (finding #1) — defense-in-depth: service_id is
-    # part of the (Object ID, Service ID) duplicate key that
-    # find_active_roadmap_for_object() uses to prevent a second active
-    # Roadmap for the same Object. A blank/whitespace-only service_id
-    # must never reach Roadmap creation — it previously bypassed the
-    # reuse lookup entirely (`if service_id else None`) and created a
-    # distinct, dedup-invisible Roadmap (the RM-002 incident). This is
-    # enforced here even though telegram_handlers.startroadmap_cmd now
-    # also validates it, so any other/future caller gets the same
-    # guarantee — no Roadmap record, no Stage rows, no Extension calls.
-    if not service_id or not service_id.strip():
-        return _empty_roadmap_creation_result("service_id обязателен")
-
-    # Phase 29CD, Decision 7: Roadmap может быть создан только для
-    # существующего Service со статусом active. Проверка находится
-    # здесь (orchestration), а не в roadmap_manager.create_roadmap_record
-    # — existence/status validation не относится к persistence owner.
-    # Выполняется до find_active_roadmap_for_object(), до
-    # create_roadmap_record(), до ensure_roadmap_stages(), до Extension
-    # operations — без production writes при отказе.
+    # E. Service validation (ADR-016 §5; existence/status unchanged from
+    # Phase 29CD/Decision 7 — Business consistency new this phase).
     from business_core.service_manager import find_service_by_id, SERVICE_STATUSES
     service = find_service_by_id(service_id)
     if service is None:
-        return _empty_roadmap_creation_result(f"Service {service_id} не найден")
+        return _empty_roadmap_creation_result(f"Service {service_id} не найден", error_code="SERVICE_NOT_FOUND")
     service_status = (service.get("status") or "").strip().lower()
     if service_status not in SERVICE_STATUSES:
         return _empty_roadmap_creation_result(
-            f"Service {service_id}: неизвестный статус '{service_status}' — Roadmap не создан"
+            f"Service {service_id}: неизвестный статус '{service_status}' — Roadmap не создан",
+            error_code="SERVICE_INACTIVE",
         )
     if service_status != "active":
         return _empty_roadmap_creation_result(
             f"Service {service_id} имеет статус '{service_status}' — "
-            f"Roadmap можно создать только для Service со статусом active"
+            f"Roadmap можно создать только для Service со статусом active",
+            error_code="SERVICE_INACTIVE",
+        )
+    if (service.get("biz_id") or "") != biz_id:
+        return _empty_roadmap_creation_result(
+            f"Service {service_id} принадлежит бизнесу {service.get('biz_id', '')!r}, а не {biz_id!r}",
+            error_code="SERVICE_BUSINESS_MISMATCH",
         )
 
     if not title:
         title = f"Roadmap {obj_id}" + (f" / {service_id}" if service_id else "")
 
-    from business_core.roadmap_manager import create_roadmap_record, find_active_roadmap_for_object, list_roadmaps
-
     warnings: list[str] = []
     template_warning = None
 
-    # service_id is now guaranteed non-empty above — no conditional
-    # bypass of the dedup lookup remains.
-    existing = find_active_roadmap_for_object(obj_id, service_id)
+    # F. Object Type compatibility — WARNING only, never blocking
+    # (ADR-016 §6 — the vocabulary mismatch between SERVICE_CATALOG.Object
+    # Type (English machine slugs) and OBJECT_REGISTRY.Object Type (free
+    # Russian text) makes a hard gate unsafe today). Client Type
+    # compatibility remains explicitly deferred (ADR-016 §7).
+    object_type_raw = obj.get("object_type", "") or ""
+    service_object_type_raw = service.get("object_type", "") or ""
+    object_type_norm = _normalize_type_value(object_type_raw)
+    service_object_type_norm = _normalize_type_value(service_object_type_raw)
+    type_compatibility_warning = None
+    if not object_type_norm or not service_object_type_norm:
+        type_compatibility_warning = {
+            "status": "unavailable", "object_type": object_type_raw, "service_object_type": service_object_type_raw,
+        }
+        warnings.append(
+            "Object Type compatibility: сравнение недоступно "
+            f"(Object.Object Type={object_type_raw!r}, Service.Object Type={service_object_type_raw!r})"
+        )
+    elif object_type_norm != service_object_type_norm:
+        type_compatibility_warning = {
+            "status": "mismatch", "object_type": object_type_raw, "service_object_type": service_object_type_raw,
+        }
+        warnings.append(
+            f"OBJECT_SERVICE_TYPE_MISMATCH: Object.Object Type={object_type_raw!r} "
+            f"не совпадает с Service.Object Type={service_object_type_raw!r} (не блокирует создание)"
+        )
+    # else: exact normalized match — no warning.
 
+    # G. Template resolution + validation (ADR-016 §8/§11) — happens
+    # before any Roadmap row is written, for both explicit and
+    # auto-selected Template IDs; single implementation, no duplicate
+    # validation left in telegram_handlers.py.
+    tmpl_resolution = _resolve_and_validate_roadmap_template(template_id, service, service_id)
+    if tmpl_resolution["error_code"]:
+        result = _empty_roadmap_creation_result(tmpl_resolution["error"], error_code=tmpl_resolution["error_code"])
+        result["candidate_template_ids"] = tmpl_resolution["candidate_template_ids"]
+        return result
+    resolved_template_id = tmpl_resolution["template_id"]
+
+    from business_core.roadmap_manager import create_roadmap_record, find_open_roadmaps_for_object
+
+    # H. Open-Roadmap duplicate detection (ADR-016 §9). Open = {active,
+    # on_hold}. >1 open Roadmap for this key is a blocking integrity
+    # error, never an arbitrary first pick.
+    open_roadmaps = find_open_roadmaps_for_object(obj_id, service_id)
+    if len(open_roadmaps) > 1:
+        result = _empty_roadmap_creation_result(
+            f"Найдено {len(open_roadmaps)} открытых Roadmap для "
+            f"(Object ID={obj_id!r}, Service ID={service_id!r}): "
+            f"{[r['roadmap_id'] for r in open_roadmaps]} — новый Roadmap не создан",
+            error_code="MULTIPLE_OPEN_ROADMAPS_INTEGRITY_ERROR",
+        )
+        result["conflicting_roadmap_ids"] = [r["roadmap_id"] for r in open_roadmaps]
+        return result
+
+    existing = open_roadmaps[0] if open_roadmaps else None
+
+    # I. Create or reuse the Roadmap row.
     if existing is not None:
-        # Data-integrity visibility (Phase 28G): more than one active
-        # Roadmap for this key is a pre-existing anomaly this function
-        # never itself creates — surface it rather than silently
-        # picking one.
-        all_active = list_roadmaps(object_id=obj_id, service_id=service_id, status="active")
-        if len(all_active) > 1:
-            warnings.append(
-                f"data integrity: {len(all_active)} active Roadmaps found for "
-                f"(Object ID={obj_id!r}, Service ID={service_id!r}) — using {existing['roadmap_id']}"
+        # Immutable-identity consistency (ADR-016 §12/§13): an existing
+        # Roadmap's Business ID/Client ID must match the requested
+        # context — never silently rewritten, never silently ignored.
+        immutable_conflicts = []
+        if (existing.get("business_id") or "") != biz_id:
+            immutable_conflicts.append("business_id")
+        if (existing.get("client_id") or "") != client_id:
+            immutable_conflicts.append("client_id")
+        if immutable_conflicts:
+            return _empty_roadmap_creation_result(
+                f"Roadmap {existing['roadmap_id']} уже существует с другими "
+                f"неизменяемыми полями ({', '.join(immutable_conflicts)}) — "
+                f"новый Roadmap не создан, существующий не изменён",
+                error_code="ROADMAP_IMMUTABLE_FIELD_CONFLICT",
             )
 
         roadmap_id = existing["roadmap_id"]
@@ -1558,34 +1781,34 @@ def create_roadmap_for_object(
         existing_template_id = (existing.get("template_id") or "").strip()
         if existing_template_id:
             effective_template_id = existing_template_id
-            if template_id and template_id != existing_template_id:
+            if resolved_template_id and resolved_template_id != existing_template_id:
                 # No underscores in the human-readable text — this
                 # message is shown verbatim in Telegram (Markdown
                 # parse_mode), where unescaped underscores are consumed
                 # as italic delimiters and silently dropped (a real bug
                 # found via the Phase 28GH production smoke test).
                 template_warning = (
-                    f"Запрошенный шаблон ({template_id}) отличается от уже "
+                    f"Запрошенный шаблон ({resolved_template_id}) отличается от уже "
                     f"сохранённого ({existing_template_id}) — сохранён "
                     f"прежний шаблон Roadmap."
                 )
                 warnings.append(template_warning)
         else:
             # Existing Roadmap has no stored template — use the
-            # requested/resolved one for Stage creation this call.
+            # newly resolved one for Stage creation this call.
             # Deliberately NOT written back onto the existing ROADMAPS
             # row: no owner API exists yet for that one narrow field
             # update, and improvising a raw write here would violate
             # this module's own "no direct Roadmap registry writes"
             # boundary. Deferred — see the Phase 28G report.
-            effective_template_id = template_id
+            effective_template_id = resolved_template_id
 
         log.info(f"create_roadmap_for_object: reusing existing Roadmap {roadmap_id} / {obj_id} / {service_id}")
 
     else:
         rm_result = create_roadmap_record(
             business_id=biz_id, client_id=client_id, object_id=obj_id,
-            service_id=service_id, template_id=template_id,
+            service_id=service_id, template_id=resolved_template_id,
             client_name=title, case_type=case_type, notes=notes,
         )
         if not rm_result["ok"]:
@@ -1595,7 +1818,7 @@ def create_roadmap_for_object(
         roadmap_id = rm_result["roadmap_id"]
         roadmap_created = True
         roadmap_reused = False
-        effective_template_id = template_id
+        effective_template_id = resolved_template_id
         log.info(f"create_roadmap_for_object: {roadmap_id} / {obj_id} / {case_type}")
 
     stages_count = 0
@@ -1605,6 +1828,7 @@ def create_roadmap_for_object(
     relation_copy_errors: list[tuple] = []
     relation_copy_created_count = 0
     total_stage_count = 0
+    stage_materialization_failed = False
 
     if effective_template_id:
         try:
@@ -1650,6 +1874,13 @@ def create_roadmap_for_object(
                         except Exception as exc:
                             relation_copy_errors.append((new_stage_id, source_template_stage_id, (str(exc),)))
             else:
+                # Phase 33C: a Stage-materialization failure is now
+                # surfaced structurally (error_code + partial_failure),
+                # not just a warning string — the Roadmap row itself is
+                # retained (never rolled back), and a retry is safe:
+                # ensure_roadmap_stages() re-reads existing Orders fresh
+                # and only attempts genuinely still-missing ones.
+                stage_materialization_failed = True
                 warnings.append(stage_result.get("error") or "Не удалось создать этапы из шаблона")
         else:
             warnings.append(f"Шаблон {effective_template_id} не содержит этапов.")
@@ -1674,12 +1905,14 @@ def create_roadmap_for_object(
         except Exception as exc:
             warnings.append(str(exc))
 
-    partial_failure = bool(relation_copy_errors)
+    partial_failure = bool(relation_copy_errors) or stage_materialization_failed
+    error_code = "STAGE_MATERIALIZATION_PARTIAL_FAILURE" if stage_materialization_failed else ""
 
     return {
         "ok": True,
         "roadmap_id": roadmap_id,
         "error": None,
+        "error_code": error_code,
         "core_created": True,
         "stages_created": stages_count > 0,
         "stages_count": stages_count,
@@ -1702,6 +1935,13 @@ def create_roadmap_for_object(
             "errors": tuple(relation_copy_errors),
         },
         "knowledge_result": {"merged_inline": used_template},
+        # Phase 33C additive fields (ADR-016 §4):
+        "stages_reused": bool(existing_stage_ids),
+        "conflicting_roadmap_ids": [],
+        "candidate_template_ids": [],
+        "selected_template_id": effective_template_id,
+        "type_compatibility_warning": type_compatibility_warning,
+        "client_type_validation": "deferred",
     }
 
 

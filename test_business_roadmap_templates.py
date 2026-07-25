@@ -700,24 +700,21 @@ class TestStartRoadmapWithTemplate(unittest.TestCase):
     def test_M_uses_service_template(self):
         """M: /startroadmap использует шаблон из услуги.
 
-        Phase 28C: template auto-selection (from the service's own
-        default_roadmap_template_id) still happens in startroadmap_cmd
-        itself, unchanged — what changed is that stage creation from
-        that resolved template_id now happens INSIDE
-        create_roadmap_for_object, not via a separate call this handler
-        makes. So this asserts the resolved template_id is the one
-        passed to create_roadmap_for_object, rather than asserting a
-        (now nonexistent, from this handler's perspective) direct call
-        to create_stages_from_template_record."""
+        Phase 33C (ADR-016 §11/§15): template auto-selection (from the
+        service's own default_roadmap_template_id) moved OUT of
+        startroadmap_cmd and INTO create_roadmap_for_object() — this
+        handler-level test now asserts only that the raw (here: empty,
+        since the user didn't pass template_id=) explicit_template_id is
+        passed through unchanged to create_roadmap_for_object(), which
+        is mocked as a whole here. The actual "does auto-selection from
+        the Service's default template work" behavior is covered
+        directly against create_roadmap_for_object()/
+        _resolve_and_validate_roadmap_template() in
+        test_roadmap_cross_domain_validation.py — testing it at this
+        handler layer would just re-test a mock's return value."""
         import asyncio
         self._setup()
         from business_core.telegram_handlers import startroadmap_cmd
-
-        svc_mock = {
-            "service_id": "SVC-001",
-            "biz_id": "BIZ-001",
-            "default_roadmap_template_id": "RTMPL-001",
-        }
 
         update  = MagicMock()
         context = MagicMock()
@@ -737,15 +734,15 @@ class TestStartRoadmapWithTemplate(unittest.TestCase):
                            "stages_count": 5, "stage_ids": [], "used_template": True,
                            "relation_copy_errors": (), "relation_copy_created_count": 0,
                            "partial_success": False, "partial_failure": False, "warnings": (),
+                           "template_id": "RTMPL-001", "selected_template_id": "RTMPL-001",
                        }) as mock_create_rm, \
-                 patch("business_core.business_builder.update_object_roadmap_id"), \
-                 patch("business_core.service_manager.find_service_by_id", return_value=svc_mock), \
-                 patch("business_core.roadmap_template_manager.find_roadmap_templates_by_service",
-                       return_value=[]):
+                 patch("business_core.business_builder.update_object_roadmap_id"):
                 await startroadmap_cmd(update, context)
-                # Должен передать в create_roadmap_for_object именно
-                # шаблон из сервиса (не пустую строку/case_type-only путь).
-                self.assertEqual(mock_create_rm.call_args.kwargs["template_id"], "RTMPL-001")
+                # Phase 33C: the handler passes the raw explicit
+                # template_id through unchanged (here: "", since the
+                # user didn't supply one) — resolution happens inside
+                # the (mocked) create_roadmap_for_object() itself.
+                self.assertEqual(mock_create_rm.call_args.kwargs["template_id"], "")
 
         asyncio.run(run())
 
@@ -789,6 +786,13 @@ class TestStartRoadmapWithTemplate(unittest.TestCase):
                  patch("business_core.business_builder.update_object_roadmap_id"), \
                  patch("business_core.service_manager.find_service_by_id",
                        return_value=svc_mock_no_template), \
+             patch("business_core.sheets.find_row_by_id", return_value=("2", {"ID": "BIZ-001"})), \
+             patch("business_core.person_manager.find_person_by_id",
+                   return_value={"person_id": "PRS-DEFAULT", "status": "active",
+                                 "person_type": "клиент", "biz_ids": [], "primary_biz_id": ""}), \
+             patch("business_core.person_manager.is_person_archived", return_value=False), \
+             patch("business_core.person_manager.is_client_person", return_value=True), \
+             patch("business_core.person_manager.has_person_business_link", return_value=True), \
                  patch("business_core.roadmap_template_manager.find_roadmap_templates_by_service",
                        return_value=[]):
                 await startroadmap_cmd(update, context)

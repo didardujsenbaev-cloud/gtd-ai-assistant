@@ -160,9 +160,16 @@ class TestCreateRoadmapForObject(unittest.TestCase):
         # Google Sheets API (тот же паттерн, что уже использовался ниже
         # для append_business_row/generate_next_id).
         with patch("business_core.object_manager.find_object_by_id",
-                   return_value={"object_id": "OBJ-001", "status": "new"}), \
+                   return_value={"object_id": "OBJ-001", "status": "new", "biz_id": "BIZ-001", "client_id": "PRS-001"}), \
              patch("business_core.service_manager.find_service_by_id",
-                   return_value={"service_id": "SVC-001", "status": "active"}), \
+                   return_value={"service_id": "SVC-001", "status": "active", "biz_id": "BIZ-001"}), \
+             patch("business_core.sheets.find_row_by_id", return_value=("2", {"ID": "BIZ-001"})), \
+             patch("business_core.person_manager.find_person_by_id",
+                   return_value={"person_id": "PRS-DEFAULT", "status": "active",
+                                 "person_type": "клиент", "biz_ids": [], "primary_biz_id": ""}), \
+             patch("business_core.person_manager.is_person_archived", return_value=False), \
+             patch("business_core.person_manager.is_client_person", return_value=True), \
+             patch("business_core.person_manager.has_person_business_link", return_value=True), \
              patch("business_core.sheets.get_business_sheet",
                    return_value=_make_roadmaps_sheet()), \
              patch("business_core.sheets.append_business_row") as mock_ap, \
@@ -181,13 +188,27 @@ class TestCreateRoadmapForObject(unittest.TestCase):
             self.assertIn("OBJ-001", appended_row)
 
     def test_D_saves_biz_client_service(self):
-        """D: create_roadmap_for_object сохраняет biz_id, client_id, service_id."""
+        """D: create_roadmap_for_object сохраняет biz_id, client_id, service_id.
+
+        Phase 33C (ADR-016 §4): Object/Service Business+Client now must
+        be consistent with the requested biz_id/client_id — mocks
+        updated to BIZ-002/PRS-002 to match the call (previously any
+        arbitrary biz_id/client_id was accepted with no consistency
+        check at all; that gap is exactly what ADR-016 closes)."""
         bb = self._reload_bb()
 
         with patch("business_core.object_manager.find_object_by_id",
-                   return_value={"object_id": "OBJ-002", "status": "new"}), \
+                   return_value={"object_id": "OBJ-002", "status": "new", "biz_id": "BIZ-002", "client_id": "PRS-002"}), \
              patch("business_core.service_manager.find_service_by_id",
-                   return_value={"service_id": "SVC-002", "status": "active"}), \
+                   return_value={"service_id": "SVC-002", "status": "active", "biz_id": "BIZ-002"}), \
+             patch("business_core.sheets.find_row_by_id", return_value=("2", {"ID": "BIZ-002"})), \
+             patch("business_core.person_manager.find_person_by_id",
+                   return_value={"person_id": "PRS-002", "status": "active",
+                                 "person_type": "клиент", "biz_ids": ["BIZ-002"], "primary_biz_id": "BIZ-002"}), \
+             patch("business_core.person_manager.is_person_archived", return_value=False), \
+             patch("business_core.person_manager.is_client_person", return_value=True), \
+             patch("business_core.person_manager.has_person_business_link", return_value=True), \
+             patch("business_core.roadmap_template_manager.find_roadmap_templates_by_service", return_value=[]), \
              patch("business_core.sheets.get_business_sheet",
                    return_value=_make_roadmaps_sheet()), \
              patch("business_core.sheets.append_business_row") as mock_ap, \
@@ -247,11 +268,20 @@ class TestCreateRoadmapForObjectExtensionOrchestration(unittest.TestCase):
     def test_calls_roadmap_manager_create_roadmap_record_not_raw_sheets(self):
         bb = self._reload_bb()
         with patch("business_core.object_manager.find_object_by_id",
-                   return_value={"object_id": "OBJ-901", "status": "new"}), \
+                   return_value={"object_id": "OBJ-901", "status": "new", "biz_id": "BIZ-001", "client_id": "PRS-001"}), \
              patch("business_core.service_manager.find_service_by_id",
-                   return_value={"service_id": "SVC-001", "status": "active"}), \
+                   return_value={"service_id": "SVC-001", "status": "active", "biz_id": "BIZ-001"}), \
+             patch("business_core.sheets.find_row_by_id", return_value=("2", {"ID": "BIZ-001"})), \
+             patch("business_core.person_manager.find_person_by_id",
+                   return_value={"person_id": "PRS-DEFAULT", "status": "active",
+                                 "person_type": "клиент", "biz_ids": [], "primary_biz_id": ""}), \
+             patch("business_core.person_manager.is_person_archived", return_value=False), \
+             patch("business_core.person_manager.is_client_person", return_value=True), \
+             patch("business_core.person_manager.has_person_business_link", return_value=True), \
              patch("business_core.roadmap_manager.create_roadmap_record",
                    return_value={"ok": True, "roadmap_id": "RM-900", "roadmap": {}, "error": None}) as mock_create, \
+             patch("business_core.roadmap_template_manager.find_roadmap_template_by_id",
+                   return_value={"template_id": "RMT-001", "service_id": "SVC-001", "status": "active"}), \
              patch("business_core.roadmap_template_manager.find_template_stages", return_value=[]), \
              patch("business_core.sheets.append_business_row") as mock_append:
             result = bb.create_roadmap_for_object(
@@ -273,11 +303,20 @@ class TestCreateRoadmapForObjectExtensionOrchestration(unittest.TestCase):
             raise RuntimeError("simulated transient relation-copy failure")
 
         with patch("business_core.object_manager.find_object_by_id",
-                   return_value={"object_id": "OBJ-901", "status": "new"}), \
+                   return_value={"object_id": "OBJ-901", "status": "new", "biz_id": "BIZ-001", "client_id": "PRS-001"}), \
              patch("business_core.service_manager.find_service_by_id",
-                   return_value={"service_id": "SVC-001", "status": "active"}), \
+                   return_value={"service_id": "SVC-001", "status": "active", "biz_id": "BIZ-001"}), \
+             patch("business_core.sheets.find_row_by_id", return_value=("2", {"ID": "BIZ-001"})), \
+             patch("business_core.person_manager.find_person_by_id",
+                   return_value={"person_id": "PRS-DEFAULT", "status": "active",
+                                 "person_type": "клиент", "biz_ids": [], "primary_biz_id": ""}), \
+             patch("business_core.person_manager.is_person_archived", return_value=False), \
+             patch("business_core.person_manager.is_client_person", return_value=True), \
+             patch("business_core.person_manager.has_person_business_link", return_value=True), \
              patch("business_core.roadmap_manager.create_roadmap_record",
                    return_value={"ok": True, "roadmap_id": "RM-901", "roadmap": {}, "error": None}), \
+             patch("business_core.roadmap_template_manager.find_roadmap_template_by_id",
+                   side_effect=lambda tid: {"template_id": tid, "service_id": "SVC-001", "status": "active"}), \
              patch("business_core.roadmap_template_manager.find_template_stages",
                    return_value=self._template_rows()), \
              patch("business_core.roadmap_manager.ensure_roadmap_stages",
@@ -313,11 +352,20 @@ class TestCreateRoadmapForObjectExtensionOrchestration(unittest.TestCase):
             return CopyRelationsResult(template_stage_id=template_stage_id, stage_id=stage_id, created=())
 
         with patch("business_core.object_manager.find_object_by_id",
-                   return_value={"object_id": "OBJ-901", "status": "new"}), \
+                   return_value={"object_id": "OBJ-901", "status": "new", "biz_id": "BIZ-001", "client_id": "PRS-001"}), \
              patch("business_core.service_manager.find_service_by_id",
-                   return_value={"service_id": "SVC-001", "status": "active"}), \
+                   return_value={"service_id": "SVC-001", "status": "active", "biz_id": "BIZ-001"}), \
+             patch("business_core.sheets.find_row_by_id", return_value=("2", {"ID": "BIZ-001"})), \
+             patch("business_core.person_manager.find_person_by_id",
+                   return_value={"person_id": "PRS-DEFAULT", "status": "active",
+                                 "person_type": "клиент", "biz_ids": [], "primary_biz_id": ""}), \
+             patch("business_core.person_manager.is_person_archived", return_value=False), \
+             patch("business_core.person_manager.is_client_person", return_value=True), \
+             patch("business_core.person_manager.has_person_business_link", return_value=True), \
              patch("business_core.roadmap_manager.create_roadmap_record",
                    return_value={"ok": True, "roadmap_id": "RM-902", "roadmap": {}, "error": None}), \
+             patch("business_core.roadmap_template_manager.find_roadmap_template_by_id",
+                   side_effect=lambda tid: {"template_id": tid, "service_id": "SVC-001", "status": "active"}), \
              patch("business_core.roadmap_template_manager.find_template_stages",
                    return_value=self._template_rows()), \
              patch("business_core.roadmap_manager.ensure_roadmap_stages",
@@ -353,11 +401,20 @@ class TestCreateRoadmapForObjectExtensionOrchestration(unittest.TestCase):
         bb = self._reload_bb()
 
         with patch("business_core.object_manager.find_object_by_id",
-                   return_value={"object_id": "OBJ-901", "status": "new"}), \
+                   return_value={"object_id": "OBJ-901", "status": "new", "biz_id": "BIZ-001", "client_id": "PRS-001"}), \
              patch("business_core.service_manager.find_service_by_id",
-                   return_value={"service_id": "SVC-001", "status": "active"}), \
+                   return_value={"service_id": "SVC-001", "status": "active", "biz_id": "BIZ-001"}), \
+             patch("business_core.sheets.find_row_by_id", return_value=("2", {"ID": "BIZ-001"})), \
+             patch("business_core.person_manager.find_person_by_id",
+                   return_value={"person_id": "PRS-DEFAULT", "status": "active",
+                                 "person_type": "клиент", "biz_ids": [], "primary_biz_id": ""}), \
+             patch("business_core.person_manager.is_person_archived", return_value=False), \
+             patch("business_core.person_manager.is_client_person", return_value=True), \
+             patch("business_core.person_manager.has_person_business_link", return_value=True), \
              patch("business_core.roadmap_manager.create_roadmap_record",
                    return_value={"ok": True, "roadmap_id": "RM-903", "roadmap": {}, "error": None}), \
+             patch("business_core.roadmap_template_manager.find_roadmap_template_by_id",
+                   side_effect=lambda tid: {"template_id": tid, "service_id": "SVC-001", "status": "active"}), \
              patch("business_core.roadmap_template_manager.find_template_stages",
                    return_value=self._template_rows()), \
              patch("business_core.roadmap_manager.ensure_roadmap_stages",
@@ -903,11 +960,25 @@ class TestStartRoadmapConvergentRetryUX(unittest.TestCase):
         from business_core.telegram_handlers import startroadmap_cmd
         update, context = self._make_update("obj_id=OBJ-001 service_id=SVC-001")
         with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
+             patch("business_core.sheets.find_row_by_id", return_value=("2", {"ID": "BIZ-001"})), \
+             patch("business_core.person_manager.find_person_by_id",
+                   return_value={"person_id": "PRS-DEFAULT", "status": "active",
+                                 "person_type": "клиент", "biz_ids": [], "primary_biz_id": ""}), \
+             patch("business_core.person_manager.is_person_archived", return_value=False), \
+             patch("business_core.person_manager.is_client_person", return_value=True), \
+             patch("business_core.person_manager.has_person_business_link", return_value=True), \
              patch("business_core.business_builder.find_object_by_id",
                    return_value={"obj_id": "OBJ-001", "biz_id": "BIZ-001", "client_id": "PRS-001"}), \
              patch("business_core.business_builder.create_roadmap_for_object", return_value=rm_result), \
              patch("business_core.business_builder.update_object_roadmap_id"), \
              patch("business_core.service_manager.find_service_by_id", return_value=None), \
+             patch("business_core.sheets.find_row_by_id", return_value=("2", {"ID": "BIZ-001"})), \
+             patch("business_core.person_manager.find_person_by_id",
+                   return_value={"person_id": "PRS-DEFAULT", "status": "active",
+                                 "person_type": "клиент", "biz_ids": [], "primary_biz_id": ""}), \
+             patch("business_core.person_manager.is_person_archived", return_value=False), \
+             patch("business_core.person_manager.is_client_person", return_value=True), \
+             patch("business_core.person_manager.has_person_business_link", return_value=True), \
              patch("business_core.roadmap_template_manager.find_roadmap_templates_by_service", return_value=[]):
             await startroadmap_cmd(update, context)
         return update.message.reply_text.call_args[0][0]
