@@ -430,17 +430,29 @@ BUSINESS_HEADERS.
 
 Это правило применяется к новому коду безусловно. Существующие
 
-позиционные writer'ы (create_stages_from_template_record,
+позиционные writer'ы (create_roadmap_stages_from_template,
 
-create_roadmap_stages_from_template, create_roadmap_template,
-
-add_roadmap_template_stage, create_object_record, /newroadmap)
+create_roadmap_template, add_roadmap_template_stage, /newroadmap)
 
 остаются как технический долг до отдельной фазы Phase 10.2B —
 
 их не трогать без предварительного read-only аудита фактических
 
 заголовков соответствующего листа.
+
+(Phase 30A, docs-only correction: create_object_record уже переведён
+
+на header-mapped запись (Phase 10.2B.5, row_from_header_map) — снят
+
+из списка тех.долга выше как устаревшее заявление, не отражающее
+
+фактический код. create_stages_from_template_record также снят: он
+
+переехал из roadmap_template_manager.py в business_builder.py
+
+целиком в Phase 29CD, см. ADR-013 — прежнее упоминание относилось к
+
+уже не существующей функции в её прежнем расположении.)
 
 Причина:
 
