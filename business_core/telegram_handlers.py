@@ -6469,7 +6469,7 @@ async def startchecklist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
     is needed, mirroring /newbctask's own idempotency-key design.
     """
     if not _is_bc_enabled():
-        await _reply(update, _bc_disabled_msg())
+        await _reply(update, _bc_disabled_msg(), parse_mode=None)
         return
 
     raw = " ".join(context.args or [])
@@ -6481,8 +6481,7 @@ async def startchecklist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await _reply(
             update,
             "❌ Укажи business_id и checklist_template_id.\n\nПример:\n"
-            "`/startchecklist business_id=BIZ-001 checklist_template_id=CHK-001`",
-        )
+            "`/startchecklist business_id=BIZ-001 checklist_template_id=CHK-001`", parse_mode=None)
         return
 
     try:
@@ -6495,10 +6494,10 @@ async def startchecklist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
             created_by=args.get("created_by", "") or _telegram_username(update),
             notes=args.get("notes", ""),
         )
-        await _reply(update, _checklist_instantiation_message(result))
+        await _reply(update, _checklist_instantiation_message(result), parse_mode=None)
     except Exception as e:
         log.error(f"startchecklist_cmd error: {e}")
-        await _reply(update, "❌ Не удалось запустить Checklist.")
+        await _reply(update, "❌ Не удалось запустить Checklist.", parse_mode=None)
 
 
 _CHECKLISTS_LIST_MAX_SHOWN = 20
@@ -6513,7 +6512,7 @@ async def checklists_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     Read-only, bounded, filtered list of Checklist Instances.
     """
     if not _is_bc_enabled():
-        await _reply(update, _bc_disabled_msg())
+        await _reply(update, _bc_disabled_msg(), parse_mode=None)
         return
 
     raw = " ".join(context.args or [])
@@ -6531,7 +6530,7 @@ async def checklists_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 instances = [i for i in instances if i.get(field, "") == args[key]]
 
         if not instances:
-            await _reply(update, "ℹ️ Checklist Instances не найдены.")
+            await _reply(update, "ℹ️ Checklist Instances не найдены.", parse_mode=None)
             return
 
         lines = [f"📋 Checklist Instances ({len(instances)})", ""]
@@ -6544,10 +6543,10 @@ async def checklists_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if len(instances) > _CHECKLISTS_LIST_MAX_SHOWN:
             lines.append(f"\n… показаны первые {_CHECKLISTS_LIST_MAX_SHOWN} из {len(instances)}.")
 
-        await _reply(update, "\n".join(lines))
+        await _reply(update, "\n".join(lines), parse_mode=None)
     except Exception as e:
         log.error(f"checklists_cmd error: {e}")
-        await _reply(update, "❌ Не удалось получить список Checklist.")
+        await _reply(update, "❌ Не удалось получить список Checklist.", parse_mode=None)
 
 
 async def checklist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -6558,7 +6557,7 @@ async def checklist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     list. Never shows Notes, Blocked Reason, Skip Reason, or raw rows.
     """
     if not _is_bc_enabled():
-        await _reply(update, _bc_disabled_msg())
+        await _reply(update, _bc_disabled_msg(), parse_mode=None)
         return
 
     raw = " ".join(context.args or [])
@@ -6566,7 +6565,7 @@ async def checklist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     instance_id = args.get("checklist_instance_id") or args.get("_pos0", "")
 
     if not instance_id:
-        await _reply(update, "❌ Укажи checklist_instance_id.\n\nПример: /checklist checklist_instance_id=CLIN-001")
+        await _reply(update, "❌ Укажи checklist_instance_id.\n\nПример: /checklist checklist_instance_id=CLIN-001", parse_mode=None)
         return
 
     try:
@@ -6574,7 +6573,7 @@ async def checklist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
         instance = find_checklist_instance_by_id(instance_id)
         if instance is None:
-            await _reply(update, f"❌ Checklist Instance {instance_id} не найден.")
+            await _reply(update, f"❌ Checklist Instance {instance_id} не найден.", parse_mode=None)
             return
 
         items = list_checklist_instance_items(instance_id=instance_id)
@@ -6604,10 +6603,10 @@ async def checklist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 f"({required_label}, {_checklist_item_status_ru(item.get('Status', ''))})"
             )
 
-        await _reply(update, "\n".join(lines))
+        await _reply(update, "\n".join(lines), parse_mode=None)
     except Exception as e:
         log.error(f"checklist_cmd error: {e}")
-        await _reply(update, "❌ Не удалось получить Checklist Instance.")
+        await _reply(update, "❌ Не удалось получить Checklist Instance.", parse_mode=None)
 
 
 async def updatecheckitem_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -6619,7 +6618,7 @@ async def updatecheckitem_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
     automation.
     """
     if not _is_bc_enabled():
-        await _reply(update, _bc_disabled_msg())
+        await _reply(update, _bc_disabled_msg(), parse_mode=None)
         return
 
     raw = " ".join(context.args or [])
@@ -6631,8 +6630,7 @@ async def updatecheckitem_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
         await _reply(
             update,
             "❌ Укажи checklist_instance_item_id и status.\n\nПример:\n"
-            "`/updatecheckitem checklist_instance_item_id=CLII-001 status=done completed_by=...`",
-        )
+            "`/updatecheckitem checklist_instance_item_id=CLII-001 status=done completed_by=...`", parse_mode=None)
         return
 
     try:
@@ -6644,10 +6642,10 @@ async def updatecheckitem_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
             skip_reason=args.get("skip_reason", ""),
             completed_by=args.get("completed_by", "") or _telegram_username(update),
         )
-        await _reply(update, _checklist_item_transition_message(result, item_id))
+        await _reply(update, _checklist_item_transition_message(result, item_id), parse_mode=None)
     except Exception as e:
         log.error(f"updatecheckitem_cmd error: {e}")
-        await _reply(update, "❌ Не удалось обновить пункт Checklist.")
+        await _reply(update, "❌ Не удалось обновить пункт Checklist.", parse_mode=None)
 
 
 async def updatechecklist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -6660,7 +6658,7 @@ async def updatechecklist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
     admin policy never share a single ambiguous write.
     """
     if not _is_bc_enabled():
-        await _reply(update, _bc_disabled_msg())
+        await _reply(update, _bc_disabled_msg(), parse_mode=None)
         return
 
     raw = " ".join(context.args or [])
@@ -6672,8 +6670,7 @@ async def updatechecklist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
             update,
             "❌ Укажи checklist_instance_id.\n\nПример:\n"
             "`/updatechecklist checklist_instance_id=CLIN-001 status=in_progress`\n"
-            "`/updatechecklist checklist_instance_id=CLIN-001 notes=...`",
-        )
+            "`/updatechecklist checklist_instance_id=CLIN-001 notes=...`", parse_mode=None)
         return
 
     has_status = "status" in args
@@ -6685,27 +6682,26 @@ async def updatechecklist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
             "❌ Нельзя одновременно менять статус и Notes.\n"
             "Отправь две отдельные команды:\n"
             "`/updatechecklist checklist_instance_id=... status=...`\n"
-            "`/updatechecklist checklist_instance_id=... notes=...`",
-        )
+            "`/updatechecklist checklist_instance_id=... notes=...`", parse_mode=None)
         return
 
     if not has_status and not has_notes:
-        await _reply(update, "❌ Укажи либо status=..., либо notes=....")
+        await _reply(update, "❌ Укажи либо status=..., либо notes=....", parse_mode=None)
         return
 
     try:
         if has_status:
             from business_core.business_builder import transition_checklist_status
             result = transition_checklist_status(instance_id, args["status"])
-            await _reply(update, _checklist_instance_transition_message(result, instance_id))
+            await _reply(update, _checklist_instance_transition_message(result, instance_id), parse_mode=None)
             return
 
         from business_core.business_builder import update_checklist_admin_fields
         result = update_checklist_admin_fields(instance_id, {"Notes": args["notes"]})
-        await _reply(update, _checklist_admin_message(result, instance_id))
+        await _reply(update, _checklist_admin_message(result, instance_id), parse_mode=None)
     except Exception as e:
         log.error(f"updatechecklist_cmd error: {e}")
-        await _reply(update, "❌ Не удалось обновить Checklist Instance.")
+        await _reply(update, "❌ Не удалось обновить Checklist Instance.", parse_mode=None)
 
 
 async def milestones_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
