@@ -63,6 +63,10 @@ BUSINESS_SHEET_NAMES: dict[str, str] = {
     # Phase 36C (ADR-019): Task Domain Foundation
     "task_registry":               "TASK_REGISTRY",
     "task_assignments":            "TASK_ASSIGNMENTS",
+    # Phase 38C (ADR-021): Checklist Domain Foundation — operational layer,
+    # separate from the Phase 8C checklist_registry Template layer above.
+    "checklist_instances":         "CHECKLIST_INSTANCES",
+    "checklist_instance_items":    "CHECKLIST_INSTANCE_ITEMS",
 }
 
 BUSINESS_HEADERS: dict[str, list[str]] = {
@@ -349,6 +353,30 @@ BUSINESS_HEADERS: dict[str, list[str]] = {
         "Assignee Person ID", "Status", "Start Date", "End Date",
         "Assignment Type", "Created At", "Updated At",
     ],
+    # Phase 38C (ADR-021): Checklist Domain Foundation — operational
+    # instance layer. checklist_registry (Phase 8C, above) remains the
+    # unchanged Template/reference layer; these two registries are the
+    # canonical operational parent+child pair (mirrors task_registry/
+    # task_assignments' and document_registry/document_content's own
+    # two-table shape). Checklist Instance Item's Task ID/Document ID/
+    # SOP ID columns are physically present but never populated by
+    # Foundation automation (ADR-021 §5/§14) — future explicit linking
+    # only.
+    "checklist_instances": [
+        "Checklist Instance ID", "Business ID", "Checklist Template ID",
+        "Checklist Title Snapshot", "Service ID", "Object ID",
+        "Roadmap ID", "Stage ID", "Status",
+        "Total Items", "Required Items", "Completed Items", "Required Remaining",
+        "Created At", "Created By", "Started At", "Completed At", "Cancelled At",
+        "Updated At", "Notes",
+    ],
+    "checklist_instance_items": [
+        "Checklist Instance Item ID", "Checklist Instance ID", "Checklist Template ID",
+        "Source Item Key", "Item Order", "Item Title Snapshot", "Item Description Snapshot",
+        "Required", "Status", "Blocked Reason", "Skip Reason",
+        "Task ID", "Document ID", "SOP ID",
+        "Completed At", "Completed By", "Created At", "Updated At", "Notes",
+    ],
 }
 
 # ID-префиксы для generate_next_id
@@ -383,6 +411,12 @@ _ID_PREFIXES: dict[str, str] = {
     # Phase 36C (ADR-019)
     "task_registry":               "TSK",
     "task_assignments":            "TAS",
+    # Phase 38C (ADR-021): "CLI"/"CII" deliberately avoided (visual/
+    # mnemonic collision with "Client" shorthand and with no clear
+    # human-readable link to "Instance Item" respectively) — see
+    # ADR-021 §6.
+    "checklist_instances":         "CLIN",
+    "checklist_instance_items":    "CLII",
 }
 
 

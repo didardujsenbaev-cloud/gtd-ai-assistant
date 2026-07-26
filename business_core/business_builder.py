@@ -3948,3 +3948,637 @@ def finalize_persistence_failure_compensation(result: dict, *, compensation_succ
         business_id=result.get("business_id", ""), drive_file_id=result.get("drive_file_id", ""),
         compensation_attempted=True, compensation_succeeded=compensation_succeeded, retry_safe=True,
     )
+
+
+# ─────────────────────────────────────────────────────────────
+# Phase 38C (ADR-021): Checklist Domain orchestration.
+#
+# business_builder.py is the sole cross-domain Checklist orchestration
+# owner: relation validation, Template lookup/parsing, instantiation
+# idempotency, Instance+Item creation, progress computation, lifecycle
+# transitions, structured result assembly. business_core.checklist_
+# manager.py (persistence) and business_core.knowledge_manager.py
+# (Template reads) are called from here — never the reverse. No
+# Telegram caller exists yet (Phase 38D); nothing here is called by
+# telegram_handlers.py in this phase.
+# ─────────────────────────────────────────────────────────────
+
+_CHECKLIST_INSTANCE_ORDINARY_TRANSITIONS: dict[str, tuple[str, ...]] = {
+    "draft":       ("draft", "in_progress", "cancelled", "archived"),
+    "in_progress": ("in_progress", "blocked", "completed", "cancelled", "archived"),
+    "blocked":     ("blocked", "in_progress", "cancelled", "archived"),
+    "completed":   ("completed", "archived"),
+    "cancelled":   ("cancelled", "archived"),
+    "archived":    ("archived",),
+}
+_CHECKLIST_INSTANCE_REOPEN_GATED_STATUSES = frozenset({"completed", "cancelled", "archived"})
+
+_CHECKLIST_ITEM_ORDINARY_TRANSITIONS: dict[str, tuple[str, ...]] = {
+    "pending":         ("pending", "in_progress", "blocked", "done", "skipped", "not_applicable"),
+    "in_progress":     ("in_progress", "pending", "blocked", "done", "skipped", "not_applicable"),
+    "blocked":         ("blocked", "pending", "in_progress", "done", "skipped", "not_applicable"),
+    "done":            ("done",),
+    "skipped":         ("skipped",),
+    "not_applicable":  ("not_applicable",),
+}
+_CHECKLIST_ITEM_TERMINAL_STATUSES = frozenset({"done", "skipped", "not_applicable"})
+_CHECKLIST_SATISFYING_ITEM_STATUSES = frozenset({"done", "not_applicable"})
+
+
+def _now_utc_str() -> str:
+    from datetime import timezone
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+def _checklist_result(
+    *, ok: bool, code: str, error: str | None,
+    checklist_instance_id: str = "", checklist_template_id: str = "", checklist_instance_item_id: str = "",
+    business_id: str = "", service_id: str = "", object_id: str = "", roadmap_id: str = "", stage_id: str = "",
+    task_id: str = "", document_id: str = "", sop_id: str = "",
+    previous_status: str = "", requested_status: str = "", final_status: str = "",
+    created: bool = False, reused: bool = False, changed: bool = False, completed: bool = False,
+    total_items: int = 0, required_items: int = 0, completed_items: int = 0,
+    required_remaining: int = 0, blocked_required: int = 0,
+    conflicting_ids: tuple = (), created_item_ids: tuple = (),
+    warnings: tuple = (), retry_safe: bool = True,
+) -> dict:
+    """Shared result-builder for every Checklist orchestration function
+    (ADR-021 §24) — the stable, structured contract every caller reads
+    instead of a bare exception or ad-hoc dict shape. Never carries a
+    raw exception object or a raw Sheets row."""
+    return {
+        "ok": ok, "code": code, "error": error,
+        "checklist_instance_id": checklist_instance_id, "checklist_template_id": checklist_template_id,
+        "checklist_instance_item_id": checklist_instance_item_id,
+        "business_id": business_id, "service_id": service_id, "object_id": object_id,
+        "roadmap_id": roadmap_id, "stage_id": stage_id,
+        "task_id": task_id, "document_id": document_id, "sop_id": sop_id,
+        "previous_status": previous_status, "requested_status": requested_status, "final_status": final_status,
+        "created": created, "reused": reused, "changed": changed, "completed": completed,
+        "total_items": total_items, "required_items": required_items, "completed_items": completed_items,
+        "required_remaining": required_remaining, "blocked_required": blocked_required,
+        "conflicting_ids": tuple(conflicting_ids), "created_item_ids": tuple(created_item_ids),
+        "warnings": tuple(warnings), "retry_safe": retry_safe,
+    }
+
+
+def _split_checklist_text(text: str) -> list[str]:
+    """Deterministic separator normalization: newline treated as an
+    alternative to semicolon (both used interchangeably in production
+    Template text), never AI/fuzzy. Order preserved, whitespace
+    trimmed, empty tokens dropped."""
+    if not text:
+        return []
+    normalized = text.replace("\r\n", "\n").replace("\n", ";")
+    return [t.strip() for t in normalized.split(";") if t.strip()]
+
+
+def parse_checklist_template_items(items_text: str, required_text: str = "", optional_text: str = "") -> dict:
+    """
+    Phase 38C (ADR-021 §11/§7): the sole deterministic Template-item
+    parser. Duplicate item text remains two distinct items, keyed by
+    ordinal — never deduplicated. Required/Optional classification is
+    exact-normalized-text-match only; a token that matches neither list
+    defaults to required=true (the safest default per ADR-021 — an
+    unclassified item never silently becomes optional). A token
+    present in BOTH lists is a classification conflict and blocks
+    instantiation entirely; no fuzzy interpretation is ever attempted.
+
+    Returns:
+        {"ok": bool, "code": str, "error": str | None, "items": list[dict]}
+
+    Each item dict: {"source_item_key", "item_order", "item_title_snapshot",
+    "item_description_snapshot", "required"}.
+    """
+    raw_items = _split_checklist_text(items_text)
+    if not raw_items:
+        return {"ok": False, "code": "CHECKLIST_TEMPLATE_ITEMS_EMPTY", "error": "Список пунктов Template пуст", "items": []}
+
+    required_set = set(_split_checklist_text(required_text))
+    optional_set = set(_split_checklist_text(optional_text))
+
+    conflict = required_set & optional_set
+    if conflict:
+        return {
+            "ok": False, "code": "CHECKLIST_TEMPLATE_ITEM_CLASSIFICATION_CONFLICT",
+            "error": f"Пункты одновременно в Required Items и Optional Items: {', '.join(sorted(conflict))}",
+            "items": [],
+        }
+
+    items = []
+    for ordinal, text in enumerate(raw_items, start=1):
+        required = text not in optional_set
+        items.append({
+            "source_item_key": ordinal,
+            "item_order": ordinal,
+            "item_title_snapshot": text,
+            "item_description_snapshot": "",
+            "required": required,
+        })
+    return {"ok": True, "code": "", "error": None, "items": items}
+
+
+def _compute_checklist_progress(items: list[dict]) -> dict:
+    """
+    Phase 38C (ADR-021 §16): canonical progress calculator. `items` is
+    a list of {"required": bool, "status": str}. Item statuses are the
+    sole truth; this is always recomputed from them, never from a
+    prior cache. skipped never counts as complete for a required item.
+    """
+    total = len(items)
+    required_items = sum(1 for i in items if i["required"])
+    completed_items = sum(1 for i in items if i["status"] in _CHECKLIST_SATISFYING_ITEM_STATUSES)
+    required_remaining = sum(
+        1 for i in items if i["required"] and i["status"] not in _CHECKLIST_SATISFYING_ITEM_STATUSES
+    )
+    blocked_required = sum(1 for i in items if i["required"] and i["status"] == "blocked")
+    return {
+        "total_items": total, "required_items": required_items,
+        "completed_items": completed_items, "required_remaining": required_remaining,
+        "blocked_required": blocked_required,
+    }
+
+
+def _validate_checklist_relations(
+    business_id: str, service_id: str = "", object_id: str = "", roadmap_id: str = "", stage_id: str = "",
+) -> dict:
+    """
+    Phase 38C (ADR-021 §9): canonical cross-domain Checklist Instance
+    relation-validation path, all before any write. Resolution order
+    is most-specific-first (Stage, then Roadmap, deriving Object/
+    Service) — mirrors document_registry_manager.
+    resolve_and_validate_links() exactly, applied to Checklist's own
+    (smaller) relation set. Task/Document/SOP are Item-level and never
+    validated here — they remain blank in Foundation (ADR-021 §5/§14).
+
+    Returns:
+        {"ok": bool, "code": str, "error": str | None, "resolved": dict | None}
+    """
+    from business_core.sheets import read_business_sheet
+
+    if not business_id:
+        return {"ok": False, "code": "BUSINESS_NOT_FOUND", "error": "business_id обязателен", "resolved": None}
+
+    biz_rows = read_business_sheet("biz_registry")
+    if not any(b.get("ID", "") == business_id for b in biz_rows):
+        return {"ok": False, "code": "BUSINESS_NOT_FOUND", "error": f"Business {business_id} не найден", "resolved": None}
+
+    resolved_stage_id = stage_id
+    resolved_roadmap_id = roadmap_id
+    resolved_object_id = object_id
+    resolved_service_id = service_id
+
+    if resolved_stage_id:
+        stages = read_business_sheet("roadmap_stages")
+        stage = next((s for s in stages if s.get("Stage ID", "") == resolved_stage_id), None)
+        if stage is None:
+            return {"ok": False, "code": "STAGE_NOT_FOUND", "error": f"Stage {resolved_stage_id} не найден", "resolved": None}
+        stage_roadmap_id = stage.get("Roadmap ID", "")
+        if resolved_roadmap_id and stage_roadmap_id and resolved_roadmap_id != stage_roadmap_id:
+            return {
+                "ok": False, "code": "CHECKLIST_ENTITY_RELATION_MISMATCH",
+                "error": f"Stage {resolved_stage_id} принадлежит Roadmap {stage_roadmap_id}, а указан Roadmap {resolved_roadmap_id}",
+                "resolved": None,
+            }
+        resolved_roadmap_id = resolved_roadmap_id or stage_roadmap_id
+
+    if resolved_roadmap_id:
+        roadmaps = read_business_sheet("roadmaps")
+        rm = next((r for r in roadmaps if r.get("Roadmap ID", "") == resolved_roadmap_id), None)
+        if rm is None:
+            return {"ok": False, "code": "ROADMAP_NOT_FOUND", "error": f"Roadmap {resolved_roadmap_id} не найден", "resolved": None}
+        rm_biz_id = rm.get("Business ID", "")
+        if rm_biz_id and rm_biz_id != business_id:
+            return {
+                "ok": False, "code": "CHECKLIST_ENTITY_RELATION_MISMATCH",
+                "error": f"Roadmap {resolved_roadmap_id} принадлежит бизнесу {rm_biz_id}, а указан Business {business_id}",
+                "resolved": None,
+            }
+        rm_object_id = rm.get("Object ID", "")
+        if resolved_object_id and rm_object_id and resolved_object_id != rm_object_id:
+            return {
+                "ok": False, "code": "CHECKLIST_ENTITY_RELATION_MISMATCH",
+                "error": f"Roadmap {resolved_roadmap_id} связан с Object {rm_object_id}, а указан Object {resolved_object_id}",
+                "resolved": None,
+            }
+        resolved_object_id = resolved_object_id or rm_object_id
+        rm_service_id = rm.get("Service ID", "")
+        if resolved_service_id and rm_service_id and resolved_service_id != rm_service_id:
+            return {
+                "ok": False, "code": "CHECKLIST_ENTITY_RELATION_MISMATCH",
+                "error": f"Roadmap {resolved_roadmap_id} связан с Service {rm_service_id}, а указан Service {resolved_service_id}",
+                "resolved": None,
+            }
+        resolved_service_id = resolved_service_id or rm_service_id
+
+    if resolved_object_id:
+        from business_core.object_manager import find_object_by_id
+        obj = find_object_by_id(resolved_object_id)
+        if obj is None:
+            return {"ok": False, "code": "OBJECT_NOT_FOUND", "error": f"Object {resolved_object_id} не найден", "resolved": None}
+        obj_biz_id = obj.get("biz_id", "")
+        if obj_biz_id and obj_biz_id != business_id:
+            return {
+                "ok": False, "code": "CHECKLIST_ENTITY_RELATION_MISMATCH",
+                "error": f"Object {resolved_object_id} принадлежит бизнесу {obj_biz_id}, а указан Business {business_id}",
+                "resolved": None,
+            }
+
+    if resolved_service_id:
+        from business_core.service_manager import find_service_by_id
+        svc = find_service_by_id(resolved_service_id)
+        if svc is None:
+            return {"ok": False, "code": "SERVICE_NOT_FOUND", "error": f"Service {resolved_service_id} не найден", "resolved": None}
+        svc_biz_id = svc.get("biz_id", "")
+        if svc_biz_id and svc_biz_id != business_id:
+            return {
+                "ok": False, "code": "CHECKLIST_ENTITY_RELATION_MISMATCH",
+                "error": f"Service {resolved_service_id} принадлежит бизнесу {svc_biz_id}, а указан Business {business_id}",
+                "resolved": None,
+            }
+
+    return {
+        "ok": True, "code": "", "error": None,
+        "resolved": {
+            "business_id": business_id, "service_id": resolved_service_id, "object_id": resolved_object_id,
+            "roadmap_id": resolved_roadmap_id, "stage_id": resolved_stage_id,
+        },
+    }
+
+
+def instantiate_checklist(
+    business_id: str, checklist_template_id: str,
+    *, service_id: str = "", object_id: str = "", roadmap_id: str = "", stage_id: str = "",
+    created_by: str = "", notes: str = "",
+) -> dict:
+    """
+    Phase 38C (ADR-021 §10/§11): the sole canonical Checklist
+    instantiation orchestration boundary.
+
+    Validation order, all before any write:
+      A. required business_id / checklist_template_id
+      B. Template lookup + status validation (active only)
+      C. Template item parsing (complete, before any ID/relation work)
+      D. relation validation
+      E. idempotency lookup (zero/one/multiple)
+      F. Instance ID/Item IDs generated only after A-E pass
+      G. low-level parent + item persistence
+      H. post-write verification
+      I. structured result
+    """
+    from business_core.checklist_manager import (
+        find_instances_by_idempotency_key, create_checklist_instance, create_checklist_instance_items,
+        find_checklist_instance_by_id, list_checklist_instance_items,
+    )
+    from business_core.knowledge_manager import find_checklist_by_id
+
+    if not business_id:
+        return _checklist_result(ok=False, code="BUSINESS_NOT_FOUND", error="business_id обязателен")
+    if not checklist_template_id:
+        return _checklist_result(ok=False, code="CHECKLIST_TEMPLATE_NOT_FOUND", error="checklist_template_id обязателен")
+
+    template = find_checklist_by_id(checklist_template_id)
+    if template is None:
+        return _checklist_result(
+            ok=False, code="CHECKLIST_TEMPLATE_NOT_FOUND", error=f"Checklist Template {checklist_template_id} не найден",
+            business_id=business_id, checklist_template_id=checklist_template_id,
+        )
+
+    template_status = template.get("Status", "")
+    if template_status == "inactive":
+        return _checklist_result(
+            ok=False, code="CHECKLIST_TEMPLATE_INACTIVE", error=f"Checklist Template {checklist_template_id} неактивен",
+            business_id=business_id, checklist_template_id=checklist_template_id,
+        )
+    if template_status == "archived":
+        return _checklist_result(
+            ok=False, code="CHECKLIST_TEMPLATE_ARCHIVED", error=f"Checklist Template {checklist_template_id} архивирован",
+            business_id=business_id, checklist_template_id=checklist_template_id,
+        )
+    if template_status != "active":
+        return _checklist_result(
+            ok=False, code="INVALID_CHECKLIST_TEMPLATE_STATUS",
+            error=f"Недопустимый статус Checklist Template: '{template_status}'",
+            business_id=business_id, checklist_template_id=checklist_template_id,
+        )
+
+    parse_result = parse_checklist_template_items(
+        template.get("Items", ""), template.get("Required Items", ""), template.get("Optional Items", ""),
+    )
+    if not parse_result["ok"]:
+        return _checklist_result(
+            ok=False, code=parse_result["code"], error=parse_result["error"],
+            business_id=business_id, checklist_template_id=checklist_template_id,
+        )
+    items = parse_result["items"]
+
+    relation_result = _validate_checklist_relations(
+        business_id, service_id=service_id, object_id=object_id, roadmap_id=roadmap_id, stage_id=stage_id,
+    )
+    if not relation_result["ok"]:
+        return _checklist_result(
+            ok=False, code=relation_result["code"], error=relation_result["error"],
+            business_id=business_id, checklist_template_id=checklist_template_id,
+        )
+    resolved = relation_result["resolved"]
+
+    matches = find_instances_by_idempotency_key(
+        business_id, checklist_template_id, resolved["roadmap_id"], resolved["stage_id"],
+    )
+    if len(matches) > 1:
+        conflicting_ids = tuple(m["Checklist Instance ID"] for m in matches)
+        return _checklist_result(
+            ok=False, code="MULTIPLE_CHECKLIST_INSTANCE_MATCHES",
+            error=f"Найдено несколько Checklist Instance с этим ключом: {conflicting_ids}",
+            business_id=business_id, checklist_template_id=checklist_template_id,
+            conflicting_ids=conflicting_ids, retry_safe=True,
+        )
+    if len(matches) == 1:
+        existing = matches[0]
+        return _checklist_result(
+            ok=True, code="CHECKLIST_INSTANCE_REUSED", error=None,
+            checklist_instance_id=existing["Checklist Instance ID"], checklist_template_id=checklist_template_id,
+            business_id=business_id, service_id=existing.get("Service ID", ""), object_id=existing.get("Object ID", ""),
+            roadmap_id=existing.get("Roadmap ID", ""), stage_id=existing.get("Stage ID", ""),
+            final_status=existing.get("Status", ""), reused=True, retry_safe=True,
+            total_items=int(existing.get("Total Items") or 0), required_items=int(existing.get("Required Items") or 0),
+            completed_items=int(existing.get("Completed Items") or 0),
+            required_remaining=int(existing.get("Required Remaining") or 0),
+        )
+
+    initial_progress = _compute_checklist_progress([{"required": i["required"], "status": "pending"} for i in items])
+
+    create_result = create_checklist_instance(
+        business_id, checklist_template_id, template.get("Title", ""),
+        service_id=resolved["service_id"], object_id=resolved["object_id"],
+        roadmap_id=resolved["roadmap_id"], stage_id=resolved["stage_id"],
+        status="draft", total_items=initial_progress["total_items"], required_items=initial_progress["required_items"],
+        completed_items=0, required_remaining=initial_progress["required_remaining"],
+        created_by=created_by, notes=notes,
+    )
+    if not create_result["ok"]:
+        return _checklist_result(
+            ok=False, code="CHECKLIST_PERSISTENCE_FAILED", error=create_result.get("error"),
+            business_id=business_id, checklist_template_id=checklist_template_id, retry_safe=True,
+        )
+    instance_id = create_result["checklist_instance_id"]
+
+    items_result = create_checklist_instance_items(instance_id, checklist_template_id, items)
+    if not items_result["ok"]:
+        return _checklist_result(
+            ok=False, code="CHECKLIST_INSTANCE_PARTIAL_PERSISTENCE", error=items_result.get("error"),
+            checklist_instance_id=instance_id, business_id=business_id, checklist_template_id=checklist_template_id,
+            created_item_ids=tuple(items_result.get("item_ids", ())), retry_safe=False,
+        )
+
+    saved_instance = find_checklist_instance_by_id(instance_id)
+    saved_items = list_checklist_instance_items(instance_id=instance_id)
+    if saved_instance is None or len(saved_items) != len(items):
+        return _checklist_result(
+            ok=False, code="CHECKLIST_INSTANCE_POST_WRITE_VERIFICATION_FAILED",
+            error="Checklist Instance записан, но проверка после записи не прошла",
+            checklist_instance_id=instance_id, business_id=business_id, checklist_template_id=checklist_template_id,
+            created_item_ids=tuple(items_result["item_ids"]), retry_safe=False,
+        )
+
+    return _checklist_result(
+        ok=True, code="CHECKLIST_INSTANCE_CREATED", error=None,
+        checklist_instance_id=instance_id, checklist_template_id=checklist_template_id,
+        business_id=business_id, service_id=resolved["service_id"], object_id=resolved["object_id"],
+        roadmap_id=resolved["roadmap_id"], stage_id=resolved["stage_id"],
+        final_status="draft", created=True,
+        total_items=initial_progress["total_items"], required_items=initial_progress["required_items"],
+        completed_items=0, required_remaining=initial_progress["required_remaining"],
+        created_item_ids=tuple(items_result["item_ids"]), retry_safe=True,
+    )
+
+
+def transition_checklist_item_status(
+    checklist_instance_item_id: str, target_status: str,
+    *, blocked_reason: str = "", skip_reason: str = "", completed_by: str = "",
+) -> dict:
+    """
+    Phase 38C (ADR-021 §14/§17): the sole canonical Checklist Instance
+    Item transition orchestration boundary. Never auto-completes the
+    parent Instance — that remains a separate explicit transition
+    (ADR-021 §18/§19).
+    """
+    from business_core.checklist_manager import (
+        find_checklist_instance_item_by_id, update_checklist_instance_item_status,
+        update_checklist_instance_progress, list_checklist_instance_items, CHECKLIST_ITEM_STATUS,
+    )
+
+    if not checklist_instance_item_id:
+        return _checklist_result(ok=False, code="CHECKLIST_INSTANCE_ITEM_NOT_FOUND", error="checklist_instance_item_id обязателен")
+
+    item = find_checklist_instance_item_by_id(checklist_instance_item_id)
+    if item is None:
+        return _checklist_result(
+            ok=False, code="CHECKLIST_INSTANCE_ITEM_NOT_FOUND",
+            error=f"Checklist Instance Item {checklist_instance_item_id} не найден",
+            checklist_instance_item_id=checklist_instance_item_id,
+        )
+
+    instance_id = item.get("Checklist Instance ID", "")
+    previous_status = item.get("Status", "")
+
+    if target_status not in CHECKLIST_ITEM_STATUS:
+        return _checklist_result(
+            ok=False, code="INVALID_CHECKLIST_ITEM_STATUS",
+            error=f"Недопустимый статус '{target_status}'. Допустимые значения: {', '.join(CHECKLIST_ITEM_STATUS)}",
+            checklist_instance_item_id=checklist_instance_item_id, checklist_instance_id=instance_id,
+            previous_status=previous_status, requested_status=target_status, final_status=previous_status,
+        )
+
+    if previous_status in _CHECKLIST_ITEM_TERMINAL_STATUSES and target_status != previous_status:
+        return _checklist_result(
+            ok=False, code="CHECKLIST_ITEM_TERMINAL_REOPEN_REQUIRES_EXPLICIT_ACTION",
+            error=f"Item {checklist_instance_item_id} имеет терминальный статус '{previous_status}' — обычное обновление не может его изменить. Требуется explicit reopen (не реализовано).",
+            checklist_instance_item_id=checklist_instance_item_id, checklist_instance_id=instance_id,
+            previous_status=previous_status, requested_status=target_status, final_status=previous_status,
+        )
+
+    allowed_targets = _CHECKLIST_ITEM_ORDINARY_TRANSITIONS.get(previous_status, (previous_status,))
+    if target_status not in allowed_targets:
+        return _checklist_result(
+            ok=False, code="INVALID_CHECKLIST_ITEM_STATUS_TRANSITION",
+            error=f"Переход '{previous_status}' → '{target_status}' не разрешён",
+            checklist_instance_item_id=checklist_instance_item_id, checklist_instance_id=instance_id,
+            previous_status=previous_status, requested_status=target_status, final_status=previous_status,
+        )
+
+    if target_status == "blocked" and not blocked_reason:
+        return _checklist_result(
+            ok=False, code="CHECKLIST_ITEM_REASON_REQUIRED", error="Для статуса 'blocked' требуется Blocked Reason",
+            checklist_instance_item_id=checklist_instance_item_id, checklist_instance_id=instance_id,
+            previous_status=previous_status, requested_status=target_status, final_status=previous_status,
+        )
+    if target_status in ("skipped", "not_applicable") and not skip_reason:
+        return _checklist_result(
+            ok=False, code="CHECKLIST_ITEM_REASON_REQUIRED", error=f"Для статуса '{target_status}' требуется Skip Reason",
+            checklist_instance_item_id=checklist_instance_item_id, checklist_instance_id=instance_id,
+            previous_status=previous_status, requested_status=target_status, final_status=previous_status,
+        )
+    if target_status == "done" and not completed_by:
+        return _checklist_result(
+            ok=False, code="CHECKLIST_ITEM_COMPLETION_METADATA_REQUIRED", error="Для статуса 'done' требуется Completed By",
+            checklist_instance_item_id=checklist_instance_item_id, checklist_instance_id=instance_id,
+            previous_status=previous_status, requested_status=target_status, final_status=previous_status,
+        )
+
+    write_result = update_checklist_instance_item_status(
+        checklist_instance_item_id, target_status,
+        blocked_reason=blocked_reason if target_status == "blocked" else "",
+        skip_reason=skip_reason if target_status in ("skipped", "not_applicable") else "",
+        completed_at=(_now_utc_str() if target_status == "done" else ""),
+        completed_by=(completed_by if target_status == "done" else ""),
+    )
+    if not write_result["ok"]:
+        return _checklist_result(
+            ok=False, code=write_result.get("code") or "", error=write_result.get("error"),
+            checklist_instance_item_id=checklist_instance_item_id, checklist_instance_id=instance_id,
+            previous_status=previous_status, requested_status=target_status, final_status=previous_status,
+        )
+
+    changed = write_result["changed"]
+
+    all_items = list_checklist_instance_items(instance_id=instance_id)
+    progress = _compute_checklist_progress([
+        {"required": (i.get("Required", "") == "true"), "status": i.get("Status", "")} for i in all_items
+    ])
+    update_checklist_instance_progress(
+        instance_id, total_items=progress["total_items"], required_items=progress["required_items"],
+        completed_items=progress["completed_items"], required_remaining=progress["required_remaining"],
+    )
+
+    return _checklist_result(
+        ok=True, code="CHECKLIST_ITEM_STATUS_UPDATED" if changed else "CHECKLIST_ITEM_STATUS_UNCHANGED", error=None,
+        checklist_instance_item_id=checklist_instance_item_id, checklist_instance_id=instance_id,
+        previous_status=previous_status, requested_status=target_status, final_status=target_status, changed=changed,
+        total_items=progress["total_items"], required_items=progress["required_items"],
+        completed_items=progress["completed_items"], required_remaining=progress["required_remaining"],
+        blocked_required=progress["blocked_required"],
+    )
+
+
+def transition_checklist_status(checklist_instance_id: str, target_status: str) -> dict:
+    """
+    Phase 38C (ADR-021 §13/§16/§19): the sole canonical Checklist
+    Instance transition orchestration boundary. Never mutates Items,
+    Stage, or Roadmap.
+    """
+    from business_core.checklist_manager import (
+        find_checklist_instance_by_id, update_checklist_instance_status,
+        list_checklist_instance_items, CHECKLIST_INSTANCE_STATUS,
+    )
+
+    if not checklist_instance_id:
+        return _checklist_result(ok=False, code="CHECKLIST_INSTANCE_NOT_FOUND", error="checklist_instance_id обязателен")
+
+    instance = find_checklist_instance_by_id(checklist_instance_id)
+    if instance is None:
+        return _checklist_result(
+            ok=False, code="CHECKLIST_INSTANCE_NOT_FOUND", error=f"Checklist Instance {checklist_instance_id} не найден",
+            checklist_instance_id=checklist_instance_id,
+        )
+
+    business_id = instance.get("Business ID", "")
+    previous_status = instance.get("Status", "")
+
+    if target_status not in CHECKLIST_INSTANCE_STATUS:
+        return _checklist_result(
+            ok=False, code="INVALID_CHECKLIST_STATUS",
+            error=f"Недопустимый статус '{target_status}'. Допустимые значения: {', '.join(CHECKLIST_INSTANCE_STATUS)}",
+            checklist_instance_id=checklist_instance_id, business_id=business_id,
+            previous_status=previous_status, requested_status=target_status, final_status=previous_status,
+        )
+
+    allowed_targets = _CHECKLIST_INSTANCE_ORDINARY_TRANSITIONS.get(previous_status, (previous_status,))
+
+    if previous_status in _CHECKLIST_INSTANCE_REOPEN_GATED_STATUSES and target_status not in allowed_targets:
+        return _checklist_result(
+            ok=False, code="CHECKLIST_RESTORE_REQUIRES_EXPLICIT_ACTION",
+            error=(
+                f"Checklist Instance {checklist_instance_id} имеет статус '{previous_status}' — обычное обновление "
+                f"не может вернуть его в '{target_status}'. Требуется отдельное явное действие restore (не реализовано)."
+            ),
+            checklist_instance_id=checklist_instance_id, business_id=business_id,
+            previous_status=previous_status, requested_status=target_status, final_status=previous_status,
+        )
+
+    if target_status not in allowed_targets:
+        return _checklist_result(
+            ok=False, code="INVALID_CHECKLIST_STATUS_TRANSITION",
+            error=f"Переход '{previous_status}' → '{target_status}' не разрешён",
+            checklist_instance_id=checklist_instance_id, business_id=business_id,
+            previous_status=previous_status, requested_status=target_status, final_status=previous_status,
+        )
+
+    started_at = completed_at = cancelled_at = ""
+    required_remaining_at_check = 0
+    if target_status == "completed":
+        items = list_checklist_instance_items(instance_id=checklist_instance_id)
+        progress = _compute_checklist_progress([
+            {"required": (i.get("Required", "") == "true"), "status": i.get("Status", "")} for i in items
+        ])
+        required_remaining_at_check = progress["required_remaining"]
+        if not items or progress["required_remaining"] > 0:
+            return _checklist_result(
+                ok=False, code="CHECKLIST_COMPLETION_REQUIREMENTS_NOT_MET",
+                error="Не все обязательные пункты Checklist завершены (done/not_applicable)",
+                checklist_instance_id=checklist_instance_id, business_id=business_id,
+                previous_status=previous_status, requested_status=target_status, final_status=previous_status,
+                required_remaining=required_remaining_at_check,
+            )
+        completed_at = _now_utc_str()
+    elif target_status == "in_progress" and previous_status != "in_progress":
+        started_at = _now_utc_str()
+    elif target_status == "cancelled":
+        cancelled_at = _now_utc_str()
+
+    write_result = update_checklist_instance_status(
+        checklist_instance_id, target_status,
+        started_at=started_at, completed_at=completed_at, cancelled_at=cancelled_at,
+    )
+    if not write_result["ok"]:
+        return _checklist_result(
+            ok=False, code=write_result.get("code") or "", error=write_result.get("error"),
+            checklist_instance_id=checklist_instance_id, business_id=business_id,
+            previous_status=previous_status, requested_status=target_status, final_status=previous_status,
+        )
+
+    changed = write_result["changed"]
+    return _checklist_result(
+        ok=True, code="CHECKLIST_STATUS_UPDATED" if changed else "CHECKLIST_STATUS_UNCHANGED", error=None,
+        checklist_instance_id=checklist_instance_id, business_id=business_id,
+        previous_status=previous_status, requested_status=target_status, final_status=target_status,
+        changed=changed, completed=(target_status == "completed"),
+    )
+
+
+def update_checklist_admin_fields(checklist_instance_id: str, updates: dict) -> dict:
+    """
+    Phase 38C (ADR-021 §20/§26): the sole canonical Checklist Instance
+    admin-field update orchestration boundary. Only Notes is
+    ordinarily mutable — enforced by
+    checklist_manager.update_checklist_instance_admin_fields() itself
+    (this function is a thin resolve-then-delegate wrapper).
+    """
+    from business_core.checklist_manager import find_checklist_instance_by_id, update_checklist_instance_admin_fields
+
+    if not checklist_instance_id:
+        return _checklist_result(ok=False, code="CHECKLIST_INSTANCE_NOT_FOUND", error="checklist_instance_id обязателен")
+
+    instance = find_checklist_instance_by_id(checklist_instance_id)
+    if instance is None:
+        return _checklist_result(
+            ok=False, code="CHECKLIST_INSTANCE_NOT_FOUND", error=f"Checklist Instance {checklist_instance_id} не найден",
+            checklist_instance_id=checklist_instance_id,
+        )
+
+    result = update_checklist_instance_admin_fields(checklist_instance_id, updates)
+    return _checklist_result(
+        ok=result["ok"], code=result.get("code", ""), error=result.get("error"),
+        checklist_instance_id=checklist_instance_id, business_id=instance.get("Business ID", ""),
+        changed=result.get("changed", False), retry_safe=True,
+    )

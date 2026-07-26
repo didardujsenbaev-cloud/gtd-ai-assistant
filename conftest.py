@@ -179,6 +179,11 @@ _CHECKLIST_KNOWLEDGE_TEST_FILES = frozenset({
     "test_seed_izhs_router_sop.py",
     "test_seed_izhs_whatsapp_templates.py",
     "test_checklist_knowledge_mock_completeness.py",
+    # Phase 38C (ADR-021): Checklist Domain Foundation — registered
+    # BEFORE any test logic was written, per the PRS-003 precedent.
+    "test_checklist_manager.py",
+    "test_business_checklist_foundation.py",
+    "test_checklist_architecture_guards.py",
 })
 
 _HARD_SOCKET_BLOCK_TEST_FILES = (

@@ -44,7 +44,16 @@ _SEED_TEST_FILES = frozenset({
 
 _KNOWLEDGE_TEST_FILES = frozenset({"test_business_knowledge_core.py"})
 
-_ALL_RELEVANT_TEST_FILES = _SEED_TEST_FILES | _KNOWLEDGE_TEST_FILES
+# Phase 38C (ADR-021): Checklist Domain Foundation test files —
+# extending this guard so a newly added Foundation test file can never
+# be silently omitted from the hard socket-block set.
+_CHECKLIST_FOUNDATION_TEST_FILES = frozenset({
+    "test_checklist_manager.py",
+    "test_business_checklist_foundation.py",
+    "test_checklist_architecture_guards.py",
+})
+
+_ALL_RELEVANT_TEST_FILES = _SEED_TEST_FILES | _KNOWLEDGE_TEST_FILES | _CHECKLIST_FOUNDATION_TEST_FILES
 
 
 def _seed_module_names() -> frozenset:
