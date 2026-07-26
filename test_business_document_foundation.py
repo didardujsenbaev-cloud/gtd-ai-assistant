@@ -388,5 +388,106 @@ class TestTransitionDocumentStatus(unittest.TestCase):
         mock_admin.assert_not_called()
 
 
+class TestValidateDocumentUploadRequest(unittest.TestCase):
+    """Phase 37F.1 (ADR-020 §12): the canonical pre-Drive-upload
+    validation boundary. Delegates to document_upload_validation.py —
+    these tests only confirm the orchestration wrapping (result-dict
+    shape, code selection), not the validation rules themselves
+    (covered in test_document_upload_validation.py)."""
+
+    def test_valid_file_returns_document_upload_validated(self):
+        result = bb.validate_document_upload_request("passport.pdf", "application/pdf", 1024)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["code"], "DOCUMENT_UPLOAD_VALIDATED")
+
+    def test_analysis_unsupported_still_ok(self):
+        result = bb.validate_document_upload_request("contract.rtf", "application/rtf", 1024)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["code"], "DOCUMENT_ANALYSIS_UNSUPPORTED")
+        self.assertEqual(result["analysis_status"], "unsupported")
+
+    def test_invalid_filename_rejected(self):
+        result = bb.validate_document_upload_request("", "application/pdf", 1024)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "INVALID_DOCUMENT_FILENAME")
+
+    def test_too_large_rejected(self):
+        result = bb.validate_document_upload_request("passport.pdf", "application/pdf", 999_999_999_999)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "DOCUMENT_TOO_LARGE")
+
+    def test_dangerous_type_rejected(self):
+        result = bb.validate_document_upload_request("setup.exe", "application/x-msdownload", 1024)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "UNSUPPORTED_DOCUMENT_STORAGE_TYPE")
+
+    def test_no_drive_or_sheets_call(self):
+        with patch("business_core.sheets.get_business_sheet", side_effect=AssertionError("must not be called")), \
+             patch("integrations.google_drive_adapter.get_drive_service", side_effect=AssertionError("must not be called")):
+            result = bb.validate_document_upload_request("passport.pdf", "application/pdf", 1024)
+        self.assertTrue(result["ok"])
+
+
+class TestDriveUploadFailedResult(unittest.TestCase):
+    def test_returns_drive_upload_failed_code(self):
+        result = bb.document_drive_upload_failed_result("BIZ-001")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "DRIVE_UPLOAD_FAILED")
+        self.assertEqual(result["business_id"], "BIZ-001")
+
+    def test_no_document_id_or_family_id(self):
+        result = bb.document_drive_upload_failed_result()
+        self.assertEqual(result["document_id"], "")
+        self.assertEqual(result["document_family_id"], "")
+
+
+class TestDocumentFileMetadataInvalidResult(unittest.TestCase):
+    def test_compensation_succeeded(self):
+        result = bb.document_file_metadata_invalid_result(
+            business_id="BIZ-001", drive_file_id="FILE1",
+            compensation_attempted=True, compensation_succeeded=True,
+        )
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "DOCUMENT_FILE_METADATA_INVALID")
+        self.assertTrue(result["compensation_attempted"])
+        self.assertTrue(result["compensation_succeeded"])
+
+    def test_compensation_failed(self):
+        result = bb.document_file_metadata_invalid_result(
+            business_id="BIZ-001", drive_file_id="FILE1",
+            compensation_attempted=True, compensation_succeeded=False,
+        )
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "DOCUMENT_FILE_METADATA_INVALID")
+        self.assertTrue(result["compensation_attempted"])
+        self.assertFalse(result["compensation_succeeded"])
+        self.assertEqual(result["drive_file_id"], "FILE1")
+
+
+class TestFinalizePersistenceFailureCompensation(unittest.TestCase):
+    def test_compensation_success_returns_drive_upload_compensated(self):
+        original = {"ok": False, "code": "DOCUMENT_PERSISTENCE_FAILED", "error": "write failed", "business_id": "BIZ-001", "drive_file_id": "FILE1"}
+        result = bb.finalize_persistence_failure_compensation(original, compensation_succeeded=True)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "DRIVE_UPLOAD_COMPENSATED")
+        self.assertTrue(result["compensation_attempted"])
+        self.assertTrue(result["compensation_succeeded"])
+
+    def test_compensation_failure_returns_orphaned_file_warning(self):
+        original = {"ok": False, "code": "DOCUMENT_PERSISTENCE_FAILED", "error": "write failed", "business_id": "BIZ-001", "drive_file_id": "FILE1"}
+        result = bb.finalize_persistence_failure_compensation(original, compensation_succeeded=False)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "DOCUMENT_PERSISTENCE_FAILED_WITH_ORPHANED_FILE_WARNING")
+        self.assertTrue(result["compensation_attempted"])
+        self.assertFalse(result["compensation_succeeded"])
+        self.assertEqual(result["drive_file_id"], "FILE1")
+
+    def test_never_claims_success_either_way(self):
+        original = {"ok": False, "code": "DOCUMENT_PERSISTENCE_FAILED", "error": "x", "business_id": "BIZ-001", "drive_file_id": "FILE1"}
+        for succeeded in (True, False):
+            result = bb.finalize_persistence_failure_compensation(original, compensation_succeeded=succeeded)
+            self.assertFalse(result["ok"])
+
+
 if __name__ == "__main__":
     unittest.main()

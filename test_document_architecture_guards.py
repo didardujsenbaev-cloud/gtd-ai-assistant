@@ -697,5 +697,162 @@ class TestPhase37ECallerTestsHaveHardSocketBlock(unittest.TestCase):
         self.assertIn("test_document_caller_ux.py", conftest_src)
 
 
+# ─────────────────────────────────────────────────────────────
+# Phase 37F.1 (ADR-020 §12): Document upload-safety guards.
+# ─────────────────────────────────────────────────────────────
+
+class TestUploadValidationNotImplementedInTelegram(unittest.TestCase):
+
+    def test_telegram_does_not_import_validation_module_directly(self):
+        path = BUSINESS_CORE / "telegram_handlers.py"
+        found = _imported_module_names(path) & {"document_upload_validation"}
+        self.assertEqual(found, set(), "telegram_handlers.py must not import document_upload_validation directly — only business_builder may")
+
+    def test_business_builder_is_the_only_caller_of_validation_module(self):
+        hits = []
+        for path in BUSINESS_CORE.glob("*.py"):
+            if path.name in ("business_builder.py", "document_upload_validation.py"):
+                continue
+            src = path.read_text(encoding="utf-8")
+            if "document_upload_validation" in src:
+                hits.append(path.name)
+        self.assertEqual(hits, [])
+
+    def test_uploaddoc_receive_file_calls_canonical_validator(self):
+        body = _th_function_body("uploaddoc_receive_file")
+        self.assertIn("validate_document_upload_request(", body)
+
+    def test_uploaddoc_receive_file_has_no_inline_validation_policy(self):
+        body = _th_function_body("uploaddoc_receive_file")
+        for forbidden in ("MAX_DOCUMENT_FILE_SIZE_BYTES", "_DANGEROUS_STORAGE", "ord(ch)"):
+            self.assertNotIn(forbidden, body)
+
+
+class TestValidationRunsBeforeDriveUpload(unittest.TestCase):
+
+    def test_validation_call_precedes_drive_import_in_receive_file(self):
+        body = _th_function_body("uploaddoc_receive_file")
+        self.assertIn("validate_document_upload_request(", body)
+        self.assertNotIn("get_drive_service", body)
+        self.assertNotIn("upload_file(", body)
+
+    def test_document_manager_not_imported_in_receive_file(self):
+        body = _th_function_body("uploaddoc_receive_file")
+        self.assertNotIn("document_manager", body)
+
+
+class TestNoDedupByFilenameOrMime(unittest.TestCase):
+
+    def test_validation_module_has_no_filename_dedup(self):
+        path = BUSINESS_CORE / "document_upload_validation.py"
+        src = path.read_text(encoding="utf-8")
+        self.assertNotIn("find_documents_by_name", src)
+        self.assertNotIn("Document Name", src)
+
+    def test_mime_is_not_document_identity(self):
+        import business_core.document_manager as dm
+        self.assertNotIn("Mime Type", dm._DOCUMENT_IDENTITY_FIELDS)
+
+
+class TestUnsupportedAnalysisDoesNotBlockStorage(unittest.TestCase):
+
+    def test_rtf_storage_allowed(self):
+        import business_core.document_upload_validation as duv
+        result = duv.validate_upload_request("contract.rtf", "application/rtf", 1024)
+        self.assertTrue(result["ok"])
+
+    def test_validate_document_upload_request_never_requires_analysis_support(self):
+        import business_core.business_builder as bb
+        result = bb.validate_document_upload_request("contract.rtf", "application/rtf", 1024)
+        self.assertTrue(result["ok"])
+
+
+class TestAllApprovedResultCodesExistAtRuntime(unittest.TestCase):
+    """Guards against 'comment-only vocabulary' — every approved code
+    must be producible by an actual callable, not merely mentioned in
+    a docstring or comment."""
+
+    def test_upload_validation_codes_are_producible(self):
+        import business_core.business_builder as bb
+        self.assertEqual(bb.validate_document_upload_request("", "application/pdf", 1)["code"], "INVALID_DOCUMENT_FILENAME")
+        self.assertEqual(bb.validate_document_upload_request("a.pdf", "application/pdf", -1)["code"], "DOCUMENT_TOO_LARGE")
+        self.assertEqual(bb.validate_document_upload_request("a.exe", "application/x-msdownload", 1)["code"], "UNSUPPORTED_DOCUMENT_STORAGE_TYPE")
+        self.assertEqual(bb.validate_document_upload_request("a.rtf", "application/rtf", 1)["code"], "DOCUMENT_ANALYSIS_UNSUPPORTED")
+        self.assertEqual(bb.validate_document_upload_request("a.pdf", "application/pdf", 1)["code"], "DOCUMENT_UPLOAD_VALIDATED")
+
+    def test_drive_and_compensation_codes_are_producible(self):
+        import business_core.business_builder as bb
+        self.assertEqual(bb.document_drive_upload_failed_result()["code"], "DRIVE_UPLOAD_FAILED")
+        self.assertEqual(bb.document_file_metadata_invalid_result()["code"], "DOCUMENT_FILE_METADATA_INVALID")
+        original = {"code": "DOCUMENT_PERSISTENCE_FAILED", "error": "x", "business_id": "", "drive_file_id": ""}
+        self.assertEqual(bb.finalize_persistence_failure_compensation(original, compensation_succeeded=True)["code"], "DRIVE_UPLOAD_COMPENSATED")
+        self.assertEqual(bb.finalize_persistence_failure_compensation(original, compensation_succeeded=False)["code"], "DOCUMENT_PERSISTENCE_FAILED_WITH_ORPHANED_FILE_WARNING")
+
+    def test_no_comment_only_codes_remain_unimplemented(self):
+        """The Phase 37F closeout audit found DRIVE_UPLOAD_COMPENSATED
+        and DOCUMENT_PERSISTENCE_FAILED_WITH_ORPHANED_FILE_WARNING
+        mentioned only in a comment — verify that comment now
+        describes real, callable code, not aspirational vocabulary."""
+        import business_core.business_builder as bb
+        for fn in (
+            "validate_document_upload_request", "document_drive_upload_failed_result",
+            "document_file_metadata_invalid_result", "finalize_persistence_failure_compensation",
+        ):
+            self.assertTrue(callable(getattr(bb, fn, None)), f"{fn} must be a real callable in business_builder.py")
+
+
+class TestAllRuntimeCodesAreMappedInUx(unittest.TestCase):
+
+    def test_all_upload_safety_codes_mapped(self):
+        import business_core.telegram_handlers as th
+        for code, ok in (
+            ("DOCUMENT_UPLOAD_VALIDATED", True), ("DOCUMENT_ANALYSIS_UNSUPPORTED", True),
+            ("INVALID_DOCUMENT_FILENAME", False), ("DOCUMENT_TOO_LARGE", False),
+            ("UNSUPPORTED_DOCUMENT_STORAGE_TYPE", False), ("DRIVE_UPLOAD_FAILED", False),
+            ("DOCUMENT_FILE_METADATA_INVALID", False), ("DRIVE_UPLOAD_COMPENSATED", False),
+            ("DOCUMENT_PERSISTENCE_FAILED_WITH_ORPHANED_FILE_WARNING", False),
+        ):
+            result = {"ok": ok, "code": code, "error": "x", "drive_file_id": "FILE1"}
+            msg = th._document_creation_message(result)
+            self.assertTrue(msg)
+            self.assertNotIn(f"unmapped code={code!r}", msg)
+
+    def test_no_arbitrary_success_fallback(self):
+        """The unmapped-code fallback must never claim success."""
+        import business_core.telegram_handlers as th
+        result = {"ok": False, "code": "TOTALLY_UNKNOWN_FUTURE_CODE", "error": "x"}
+        msg = th._document_creation_message(result)
+        self.assertIn("❌", msg)
+        self.assertNotIn("✅", msg)
+
+
+class TestNoProductionOrNetworkAccessInUploadValidationTests(unittest.TestCase):
+
+    def test_document_upload_validation_module_makes_no_io_calls(self):
+        path = BUSINESS_CORE / "document_upload_validation.py"
+        src = path.read_text(encoding="utf-8")
+        for forbidden in (
+            "get_business_sheet(", "read_business_sheet(", "get_drive_service(",
+            "append_business_row(", "requests.", "socket.",
+        ):
+            self.assertNotIn(forbidden, src)
+
+
+class TestDocumentManagerRemainsPersistenceOnly(unittest.TestCase):
+
+    def test_document_manager_has_no_upload_validation_logic(self):
+        path = BUSINESS_CORE / "document_manager.py"
+        src = path.read_text(encoding="utf-8")
+        for forbidden in ("validate_filename", "validate_size", "classify_storage_type", "MAX_DOCUMENT_FILE_SIZE_BYTES"):
+            self.assertNotIn(forbidden, src)
+
+
+class TestPhase37F1TestsHaveHardSocketBlock(unittest.TestCase):
+
+    def test_phase_37f_1_test_file_registered(self):
+        conftest_src = (WORKSPACE / "conftest.py").read_text(encoding="utf-8")
+        self.assertIn("test_document_upload_validation.py", conftest_src)
+
+
 if __name__ == "__main__":
     unittest.main()

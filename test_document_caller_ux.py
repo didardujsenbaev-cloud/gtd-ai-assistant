@@ -155,6 +155,109 @@ class TestDocumentCreationMessageMapping(unittest.TestCase):
             self.assertNotIn("{\"ok\"", msg)
 
 
+class TestDocumentUploadSafetyMessageMapping(unittest.TestCase):
+    """Phase 37F.1 — the upload-validation and Drive/compensation
+    result codes must all be distinctly mapped, not comment-only
+    vocabulary."""
+
+    def test_document_upload_validated(self):
+        result = {"ok": True, "code": "DOCUMENT_UPLOAD_VALIDATED", "error": None}
+        msg = th._document_creation_message(result)
+        self.assertIn("✅", msg)
+
+    def test_analysis_unsupported_distinct_from_storage_unsupported(self):
+        analysis_result = {"ok": True, "code": "DOCUMENT_ANALYSIS_UNSUPPORTED", "error": None}
+        storage_result = {"ok": False, "code": "UNSUPPORTED_DOCUMENT_STORAGE_TYPE", "error": None}
+        analysis_msg = th._document_creation_message(analysis_result)
+        storage_msg = th._document_creation_message(storage_result)
+        self.assertNotIn("❌", analysis_msg)
+        self.assertIn("❌", storage_msg)
+        self.assertNotEqual(analysis_msg, storage_msg)
+
+    def test_invalid_filename(self):
+        result = {"ok": False, "code": "INVALID_DOCUMENT_FILENAME", "error": "Имя файла не указано"}
+        msg = th._document_creation_message(result)
+        self.assertIn("❌", msg)
+        self.assertIn("имя файла", msg.lower())
+
+    def test_too_large(self):
+        result = {"ok": False, "code": "DOCUMENT_TOO_LARGE", "error": "x"}
+        msg = th._document_creation_message(result)
+        self.assertIn("❌", msg)
+
+    def test_unsupported_storage_type(self):
+        result = {"ok": False, "code": "UNSUPPORTED_DOCUMENT_STORAGE_TYPE", "error": "x"}
+        msg = th._document_creation_message(result)
+        self.assertIn("❌", msg)
+
+    def test_drive_upload_failed(self):
+        result = {"ok": False, "code": "DRIVE_UPLOAD_FAILED", "error": "x"}
+        msg = th._document_creation_message(result)
+        self.assertIn("❌", msg)
+        self.assertIn("Drive", msg)
+
+    def test_document_file_metadata_invalid_compensation_succeeded_no_success_claim(self):
+        result = {
+            "ok": False, "code": "DOCUMENT_FILE_METADATA_INVALID", "error": "x",
+            "compensation_attempted": True, "compensation_succeeded": True,
+        }
+        msg = th._document_creation_message(result)
+        self.assertNotIn("✅", msg)
+        self.assertIn("❌", msg)
+        self.assertIn("корзину", msg)
+
+    def test_document_file_metadata_invalid_compensation_failed_shows_orphan_warning(self):
+        result = {
+            "ok": False, "code": "DOCUMENT_FILE_METADATA_INVALID", "error": "x",
+            "compensation_attempted": True, "compensation_succeeded": False, "drive_file_id": "FILE1",
+        }
+        msg = th._document_creation_message(result)
+        self.assertIn("⚠️", msg)
+        self.assertIn("ручн", msg.lower())
+        self.assertIn("FILE1", msg)
+
+    def test_orphan_warning_never_exposes_raw_drive_url(self):
+        result = {
+            "ok": False, "code": "DOCUMENT_FILE_METADATA_INVALID", "error": "x",
+            "compensation_attempted": True, "compensation_succeeded": False, "drive_file_id": "FILE1",
+        }
+        msg = th._document_creation_message(result)
+        self.assertNotIn("drive.google.com", msg)
+        self.assertNotIn("http", msg)
+
+    def test_drive_upload_compensated_not_shown_as_success(self):
+        result = {"ok": False, "code": "DRIVE_UPLOAD_COMPENSATED", "error": "x", "drive_file_id": "FILE1"}
+        msg = th._document_creation_message(result)
+        self.assertNotIn("✅", msg)
+        self.assertIn("❌", msg)
+        self.assertIn("корзину", msg)
+
+    def test_orphaned_file_warning_is_explicit_and_no_url(self):
+        result = {
+            "ok": False, "code": "DOCUMENT_PERSISTENCE_FAILED_WITH_ORPHANED_FILE_WARNING",
+            "error": "x", "drive_file_id": "FILE1",
+        }
+        msg = th._document_creation_message(result)
+        self.assertIn("⚠️", msg)
+        self.assertIn("FILE1", msg)
+        self.assertNotIn("drive.google.com", msg)
+        self.assertNotIn("http", msg)
+
+    def test_all_upload_safety_codes_produce_distinct_messages(self):
+        codes_and_ok = [
+            ("DOCUMENT_UPLOAD_VALIDATED", True), ("DOCUMENT_ANALYSIS_UNSUPPORTED", True),
+            ("INVALID_DOCUMENT_FILENAME", False), ("DOCUMENT_TOO_LARGE", False),
+            ("UNSUPPORTED_DOCUMENT_STORAGE_TYPE", False), ("DRIVE_UPLOAD_FAILED", False),
+            ("DOCUMENT_FILE_METADATA_INVALID", False), ("DRIVE_UPLOAD_COMPENSATED", False),
+            ("DOCUMENT_PERSISTENCE_FAILED_WITH_ORPHANED_FILE_WARNING", False),
+        ]
+        messages = set()
+        for code, ok in codes_and_ok:
+            result = {"ok": ok, "code": code, "error": "x", "drive_file_id": "FILE1"}
+            messages.add(th._document_creation_message(result))
+        self.assertEqual(len(messages), len(codes_and_ok), "every upload-safety code must render a distinct message")
+
+
 # ────────────────────────────────────────────────────────────
 # _document_admin_message — /updatedoc admin-field mapping
 # ────────────────────────────────────────────────────────────

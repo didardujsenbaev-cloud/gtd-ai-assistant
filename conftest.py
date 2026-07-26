@@ -153,6 +153,7 @@ _DOCUMENT_DOMAIN_TEST_FILES = frozenset({
     "test_business_document_foundation.py",
     "test_document_architecture_guards.py",
     "test_document_caller_ux.py",
+    "test_document_upload_validation.py",
 })
 
 _HARD_SOCKET_BLOCK_TEST_FILES = (

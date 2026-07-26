@@ -3858,3 +3858,93 @@ def transition_document_status(document_id: str, target_status: str) -> dict:
         previous_status=previous_status, requested_status=target_status,
         final_status=target_status, changed=changed,
     )
+
+
+# ─────────────────────────────────────────────────────────────
+# Phase 37F.1 (ADR-020 §12): Document upload-safety orchestration.
+#
+# Telegram must never implement validation or compensation-code
+# policy itself — it calls these functions and renders whatever code
+# comes back. The actual Drive upload/download and the compensation
+# trash_file() call remain in telegram_handlers.py (both require
+# `await`, which these synchronous functions cannot do), but the
+# MEANING of every resulting code is decided here, not there.
+# ─────────────────────────────────────────────────────────────
+
+def validate_document_upload_request(file_name: str, mime_type: str, file_size: int | None = None) -> dict:
+    """
+    Canonical pre-Drive-upload validation boundary. Telegram calls this
+    (never business_core.document_upload_validation directly) before
+    performing any Drive upload, using metadata it already has from
+    Telegram's own file object — so an invalid/oversized/dangerous
+    file never reaches Drive at all.
+
+    Returns the standard structured Document result. ok=True with
+    code="DOCUMENT_ANALYSIS_UNSUPPORTED" means storage is allowed but
+    business_core.document_intelligence cannot analyze this MIME type
+    — informational only, never a rejection (ADR-020 §12: AI support
+    is never a prerequisite for storage). ok=True with code="" means
+    fully supported for both storage and analysis — the caller maps
+    that to DOCUMENT_UPLOAD_VALIDATED.
+    """
+    from business_core.document_upload_validation import validate_upload_request
+
+    result = validate_upload_request(file_name, mime_type, file_size)
+    analysis_supported = result.get("analysis_supported", True)
+    return _document_result(
+        ok=result["ok"],
+        code=result["code"] or ("DOCUMENT_UPLOAD_VALIDATED" if result["ok"] else ""),
+        error=result.get("error"),
+        analysis_status="unsupported" if not analysis_supported else "",
+        retry_safe=True,
+    )
+
+
+def document_drive_upload_failed_result(business_id: str = "") -> dict:
+    """The Drive upload call itself failed — nothing was ever created
+    in Drive, so no compensation is needed or attempted."""
+    return _document_result(
+        ok=False, code="DRIVE_UPLOAD_FAILED",
+        error="Не удалось загрузить файл в Google Drive", business_id=business_id, retry_safe=True,
+    )
+
+
+def document_file_metadata_invalid_result(
+    *, business_id: str = "", drive_file_id: str = "",
+    compensation_attempted: bool = False, compensation_succeeded: bool = False,
+) -> dict:
+    """
+    Authoritative Drive metadata (name/mime_type/webViewLink) was
+    missing or incomplete after upload — no Document row is ever
+    persisted in this case. compensation_attempted/succeeded carry the
+    outcome of the caller's own (necessarily async) Drive-trash
+    attempt; the code itself stays DOCUMENT_FILE_METADATA_INVALID
+    regardless of that outcome (ADR-020 §12/§6 permits either — this
+    keeps the root cause visible, with compensation as a sub-detail).
+    """
+    return _document_result(
+        ok=False, code="DOCUMENT_FILE_METADATA_INVALID",
+        error="Не удалось получить полные метаданные файла из Google Drive после загрузки",
+        business_id=business_id, drive_file_id=drive_file_id,
+        compensation_attempted=compensation_attempted, compensation_succeeded=compensation_succeeded,
+        retry_safe=True,
+    )
+
+
+def finalize_persistence_failure_compensation(result: dict, *, compensation_succeeded: bool) -> dict:
+    """
+    Given a DOCUMENT_PERSISTENCE_FAILED result and the outcome of the
+    caller's own (necessarily async) Drive-trash compensation attempt,
+    returns the final canonical code — DRIVE_UPLOAD_COMPENSATED on
+    success, DOCUMENT_PERSISTENCE_FAILED_WITH_ORPHANED_FILE_WARNING on
+    failure. Never claims upload success either way; register-
+    existing-file mode (register_document() with no Drive upload of
+    its own) never calls this — a pre-existing Drive file is never
+    trashed by that mode.
+    """
+    code = "DRIVE_UPLOAD_COMPENSATED" if compensation_succeeded else "DOCUMENT_PERSISTENCE_FAILED_WITH_ORPHANED_FILE_WARNING"
+    return _document_result(
+        ok=False, code=code, error=result.get("error"),
+        business_id=result.get("business_id", ""), drive_file_id=result.get("drive_file_id", ""),
+        compensation_attempted=True, compensation_succeeded=compensation_succeeded, retry_safe=True,
+    )

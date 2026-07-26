@@ -3604,6 +3604,52 @@ def _document_creation_message(result: dict, *, document_name: str = "", file_na
     if code == "DOCUMENT_PERSISTENCE_FAILED":
         return "❌ Не удалось сохранить документ."
 
+    if code == "DRIVE_UPLOAD_FAILED":
+        return "❌ Не удалось загрузить файл в Google Drive."
+
+    if code == "DOCUMENT_FILE_METADATA_INVALID":
+        lines = [
+            "❌ Не удалось получить полные метаданные файла из Google Drive после загрузки — регистрация не выполнена.",
+        ]
+        if result.get("compensation_attempted"):
+            if result.get("compensation_succeeded"):
+                lines.append("Загруженный файл в Google Drive перемещён в корзину (компенсация выполнена).")
+            else:
+                lines.append("⚠️ Очистка Drive-файла НЕ удалась — требуется ручная очистка.")
+                if result.get("drive_file_id"):
+                    lines.append(f"Orphan Drive File ID: {result['drive_file_id']}")
+        return "\n".join(lines)
+
+    if code == "DRIVE_UPLOAD_COMPENSATED":
+        return (
+            "❌ Не удалось сохранить запись документа.\n"
+            "Загруженный файл в Google Drive перемещён в корзину (компенсация выполнена) — запись не создана."
+        )
+
+    if code == "DOCUMENT_PERSISTENCE_FAILED_WITH_ORPHANED_FILE_WARNING":
+        lines = [
+            "❌ Не удалось сохранить запись документа.",
+            "⚠️ Очистка Drive-файла НЕ удалась — требуется ручная очистка.",
+        ]
+        if result.get("drive_file_id"):
+            lines.append(f"Orphan Drive File ID: {result['drive_file_id']}")
+        return "\n".join(lines)
+
+    if code == "INVALID_DOCUMENT_FILENAME":
+        return f"❌ Недопустимое имя файла: {result.get('error') or ''}"
+
+    if code == "DOCUMENT_TOO_LARGE":
+        return f"❌ Недопустимый размер файла: {result.get('error') or ''}"
+
+    if code == "UNSUPPORTED_DOCUMENT_STORAGE_TYPE":
+        return "❌ Этот тип файла не поддерживается для хранения."
+
+    if code == "DOCUMENT_ANALYSIS_UNSUPPORTED":
+        return "⚠️ Файл принят, но автоматический анализ для этого формата не поддерживается."
+
+    if code == "DOCUMENT_UPLOAD_VALIDATED":
+        return "✅ Файл прошёл проверку."
+
     log.warning(f"_document_creation_message: unmapped code={code!r} business_id={result.get('business_id', '')}")
     return "❌ Не удалось сохранить документ."
 
@@ -4109,22 +4155,44 @@ async def uploaddoc_receive_file(update: Update, context: ContextTypes.DEFAULT_T
         )
         return UD_FILE
 
+    tg_file_name = doc.file_name or "document"
+    tg_mime_type = doc.mime_type or "application/octet-stream"
+
+    # Phase 37F.1 (ADR-020 §12): canonical pre-Drive-upload validation —
+    # runs before any Drive call, using only Telegram-supplied metadata
+    # already available at this point. An invalid/oversized/dangerous
+    # file is rejected here and never reaches Drive.
+    from business_core.business_builder import validate_document_upload_request
+    validation = validate_document_upload_request(tg_file_name, tg_mime_type, doc.file_size)
+    if not validation["ok"]:
+        await update.message.reply_text(
+            _document_creation_message(validation) + "\n\nОтправь другой документ или /cancel.",
+        )
+        return UD_FILE
+
     context.user_data["ud"] = {
         "tg_file_id": doc.file_id,
         "tg_file_unique_id": doc.file_unique_id,
-        "tg_file_name": doc.file_name or "document",
-        "tg_mime_type": doc.mime_type or "application/octet-stream",
+        "tg_file_name": tg_file_name,
+        "tg_mime_type": tg_mime_type,
         "tg_file_size": doc.file_size,
         "uploaded_by": _telegram_username(update),
     }
 
-    await update.message.reply_text(
-        "✅ Файл получен: " + (doc.file_name or "(без имени)") + "\n\n"
-        "Теперь одной строкой укажи данные документа:\n\n"
-        'business=BIZ-001 name="Технический паспорт"\n\n'
-        "Опционально: client=, object=, roadmap=, stage=, template=, notes=\n\n"
-        "/cancel — отменить."
-    )
+    lines = ["✅ Файл получен: " + (doc.file_name or "(без имени)")]
+    if validation["code"] == "DOCUMENT_ANALYSIS_UNSUPPORTED":
+        lines.append(_document_creation_message(validation))
+    lines.extend([
+        "",
+        "Теперь одной строкой укажи данные документа:",
+        "",
+        'business=BIZ-001 name="Технический паспорт"',
+        "",
+        "Опционально: client=, object=, roadmap=, stage=, template=, notes=",
+        "",
+        "/cancel — отменить.",
+    ])
+    await update.message.reply_text("\n".join(lines))
     return UD_DETAILS
 
 
@@ -4346,6 +4414,10 @@ async def uploaddoc_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             tmp.write(file_bytes)
             tmp_path = tmp.name
 
+        from business_core.business_builder import (
+            document_drive_upload_failed_result, document_file_metadata_invalid_result,
+        )
+
         try:
             upload_result = upload_file(
                 service, tmp_path, snap["folder_id"],
@@ -4354,7 +4426,7 @@ async def uploaddoc_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         except Exception as e:
             log.error(f"uploaddoc_confirm: Drive upload error: {e}")
             await update.message.reply_text(
-                "❌ Ошибка загрузки в Google Drive.",
+                _document_creation_message(document_drive_upload_failed_result(snap["business_id"])),
                 reply_markup=ReplyKeyboardRemove(),
             )
             context.user_data.pop("ud_confirmed_snapshot", None)
@@ -4379,24 +4451,13 @@ async def uploaddoc_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 f"{drive_file_id}: {meta}"
             )
             cleanup = trash_file(service, drive_file_id)
-            if cleanup.get("ok"):
-                await update.message.reply_text(
-                    "❌ Не удалось получить полные метаданные файла из Google Drive после загрузки — "
-                    "регистрация не выполнена.\n"
-                    "Загруженный файл в Google Drive перемещён в корзину (компенсация выполнена).",
-                    reply_markup=ReplyKeyboardRemove(),
-                )
-            else:
-                parts = [
-                    "❌ Не удалось получить полные метаданные файла из Google Drive после загрузки — "
-                    "регистрация не выполнена.",
-                    f"⚠️ Очистка Drive-файла НЕ удалась: {cleanup.get('error')}",
-                    f"Orphan Drive File ID: {drive_file_id}",
-                ]
-                if meta.get("web_view_link"):
-                    parts.append(f"Drive URL: {meta['web_view_link']}")
-                parts.append("Требуется ручная очистка.")
-                await update.message.reply_text("\n".join(parts), reply_markup=ReplyKeyboardRemove())
+            invalid_result = document_file_metadata_invalid_result(
+                business_id=snap["business_id"], drive_file_id=drive_file_id,
+                compensation_attempted=True, compensation_succeeded=bool(cleanup.get("ok")),
+            )
+            await update.message.reply_text(
+                _document_creation_message(invalid_result), reply_markup=ReplyKeyboardRemove(),
+            )
             context.user_data.pop("ud_confirmed_snapshot", None)
             return ConversationHandler.END
 
@@ -4423,22 +4484,13 @@ async def uploaddoc_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         if result["code"] == "DOCUMENT_PERSISTENCE_FAILED":
             log.error(f"uploaddoc_confirm: DOCUMENT_REGISTRY write failed: {result['error']}")
             cleanup = trash_file(service, drive_file_id)
-            if cleanup.get("ok"):
-                await update.message.reply_text(
-                    "❌ Не удалось сохранить запись в DOCUMENT_REGISTRY.\n"
-                    "Загруженный файл в Google Drive перемещён в корзину (компенсация выполнена) — "
-                    "запись не создана.",
-                    reply_markup=ReplyKeyboardRemove(),
-                )
-            else:
-                await update.message.reply_text(
-                    "❌ Не удалось сохранить запись в DOCUMENT_REGISTRY.\n"
-                    f"⚠️ Очистка Drive-файла НЕ удалась: {cleanup.get('error')}\n"
-                    f"Orphan Drive File ID: {drive_file_id}\n"
-                    f"Drive URL: {web_view_link or '(нет ссылки)'}\n"
-                    "Требуется ручная очистка.",
-                    reply_markup=ReplyKeyboardRemove(),
-                )
+            from business_core.business_builder import finalize_persistence_failure_compensation
+            final_result = finalize_persistence_failure_compensation(
+                {**result, "drive_file_id": drive_file_id}, compensation_succeeded=bool(cleanup.get("ok")),
+            )
+            await update.message.reply_text(
+                _document_creation_message(final_result), reply_markup=ReplyKeyboardRemove(),
+            )
             context.user_data.pop("ud_confirmed_snapshot", None)
             return ConversationHandler.END
 

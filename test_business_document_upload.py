@@ -280,6 +280,55 @@ class TestUploadDocFileStep(unittest.TestCase):
         card = update.message.reply_text.call_args[0][0]
         self.assertIn("альбом", card.lower())
 
+    def test_dangerous_file_rejected_before_reaching_details_step(self):
+        """Phase 37F.1: a dangerous storage type must be rejected at the
+        file-receive step — never proceeds to ask for business=/name=,
+        never reaches Drive."""
+        th = _fresh_th()
+        update, context = _doc_update(file_name="setup.exe", mime_type="application/x-msdownload"), _ctx()
+
+        result = asyncio.run(th.uploaddoc_receive_file(update, context))
+        self.assertEqual(result, th.UD_FILE)
+        self.assertNotIn("ud", context.user_data)
+        card = update.message.reply_text.call_args[0][0]
+        self.assertIn("❌", card)
+
+    def test_invalid_filename_rejected_before_reaching_details_step(self):
+        th = _fresh_th()
+        update, context = _doc_update(file_name="bad\x00name.pdf"), _ctx()
+
+        result = asyncio.run(th.uploaddoc_receive_file(update, context))
+        self.assertEqual(result, th.UD_FILE)
+        self.assertNotIn("ud", context.user_data)
+
+    def test_oversized_file_rejected_before_reaching_details_step(self):
+        th = _fresh_th()
+        update, context = _doc_update(file_size=999_999_999_999), _ctx()
+
+        result = asyncio.run(th.uploaddoc_receive_file(update, context))
+        self.assertEqual(result, th.UD_FILE)
+        self.assertNotIn("ud", context.user_data)
+
+    def test_analysis_unsupported_file_still_accepted(self):
+        """Storage-allowed-but-analysis-unsupported (e.g. RTF, matching
+        the existing production Document) must still proceed to
+        UD_DETAILS — AI support is never a prerequisite for storage."""
+        th = _fresh_th()
+        update, context = _doc_update(file_name="contract.rtf", mime_type="application/rtf"), _ctx()
+
+        result = asyncio.run(th.uploaddoc_receive_file(update, context))
+        self.assertEqual(result, th.UD_DETAILS)
+        self.assertIn("ud", context.user_data)
+
+    def test_valid_file_never_calls_drive_or_persistence(self):
+        th = _fresh_th()
+        update, context = _doc_update(), _ctx()
+        with patch("business_core.document_manager.create_document") as mock_create, \
+             patch("integrations.google_drive_adapter.get_drive_service") as mock_drive:
+            asyncio.run(th.uploaddoc_receive_file(update, context))
+        mock_create.assert_not_called()
+        mock_drive.assert_not_called()
+
 
 # ────────────────────────────────────────────────────────────
 # UD_DETAILS step
@@ -628,6 +677,9 @@ class TestUploadDocConfirmStep(unittest.TestCase):
         )
         append_mock.assert_not_called()
         self.assertNotIn("ud_confirmed_snapshot", context.user_data)
+        reply = update.message.reply_text.call_args[0][0]
+        self.assertIn("❌", reply)
+        self.assertNotIn("drive is down", reply)
 
     def test_registry_failure_triggers_drive_cleanup(self):
         def _boom(*a, **kw):
