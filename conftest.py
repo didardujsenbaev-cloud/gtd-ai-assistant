@@ -96,6 +96,23 @@ _ROADMAP_DOMAIN_TEST_FILES = frozenset({
     "test_stage_caller_ux.py",
 })
 
+# Phase 35C (ADR-018 §24): Phase 35B's Organization Domain audit found
+# all 9 of these files missing from this registry — closed here.
+_ORGANIZATION_DOMAIN_TEST_FILES = frozenset({
+    "test_business_organization_commands.py",
+    "test_business_organization_department_role.py",
+    "test_business_organization_duplicate_protection.py",
+    "test_business_organization_function_assignment.py",
+    "test_business_organization_integration.py",
+    "test_business_organization_schema.py",
+    "test_business_organization_seed.py",
+    "test_business_work_assignment.py",
+    "test_business_work_execution_integration.py",
+    "test_inbox_bridge.py",
+    "test_organization_foundation.py",
+    "test_organization_architecture_guards.py",
+})
+
 # Phase 32A (Service Domain re-audit) found a masked live-network call
 # here — pre-existing, never fixed. Included per Phase 33C's explicit
 # requirement (ADR-016 §16).
@@ -103,7 +120,10 @@ _OTHER_HARDENED_TEST_FILES = frozenset({
     "test_service_ownership_migration.py",
 })
 
-_HARD_SOCKET_BLOCK_TEST_FILES = _CLIENT_DOMAIN_TEST_FILES | _ROADMAP_DOMAIN_TEST_FILES | _OTHER_HARDENED_TEST_FILES
+_HARD_SOCKET_BLOCK_TEST_FILES = (
+    _CLIENT_DOMAIN_TEST_FILES | _ROADMAP_DOMAIN_TEST_FILES
+    | _ORGANIZATION_DOMAIN_TEST_FILES | _OTHER_HARDENED_TEST_FILES
+)
 
 
 def _blocked_connect(*_args, **_kwargs):

@@ -199,6 +199,21 @@ def resolve_stage_responsibility(stage_id: str) -> dict:
             errors=(f"Role '{role_id}' архивирована",),
         )
 
+    # Phase 35D (ADR-018 §16/§23): a Role that later moved to "paused"
+    # (active -> paused is a valid Role-lifecycle transition — see
+    # _ROLE_ORDINARY_TRANSITIONS in organization_manager.py) is not a
+    # valid current executor either, but this is NOT a new top-level
+    # RESOLUTION_STATUS value — the locked four-value enum
+    # (test_resolution_status_enum_has_exactly_four_values) stays
+    # exactly as-is. Folded into the same "configuration_error" bucket
+    # the archived-Role case already uses, distinguished only via the
+    # diagnostic `errors` text.
+    if role["status"] == "paused":
+        return _resolution_result(
+            status="configuration_error", stage_id=stage_id, role_id=role_id, relation_id=relation_id,
+            errors=(f"Role '{role_id}' приостановлена (paused)",),
+        )
+
     assignments = list_assignments_for_role(role_id, status="active")
 
     if not assignments:
@@ -213,6 +228,39 @@ def resolve_stage_responsibility(stage_id: str) -> dict:
     )
 
 
+def _role_eligible_for_stage_assignment(role: dict) -> tuple[bool, str, str]:
+    """
+    Phase 35D (ADR-018 §16): shared eligibility check for a Role
+    receiving NEW or REASSIGNED Stage responsibility — only "active"
+    is eligible for live execution (planned/paused Roles are pre-
+    staffing/temporarily-off, neither is a valid current executor;
+    archived was already blocked before this phase, now folded into
+    the same check). Also requires the Role's parent Department to
+    exist and not be archived. Returns (eligible, code, error) — code
+    is "" when eligible.
+    """
+    if role["status"] != "active":
+        return (
+            False, "ROLE_NOT_ACTIVE_FOR_STAGE_ASSIGNMENT",
+            f"Role '{role['role_id']}' имеет статус '{role['status']}' — "
+            f"для Stage responsibility требуется статус active",
+        )
+
+    try:
+        from business_core.organization_manager import find_department_by_id
+        department = find_department_by_id(role.get("department_id", ""))
+    except Exception as exc:
+        log.error(f"_role_eligible_for_stage_assignment department lookup error: {exc}")
+        return False, "", str(exc)
+
+    if department is None:
+        return False, "DEPARTMENT_NOT_FOUND", f"Department '{role.get('department_id', '')}' не найден"
+    if department.get("status") == "archived":
+        return False, "DEPARTMENT_ARCHIVED", f"Department '{role.get('department_id', '')}' архивирован"
+
+    return True, "", ""
+
+
 def assign_role_to_stage(stage_id: str, role_id: str) -> dict:
     """
     Create a new "role"-type STAGE_ENTITY_RELATIONS row linking `stage_id`
@@ -221,22 +269,27 @@ def assign_role_to_stage(stage_id: str, role_id: str) -> dict:
     (keeps "exactly one active Role relation per stage" enforced at the
     write boundary, not left to resolution-time luck).
 
+    Phase 35D (ADR-018 §16): tightened eligibility — only an "active"
+    Role (with a non-archived parent Department) may receive NEW Stage
+    responsibility; planned/paused Roles are now blocked here too
+    (previously only archived was blocked).
+
     Returns:
-        {"ok": bool, "relation_id": str, "error": str | None}
+        {"ok": bool, "relation_id": str, "code": str, "error": str | None}
     """
     if not stage_id:
-        return {"ok": False, "relation_id": "", "error": "stage_id обязателен"}
+        return {"ok": False, "relation_id": "", "code": "", "error": "stage_id обязателен"}
     if not role_id:
-        return {"ok": False, "relation_id": "", "error": "role_id обязателен"}
+        return {"ok": False, "relation_id": "", "code": "", "error": "role_id обязателен"}
 
     try:
         from business_core.sheets import find_row_by_id
 
         if find_row_by_id("roadmap_stages", stage_id) is None:
-            return {"ok": False, "relation_id": "", "error": f"Stage '{stage_id}' не найден"}
+            return {"ok": False, "relation_id": "", "code": "STAGE_NOT_FOUND", "error": f"Stage '{stage_id}' не найден"}
     except Exception as exc:
         log.error(f"assign_role_to_stage stage lookup error: {exc}")
-        return {"ok": False, "relation_id": "", "error": str(exc)}
+        return {"ok": False, "relation_id": "", "code": "", "error": str(exc)}
 
     try:
         from business_core.organization_manager import find_role_by_id
@@ -244,12 +297,14 @@ def assign_role_to_stage(stage_id: str, role_id: str) -> dict:
         role = find_role_by_id(role_id)
     except Exception as exc:
         log.error(f"assign_role_to_stage role lookup error: {exc}")
-        return {"ok": False, "relation_id": "", "error": str(exc)}
+        return {"ok": False, "relation_id": "", "code": "", "error": str(exc)}
 
     if role is None:
-        return {"ok": False, "relation_id": "", "error": f"Role '{role_id}' не найден"}
-    if role["status"] == "archived":
-        return {"ok": False, "relation_id": "", "error": f"Role '{role_id}' архивирована"}
+        return {"ok": False, "relation_id": "", "code": "ROLE_NOT_FOUND", "error": f"Role '{role_id}' не найден"}
+
+    eligible, code, error = _role_eligible_for_stage_assignment(role)
+    if not eligible:
+        return {"ok": False, "relation_id": "", "code": code, "error": error}
 
     try:
         from business_core.stage_entity_relations import get_relations_for_stage, find_active_duplicate_relation
@@ -258,6 +313,7 @@ def assign_role_to_stage(stage_id: str, role_id: str) -> dict:
         if existing:
             return {
                 "ok": False, "relation_id": "",
+                "code": "MULTIPLE_ACTIVE_STAGE_ROLE_RELATIONS_INTEGRITY_ERROR",
                 "error": (
                     f"У stage '{stage_id}' уже есть активная Role-relation "
                     f"({existing[0].get('Relation ID', '')}) — используй reassign_stage_role()"
@@ -272,17 +328,20 @@ def assign_role_to_stage(stage_id: str, role_id: str) -> dict:
         if duplicate is not None:
             return {
                 "ok": False, "relation_id": "",
+                "code": "MULTIPLE_ACTIVE_STAGE_ROLE_RELATIONS_INTEGRITY_ERROR",
                 "error": f"Активная relation уже существует: {duplicate.get('Relation ID', '')}",
             }
     except Exception as exc:
         log.error(f"assign_role_to_stage duplicate check error: {exc}")
-        return {"ok": False, "relation_id": "", "error": str(exc)}
+        return {"ok": False, "relation_id": "", "code": "", "error": str(exc)}
 
     try:
-        return _create_role_relation(stage_id, role_id)
+        result = _create_role_relation(stage_id, role_id)
+        result["code"] = "STAGE_ROLE_ASSIGNED" if result["ok"] else result.get("code", "")
+        return result
     except Exception as exc:
         log.error(f"assign_role_to_stage write error: {exc}")
-        return {"ok": False, "relation_id": "", "error": str(exc)}
+        return {"ok": False, "relation_id": "", "code": "", "error": str(exc)}
 
 
 def _create_role_relation(stage_id: str, role_id: str) -> dict:
@@ -332,26 +391,33 @@ def reassign_stage_role(stage_id: str, new_role_id: str) -> dict:
     If no active Role relation exists yet for this stage, behaves like
     a plain assign_role_to_stage() call (creates the first one).
 
+    Phase 35D (ADR-018 §16): tightened eligibility — only an "active"
+    Role (with a non-archived parent Department) may receive a NEW or
+    REASSIGNED Stage responsibility, including a same-Role idempotent
+    call — this is a new write request being evaluated, not an
+    automatic modification of an existing relation.
+
     Returns:
         {"ok": bool, "changed": bool, "old_relation_id": str | None,
-         "new_relation_id": str | None, "error": str | None}
+         "new_relation_id": str | None, "code": str, "error": str | None}
     """
     if not stage_id:
         return {"ok": False, "changed": False, "old_relation_id": None, "new_relation_id": None,
-                "error": "stage_id обязателен"}
+                "code": "", "error": "stage_id обязателен"}
     if not new_role_id:
         return {"ok": False, "changed": False, "old_relation_id": None, "new_relation_id": None,
-                "error": "new_role_id обязателен"}
+                "code": "", "error": "new_role_id обязателен"}
 
     try:
         from business_core.sheets import find_row_by_id
 
         if find_row_by_id("roadmap_stages", stage_id) is None:
             return {"ok": False, "changed": False, "old_relation_id": None, "new_relation_id": None,
-                    "error": f"Stage '{stage_id}' не найден"}
+                    "code": "STAGE_NOT_FOUND", "error": f"Stage '{stage_id}' не найден"}
     except Exception as exc:
         log.error(f"reassign_stage_role stage lookup error: {exc}")
-        return {"ok": False, "changed": False, "old_relation_id": None, "new_relation_id": None, "error": str(exc)}
+        return {"ok": False, "changed": False, "old_relation_id": None, "new_relation_id": None,
+                "code": "", "error": str(exc)}
 
     try:
         from business_core.organization_manager import find_role_by_id
@@ -359,14 +425,17 @@ def reassign_stage_role(stage_id: str, new_role_id: str) -> dict:
         role = find_role_by_id(new_role_id)
     except Exception as exc:
         log.error(f"reassign_stage_role role lookup error: {exc}")
-        return {"ok": False, "changed": False, "old_relation_id": None, "new_relation_id": None, "error": str(exc)}
+        return {"ok": False, "changed": False, "old_relation_id": None, "new_relation_id": None,
+                "code": "", "error": str(exc)}
 
     if role is None:
         return {"ok": False, "changed": False, "old_relation_id": None, "new_relation_id": None,
-                "error": f"Role '{new_role_id}' не найден"}
-    if role["status"] == "archived":
+                "code": "ROLE_NOT_FOUND", "error": f"Role '{new_role_id}' не найден"}
+
+    eligible, code, error = _role_eligible_for_stage_assignment(role)
+    if not eligible:
         return {"ok": False, "changed": False, "old_relation_id": None, "new_relation_id": None,
-                "error": f"Role '{new_role_id}' архивирована"}
+                "code": code, "error": error}
 
     try:
         from business_core.stage_entity_relations import get_relations_for_stage
@@ -374,13 +443,15 @@ def reassign_stage_role(stage_id: str, new_role_id: str) -> dict:
         existing = get_relations_for_stage(stage_id, entity_type=_ROLE_ENTITY_TYPE)
     except Exception as exc:
         log.error(f"reassign_stage_role existing-relation lookup error: {exc}")
-        return {"ok": False, "changed": False, "old_relation_id": None, "new_relation_id": None, "error": str(exc)}
+        return {"ok": False, "changed": False, "old_relation_id": None, "new_relation_id": None,
+                "code": "", "error": str(exc)}
 
     if not existing:
         result = _create_role_relation(stage_id, new_role_id)
         return {
             "ok": result["ok"], "changed": result["ok"],
             "old_relation_id": None, "new_relation_id": result["relation_id"] or None,
+            "code": "STAGE_ROLE_ASSIGNED" if result["ok"] else "",
             "error": result["error"],
         }
 
@@ -389,7 +460,7 @@ def reassign_stage_role(stage_id: str, new_role_id: str) -> dict:
         return {
             "ok": True, "changed": False,
             "old_relation_id": current.get("Relation ID", ""), "new_relation_id": current.get("Relation ID", ""),
-            "error": None,
+            "code": "STAGE_ROLE_REUSED", "error": None,
         }
 
     try:
@@ -403,26 +474,27 @@ def reassign_stage_role(stage_id: str, new_role_id: str) -> dict:
         cell = sheet.find(current.get("Relation ID", ""), in_column=1)
         if not cell:
             return {"ok": False, "changed": False, "old_relation_id": None, "new_relation_id": None,
-                    "error": f"Relation '{current.get('Relation ID', '')}' не найдена в листе"}
+                    "code": "", "error": f"Relation '{current.get('Relation ID', '')}' не найдена в листе"}
 
         sheet.update_cell(cell.row, idx["Status"] + 1, "inactive")
         if "Updated At" in idx:
             sheet.update_cell(cell.row, idx["Updated At"] + 1, datetime.now().strftime("%Y-%m-%d"))
     except Exception as exc:
         log.error(f"reassign_stage_role deactivation error: {exc}")
-        return {"ok": False, "changed": False, "old_relation_id": None, "new_relation_id": None, "error": str(exc)}
+        return {"ok": False, "changed": False, "old_relation_id": None, "new_relation_id": None,
+                "code": "", "error": str(exc)}
 
     result = _create_role_relation(stage_id, new_role_id)
     if not result["ok"]:
         return {
             "ok": False, "changed": True,  # old relation IS already deactivated
             "old_relation_id": current.get("Relation ID", ""), "new_relation_id": None,
-            "error": result["error"],
+            "code": "", "error": result["error"],
         }
 
     log.info(f"reassign_stage_role: stage={stage_id} {current.get('Entity ID', '')} -> {new_role_id}")
     return {
         "ok": True, "changed": True,
         "old_relation_id": current.get("Relation ID", ""), "new_relation_id": result["relation_id"],
-        "error": None,
+        "code": "STAGE_ROLE_REASSIGNED", "error": None,
     }

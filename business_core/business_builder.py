@@ -2547,3 +2547,225 @@ def update_stage_admin_fields(stage_id: str, writes: dict) -> dict:
         written_fields=tuple(write_result.get("written_fields", ())),
         roadmap_status_before=roadmap_status, roadmap_status_after=roadmap_status,
     )
+
+
+# ─────────────────────────────────────────────────────────────
+# Phase 35D (ADR-018): Organization Person↔Role assignment
+# orchestration boundary.
+#
+# organization_manager.py remains the sole persistence owner of
+# DEPARTMENT_REGISTRY/ROLE_REGISTRY/ROLE_FUNCTIONS/
+# PERSON_ROLE_ASSIGNMENTS (unchanged by this phase). Everything that
+# crosses from "one Person" / "one Role" to cross-entity eligibility —
+# archived-Person, Role status, parent-Department status, Business
+# membership, duplicate-active-Assignment policy — lives here instead,
+# exactly the same boundary principle ADR-016/ADR-017 already applied
+# to Roadmap creation and Stage transitions. No second implementation
+# of this policy exists anywhere else (see
+# test_organization_architecture_guards.py).
+# ─────────────────────────────────────────────────────────────
+
+def _assignment_result(
+    *, ok: bool, code: str, error: str | None, department_id: str = "",
+    role_id: str = "", person_id: str = "", assignment_id: str = "",
+    assignment_created: bool = False, assignment_reused: bool = False,
+    previous_status: str = "", final_status: str = "", warnings: tuple = (),
+    conflicting_assignment_ids: tuple = (), retry_safe: bool = True,
+) -> dict:
+    """
+    Shared result-builder for assign_person_to_role_canonical() —
+    ADR-018 §21's stable, structured contract.
+    """
+    return {
+        "ok": ok,
+        "code": code,
+        "error": error,
+        "department_id": department_id,
+        "role_id": role_id,
+        "person_id": person_id,
+        "assignment_id": assignment_id,
+        "assignment_created": assignment_created,
+        "assignment_reused": assignment_reused,
+        "previous_status": previous_status,
+        "final_status": final_status,
+        "warnings": tuple(warnings),
+        "conflicting_assignment_ids": tuple(conflicting_assignment_ids),
+        "retry_safe": retry_safe,
+    }
+
+
+def assign_person_to_role_canonical(
+    person_id: str,
+    role_id: str,
+    start_date: str,
+    assignment_type: str = "primary",
+    notes: str = "",
+) -> dict:
+    """
+    Phase 35D (ADR-018): the sole canonical Person↔Role assignment
+    orchestration boundary. /assignrole and any other future caller
+    must call this — never organization_manager.assign_person_to_role()
+    directly — so Person/Role/Department/Business-membership eligibility
+    and duplicate-active-Assignment policy is enforced exactly once, in
+    exactly one place.
+
+    Validation order (ADR-018 §5, all before any write):
+      A. required person_id
+      B. Person exists (PERSON_NOT_FOUND)
+      C. Person not archived (PERSON_ARCHIVED)
+      D. required role_id
+      E. Role exists (ROLE_NOT_FOUND)
+      F. parent Department exists (DEPARTMENT_NOT_FOUND)
+      G. Department not archived (DEPARTMENT_ARCHIVED)
+      H. Role eligibility — planned/active allowed, paused/archived
+         blocked (ROLE_PAUSED/ROLE_ARCHIVED)
+      I. Business-scope membership — only when the Department is
+         Business-scoped (PERSON_NOT_LINKED_TO_BUSINESS/
+         PERSON_ROLE_BUSINESS_MISMATCH); a global Department (blank
+         Business ID) requires no membership at all
+      J. active-duplicate Assignment lookup for (Person ID, Role ID)
+      K. zero/one/multiple policy — zero creates, exactly one is
+         reused idempotently, more than one blocks
+         (MULTIPLE_ACTIVE_ASSIGNMENTS_INTEGRITY_ERROR, never an
+         arbitrary first pick)
+      L. create or reuse via organization_manager.assign_person_to_role()
+         (unchanged low-level persistence)
+      M. return the structured result (ADR-018 §21)
+
+    Args:
+        person_id:       PRS-... to assign
+        role_id:         ROLE-... to assign to
+        start_date:      YYYY-MM-DD, required by the low-level API
+        assignment_type: primary/backup/temporary
+        notes:           optional Notes column value
+
+    Returns:
+        See _assignment_result() for the full field list.
+    """
+    from business_core.organization_manager import (
+        find_role_by_id, find_department_by_id, assign_person_to_role,
+        list_assignments_for_role,
+    )
+
+    # A/B. Required person_id, Person exists.
+    if not person_id:
+        return _assignment_result(ok=False, code="PERSON_NOT_FOUND", error="person_id обязателен")
+
+    from business_core.person_manager import find_person_by_id, is_person_archived, has_person_business_link
+    person = find_person_by_id(person_id)
+    if person is None:
+        return _assignment_result(
+            ok=False, code="PERSON_NOT_FOUND", error=f"Person {person_id} не найден", person_id=person_id,
+        )
+
+    # C. Person not archived.
+    if is_person_archived(person):
+        return _assignment_result(
+            ok=False, code="PERSON_ARCHIVED",
+            error=f"Person {person_id} архивирован — назначение не разрешено", person_id=person_id,
+        )
+
+    # D/E. Required role_id, Role exists.
+    if not role_id:
+        return _assignment_result(ok=False, code="ROLE_NOT_FOUND", error="role_id обязателен", person_id=person_id)
+
+    role = find_role_by_id(role_id)
+    if role is None:
+        return _assignment_result(
+            ok=False, code="ROLE_NOT_FOUND", error=f"Role {role_id} не найден",
+            person_id=person_id, role_id=role_id,
+        )
+
+    # F/G. Parent Department exists and is not archived.
+    department_id = role.get("department_id", "")
+    department = find_department_by_id(department_id) if department_id else None
+    if department is None:
+        return _assignment_result(
+            ok=False, code="DEPARTMENT_NOT_FOUND", error=f"Department {department_id} не найден",
+            person_id=person_id, role_id=role_id, department_id=department_id,
+        )
+    if department.get("status") == "archived":
+        return _assignment_result(
+            ok=False, code="DEPARTMENT_ARCHIVED", error=f"Department {department_id} архивирован",
+            person_id=person_id, role_id=role_id, department_id=department_id,
+        )
+
+    # H. Role eligibility for Person assignment — planned/active allowed,
+    # paused/archived blocked.
+    role_status = role.get("status", "")
+    if role_status == "paused":
+        return _assignment_result(
+            ok=False, code="ROLE_PAUSED", error=f"Role {role_id} приостановлена — назначение не разрешено",
+            person_id=person_id, role_id=role_id, department_id=department_id,
+        )
+    if role_status == "archived":
+        return _assignment_result(
+            ok=False, code="ROLE_ARCHIVED", error=f"Role {role_id} архивирована — назначение не разрешено",
+            person_id=person_id, role_id=role_id, department_id=department_id,
+        )
+    if role_status not in ("planned", "active"):
+        return _assignment_result(
+            ok=False, code="INVALID_ROLE_STATUS", error=f"Role {role_id} имеет неизвестный статус '{role_status}'",
+            person_id=person_id, role_id=role_id, department_id=department_id,
+        )
+
+    # I. Business-scope membership — only when Department is Business-
+    # scoped (ADR-018 §11). A global Department (blank Business ID)
+    # requires no membership at all.
+    business_id = department.get("business_id", "")
+    if business_id:
+        if not has_person_business_link(person, business_id):
+            linked_ids = person.get("biz_ids") or []
+            if not linked_ids:
+                return _assignment_result(
+                    ok=False, code="PERSON_NOT_LINKED_TO_BUSINESS",
+                    error=f"Person {person_id} не привязан к бизнесу {business_id}",
+                    person_id=person_id, role_id=role_id, department_id=department_id,
+                )
+            return _assignment_result(
+                ok=False, code="PERSON_ROLE_BUSINESS_MISMATCH",
+                error=f"Person {person_id} привязан к другому бизнесу, а не к {business_id}",
+                person_id=person_id, role_id=role_id, department_id=department_id,
+            )
+
+    # J/K. Active-duplicate Assignment lookup for (Person ID, Role ID).
+    active_assignments = list_assignments_for_role(role_id, status="active")
+    matching = [a for a in active_assignments if a.get("person_id") == person_id]
+
+    if len(matching) > 1:
+        conflicting_ids = tuple(a.get("assignment_id", "") for a in matching)
+        return _assignment_result(
+            ok=False, code="MULTIPLE_ACTIVE_ASSIGNMENTS_INTEGRITY_ERROR",
+            error=(
+                f"Найдено {len(matching)} активных Assignment для (Person={person_id}, "
+                f"Role={role_id}): {conflicting_ids} — новый Assignment не создан"
+            ),
+            person_id=person_id, role_id=role_id, department_id=department_id,
+            conflicting_assignment_ids=conflicting_ids, retry_safe=True,
+        )
+
+    if len(matching) == 1:
+        existing = matching[0]
+        return _assignment_result(
+            ok=True, code="ASSIGNMENT_REUSED", error=None,
+            person_id=person_id, role_id=role_id, department_id=department_id,
+            assignment_id=existing.get("assignment_id", ""), assignment_reused=True,
+            previous_status="active", final_status="active", retry_safe=True,
+        )
+
+    # L. Create — zero matching active Assignment.
+    write_result = assign_person_to_role(
+        person_id, role_id, start_date, assignment_type=assignment_type, notes=notes,
+    )
+    if not write_result["ok"]:
+        return _assignment_result(
+            ok=False, code=write_result.get("code") or "", error=write_result.get("error"),
+            person_id=person_id, role_id=role_id, department_id=department_id, retry_safe=True,
+        )
+
+    return _assignment_result(
+        ok=True, code="ASSIGNMENT_CREATED", error=None,
+        person_id=person_id, role_id=role_id, department_id=department_id,
+        assignment_id=write_result["assignment_id"], assignment_created=True,
+        previous_status="", final_status="active", retry_safe=True,
+    )

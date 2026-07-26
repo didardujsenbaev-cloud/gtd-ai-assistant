@@ -6368,15 +6368,29 @@ async def assignrole_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     try:
-        from business_core.organization_manager import assign_person_to_role
+        # Phase 35D (ADR-018 §17): this command only parses IDs and
+        # renders a minimal compatibility message. All Person/Role/
+        # Department/Business-membership eligibility and duplicate-
+        # Assignment policy lives solely in business_builder.
+        # assign_person_to_role_canonical() — never called directly
+        # here again.
+        from business_core.business_builder import assign_person_to_role_canonical
 
         start_date = args.get("start_date", "") or datetime.now().strftime("%Y-%m-%d")
-        result = assign_person_to_role(
+        result = assign_person_to_role_canonical(
             person_id, role_id, start_date,
             assignment_type=args.get("assignment_type", "primary"),
         )
         if not result["ok"]:
-            await _reply(update, f"❌ Ошибка: {result['error']}")
+            await _reply(update, f"❌ Ошибка ({result['code']}): {result['error']}")
+            return
+
+        if result["code"] == "ASSIGNMENT_REUSED":
+            await _reply(update, "\n".join([
+                "✅ Уже назначен (активное назначение уже существует)",
+                f"Assignment ID: `{result['assignment_id']}`",
+                f"{person_id} → {role_id}",
+            ]))
             return
 
         await _reply(update, "\n".join([

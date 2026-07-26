@@ -269,7 +269,12 @@ class TestVacancy(WorkExecutionIntegrationTestCase):
     def test_vacant_role_resolves_vacant_even_with_filled_parent(self):
         """The Role's Reports To Role ID points at a FILLED role — this
         proves (behaviorally, not just via a call-count spy) that no
-        Reports-To hierarchy walk-up occurs (Phase 22A adjustment 2)."""
+        Reports-To hierarchy walk-up occurs (Phase 22A adjustment 2).
+
+        Phase 35D (ADR-018 §16): assign_role_to_stage() now requires an
+        "active" Role (previously "planned" was also accepted) — the
+        vacancy scenario here is created via an active Role with zero
+        Person assignments, not a planned one."""
         dept = self.om.create_department("Operations")
         manager_role = self.om.create_role("Operations Manager", department_id=dept["department_id"], status="active")
         _seed_person(self.registries, "PRS-MANAGER")
@@ -277,7 +282,7 @@ class TestVacancy(WorkExecutionIntegrationTestCase):
 
         vacant_role = self.om.create_role(
             "Coordinator", department_id=dept["department_id"],
-            reports_to_role_id=manager_role["role_id"], status="planned",
+            reports_to_role_id=manager_role["role_id"], status="active",
         )
         # deliberately no assign_person_to_role() call for vacant_role
 
@@ -451,7 +456,11 @@ class TestStableResolutionContract(WorkExecutionIntegrationTestCase):
 
         unconfigured = self.wam.resolve_stage_responsibility("STAGE-B")
 
-        vacant_role = self.om.create_role("Document Controller", department_id=dept["department_id"], status="planned")
+        # Phase 35D (ADR-018 §16): assign_role_to_stage() now requires
+        # an "active" Role — "planned" no longer reaches a vacant
+        # relation, it's rejected outright. Vacancy here is an active
+        # Role with zero Person assignments instead.
+        vacant_role = self.om.create_role("Document Controller", department_id=dept["department_id"], status="active")
         self.wam.assign_role_to_stage("STAGE-C", vacant_role["role_id"])
         vacant = self.wam.resolve_stage_responsibility("STAGE-C")
 

@@ -574,45 +574,57 @@ def create_role(
     _find_duplicate_role) — it is an editable attribute, not identity.
     No merge, no automatic archival, no automatic reuse.
 
+    Phase 35D (ADR-018 §4/§8/§13/§22): a Department that is archived
+    must not receive a new Role — validated here (DEPARTMENT_ARCHIVED),
+    in addition to the pre-existing existence check
+    (DEPARTMENT_NOT_FOUND). Every branch now also returns a stable
+    "code" for machine callers, alongside the unchanged "error" text.
+
     Returns:
-        {"ok": bool, "role_id": str, "error": str | None}
+        {"ok": bool, "role_id": str, "code": str, "error": str | None}
     """
     if not role_name:
-        return {"ok": False, "role_id": "", "error": "role_name обязателен"}
+        return {"ok": False, "role_id": "", "code": "", "error": "role_name обязателен"}
     if not department_id:
-        return {"ok": False, "role_id": "", "error": "department_id обязателен"}
+        return {"ok": False, "role_id": "", "code": "", "error": "department_id обязателен"}
 
     if role_type not in ROLE_TYPE:
         return {
-            "ok": False, "role_id": "",
+            "ok": False, "role_id": "", "code": "",
             "error": f"Недопустимый Role Type '{role_type}'. Допустимые значения: {', '.join(ROLE_TYPE)}",
         }
     if employment_model not in EMPLOYMENT_MODEL:
         return {
-            "ok": False, "role_id": "",
+            "ok": False, "role_id": "", "code": "",
             "error": f"Недопустимый Employment Model '{employment_model}'. Допустимые значения: {', '.join(EMPLOYMENT_MODEL)}",
         }
     if status not in ROLE_STATUS:
         return {
-            "ok": False, "role_id": "",
+            "ok": False, "role_id": "", "code": "INVALID_ROLE_STATUS",
             "error": f"Недопустимый статус '{status}'. Допустимые значения: {', '.join(ROLE_STATUS)}",
         }
 
-    if not find_department_by_id(department_id):
-        return {"ok": False, "role_id": "", "error": f"Department '{department_id}' не найден"}
+    department = find_department_by_id(department_id)
+    if not department:
+        return {"ok": False, "role_id": "", "code": "DEPARTMENT_NOT_FOUND", "error": f"Department '{department_id}' не найден"}
+    if department.get("status") == "archived":
+        return {
+            "ok": False, "role_id": "", "code": "DEPARTMENT_ARCHIVED",
+            "error": f"Department '{department_id}' архивирован — новая Role не может быть создана",
+        }
 
     if reports_to_role_id and not find_role_by_id(reports_to_role_id):
-        return {"ok": False, "role_id": "", "error": f"Reports To Role '{reports_to_role_id}' не найден"}
+        return {"ok": False, "role_id": "", "code": "", "error": f"Reports To Role '{reports_to_role_id}' не найден"}
 
     try:
         duplicate = _find_duplicate_role(role_name, department_id)
     except Exception as exc:
         log.error(f"create_role duplicate check error: {exc}")
-        return {"ok": False, "role_id": "", "error": str(exc)}
+        return {"ok": False, "role_id": "", "code": "", "error": str(exc)}
 
     if duplicate is not None:
         return {
-            "ok": False, "role_id": "",
+            "ok": False, "role_id": "", "code": "ROLE_DUPLICATE",
             "error": (
                 f"Активная/planned Role с таким именем уже существует в этом Department: "
                 f"{duplicate['role_id']} ({duplicate['role_name']})"
@@ -629,16 +641,34 @@ def create_role(
         ]
         append_business_row("role_registry", row)
         log.info(f"create_role: {role_id} / {role_name}")
-        return {"ok": True, "role_id": role_id, "error": None}
+        return {"ok": True, "role_id": role_id, "code": "ROLE_CREATED", "error": None}
     except Exception as exc:
         log.error(f"create_role error: {exc}")
-        return {"ok": False, "role_id": "", "error": str(exc)}
+        return {"ok": False, "role_id": "", "code": "", "error": str(exc)}
 
 
 _ROLE_EDITABLE_FIELDS = (
-    "Department ID", "Role Name", "Reports To Role ID", "Role Type",
+    "Role Name", "Reports To Role ID", "Role Type",
     "Employment Model", "Status", "Purpose", "Main Result", "Notes",
 )
+
+# ADR-018 §2: Role ID and Department ID are Role's immutable identity
+# fields — "Department ID" was previously in _ROLE_EDITABLE_FIELDS
+# (a Role could be moved between Departments via update_role), which
+# this ADR closes. No production Role has ever exercised a Department
+# move (Phase 35B found none), so this is a behavior-narrowing change
+# with zero evidenced impact, not a redesign of existing usage.
+
+# ADR-018 §6: minimal Role status transition matrix — leaving
+# "archived" through this ordinary update path is blocked; a restore
+# requires a future explicit action (ROLE_RESTORE_REQUIRES_EXPLICIT_ACTION,
+# not implemented in Phase 35D, only the block + code).
+_ROLE_ORDINARY_TRANSITIONS: dict[str, tuple[str, ...]] = {
+    "planned":  ("planned", "active", "archived"),
+    "active":   ("active", "paused", "archived"),
+    "paused":   ("paused", "active", "archived"),
+    "archived": ("archived",),
+}
 
 
 def update_role(role_id: str, updates: dict) -> dict:
@@ -649,59 +679,76 @@ def update_role(role_id: str, updates: dict) -> dict:
     Args:
         role_id: ROLE-xxx
         updates: {header_name: new_value}, только поля из
-                 _ROLE_EDITABLE_FIELDS. "Role ID" не может быть изменён.
+                 _ROLE_EDITABLE_FIELDS. "Role ID" и "Department ID" не
+                 могут быть изменены (Phase 35D / ADR-018 §2 — оба
+                 являются неизменяемой идентичностью Role).
 
     Returns:
-        {"ok": bool, "changed": bool, "updated_fields": tuple, "error": str | None}
+        {"ok": bool, "changed": bool, "updated_fields": tuple, "code": str, "error": str | None}
     """
     if not role_id:
-        return {"ok": False, "changed": False, "updated_fields": (), "error": "role_id не указан"}
+        return {"ok": False, "changed": False, "updated_fields": (), "code": "", "error": "role_id не указан"}
 
     unknown = [k for k in updates if k not in _ROLE_EDITABLE_FIELDS]
     if unknown:
         return {
-            "ok": False, "changed": False, "updated_fields": (),
+            "ok": False, "changed": False, "updated_fields": (), "code": "",
             "error": f"Недопустимые поля для обновления: {', '.join(unknown)}",
         }
 
     if "Role Type" in updates and updates["Role Type"] not in ROLE_TYPE:
         return {
-            "ok": False, "changed": False, "updated_fields": (),
+            "ok": False, "changed": False, "updated_fields": (), "code": "",
             "error": f"Недопустимый Role Type '{updates['Role Type']}'. Допустимые значения: {', '.join(ROLE_TYPE)}",
         }
     if "Employment Model" in updates and updates["Employment Model"] not in EMPLOYMENT_MODEL:
         return {
-            "ok": False, "changed": False, "updated_fields": (),
+            "ok": False, "changed": False, "updated_fields": (), "code": "",
             "error": f"Недопустимый Employment Model '{updates['Employment Model']}'. Допустимые значения: {', '.join(EMPLOYMENT_MODEL)}",
         }
     if "Status" in updates and updates["Status"] not in ROLE_STATUS:
         return {
-            "ok": False, "changed": False, "updated_fields": (),
+            "ok": False, "changed": False, "updated_fields": (), "code": "INVALID_ROLE_STATUS",
             "error": f"Недопустимый статус '{updates['Status']}'. Допустимые значения: {', '.join(ROLE_STATUS)}",
         }
 
-    if "Department ID" in updates:
-        if not updates["Department ID"] or not find_department_by_id(updates["Department ID"]):
-            return {
-                "ok": False, "changed": False, "updated_fields": (),
-                "error": f"Department '{updates.get('Department ID', '')}' не найден",
-            }
+    if "Status" in updates:
+        existing_for_status = find_role_by_id(role_id)
+        if existing_for_status:
+            current_status = existing_for_status.get("status", "")
+            target_status = updates["Status"]
+            allowed = _ROLE_ORDINARY_TRANSITIONS.get(current_status, (current_status,))
+            if target_status not in allowed:
+                if current_status == "archived" and target_status != "archived":
+                    return {
+                        "ok": False, "changed": False, "updated_fields": (),
+                        "code": "ROLE_RESTORE_REQUIRES_EXPLICIT_ACTION",
+                        "error": (
+                            f"Role '{role_id}' архивирована — обычное обновление не может вернуть "
+                            f"её в '{target_status}'. Требуется отдельное явное действие restore "
+                            f"(не реализовано)."
+                        ),
+                    }
+                return {
+                    "ok": False, "changed": False, "updated_fields": (), "code": "INVALID_ROLE_STATUS",
+                    "error": f"Переход статуса Role '{current_status}' → '{target_status}' не разрешён",
+                }
 
     if "Reports To Role ID" in updates and updates["Reports To Role ID"]:
         if updates["Reports To Role ID"] == role_id:
             return {
-                "ok": False, "changed": False, "updated_fields": (),
+                "ok": False, "changed": False, "updated_fields": (), "code": "",
                 "error": "Role не может подчиняться самой себе",
             }
         if not find_role_by_id(updates["Reports To Role ID"]):
             return {
-                "ok": False, "changed": False, "updated_fields": (),
+                "ok": False, "changed": False, "updated_fields": (), "code": "",
                 "error": f"Reports To Role '{updates['Reports To Role ID']}' не найден",
             }
 
     found = _find_role_row(role_id)
     if not found:
-        return {"ok": False, "changed": False, "updated_fields": (), "error": f"Role '{role_id}' не найден"}
+        return {"ok": False, "changed": False, "updated_fields": (), "code": "ROLE_NOT_FOUND", "error": f"Role '{role_id}' не найден"}
     row_num, current = found
 
     field_key_map = {
@@ -731,10 +778,10 @@ def update_role(role_id: str, updates: dict) -> dict:
             changed = True
 
         log.info(f"update_role: {role_id} fields={updated_fields}")
-        return {"ok": True, "changed": changed, "updated_fields": tuple(updated_fields), "error": None}
+        return {"ok": True, "changed": changed, "updated_fields": tuple(updated_fields), "code": "", "error": None}
     except Exception as exc:
         log.error(f"update_role({role_id}) error: {exc}")
-        return {"ok": False, "changed": False, "updated_fields": (), "error": str(exc)}
+        return {"ok": False, "changed": False, "updated_fields": (), "code": "", "error": str(exc)}
 
 
 def archive_role(role_id: str) -> dict:
@@ -1239,39 +1286,48 @@ def assign_person_to_role(
     одного Person разрешены (multi-role) — эта функция НЕ проверяет и не
     запрещает такое дублирование.
 
+    Phase 35D (ADR-018 §15): this remains the low-level persistence
+    function — it does NOT check archived-Person, Role status, parent
+    Department status, or Business membership eligibility (that
+    cross-entity policy lives solely in business_builder.
+    assign_person_to_role_canonical(), the sole orchestration boundary
+    Telegram/other callers must use instead). Calling this function
+    directly bypasses that policy by design — it is the primitive the
+    orchestrator itself calls after its own validation passes.
+
     Returns:
-        {"ok": bool, "assignment_id": str, "error": str | None}
+        {"ok": bool, "assignment_id": str, "code": str, "error": str | None}
     """
     if not person_id:
-        return {"ok": False, "assignment_id": "", "error": "person_id обязателен"}
+        return {"ok": False, "assignment_id": "", "code": "", "error": "person_id обязателен"}
     if not role_id:
-        return {"ok": False, "assignment_id": "", "error": "role_id обязателен"}
+        return {"ok": False, "assignment_id": "", "code": "", "error": "role_id обязателен"}
     if not start_date:
-        return {"ok": False, "assignment_id": "", "error": "start_date обязателен"}
+        return {"ok": False, "assignment_id": "", "code": "", "error": "start_date обязателен"}
 
     if not _is_valid_date(start_date):
-        return {"ok": False, "assignment_id": "", "error": f"Недопустимый формат start_date '{start_date}'. Ожидается YYYY-MM-DD"}
+        return {"ok": False, "assignment_id": "", "code": "", "error": f"Недопустимый формат start_date '{start_date}'. Ожидается YYYY-MM-DD"}
     if assignment_type not in ASSIGNMENT_TYPE:
         return {
-            "ok": False, "assignment_id": "",
+            "ok": False, "assignment_id": "", "code": "",
             "error": f"Недопустимый Assignment Type '{assignment_type}'. Допустимые значения: {', '.join(ASSIGNMENT_TYPE)}",
         }
     if status not in ASSIGNMENT_STATUS:
         return {
-            "ok": False, "assignment_id": "",
+            "ok": False, "assignment_id": "", "code": "INVALID_ASSIGNMENT_STATUS",
             "error": f"Недопустимый статус '{status}'. Допустимые значения: {', '.join(ASSIGNMENT_STATUS)}",
         }
 
     try:
         from business_core.person_manager import find_person_by_id
         if not find_person_by_id(person_id):
-            return {"ok": False, "assignment_id": "", "error": f"Person '{person_id}' не найден"}
+            return {"ok": False, "assignment_id": "", "code": "PERSON_NOT_FOUND", "error": f"Person '{person_id}' не найден"}
     except Exception as exc:
         log.error(f"assign_person_to_role person_id validation error: {exc}")
-        return {"ok": False, "assignment_id": "", "error": str(exc)}
+        return {"ok": False, "assignment_id": "", "code": "", "error": str(exc)}
 
     if not find_role_by_id(role_id):
-        return {"ok": False, "assignment_id": "", "error": f"Role '{role_id}' не найден"}
+        return {"ok": False, "assignment_id": "", "code": "ROLE_NOT_FOUND", "error": f"Role '{role_id}' не найден"}
 
     try:
         from business_core.sheets import generate_next_id, append_business_row
@@ -1283,10 +1339,10 @@ def assign_person_to_role(
         ]
         append_business_row("person_role_assignments", row)
         log.info(f"assign_person_to_role: {assignment_id} / {person_id} -> {role_id}")
-        return {"ok": True, "assignment_id": assignment_id, "error": None}
+        return {"ok": True, "assignment_id": assignment_id, "code": "ASSIGNMENT_CREATED", "error": None}
     except Exception as exc:
         log.error(f"assign_person_to_role error: {exc}")
-        return {"ok": False, "assignment_id": "", "error": str(exc)}
+        return {"ok": False, "assignment_id": "", "code": "", "error": str(exc)}
 
 
 def end_assignment(assignment_id: str, end_date: Optional[str] = None) -> dict:
@@ -1297,24 +1353,24 @@ def end_assignment(assignment_id: str, end_date: Optional[str] = None) -> dict:
     НЕ трогается — вакансия вычисляется отдельно (is_role_vacant()).
 
     Returns:
-        {"ok": bool, "changed": bool, "error": str | None}
+        {"ok": bool, "changed": bool, "code": str, "error": str | None}
     """
     existing = find_assignment_by_id(assignment_id)
     if not existing:
-        return {"ok": False, "changed": False, "error": f"Assignment '{assignment_id}' не найден"}
+        return {"ok": False, "changed": False, "code": "", "error": f"Assignment '{assignment_id}' не найден"}
 
     if existing["status"] == "ended":
-        return {"ok": True, "changed": False, "error": None}
+        return {"ok": True, "changed": False, "code": "", "error": None}
 
     if end_date and not _is_valid_date(end_date):
-        return {"ok": False, "changed": False, "error": f"Недопустимый формат end_date '{end_date}'. Ожидается YYYY-MM-DD"}
+        return {"ok": False, "changed": False, "code": "", "error": f"Недопустимый формат end_date '{end_date}'. Ожидается YYYY-MM-DD"}
 
     if not end_date:
         from datetime import datetime
         end_date = datetime.now().strftime("%Y-%m-%d")
 
     result = update_assignment(assignment_id, {"End Date": end_date, "Status": "ended"})
-    return {"ok": result["ok"], "changed": result["changed"], "error": result["error"]}
+    return {"ok": result["ok"], "changed": result["changed"], "code": result.get("code", ""), "error": result["error"]}
 
 
 _ASSIGNMENT_EDITABLE_FIELDS = (
@@ -1330,44 +1386,64 @@ def update_assignment(assignment_id: str, updates: dict) -> dict:
     старой + assign_person_to_role() новой (сохраняет полную историю,
     см. get_assignment_history()), а не как in-place перезапись FK.
 
+    Phase 35D (ADR-018 §13): "ended" is terminal through this ordinary
+    update path — an Assignment whose current Status is "ended" cannot
+    have its Status changed to anything else here (ASSIGNMENT_ENDED_
+    IMMUTABLE); a later period of the same Person/Role pairing requires
+    a brand-new Assignment row via assign_person_to_role(), never
+    reactivating this historical one in place.
+
     Returns:
-        {"ok": bool, "changed": bool, "updated_fields": tuple, "error": str | None}
+        {"ok": bool, "changed": bool, "updated_fields": tuple, "code": str, "error": str | None}
     """
     if not assignment_id:
-        return {"ok": False, "changed": False, "updated_fields": (), "error": "assignment_id не указан"}
+        return {"ok": False, "changed": False, "updated_fields": (), "code": "", "error": "assignment_id не указан"}
 
     unknown = [k for k in updates if k not in _ASSIGNMENT_EDITABLE_FIELDS]
     if unknown:
         return {
-            "ok": False, "changed": False, "updated_fields": (),
+            "ok": False, "changed": False, "updated_fields": (), "code": "",
             "error": f"Недопустимые поля для обновления: {', '.join(unknown)}",
         }
 
     if "Start Date" in updates and not _is_valid_date(updates["Start Date"]):
         return {
-            "ok": False, "changed": False, "updated_fields": (),
+            "ok": False, "changed": False, "updated_fields": (), "code": "",
             "error": f"Недопустимый формат Start Date '{updates['Start Date']}'. Ожидается YYYY-MM-DD",
         }
     if "End Date" in updates and updates["End Date"] and not _is_valid_date(updates["End Date"]):
         return {
-            "ok": False, "changed": False, "updated_fields": (),
+            "ok": False, "changed": False, "updated_fields": (), "code": "",
             "error": f"Недопустимый формат End Date '{updates['End Date']}'. Ожидается YYYY-MM-DD",
         }
     if "Assignment Type" in updates and updates["Assignment Type"] not in ASSIGNMENT_TYPE:
         return {
-            "ok": False, "changed": False, "updated_fields": (),
+            "ok": False, "changed": False, "updated_fields": (), "code": "",
             "error": f"Недопустимый Assignment Type '{updates['Assignment Type']}'. Допустимые значения: {', '.join(ASSIGNMENT_TYPE)}",
         }
     if "Status" in updates and updates["Status"] not in ASSIGNMENT_STATUS:
         return {
-            "ok": False, "changed": False, "updated_fields": (),
+            "ok": False, "changed": False, "updated_fields": (), "code": "INVALID_ASSIGNMENT_STATUS",
             "error": f"Недопустимый статус '{updates['Status']}'. Допустимые значения: {', '.join(ASSIGNMENT_STATUS)}",
         }
 
     found = _find_assignment_row(assignment_id)
     if not found:
-        return {"ok": False, "changed": False, "updated_fields": (), "error": f"Assignment '{assignment_id}' не найден"}
+        return {"ok": False, "changed": False, "updated_fields": (), "code": "", "error": f"Assignment '{assignment_id}' не найден"}
     row_num, current = found
+
+    if "Status" in updates:
+        current_status = current.get("Status", "")
+        target_status = updates["Status"]
+        if current_status == "ended" and target_status != "ended":
+            return {
+                "ok": False, "changed": False, "updated_fields": (), "code": "ASSIGNMENT_ENDED_IMMUTABLE",
+                "error": (
+                    f"Assignment '{assignment_id}' завершён (ended) — обычное обновление не может "
+                    f"вернуть его в '{target_status}'. Для нового периода создайте новый Assignment "
+                    f"через assign_person_to_role()."
+                ),
+            }
 
     field_key_map = {
         "Start Date": "Start Date", "End Date": "End Date",
@@ -1394,10 +1470,10 @@ def update_assignment(assignment_id: str, updates: dict) -> dict:
             changed = True
 
         log.info(f"update_assignment: {assignment_id} fields={updated_fields}")
-        return {"ok": True, "changed": changed, "updated_fields": tuple(updated_fields), "error": None}
+        return {"ok": True, "changed": changed, "updated_fields": tuple(updated_fields), "code": "", "error": None}
     except Exception as exc:
         log.error(f"update_assignment({assignment_id}) error: {exc}")
-        return {"ok": False, "changed": False, "updated_fields": (), "error": str(exc)}
+        return {"ok": False, "changed": False, "updated_fields": (), "code": "", "error": str(exc)}
 
 
 # ═══════════════════════════════════════════════════════════════

@@ -336,8 +336,8 @@ class TestAssignRoleCommand(unittest.TestCase):
 
         async def run():
             with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
-                 patch("business_core.organization_manager.assign_person_to_role",
-                       return_value={"ok": True, "assignment_id": "PRA-001", "error": None}):
+                 patch("business_core.business_builder.assign_person_to_role_canonical",
+                       return_value={"ok": True, "code": "ASSIGNMENT_CREATED", "assignment_id": "PRA-001", "error": None}):
                 await th.assignrole_cmd(upd, ctx)
 
         _run(run())
@@ -368,8 +368,8 @@ class TestAssignRoleCommand(unittest.TestCase):
 
         async def run():
             with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
-                 patch("business_core.organization_manager.assign_person_to_role",
-                       return_value={"ok": False, "assignment_id": "", "error": "Person 'PRS-999' не найден"}):
+                 patch("business_core.business_builder.assign_person_to_role_canonical",
+                       return_value={"ok": False, "code": "PERSON_NOT_FOUND", "assignment_id": "", "error": "Person 'PRS-999' не найден"}):
                 await th.assignrole_cmd(upd, ctx)
 
         _run(run())
@@ -387,11 +387,11 @@ class TestAssignRoleCommand(unittest.TestCase):
 
         def fake_assign(person_id, role_id, start_date, **kwargs):
             captured["start_date"] = start_date
-            return {"ok": True, "assignment_id": "PRA-001", "error": None}
+            return {"ok": True, "code": "ASSIGNMENT_CREATED", "assignment_id": "PRA-001", "error": None}
 
         async def run():
             with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
-                 patch("business_core.organization_manager.assign_person_to_role", side_effect=fake_assign):
+                 patch("business_core.business_builder.assign_person_to_role_canonical", side_effect=fake_assign):
                 await th.assignrole_cmd(upd, ctx)
 
         _run(run())

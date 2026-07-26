@@ -47,6 +47,19 @@ ACTIVE_ROLE = {
 }
 
 ARCHIVED_ROLE = dict(ACTIVE_ROLE, status="archived")
+PLANNED_ROLE = dict(ACTIVE_ROLE, status="planned")
+PAUSED_ROLE = dict(ACTIVE_ROLE, status="paused")
+
+# Phase 35D (ADR-018 §16): assign_role_to_stage/reassign_stage_role now
+# also resolve the Role's parent Department — every test exercising a
+# Role eligibility path (including the pre-existing archived-Role case)
+# must mock find_department_by_id too.
+ACTIVE_DEPARTMENT = {
+    "row_num": 2, "department_id": "DEPT-001", "business_id": "BIZ-001",
+    "department_name": "Operations", "parent_department_id": "",
+    "head_role_id": "", "status": "active", "notes": "",
+}
+ARCHIVED_DEPARTMENT = dict(ACTIVE_DEPARTMENT, status="archived")
 
 ACTIVE_ASSIGNMENT = {
     "assignment_id": "PRA-001", "person_id": "PRS-001", "role_id": "ROLE-001",
@@ -301,6 +314,7 @@ class TestAssignRoleToStage(unittest.TestCase):
 
         with patch("business_core.sheets.find_row_by_id", return_value=(2, {})), \
              patch("business_core.organization_manager.find_role_by_id", return_value=dict(ACTIVE_ROLE)), \
+             patch("business_core.organization_manager.find_department_by_id", return_value=dict(ACTIVE_DEPARTMENT)), \
              patch("business_core.stage_entity_relations.get_relations_for_stage", return_value=()), \
              patch("business_core.stage_entity_relations.find_active_duplicate_relation", return_value=None), \
              patch("business_core.sheets.get_business_sheet", return_value=relation_sheet):
@@ -346,7 +360,35 @@ class TestAssignRoleToStage(unittest.TestCase):
              patch("business_core.organization_manager.find_role_by_id", return_value=dict(ARCHIVED_ROLE)):
             result = wam.assign_role_to_stage("STAGE-001", "ROLE-001")
         self.assertFalse(result["ok"])
-        self.assertIn("архивирована", result["error"])
+        self.assertEqual(result["code"], "ROLE_NOT_ACTIVE_FOR_STAGE_ASSIGNMENT")
+
+    def test_planned_role_rejected(self):
+        """Phase 35D (ADR-018 §16): a planned Role is pre-staffing, not
+        a valid current executor — new Stage responsibility is blocked,
+        not just for archived Roles as before this phase."""
+        wam = _fresh_wam()
+        with patch("business_core.sheets.find_row_by_id", return_value=(2, {})), \
+             patch("business_core.organization_manager.find_role_by_id", return_value=dict(PLANNED_ROLE)):
+            result = wam.assign_role_to_stage("STAGE-001", "ROLE-001")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "ROLE_NOT_ACTIVE_FOR_STAGE_ASSIGNMENT")
+
+    def test_paused_role_rejected(self):
+        wam = _fresh_wam()
+        with patch("business_core.sheets.find_row_by_id", return_value=(2, {})), \
+             patch("business_core.organization_manager.find_role_by_id", return_value=dict(PAUSED_ROLE)):
+            result = wam.assign_role_to_stage("STAGE-001", "ROLE-001")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "ROLE_NOT_ACTIVE_FOR_STAGE_ASSIGNMENT")
+
+    def test_archived_department_rejected(self):
+        wam = _fresh_wam()
+        with patch("business_core.sheets.find_row_by_id", return_value=(2, {})), \
+             patch("business_core.organization_manager.find_role_by_id", return_value=dict(ACTIVE_ROLE)), \
+             patch("business_core.organization_manager.find_department_by_id", return_value=dict(ARCHIVED_DEPARTMENT)):
+            result = wam.assign_role_to_stage("STAGE-001", "ROLE-001")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "DEPARTMENT_ARCHIVED")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -359,6 +401,7 @@ class TestDuplicateProtection(unittest.TestCase):
         wam = _fresh_wam()
         with patch("business_core.sheets.find_row_by_id", return_value=(2, {})), \
              patch("business_core.organization_manager.find_role_by_id", return_value=dict(ACTIVE_ROLE)), \
+             patch("business_core.organization_manager.find_department_by_id", return_value=dict(ACTIVE_DEPARTMENT)), \
              patch("business_core.stage_entity_relations.get_relations_for_stage",
                    return_value=(ACTIVE_ROLE_RELATION,)):
             result = wam.assign_role_to_stage("STAGE-001", "ROLE-002")
@@ -370,6 +413,7 @@ class TestDuplicateProtection(unittest.TestCase):
         wam = _fresh_wam()
         with patch("business_core.sheets.find_row_by_id", return_value=(2, {})), \
              patch("business_core.organization_manager.find_role_by_id", return_value=dict(ACTIVE_ROLE)), \
+             patch("business_core.organization_manager.find_department_by_id", return_value=dict(ACTIVE_DEPARTMENT)), \
              patch("business_core.stage_entity_relations.get_relations_for_stage", return_value=()), \
              patch("business_core.stage_entity_relations.find_active_duplicate_relation",
                    return_value=dict(ACTIVE_ROLE_RELATION)):
@@ -392,6 +436,7 @@ class TestReassignStageRole(unittest.TestCase):
 
         with patch("business_core.sheets.find_row_by_id", return_value=(2, {})), \
              patch("business_core.organization_manager.find_role_by_id", return_value=new_role), \
+             patch("business_core.organization_manager.find_department_by_id", return_value=dict(ACTIVE_DEPARTMENT)), \
              patch("business_core.stage_entity_relations.get_relations_for_stage",
                    return_value=(ACTIVE_ROLE_RELATION,)), \
              patch("business_core.sheets.get_business_sheet", return_value=relation_sheet):
@@ -411,6 +456,7 @@ class TestReassignStageRole(unittest.TestCase):
         wam = _fresh_wam()
         with patch("business_core.sheets.find_row_by_id", return_value=(2, {})), \
              patch("business_core.organization_manager.find_role_by_id", return_value=dict(ACTIVE_ROLE)), \
+             patch("business_core.organization_manager.find_department_by_id", return_value=dict(ACTIVE_DEPARTMENT)), \
              patch("business_core.stage_entity_relations.get_relations_for_stage",
                    return_value=(ACTIVE_ROLE_RELATION,)):
             result = wam.reassign_stage_role("STAGE-001", "ROLE-001")
@@ -426,6 +472,7 @@ class TestReassignStageRole(unittest.TestCase):
 
         with patch("business_core.sheets.find_row_by_id", return_value=(2, {})), \
              patch("business_core.organization_manager.find_role_by_id", return_value=dict(ACTIVE_ROLE)), \
+             patch("business_core.organization_manager.find_department_by_id", return_value=dict(ACTIVE_DEPARTMENT)), \
              patch("business_core.stage_entity_relations.get_relations_for_stage", return_value=()), \
              patch("business_core.sheets.get_business_sheet", return_value=relation_sheet):
             result = wam.reassign_stage_role("STAGE-001", "ROLE-001")
@@ -449,7 +496,15 @@ class TestReassignStageRole(unittest.TestCase):
              patch("business_core.organization_manager.find_role_by_id", return_value=dict(ARCHIVED_ROLE)):
             result = wam.reassign_stage_role("STAGE-001", "ROLE-001")
         self.assertFalse(result["ok"])
-        self.assertIn("архивирована", result["error"])
+        self.assertEqual(result["code"], "ROLE_NOT_ACTIVE_FOR_STAGE_ASSIGNMENT")
+
+    def test_reassign_planned_role_rejected(self):
+        wam = _fresh_wam()
+        with patch("business_core.sheets.find_row_by_id", return_value=(2, {})), \
+             patch("business_core.organization_manager.find_role_by_id", return_value=dict(PLANNED_ROLE)):
+            result = wam.reassign_stage_role("STAGE-001", "ROLE-001")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "ROLE_NOT_ACTIVE_FOR_STAGE_ASSIGNMENT")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -544,9 +599,16 @@ class TestImportGuardsAndCoreProtection(unittest.TestCase):
         self.assertNotIn("roadmap_manager", src)
 
     def test_never_writes_to_roadmap_stages_or_roadmaps(self):
-        """The only sheet this module ever writes to is
+        """The only sheet this module ever WRITES to is
         stage_entity_relations — confirmed by tracking every
-        get_business_sheet() call during a full write-path exercise."""
+        get_business_sheet() call during a full write-path exercise.
+
+        Phase 35D (ADR-018 §16) added a read-only parent-Department
+        eligibility check via organization_manager.find_department_by_id()
+        — a legitimate additional READ through the canonical Organization
+        API, not a direct or write access. "department_registry" is
+        therefore now an expected READ-only touch; ROADMAP_STAGES/
+        ROADMAPS remain forbidden entirely, matching this test's own name."""
         wam = _fresh_wam()
         relation_sheet, values = _make_relation_sheet([])
         touched_sheets = []
@@ -555,6 +617,18 @@ class TestImportGuardsAndCoreProtection(unittest.TestCase):
             touched_sheets.append(key)
             if key == "stage_entity_relations":
                 return relation_sheet
+            if key == "department_registry":
+                dept_sheet = MagicMock()
+                dept_cell = MagicMock()
+                dept_cell.row = 2
+                dept_sheet.find.return_value = dept_cell
+                dept_headers = [
+                    "Department ID", "Business ID", "Department Name",
+                    "Parent Department ID", "Head Role ID", "Status", "Notes",
+                ]
+                dept_row = ["DEPT-001", "BIZ-001", "Operations", "", "", "active", ""]
+                dept_sheet.row_values.side_effect = lambda r: dept_headers if r == 1 else dept_row
+                return dept_sheet
             raise AssertionError(f"work_assignment_manager must not touch sheet '{key}'")
 
         with patch("business_core.sheets.find_row_by_id", return_value=(2, {})), \
@@ -564,7 +638,7 @@ class TestImportGuardsAndCoreProtection(unittest.TestCase):
              patch("business_core.sheets.get_business_sheet", side_effect=fake_get_business_sheet):
             wam.assign_role_to_stage("STAGE-001", "ROLE-001")
 
-        self.assertEqual(set(touched_sheets), {"stage_entity_relations"})
+        self.assertEqual(set(touched_sheets), {"stage_entity_relations", "department_registry"})
 
     def test_env_not_modified_by_import(self):
         env_path = WORKSPACE / ".env"
