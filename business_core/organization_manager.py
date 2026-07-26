@@ -283,9 +283,19 @@ def create_department(
 
 
 _DEPARTMENT_EDITABLE_FIELDS = (
-    "Business ID", "Department Name", "Parent Department ID",
+    "Department Name", "Parent Department ID",
     "Head Role ID", "Status", "Notes",
 )
+
+# Phase 35G (ADR-018 §2, closing the Phase 35F identity-tightening
+# finding): Department ID and Business ID are both canonical identity —
+# neither may be rewritten via this ordinary update path. "Business ID"
+# was previously in _DEPARTMENT_EDITABLE_FIELDS (a Department could be
+# silently moved between Businesses via update_department()), which
+# this closes. No test ever positively exercised a successful Business
+# ID move (Phase 35F found none), so this is a zero-impact tightening,
+# not a behavior change any caller relied on.
+_DEPARTMENT_IDENTITY_FIELDS = ("Department ID", "Business ID")
 
 
 def update_department(department_id: str, updates: dict) -> dict:
@@ -296,59 +306,59 @@ def update_department(department_id: str, updates: dict) -> dict:
     Args:
         department_id: DEPT-xxx
         updates: {header_name: new_value}, только поля из
-                 _DEPARTMENT_EDITABLE_FIELDS. "Department ID" не может быть
-                 изменён (это ключ записи, не редактируемое поле).
+                 _DEPARTMENT_EDITABLE_FIELDS. "Department ID" и
+                 "Business ID" не могут быть изменены (Phase 35G / ADR-018
+                 §2 — оба являются неизменяемой идентичностью Department).
 
     Returns:
-        {"ok": bool, "changed": bool, "updated_fields": tuple, "error": str | None}
+        {"ok": bool, "changed": bool, "updated_fields": tuple, "code": str, "error": str | None}
     """
     if not department_id:
-        return {"ok": False, "changed": False, "updated_fields": (), "error": "department_id не указан"}
+        return {"ok": False, "changed": False, "updated_fields": (), "code": "", "error": "department_id не указан"}
+
+    identity_conflict = [k for k in updates if k in _DEPARTMENT_IDENTITY_FIELDS]
+    if identity_conflict:
+        return {
+            "ok": False, "changed": False, "updated_fields": (),
+            "code": "DEPARTMENT_IMMUTABLE_FIELD_CONFLICT",
+            "error": (
+                f"Поля {', '.join(identity_conflict)} являются неизменяемой идентичностью "
+                f"Department и не могут быть изменены через обычное обновление"
+            ),
+        }
 
     unknown = [k for k in updates if k not in _DEPARTMENT_EDITABLE_FIELDS]
     if unknown:
         return {
-            "ok": False, "changed": False, "updated_fields": (),
+            "ok": False, "changed": False, "updated_fields": (), "code": "",
             "error": f"Недопустимые поля для обновления: {', '.join(unknown)}",
         }
 
     if "Status" in updates and updates["Status"] not in DEPARTMENT_STATUS:
         return {
-            "ok": False, "changed": False, "updated_fields": (),
+            "ok": False, "changed": False, "updated_fields": (), "code": "INVALID_DEPARTMENT_STATUS",
             "error": f"Недопустимый статус '{updates['Status']}'. Допустимые значения: {', '.join(DEPARTMENT_STATUS)}",
         }
-
-    if "Business ID" in updates and updates["Business ID"]:
-        try:
-            from business_core.sheets import find_row_by_id
-            if not find_row_by_id("biz_registry", updates["Business ID"]):
-                return {
-                    "ok": False, "changed": False, "updated_fields": (),
-                    "error": f"Business '{updates['Business ID']}' не найден",
-                }
-        except Exception as exc:
-            log.error(f"update_department business_id validation error: {exc}")
-            return {"ok": False, "changed": False, "updated_fields": (), "error": str(exc)}
 
     if "Parent Department ID" in updates and updates["Parent Department ID"]:
         if updates["Parent Department ID"] == department_id:
             return {
-                "ok": False, "changed": False, "updated_fields": (),
+                "ok": False, "changed": False, "updated_fields": (), "code": "",
                 "error": "Department не может быть родителем самого себя",
             }
         if not find_department_by_id(updates["Parent Department ID"]):
             return {
-                "ok": False, "changed": False, "updated_fields": (),
+                "ok": False, "changed": False, "updated_fields": (), "code": "",
                 "error": f"Parent Department '{updates['Parent Department ID']}' не найден",
             }
 
     found = _find_department_row(department_id)
     if not found:
-        return {"ok": False, "changed": False, "updated_fields": (), "error": f"Department '{department_id}' не найден"}
+        return {"ok": False, "changed": False, "updated_fields": (), "code": "DEPARTMENT_NOT_FOUND", "error": f"Department '{department_id}' не найден"}
     row_num, current = found
 
     field_key_map = {
-        "Business ID": "Business ID", "Department Name": "Department Name",
+        "Department Name": "Department Name",
         "Parent Department ID": "Parent Department ID", "Head Role ID": "Head Role ID",
         "Status": "Status", "Notes": "Notes",
     }
@@ -373,10 +383,10 @@ def update_department(department_id: str, updates: dict) -> dict:
             changed = True
 
         log.info(f"update_department: {department_id} fields={updated_fields}")
-        return {"ok": True, "changed": changed, "updated_fields": tuple(updated_fields), "error": None}
+        return {"ok": True, "changed": changed, "updated_fields": tuple(updated_fields), "code": "", "error": None}
     except Exception as exc:
         log.error(f"update_department({department_id}) error: {exc}")
-        return {"ok": False, "changed": False, "updated_fields": (), "error": str(exc)}
+        return {"ok": False, "changed": False, "updated_fields": (), "code": "", "error": str(exc)}
 
 
 def archive_department(department_id: str) -> dict:

@@ -283,6 +283,79 @@ class TestUpdateDepartment(unittest.TestCase):
         self.assertIn("самого себя", result["error"])
 
 
+class TestDepartmentIdentityImmutability(unittest.TestCase):
+    """Phase 35G (ADR-018 §2, closing the Phase 35F finding): Department
+    ID and Business ID are both canonical identity — neither may be
+    rewritten via update_department()."""
+
+    def test_business_id_update_blocked_before_any_write(self):
+        om = _fresh_om()
+        sheet = _make_sheet(DEPARTMENT_HEADERS, list(DEPARTMENT_ROW))
+        with patch("business_core.sheets.get_business_sheet", return_value=sheet):
+            result = om.update_department("DEPT-001", {"Business ID": "BIZ-999"})
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "DEPARTMENT_IMMUTABLE_FIELD_CONFLICT")
+        self.assertIn("Business ID", result["error"])
+        sheet.update_cell.assert_not_called()
+        sheet.find.assert_not_called()
+
+    def test_department_id_update_blocked_before_any_write(self):
+        om = _fresh_om()
+        sheet = _make_sheet(DEPARTMENT_HEADERS, list(DEPARTMENT_ROW))
+        with patch("business_core.sheets.get_business_sheet", return_value=sheet):
+            result = om.update_department("DEPT-001", {"Department ID": "DEPT-999"})
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "DEPARTMENT_IMMUTABLE_FIELD_CONFLICT")
+        sheet.update_cell.assert_not_called()
+
+    def test_original_business_id_unchanged_after_blocked_attempt(self):
+        om = _fresh_om()
+        row = ["DEPT-001", "BIZ-001", "Executive", "", "", "active", ""]
+        sheet = _make_sheet(DEPARTMENT_HEADERS, row)
+        with patch("business_core.sheets.get_business_sheet", return_value=sheet):
+            om.update_department("DEPT-001", {"Business ID": "BIZ-999"})
+            dept = om.find_department_by_id("DEPT-001")
+        self.assertEqual(dept["business_id"], "BIZ-001")
+
+    def test_mixed_identity_and_mutable_fields_blocked_entirely(self):
+        """An update mixing an identity field with an otherwise-valid
+        mutable field must still be rejected wholesale — never a
+        partial write."""
+        om = _fresh_om()
+        sheet = _make_sheet(DEPARTMENT_HEADERS, list(DEPARTMENT_ROW))
+        with patch("business_core.sheets.get_business_sheet", return_value=sheet):
+            result = om.update_department("DEPT-001", {"Business ID": "BIZ-999", "Department Name": "New Name"})
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "DEPARTMENT_IMMUTABLE_FIELD_CONFLICT")
+        sheet.update_cell.assert_not_called()
+
+    def test_approved_mutable_fields_still_work(self):
+        om = _fresh_om()
+        sheet = _make_sheet(DEPARTMENT_HEADERS, list(DEPARTMENT_ROW))
+        with patch("business_core.sheets.get_business_sheet", return_value=sheet):
+            result = om.update_department("DEPT-001", {
+                "Department Name": "New Name", "Parent Department ID": "",
+                "Head Role ID": "ROLE-002", "Status": "active", "Notes": "x",
+            })
+        self.assertTrue(result["ok"])
+
+    def test_archived_department_lifecycle_behavior_unchanged(self):
+        """Archiving/idempotent-archive still routes through
+        update_department({"Status": ...}) unaffected by the identity
+        tightening — Status stays fully mutable."""
+        om = _fresh_om()
+        sheet = _make_sheet(DEPARTMENT_HEADERS, list(DEPARTMENT_ROW))
+        with patch("business_core.sheets.get_business_sheet", return_value=sheet):
+            result = om.archive_department("DEPT-001")
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["changed"])
+
+    def test_business_id_editable_fields_tuple_excludes_identity(self):
+        om = _fresh_om()
+        self.assertNotIn("Business ID", om._DEPARTMENT_EDITABLE_FIELDS)
+        self.assertNotIn("Department ID", om._DEPARTMENT_EDITABLE_FIELDS)
+
+
 class TestArchiveDepartment(unittest.TestCase):
 
     def test_archive_sets_status(self):

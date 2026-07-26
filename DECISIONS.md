@@ -2323,12 +2323,19 @@ Stage-relation логику.
    Department: Department ID. Role: Role ID. Role Function: Function
    ID. Person Role Assignment: Assignment ID. Stage Role Relation:
    Relation ID. Неизменяемые поля: Department (Department ID, Business
-   ID, Created); Role (Role ID, Department ID — перемещение Role между
-   Department не реализуется); Role Function (Function ID, Role ID);
-   Assignment (Assignment ID, Person ID, Role ID); Stage Role Relation
-   (Relation ID, Stage ID, Entity Type, Entity ID). Ни один
-   update-API не может переписать эти поля. Схема не меняется в этом
-   ADR.
+   ID); Role (Role ID, Department ID — перемещение Role между
+   Department не реализуется); Role Function (Function ID — см. Phase
+   35G §2 ниже: Role ID у Role Function является редактируемым
+   reference-полем, НЕ идентичностью); Assignment (Assignment ID,
+   Person ID, Role ID); Stage Role Relation (Relation ID, Stage ID,
+   Entity Type, Entity ID). Ни один update-API не может переписать эти
+   поля (кроме документированного исключения Role Function.Role ID).
+   Схема не меняется в этом ADR.
+
+   [Phase 35G, закрытие находки Phase 35F: пункт "Department (…,
+   Created)" в исходной формулировке ссылался на несуществующее поле —
+   DEPARTMENT_REGISTRY никогда не имел колонки Created/timestamp;
+   формулировка выше исправлена, это не поведенческое изменение.]
 
 3. Business-принадлежность Department.
 
@@ -2671,3 +2678,52 @@ Assignment reactivation в той же строке), оформленные к�
 рамках этого ADR — только архитектурное решение. Ни один
 production-caller не мигрирован, ни один код не изменён, схема
 Organization-реестров не менялась.
+
+Дополнение (Phase 35G — закрытие находки Phase 35F):
+
+Phase 35F (Organization Domain Closeout Audit) нашёл два расхождения
+между §2 этого ADR и фактической реализацией:
+
+1. Department.Business ID оставался редактируемым через
+   update_department() (был в _DEPARTMENT_EDITABLE_FIELDS), хотя §2
+   декларировал его неизменяемым. Ни один caller/тест никогда не
+   полагался на успешное изменение Business ID — Phase 35F
+   подтвердила это прямым поиском. Решение: закрыто в Phase 35G —
+   "Business ID" убран из _DEPARTMENT_EDITABLE_FIELDS; попытка
+   изменить Department ID или Business ID через update_department()
+   теперь блокируется кодом DEPARTMENT_IMMUTABLE_FIELD_CONFLICT ДО
+   любой записи. Нулевое поведенческое влияние на существующих
+   caller'ов (подтверждено тестами).
+
+2. Role Function.Role ID оставался редактируемым через
+   update_role_function(), и существующий тест
+   (test_reassign_function_to_different_role,
+   test_business_organization_function_assignment.py) явно проверяет
+   успешное переназначение — это не случайный пробел, а
+   спроектированная, задокументированная в коде (комментарий "Phase
+   20A revised §6") возможность "перенести эту функцию с одной Role на
+   другую". Phase 35G выбирает Вариант B (одобренное исключение), а не
+   Вариант A (запрет), по следующим причинам:
+     - Role Function — это документация ответственности
+       (function_category/function_name/description), НЕ historical
+       record: в отличие от Person Role Assignment и Stage Role
+       Relation, ROLE_FUNCTIONS не хранит историю по дизайну (нет
+       append-only-паттерна, нет Start/End Date) — это текущее
+       состояние документации, не журнал событий.
+     - Ни один caller, тест или production-ряд не зависит от Role ID
+       Role Function как identity-инварианта; Function ID остаётся
+       единственной идентичностью и НЕ меняется этим решением.
+     - Role Functions никогда не участвуют в eligibility/assignment/
+       resolution логике (подтверждено Phase 35F §8) — перемещение
+       Function между Role не может нарушить Person↔Role assignment
+       или Stage→Role resolution целостность, потому что ни один из
+       этих путей никогда их не читает.
+   Итоговое решение: Role Function.Role ID официально
+   ЗАДОКУМЕНТИРОВАННОЕ ИСКЛЮЧЕНИЕ — редактируемое
+   ownership/reference-поле, НЕ идентичность. Function ID остаётся
+   единственной неизменяемой идентичностью Role Function. Существующий
+   позитивный тест переноса сохранён без изменений.
+
+Статус (Phase 35G): оба расхождения закрыты. §2 выше исправлен, чтобы
+не противоречить фактической реализации. Organization Domain
+identity-политика теперь внутренне согласована.

@@ -368,5 +368,67 @@ class TestSensitiveOrganizationValuesAreNotLogged(unittest.TestCase):
                     self.assertNotIn(token, line, f"{fn_name} logs disallowed token {token!r}: {line}")
 
 
+# ─────────────────────────────────────────────────────────────
+# Phase 35G (ADR-018 §2, closing the Phase 35F identity-tightening
+# finding): Department identity immutability + the documented Role
+# Function.Role ID exception.
+# ─────────────────────────────────────────────────────────────
+
+class TestDepartmentIdentityFieldsAreImmutable(unittest.TestCase):
+
+    def test_business_id_and_department_id_excluded_from_editable_fields(self):
+        import business_core.organization_manager as om
+        self.assertNotIn("Business ID", om._DEPARTMENT_EDITABLE_FIELDS)
+        self.assertNotIn("Department ID", om._DEPARTMENT_EDITABLE_FIELDS)
+
+    def test_identity_conflict_code_exists_and_is_checked_before_any_other_validation(self):
+        path = BUSINESS_CORE / "organization_manager.py"
+        src = path.read_text(encoding="utf-8")
+        self.assertIn("DEPARTMENT_IMMUTABLE_FIELD_CONFLICT", src)
+        start = src.index("def update_department(")
+        end = src.index("\ndef ", start + 10)
+        body = src[start:end]
+        conflict_pos = body.index("DEPARTMENT_IMMUTABLE_FIELD_CONFLICT")
+        write_pos = body.index("sheet.update_cell(")
+        self.assertLess(conflict_pos, write_pos, "identity check must run before any Sheets write")
+
+
+class TestRoleFunctionRoleIdDocumentedException(unittest.TestCase):
+    """ADR-018 §2 (Phase 35G addendum): Role Function.Role ID is an
+    approved, documented exception — an editable ownership/reference
+    field, not identity. Function ID remains the sole immutable
+    identity. This guard proves the decision is recorded in DECISIONS.md
+    (not a silent, undocumented compromise) and that Function ID itself
+    stays non-editable."""
+
+    def test_function_id_remains_non_editable(self):
+        import business_core.organization_manager as om
+        self.assertNotIn("Function ID", om._ROLE_FUNCTION_EDITABLE_FIELDS)
+
+    def test_role_id_mutability_is_recorded_in_decisions_md(self):
+        path = WORKSPACE / "DECISIONS.md"
+        src = path.read_text(encoding="utf-8")
+        self.assertIn("Role Function.Role ID", src)
+        self.assertIn("ЗАДОКУМЕНТИРОВАННОЕ ИСКЛЮЧЕНИЕ", src)
+
+
+class TestTelegramCannotBypassIdentityPolicy(unittest.TestCase):
+    """No Organization-facing Telegram command may pass Department ID/
+    Business ID through to update_department(), and none may write
+    Organization registries directly (already guarded above; reasserted
+    here scoped specifically to the identity-tightening surface)."""
+
+    def test_no_command_updates_department_identity_fields(self):
+        path = BUSINESS_CORE / "telegram_handlers.py"
+        src = path.read_text(encoding="utf-8")
+        for fn_name in (
+            "newdept_cmd", "newrole_cmd", "roles_cmd", "roledetails_cmd",
+            "assignrole_cmd", "assignstagerole_cmd", "reassignstagerole_cmd",
+            "stageresponsibility_cmd",
+        ):
+            body = _function_body(src, fn_name)
+            self.assertNotIn("update_department(", body)
+
+
 if __name__ == "__main__":
     unittest.main()
