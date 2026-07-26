@@ -156,10 +156,36 @@ _DOCUMENT_DOMAIN_TEST_FILES = frozenset({
     "test_document_upload_validation.py",
 })
 
+# Phase 38A.1: Phase 38A's Checklist Domain architecture audit found
+# test_business_knowledge_core.py and 12 of 16 test_seed_izhs_*.py
+# files (which test the scripts that created the actual production
+# checklist_registry/sop_registry/document_template_registry rows)
+# missing from this registry — the same PRS-003-class gap found for
+# every prior domain. Closed here, BEFORE any Checklist Domain
+# Foundation work begins, per that audit's explicit blocking finding
+# (CHECKLIST_TESTS_HAVE_HARD_SOCKET_BLOCK = NO).
+_CHECKLIST_KNOWLEDGE_TEST_FILES = frozenset({
+    "test_business_knowledge_core.py",
+    "test_seed_izhs_almaty_demolition.py",
+    "test_seed_izhs_almaty_newbuild.py",
+    "test_seed_izhs_almaty_outbuilding.py",
+    "test_seed_izhs_almaty_standard_reconstruction_finished_smr.py",
+    "test_seed_izhs_astana_demolition.py",
+    "test_seed_izhs_astana_newbuild.py",
+    "test_seed_izhs_astana_outbuilding.py",
+    "test_seed_izhs_astana_reconstruction.py",
+    "test_seed_izhs_commercial_offer_templates.py",
+    "test_seed_izhs_intake_sop.py",
+    "test_seed_izhs_router_sop.py",
+    "test_seed_izhs_whatsapp_templates.py",
+    "test_checklist_knowledge_mock_completeness.py",
+})
+
 _HARD_SOCKET_BLOCK_TEST_FILES = (
     _CLIENT_DOMAIN_TEST_FILES | _ROADMAP_DOMAIN_TEST_FILES
     | _ORGANIZATION_DOMAIN_TEST_FILES | _OTHER_HARDENED_TEST_FILES
     | _TASK_DOMAIN_TEST_FILES | _DOCUMENT_DOMAIN_TEST_FILES
+    | _CHECKLIST_KNOWLEDGE_TEST_FILES
 )
 
 
