@@ -2272,3 +2272,402 @@ machine, не вводится schema-миграция, не создаются 
 рамках этого ADR — только архитектурное решение. Ни один
 production-caller не мигрирован, ни один код не изменён, схема
 ROADMAP_STAGES не менялась.
+
+## ADR-018 — Organization Domain Ownership & Eligibility (Phase 35C)
+
+Контекст:
+
+Phase 35B (Organization Domain Architecture Audit, read-only) подтвердила,
+что persistence-слой Organization Domain (organization_manager.py —
+единственный transactional writer DEPARTMENT_REGISTRY/ROLE_REGISTRY/
+ROLE_FUNCTIONS/PERSON_ROLE_ASSIGNMENTS; work_assignment_manager.py —
+канонический владелец Stage→Role responsibility поверх
+STAGE_ENTITY_RELATIONS) уже корректен и не пересматривается этим ADR.
+В отличие от Service/Object/Client/Roadmap/Stage, у Organization Domain
+никогда не было своего ADR — вся текущая логика построена до введения
+дисциплины Audit→ADR→Foundation→Closeout. Аудит нашёл два конкретных,
+подтверждённых кодом пробела: (1) organization_manager.
+assign_person_to_role() проверяет существование Person, но не
+проверяет is_person_archived() — архивированный Person сегодня может
+быть назначен на любую Role; (2) та же функция не проверяет статус
+Role вообще — planned/paused/archived Role одинаково принимают новое
+назначение, хотя work_assignment_manager.assign_role_to_stage() уже
+блокирует archived Role на уровне Stage-relation. Аудит также
+зафиксировал реальное, не гипотетическое расхождение в production:
+ROLE-001 имеет ноль активных Person Assignment (единственная запись
+PRA-001 — ended), поэтому все 8 Stage у RM-001 канонически резолвятся
+как "vacant", тогда как их свободно-текстовое поле Responsible
+заполнено другими значениями — ничто это не согласовывает и не
+показывает пользователю. Это решение закрывает эти пробелы минимально
+— тем же принципом, каким ADR-013…ADR-017 закрыли аналогичные пробелы
+для своих доменов — не редизайня уже корректную persistence и
+Stage-relation логику.
+
+Решения:
+
+1. Канонические владельцы persistence.
+
+   organization_manager.py остаётся единственным transactional-
+   владельцем DEPARTMENT_REGISTRY, ROLE_REGISTRY, ROLE_FUNCTIONS,
+   PERSON_ROLE_ASSIGNMENTS. work_assignment_manager.py остаётся
+   каноническим orchestration-владельцем Stage→Role responsibility,
+   используя STAGE_ENTITY_RELATIONS (через stage_entity_relations.py)
+   как persistence-границу для role-type relation. telegram_handlers.py
+   и business_builder.py не пишут эти реестры напрямую — уже так
+   сегодня (Phase 35B подтвердила ноль нарушений), этим ADR не
+   меняется. Второй реализации идентичности не вводится. Обратных
+   импортов/циклов не вводится.
+
+2. Канонические идентичности и неизменяемые поля.
+
+   Department: Department ID. Role: Role ID. Role Function: Function
+   ID. Person Role Assignment: Assignment ID. Stage Role Relation:
+   Relation ID. Неизменяемые поля: Department (Department ID, Business
+   ID, Created); Role (Role ID, Department ID — перемещение Role между
+   Department не реализуется); Role Function (Function ID, Role ID);
+   Assignment (Assignment ID, Person ID, Role ID); Stage Role Relation
+   (Relation ID, Stage ID, Entity Type, Entity ID). Ни один
+   update-API не может переписать эти поля. Схема не меняется в этом
+   ADR.
+
+3. Business-принадлежность Department.
+
+   Текущий дизайн сохраняется: Business ID у Department опционален;
+   пустой Business ID означает явно глобальный/общий Department;
+   Business ID валидируется только если указан (против BIZ_REGISTRY);
+   Business status eligibility остаётся отложенным (тот же принцип,
+   что ADR-016 §2 уже применило к Roadmap — BIZ_REGISTRY не имеет
+   канонической owned status-модели); никакого silent переноса
+   Department между Business не существует и не вводится.
+
+4. Жизненный цикл Department.
+
+   Статусы active/archived сохраняются без изменений. Утверждено:
+   ARCHIVED_DEPARTMENT_CAN_RECEIVE_NEW_ROLE = NO — будущая
+   orchestration-функция создания Role должна проверять статус
+   родительского Department и блокировать создание новой Role под
+   archived Department кодом DEPARTMENT_ARCHIVED. Архивирование
+   остаётся мягким (soft) и НЕ каскадным (подтверждено существующим
+   regression-тестом — archive_department() не трогает
+   role_registry) — это поведение подтверждается как обязательное, не
+   переизобретается. Существующие Role сохраняются как есть. Hard
+   delete не вводится. Автоматической реактивации не существует.
+
+5. Жизненный цикл Role.
+
+   Статусы planned/active/paused/archived сохраняются без изменений.
+   Eligibility для НОВОГО Person Role Assignment:
+     planned:  разрешено (пре-стаффинг), но Stage responsibility НЕ
+               получает, пока Role не станет active;
+     active:   разрешено и для Assignment, и для Stage responsibility;
+     paused:   существующие Assignment и Stage relations сохраняются
+               без изменений; новый Assignment и новая Stage
+               responsibility — заблокированы;
+     archived: то же самое, что paused, плюс read-паттерны (`resolve_
+               stage_responsibility`) должны явно показывать
+               archived_role как configuration-состояние, а не
+               молчать.
+   Никакого автоматического изменения существующих Assignment при
+   смене статуса Role не происходит — только будущие записи меняют
+   поведение.
+
+6. Transition-политика Role.
+
+   Утверждена минимальная матрица:
+     planned  → planned, active, archived
+     active   → active, paused, archived
+     paused   → paused, active, archived
+     archived → archived только через обычный update
+   Выход из archived через обычный update ЗАБЛОКИРОВАН — требуется
+   отдельное явное действие restore (код
+   ROLE_RESTORE_REQUIRES_EXPLICIT_ACTION), которое НЕ реализуется в
+   Phase 35D, только фиксируется инвариант и код ошибки — тот же
+   принцип, что ADR-017 уже применило к Stage reopen.
+
+7. Семантика Role Function.
+
+   Подтверждено: Role Function — документация обязанностей/
+   ответственности Role, НЕ исполняемая задача, НЕ экземпляр
+   checklist, НЕ назначение сотруднику. Текущие поля и поведение
+   сохраняются без изменений. Organization Domain не генерирует Task
+   из Role Function.
+
+8. Person eligibility.
+
+   Для НОВОГО Person Role Assignment утверждены обязательные гейты:
+   Person должен существовать (PERSON_NOT_FOUND); Person не должен
+   быть archived (PERSON_ARCHIVED, проверка через уже существующую
+   person_manager.is_person_archived()) — PRS-003 структурно
+   заблокирован этим правилом для ЛЮБОГО будущего назначения, без
+   изменения самой записи PRS-003. Никакой автоматической
+   реактивации Person не происходит. Никакой мутации person_type не
+   происходит. Специальный "employee" person_type НЕ требуется в этой
+   фазе. Employment/contractor-семантика остаётся отложенной.
+
+9. Role eligibility для Person assignment.
+
+   planned:  разрешено. active: разрешено. paused: заблокировано
+   (ROLE_PAUSED). archived: заблокировано (ROLE_ARCHIVED). Role
+   должна существовать (ROLE_NOT_FOUND). Валидация происходит до
+   любой записи Assignment.
+
+10. Department eligibility для Role assignment.
+
+    Родительский Department Role должен существовать
+    (DEPARTMENT_NOT_FOUND); archived родительский Department блокирует
+    НОВОЕ Person assignment (DEPARTMENT_ARCHIVED) — тем же принципом,
+    что и решение 4. Существующий исторический Assignment не
+    затрагивается.
+
+11. Кросс-Business семантика.
+
+    Принят Вариант A+B в комбинации, ровно как и предложено: если
+    Department.Business ID пуст — Role глобальна, Person Business
+    membership НЕ требуется; если Department.Business ID заполнен —
+    Person должен быть привязан к этому же Business
+    (PERSON_NOT_LINKED_TO_BUSINESS при отсутствии привязки,
+    PERSON_ROLE_BUSINESS_MISMATCH при привязке к другому Business),
+    кросс-Business назначение блокируется. Используется существующий
+    person_manager.has_person_business_link() — новая система
+    membership не изобретается. Business ID НЕ добавляется ни в Role,
+    ни в Assignment — Business принадлежность Role по-прежнему
+    выводится исключительно через Department (без изменения схемы).
+
+12. Идентичность и duplicate-политика Assignment.
+
+    Assignment ID остаётся глобально уникальным. Множественные
+    активные Role на одного Person разрешены (multi-role, без
+    изменений). Множественные активные People на одну Role разрешены
+    (без изменений). Для ТОЧНОГО дубликата (тот же Person ID + тот же
+    Role ID, оба active одновременно): ноль совпадающих active
+    Assignment → создать (ASSIGNMENT_CREATED); ровно один совпадающий
+    active Assignment → переиспользовать, idempotent no-op
+    (ASSIGNMENT_REUSED); более одного совпадающего active Assignment
+    (уже существующая целостностная аномалия, если возникнет) →
+    блокирующая ошибка (MULTIPLE_ACTIVE_ASSIGNMENTS_INTEGRITY_ERROR),
+    без произвольного выбора первого — тот же принцип, что ADR-016 §9
+    уже применило к дублирующимся открытым Roadmap.
+
+13. Vocabulary и transition-политика статуса Assignment.
+
+    Статусы active/paused/ended сохраняются без изменений. Неизвестные
+    значения остаются незаписываемыми. Утверждена минимальная матрица:
+      active → active, paused, ended
+      paused → paused, active, ended
+      ended  → ended только через обычный update
+    Реактивация из ended НЕ переиспользует старую строку — требуется
+    СОЗДАНИЕ НОВОЙ строки Assignment (нового периода трудоустройства/
+    участия), а не мутация исторической. Код
+    ASSIGNMENT_ENDED_IMMUTABLE фиксирует этот инвариант для будущей
+    orchestration-функции.
+
+14. История и неизменяемость Assignment.
+
+    ended-строки Assignment — исторические записи. Person ID и Role ID
+    неизменяемы. Hard delete не существует и не вводится. Start Date
+    сохраняется, End Date выставляется при завершении. Старая строка
+    никогда не переиспользуется для нового периода — для этого
+    создаётся новый Assignment ID (см. решение 13). Никакой
+    production-перезаписи не происходит в рамках этого ADR.
+
+15. Владелец assignment-orchestration.
+
+    Принят предпочтённый вариант: business_builder.py становится
+    владельцем будущей cross-entity orchestration-функции для Person
+    Role Assignment (рабочее имя `assign_person_to_role_validated()`
+    или аналогичное, точное имя решает Phase 35D) — она проверяет
+    Person (решение 8), Role (решение 9), Department (решение 10),
+    Business membership (решение 11), duplicate-политику (решение 12)
+    ДО вызова organization_manager.assign_person_to_role() (низкоуровневая
+    persistence, без изменений). organization_manager.py остаётся
+    persistence-only и не приобретает эту orchestration-логику — тот
+    же принцип разделения, что ADR-016 и ADR-017 уже применили к
+    Roadmap-созданию и Stage-transition. Telegram только парсит и
+    рендерит. Второй реализации этой валидации нигде не создаётся.
+
+16. Политика Stage→Role relation.
+
+    Сохраняются без изменений: ровно одна активная Role-relation на
+    Stage; reassign создаёт новую Relation-строку и деактивирует
+    старую; история сохраняется; idempotent no-op при повторном
+    назначении той же Role; hard delete не существует. Eligibility для
+    НОВОЙ/переназначаемой Role: active — разрешено; planned/paused/
+    archived — заблокировано (код ROLE_NOT_ACTIVE_FOR_STAGE_ASSIGNMENT
+    — ужесточение по сравнению с текущим кодом, который сегодня
+    блокирует только archived, но не planned/paused; это единственное
+    расхождение с "не менять существующее поведение", явно
+    обосновано: Stage responsibility — это АКТИВНОЕ исполнение
+    процесса, а не пре-стаффинг, поэтому planned/paused Role логически
+    не могут быть исполнителем прямо сейчас). Родительский Department
+    Role должен существовать; archived Department блокирует НОВОЕ
+    Stage-назначение (код DEPARTMENT_ARCHIVED), тем же принципом, что
+    и решение 10.
+
+17. Поведение существующих Stage relations после смены статуса Role.
+
+    Явно принята non-cascade политика: пауза или архивирование Role
+    НЕ деактивирует автоматически исторические Stage relations —
+    ничего не переписывается и не удаляется. resolve_stage_
+    responsibility() должен явно возвращать paused_role/archived_role/
+    vacant_role как отдельные configuration-состояния (не просто
+    единый generic "configuration_error", как сегодня, — уточнение
+    видимости, не поведения) — точное имя полей решает Phase 35D.
+    Будущее создание Task не должно трактовать эти состояния как
+    валидного исполнителя. Автоматического ремонта не происходит.
+    Существующие production-relations не изменяются в рамках этого
+    ADR.
+
+18. Границы Stage Responsible.
+
+    Утверждено НАВСЕГДА (в дополнение к тому, что уже задокументировано
+    для Stage Domain): ROADMAP_STAGES.Responsible остаётся
+    информационным свободным текстом; НЕ является канонической
+    ответственностью; НЕ используется для авторизации; НЕ определяет
+    будущего Task assignee. Канонической ответственностью остаётся
+    Stage→Role relation, канонический исполнитель разрешается через
+    активные Person Role Assignment на эту Role. Поле сохраняется для
+    исторического/шаблонного отображения, помечается как
+    информационное в будущем UX, автоматически НЕ сверяется с
+    канонической записью. Production не переписывается.
+
+19. Концепция Employee.
+
+    Employee-сущность не создаётся. Organization Domain использует
+    Person Role Assignment как представление организационного участия
+    Person. Трудовые договоры, зарплата, отпуска, HR-документы
+    остаются вне Organization Domain. Специальный employee person_type
+    не требуется в этой фазе.
+
+20. Граница Permissions.
+
+    Permission Domain не реализуется в Phase 35D. Organization-команды
+    остаются доверенными только по операционному контексту (единый
+    доверенный оператор — тот же принцип, что и весь остальной бот
+    сегодня). Будущий multi-user access control — отдельный будущий
+    Permission Domain. Self-service сотрудника и фильтрация "только
+    моя работа" не реализуются в этом цикле. Зафиксировано как
+    принятый, осознанный технический долг, а не молчаливо
+    проигнорированный пробел.
+
+21. Структурированный контракт результата (assignment orchestration).
+
+    Новая orchestration-функция (решение 15) возвращает как минимум:
+    ok, code, error, department_id, role_id, person_id, assignment_id,
+    assignment_created, assignment_reused, previous_status,
+    final_status, warnings, conflicting_assignment_ids, retry_safe.
+
+    Машиночитаемые коды (минимум): PERSON_NOT_FOUND, PERSON_ARCHIVED,
+    ROLE_NOT_FOUND, ROLE_PAUSED, ROLE_ARCHIVED, DEPARTMENT_NOT_FOUND,
+    DEPARTMENT_ARCHIVED, PERSON_NOT_LINKED_TO_BUSINESS,
+    PERSON_ROLE_BUSINESS_MISMATCH, ASSIGNMENT_CREATED,
+    ASSIGNMENT_REUSED, MULTIPLE_ACTIVE_ASSIGNMENTS_INTEGRITY_ERROR,
+    ASSIGNMENT_ENDED_IMMUTABLE, ROLE_RESTORE_REQUIRES_EXPLICIT_ACTION,
+    INVALID_ROLE_STATUS, INVALID_ASSIGNMENT_STATUS. Для Stage Role
+    assignment дополнительно: STAGE_NOT_FOUND,
+    ROLE_NOT_ACTIVE_FOR_STAGE_ASSIGNMENT, STAGE_ROLE_ASSIGNED,
+    STAGE_ROLE_REUSED, STAGE_ROLE_REASSIGNED,
+    MULTIPLE_ACTIVE_STAGE_ROLE_RELATIONS_INTEGRITY_ERROR. Русский
+    пользовательский текст остаётся исключительно в
+    telegram_handlers.py (централизованный маппинг, тот же паттерн,
+    что Phase 33D/34D уже применили).
+
+22. Коды результата создания Department/Role.
+
+    Department: DEPARTMENT_CREATED, DEPARTMENT_DUPLICATE,
+    DEPARTMENT_NOT_FOUND, DEPARTMENT_ARCHIVED, INVALID_DEPARTMENT_STATUS.
+    Role: ROLE_CREATED, ROLE_DUPLICATE, ROLE_NOT_FOUND, ROLE_PAUSED,
+    ROLE_ARCHIVED, INVALID_ROLE_STATUS, DEPARTMENT_NOT_FOUND,
+    DEPARTMENT_ARCHIVED. Новые orchestration-пути не используют
+    бизнес-логику на основе только строк текста ошибки; существующие
+    строки могут временно сохраняться как compatibility-wrapper для
+    уже существующих вызывающих.
+
+23. Приватность и логирование.
+
+    Разрешено логировать: code, Department ID, Role ID, Assignment ID,
+    Relation ID, Person ID, значения статусов, флаги changed/reused.
+    Запрещено логировать: номера телефонов, Notes, Purpose, Main
+    Result, полное имя Person без необходимости, документы, полное
+    тело Telegram-сообщения, credentials/токены — тот же стандарт, что
+    уже применён к Stage Domain (ADR-017 §23).
+
+24. Изоляция тестов.
+
+    Обязательно до Phase 35D реализации: все 9 файлов
+    (test_business_organization_commands.py,
+    test_business_organization_department_role.py,
+    test_business_organization_duplicate_protection.py,
+    test_business_organization_function_assignment.py,
+    test_business_organization_integration.py,
+    test_business_organization_schema.py,
+    test_business_organization_seed.py,
+    test_business_work_assignment.py, test_inbox_bridge.py)
+    добавляются в hard socket-block реестр conftest.py — закрывает
+    находку Phase 35B. Все новые Phase 35D Organization-тесты — под
+    hard socket-block. Никакого обращения к живым Google/Drive/
+    Telegram/Railway/HTTP/сокетам. Моки должны соответствовать
+    реальным call site после изменений. AST-guard, подтверждающий
+    отсутствие второй реализации eligibility-политики. Production-
+    снимок до и после тестов идентичен. Инцидент PRS-003 остаётся
+    постоянным прецедентом.
+
+25. Production migration.
+
+    PRODUCTION_SCHEMA_MIGRATION_REQUIRED = NO
+    PRODUCTION_DATA_REWRITE_REQUIRED = NO
+
+    PRA-001 не реактивируется. Новый Person Assignment не создаётся.
+    Stage Responsible не сверяется автоматически. Stage Role relations
+    не деактивируются. Вакансия (ROLE-001 без активного Assignment) не
+    "чинится". PRS-003 не изменяется. Изменяется только поведение
+    БУДУЩИХ записей (Phase 35D), задним числом ничего не проверяется и
+    не переписывается.
+
+26. Контракт для Task Domain.
+
+    Task Domain (будущая отдельная фаза) может полагаться ТОЛЬКО на
+    следующие гарантии Organization Domain: assignee-Person должен
+    существовать и не быть archived; assignee-Role должна быть active
+    для реального исполнения; paused/archived Role не может получить
+    новую работу; Business-scoped Role требует Person Business
+    membership; глобальная Role принимает любого eligible Person;
+    история назначений неизменяема; Task Domain НЕ должен использовать
+    Stage Responsible свободный текст как источник истины; Task Domain
+    НЕ должен изобретать вторую систему назначений. Схема и словарь
+    статусов Task здесь НЕ утверждаются — это предмет отдельного Task
+    ADR.
+
+27. Явно отложено (Deferred).
+
+    Permission Domain; employee self-service; HR/payroll; трудовые
+    договоры; команда Role restore; команда Assignment restore;
+    lifecycle Telegram-команды (archive/pause/end через бота);
+    автоматические каскады; сверка Stage Responsible; уведомления о
+    вакансии; Task Domain; multi-user visibility; audit log сверх уже
+    существующей истории строк; schema timestamps там, где их сейчас
+    нет (PERSON_ROLE_ASSIGNMENTS).
+
+Причина:
+
+Тот же архитектурный принцип, применённый ADR-013…ADR-017 к границам
+Business/Client/Object/Service/Roadmap-создания и Stage-transition,
+здесь применяется к границе Person↔Role assignment — единственной
+содержательной незакрытой границе в уже корректно устроенном
+Organization Domain. Phase 35B не нашла нарушений владения или циклов
+зависимостей; реальная проблема — отсутствие проверки Person/Role/
+Department eligibility перед записью Assignment, что структурно
+допускает назначение archived Person или неактивной Role, и служит
+слабым основанием для будущего Task Domain, который иначе унаследовал
+бы эти же пробелы без явного решения. Решение здесь минимально: не
+вводится новая Employee-сущность, не вводится Permission Domain, не
+меняется схема — добавляется только проверка eligibility (Person/Role/
+Department/Business) и явные запреты (Role restore из archived,
+Assignment reactivation в той же строке), оформленные как
+структурированные, машиночитаемые коды.
+
+Статус:
+
+Утверждено для реализации (Phase 35D). Ничего не реализовано в
+рамках этого ADR — только архитектурное решение. Ни один
+production-caller не мигрирован, ни один код не изменён, схема
+Organization-реестров не менялась.
