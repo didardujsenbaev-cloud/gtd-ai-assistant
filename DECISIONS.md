@@ -3169,3 +3169,517 @@ task_assignments не созданы. Ни один production-caller не ми�
 ни один код не изменён, схема Google Sheets не менялась. GTD Core
 (`/tasks`, inbox_processor.py, telegram_bot.py, project_planner.py,
 calendar_sync.py) не затронут.
+
+
+## ADR-020 — Document Domain Architecture Decision (Phase 37C)
+
+Контекст:
+
+Phase 37B (Document Domain Architecture Audit, read-only) нашла домен
+существенно более зрелым, чем предполагалось при выборе (Phase 37A):
+уже существует частичный persistence-модуль
+(`document_registry_manager.py` — генерация ID, разрешение и
+кросс-валидация связей, выбор Drive-папки, устаревший
+stage-scoped алгоритм missing-document), полностью изолированная и
+приватность-дисциплинированная AI-подсистема
+(`document_intelligence.py` — никогда не пишет `document_registry`,
+всегда bounded-логирование), отдельный более полный evaluator
+требований (`document_requirements_query.py`), и 376 уже проходящих
+тестов (в 4 файлах, ни один не зарегистрирован в hard socket-block —
+самая критичная находка аудита). Реальный архитектурный пробел уже,
+чем предполагалось изначально при выборе домена: сама
+запись `append_business_row("document_registry", ...)` выполняется
+напрямую внутри `telegram_handlers.py` (`registerdoc_confirm()` и
+`uploaddoc_confirm()`), никакого business_builder-orchestration нет,
+никакого структурированного result-контракта нет, и существуют два
+конкурирующих алгоритма missing-document
+(`compute_stage_document_status()` устаревший рядом с более полным
+`evaluate_scope()`). Оба существующих production-ряда (DREG-001,
+DREG-002) корректны и не требуют миграции. Это решение — тот же
+архитектурный принцип, применённый ADR-013…ADR-019 к
+Service/Object/Client/Roadmap/Stage/Organization/Task — здесь впервые
+применяется к домену, где значительная часть логики уже написана
+качественно и нуждается в формализации владения, а не в редизайне.
+
+Решения:
+
+1. Канонические границы сущностей.
+
+   Operational Document — канонический Document Domain entity.
+   Реестр: document_registry. Идентичность: Document ID, префикс
+   `DREG-`. Operational Document — источник истины для business
+   ownership, business-entity связей, document lifecycle, Drive file
+   references, version family, version number, upload-метаданных и
+   (в будущем) текущих review-полей.
+
+   Document Template остаётся отдельной supporting reference
+   подсистемой: document_template_registry, владелец —
+   knowledge_manager.py без изменений. Document Template НЕ является
+   идентичностью Operational Document; Document Domain может читать
+   его для классификации и требований, но не берёт на себя владение
+   его persistence.
+
+   Document Requirement НЕ вводится как хранимая сущность в
+   foundation — требования остаются детерминированным derived view
+   поверх связей Document Template↔Stage/knowledge relations; никакого
+   реестра document_requirements в Phase 37D.
+
+   Document Content / AI Analysis остаётся derived intelligence
+   данными; владелец — document_intelligence.py без изменений; НЕ
+   является идентичностью Operational Document; анализ опционален;
+   сбой анализа не может испортить Document lifecycle; AI не может
+   approve/reject/review/archive или иным образом менять operational
+   truth — AI-классификация производит только suggestions.
+
+   Drive File — внешняя ссылка на файл, не идентичность Document;
+   Drive-интеграция владеет фактическим хранением файла; Document
+   Domain владеет каноническими reference-полями; Drive URL —
+   метаданные, не идентичность; Drive-операции orchestrated, никогда
+   не рассматриваются как отдельное владение сущностью.
+
+2. Владение persistence.
+
+   Новый модуль business_core/document_manager.py становится
+   единственным persistence-владельцем document_registry: exact-ID
+   чтения, list/filter чтения, генерация Document ID, генерация
+   Document Family ID, низкоуровневое создание Document,
+   низкоуровневая запись разрешённых полей, низкоуровневая запись
+   статуса, version/family lookups, Drive File ID duplicate lookup,
+   будущий exact idempotency lookup, current-row verification.
+   Существующий document_registry_manager.py: его
+   persistence-примыкающие helpers (генерация ID, resolve_and_
+   validate_links, compute_stage_document_status) мигрируют в
+   document_manager.py там, где это уместно; чисто relation/folder-
+   resolution helpers (resolve_target_drive_folder) сохраняются
+   отдельно только если их размещение остаётся чистым. После Phase
+   37D должен существовать РОВНО один канонический
+   persistence-владелец Operational Document — не два конкурирующих
+   Document-менеджера. Реализация — предмет Phase 37D, не этого ADR.
+
+3. Владение cross-domain orchestration.
+
+   business_builder.py — единственный владелец Document orchestration:
+   регистрация метаданных, orchestration Telegram-file upload,
+   валидация связей, последовательность Drive/Sheet failure,
+   creation retry/idempotency, lifecycle transitions, admin-обновления
+   метаданных, создание версии, entry point для requirement
+   evaluation, сборка structured result. Направление зависимостей:
+   telegram_handlers → business_builder → document_manager → sheets;
+   для upload: business_builder → Drive adapter → document_manager.
+   business_builder может вызывать read-only API из person_manager,
+   object_manager, service_manager, roadmap_manager, task_manager
+   (если Task-связь одобрена в будущем), knowledge_manager,
+   document_requirements_query, document_intelligence, Drive adapter.
+   document_manager НЕ импортирует business_builder/telegram_handlers;
+   document_intelligence НЕ пишет document_registry; knowledge_manager
+   НЕ пишет operational Documents; Telegram НЕ пишет document_registry
+   напрямую; закрытые домены НЕ импортируют document_manager; обратных
+   циклов зависимостей нет.
+
+4. Идентичность и неизменяемые поля.
+
+   Каноническая идентичность: Document ID, префикс DREG-, глобально
+   уникален. Неизменяемые поля: Document ID, Business ID, Created At,
+   Document Family ID (после создания), Version (после создания).
+   Drive File ID — не идентичность. Document Template ID — не
+   идентичность. Никакого переноса Document между Business.
+   Обычный update не может изменить identity/version поля. После
+   Foundation — ни одной второй реализации генерации ID; генерация ID
+   caller-стороной запрещена; ID генерируется только после валидации
+   и проверки reuse. Коды: DOCUMENT_IMMUTABLE_FIELD_CONFLICT,
+   DOCUMENT_VERSION_FIELD_IMMUTABLE, DOCUMENT_FAMILY_FIELD_IMMUTABLE.
+
+5. Решение по схеме.
+
+   Существующая схема document_registry сохраняется без изменений в
+   Phase 37D: Document ID, Document Family ID, Version, Business ID,
+   Client ID, Object ID, Roadmap ID, Stage ID, Document Template ID,
+   Document Name, Status, Drive File ID, Drive File URL, File Name,
+   Mime Type, Uploaded At, Uploaded By, Reviewed At, Reviewed By,
+   Rejection Reason, Notes, Created At, Updated At. Task ID НЕ
+   добавляется в Phase 37D — Task-связи сегодня не существует,
+   добавление расширило бы объём миграции и связей; Task↔Document
+   связь может быть спроектирована позже через явный relation-механизм
+   или изменение схемы. Не добавляются: idempotency key, checksum,
+   file size, review-history поля, retention-поля, AI-derived поля,
+   automation-поля. Phase 37D закрывает владение на текущей схеме.
+
+6. Модель регистрации и загрузки.
+
+   Одна каноническая creation orchestration с двумя режимами входа.
+   Mode A (register existing Drive file): валидирует метаданные и
+   связи, читает authoritative Drive-метаданные, создаёт один
+   Operational Document, не загружает новый файл. Mode B (upload
+   Telegram file): валидирует метаданные и связи где возможно заранее,
+   загружает в Drive, читает authoritative Drive-метаданные,
+   персистирует один Operational Document, компенсирует при сбое
+   persistence. Оба режима используют один и тот же канонический
+   Document creation result contract. Upload — не отдельная сущность;
+   регистрация и upload не имеют раздельных identity-правил; оба
+   создают одну версию Operational Document. Telegram не строит
+   финальные строки напрямую.
+
+7. Безопасность Drive/Sheet сбоев.
+
+   Ратифицируется и формализуется уже существующий безопасный паттерн
+   (Phase 15B): валидация Business и связей → выбор целевой папки →
+   установка request guard → загрузка в Drive → чтение authoritative
+   Drive-метаданных → персистирование строки Document → верификация
+   персистированной строки → структурированный успех. Если Drive
+   upload не удался — ни одна строка Document не создаётся. Если
+   persistence Document не удалась после успешного Drive upload —
+   попытка Drive-компенсации (trash); DRIVE_UPLOAD_COMPENSATED при
+   успехе; DOCUMENT_PERSISTENCE_FAILED_WITH_ORPHANED_FILE_WARNING при
+   неудаче компенсации; успех никогда не заявляется ложно.
+   Существующие Drive-файлы, зарегистрированные через Mode A, никогда
+   не удаляются автоматически. Текущее compensation-поведение не
+   ослабляется.
+
+8. Идемпотентность создания.
+
+   Событийная/request-scoped идемпотентность без нового поля схемы.
+   Telegram upload: Telegram update ID + Telegram file unique ID,
+   одна и та же in-memory/request операция переиспользуется или
+   блокируется, без дублирующей загрузки при retry в поддерживаемом
+   окне операции. Register-existing-file: проверяется Business ID +
+   Drive File ID — ноль совпадений → создать; ровно один совпадающий
+   Operational Document → переиспользовать; больше одного → блок со
+   всеми конфликтующими Document ID, без первого выбора.
+   Telegram-upload после создания в Drive: Drive File ID должен быть
+   уникален среди активных/не-archived Document; один существующий
+   совпадающий может быть переиспользован только при совместимых
+   связях; несколько совпадений блокируют. Dedup по filename запрещён;
+   dedup по Document Name запрещён; dedup по MIME запрещён; content
+   hash не является foundation Document-creation ключом; будущие
+   автоматизированные интеграции должны добавить явный Source/External
+   ID или Idempotency Key через отдельное будущее решение о схеме.
+   Коды: DOCUMENT_REGISTERED, DOCUMENT_UPLOADED, DOCUMENT_REUSED,
+   MULTIPLE_DOCUMENT_DRIVE_FILE_MATCHES,
+   DOCUMENT_RELATION_CONFLICT_ON_REUSE, DRIVE_UPLOAD_FAILED,
+   DRIVE_UPLOAD_COMPENSATED, DOCUMENT_PERSISTENCE_FAILED,
+   DOCUMENT_PERSISTENCE_FAILED_WITH_ORPHANED_FILE_WARNING.
+
+9. Модель версионирования.
+
+   Существующая модель сохраняется: одна строка document_registry —
+   одна неизменяемая версия Document; Document Family ID группирует
+   логические версии; Version неизменяем; новая версия создаёт новую
+   строку Document; старые версии сохраняются; никакой замены
+   file-reference на старой строке; никакого hard delete; никакого
+   отдельного реестра document_versions. Новый независимый Document:
+   новый Document ID, новый Document Family ID, Version=1. Новая
+   версия: новый Document ID, существующий Document Family ID,
+   Version=max+1. Явная команда /newdocversion, supersedes-поле,
+   автоматическое создание версии и сравнение версий откладываются.
+   Phase 37D может реализовать низкоуровневую/каноническую поддержку
+   новой версии только если она ограничена, полностью протестирована
+   и требуется текущей миграцией кода — иначе схема сохраняется, а
+   user-facing операция откладывается.
+
+10. Словарь операционных статусов Document.
+
+    Точные операционные статусы: uploaded, under_review, approved,
+    rejected, superseded, archived. НЕ вводятся: registered как
+    отдельный статус (оба текущих режима создания дают Document с
+    authoritative Drive-ссылкой — разделения "зарегистрирован без
+    файла" не существует и не вводится); processing/analyzed как
+    операционные статусы; expired как хранимый статус в foundation;
+    deleted. Content/AI-статусы остаются отдельными: pending,
+    processing, completed, failed, unsupported.
+
+11. Матрица переходов.
+
+    uploaded → {uploaded, under_review, archived, superseded}.
+    under_review → {under_review, approved, rejected, uploaded,
+    archived, superseded}. approved → {approved, archived,
+    superseded}. rejected → {rejected, under_review, uploaded,
+    archived, superseded}. superseded → {superseded только через
+    обычное обновление}. archived → {archived только через обычное
+    обновление}. Неизменившийся статус — успех/no-op. Неизвестный
+    статус блокируется. Недопустимый переход блокируется. Выход из
+    superseded/archived требует будущего явного restore-действия; в
+    Phase 37D restore API не реализуется. Hard delete не вводится.
+    AI не может инициировать lifecycle-переход. Никакого
+    автоматического перехода Roadmap/Stage/Task. Коды:
+    INVALID_DOCUMENT_STATUS, INVALID_DOCUMENT_TRANSITION,
+    DOCUMENT_RESTORE_REQUIRES_EXPLICIT_ACTION,
+    DOCUMENT_STATUS_UPDATED, DOCUMENT_STATUS_UNCHANGED.
+
+12. Политика временных меток.
+
+    Uploaded At: устанавливается при первичном создании/загрузке,
+    неизменяем после создания. Reviewed At: устанавливается только
+    через явное review-решение, не пишется обычным обновлением
+    статуса, если review workflow не вызван явно. Reviewed By:
+    явный Person ID только через review workflow. Rejection Reason:
+    обязателен для решения rejected; очищается только будущим явным
+    review-действием, не обычным обновлением. Updated At — только при
+    фактической мутации. Created At — неизменяем. Approved At в
+    текущей схеме не существует; не добавляется в Phase 37D.
+
+13. Модель review/approval — архитектура одобрена, реализация
+    отложена.
+
+    Review — отдельная операция Document Domain; Reviewer — Person ID;
+    Role eligibility через Organization может потребоваться в будущем;
+    rejected требует Rejection Reason; AI не может выполнять review;
+    история review в конечном счёте должна быть append-only. Phase
+    37D НЕ добавляет реестр document_reviews, НЕ реализует полный
+    approve/reject Telegram UX; Reviewed At/Reviewed By/Rejection
+    Reason сохраняются как reserved операционные поля; lifecycle
+    foundation может структурно поддерживать статусы, но user-facing
+    review-команды остаются отложенными, если Phase 37E явно не
+    расширена после доказательств из Foundation. Document Review
+    history entity одобрена концептуально, отложена до отдельной
+    будущей фазы, не требуется для закрытия owner ship persistence.
+
+14. Политика связей.
+
+    Business ID обязателен. Опциональные единичные ссылки: Client ID,
+    Object ID, Roadmap ID, Stage ID, Document Template ID. Service ID
+    отсутствует в document_registry и не добавляется в Phase 37D — может
+    выводиться через Roadmap/template-контекст при необходимости. Task
+    ID отсутствует и отложен. Каждая указанная ссылка должна
+    существовать; ссылки должны принадлежать тому же Business там, где
+    применимо; Stage подразумевает Roadmap; Roadmap подразумевает
+    Object/Client там, где канонические данные их предоставляют;
+    указанные ID должны быть взаимно согласованы; более специфичная
+    связь может вывести отсутствующую более широкую связь; противоречие
+    блокирует; никакого автоматического исправления; никаких
+    many-to-many связей в foundation; обычное admin-обновление не может
+    релинковать сущности; будущий relink должен быть явным. Коды:
+    DOCUMENT_ENTITY_RELATION_MISMATCH,
+    DOCUMENT_RELATION_UPDATE_REQUIRES_EXPLICIT_ACTION.
+
+15. Семантика требуемых документов.
+
+    Document Requirement остаётся derived read model; реестра
+    требований нет; канонический источник требований — связи Document
+    Template↔Stage/knowledge relation; канонический ключ
+    удовлетворения — точный Document Template ID; угадывание по
+    filename/title/type запрещено; никакого fuzzy matching; никакого
+    первого выбора. Требование удовлетворяется только Document, чей
+    операционный статус — один из uploaded/under_review/approved.
+    Rejected не удовлетворяет. Archived не удовлетворяет. Superseded
+    не удовлетворяет, если существует более новая активная версия;
+    иначе остаётся только историческим. Если существует несколько
+    активных подходящих Document — сообщаются все совпадающие ID;
+    требование может быть помечено удовлетворённым; дополнительно
+    выдаётся duplicate/configuration warning; произвольный выбор
+    одного никогда не выполняется.
+
+16. Канонический алгоритм missing-document.
+
+    document_requirements_query.evaluate_scope() утверждается
+    единственным каноническим evaluator требований/missing-document;
+    владеет read-only оценкой для Stage/Roadmap/Object и любого
+    поддерживаемого текущего scope.
+    organization_manager.compute_stage_document_status() (в
+    document_registry_manager.py) признаётся legacy; Phase 37D должна
+    либо удалить его, если это безопасно, либо превратить в тонкий
+    адаптер поверх evaluate_scope(); /docs4stage, /missingdocs и
+    /docsrequired должны в конечном счёте использовать один и тот же
+    канонический алгоритм; никаких записей; детерминированная
+    структура результата; никакого fuzzy matching; никакого
+    произвольного первого выбора.
+
+17. Политика валидации загрузки.
+
+    Foundation допускает хранение файлов, которые AI не может
+    анализировать — Document не отклоняется только потому, что AI не
+    может его проанализировать; чётко различаются "разрешено для
+    хранения" и "поддерживается для AI-анализа" (существующий RTF —
+    legacy пример именно такого случая). Одобрены: явный максимальный
+    размер (меньшее из настроенного системного лимита и
+    предоставленного Telegram размера); лимит длины filename;
+    санитизация filename для безопасного отображения/хранения; пустое
+    имя файла отклоняется; управляющие символы/path separators
+    отклоняются; опасные исполняемые/бинарные типы блокируются;
+    никакого логирования сырого содержимого файла; обработка
+    password-protected/encrypted документов откладывается, если
+    детектирование ещё не доступно. Phase 37D должна сначала
+    инвентаризировать текущие принимаемые MIME-типы, прежде чем
+    устанавливать лимиты, которые могли бы сломать текущее поведение.
+    Коды: UNSUPPORTED_DOCUMENT_STORAGE_TYPE,
+    DOCUMENT_ANALYSIS_UNSUPPORTED, DOCUMENT_TOO_LARGE,
+    INVALID_DOCUMENT_FILENAME, DOCUMENT_FILE_METADATA_INVALID.
+
+18. Граница AI-анализа.
+
+    Существующая архитектура ратифицируется без переписывания.
+    document_intelligence.py остаётся владельцем document_content;
+    Document может существовать без анализа; анализ опционален и имеет
+    собственный lifecycle; анализ не мутирует операционный статус
+    Document; AI-suggestions никогда не approve/reject Document; анализ
+    требует валидный Document ID; анализ должен быть
+    идемпотентным/retry-aware; force re-analysis может перезаписать
+    текущую derived-строку в foundation; никакого append-only
+    analysis-history реестра в Phase 37D; сырой полный извлечённый
+    текст не хранится неограниченно; bounded preview/summary/error
+    поведение остаётся обязательным. document_intelligence.py не
+    переписывается, кроме минимального boundary-адаптера или
+    result-code wrapper при необходимости.
+
+19. Политика persistence Document Content.
+
+    Одна текущая derived-строка на Document ID. Foundation-поведение:
+    создать или обновить единственную текущую строку анализа; никаких
+    дублирующих активных content-строк; content hash может подавлять
+    ненужный повторный анализ; overwrite-in-place принимается для
+    derived-данных; append-only analysis history откладывается;
+    Document Content не становится операционной audit-историей;
+    политика retention/удаления откладывается.
+
+20. Политика admin-обновления.
+
+    Обычные редактируемые поля: Document Name, Notes. Поля, редактируемые
+    только через выделенные операции: Status (через transition API),
+    review-поля (через review API), Drive references (через
+    create/new-version/repair операцию), relation-поля (через будущий
+    relink API). Неизменяемые/блокируемые для обычного обновления:
+    Document ID, Business ID, Created At, Document Family ID, Version,
+    Uploaded At, Uploaded By, Drive File ID, Drive File URL, File Name,
+    Mime Type, relation-поля, Status, review-поля. Коды:
+    DOCUMENT_ADMIN_FIELDS_UPDATED, DOCUMENT_ADMIN_FIELDS_UNCHANGED,
+    INVALID_DOCUMENT_ADMIN_FIELD, DOCUMENT_IMMUTABLE_FIELD_CONFLICT,
+    DOCUMENT_RELATION_UPDATE_REQUIRES_EXPLICIT_ACTION.
+
+21. Структурированный result-контракт.
+
+    Стабильные поля: ok, code, error, document_id, document_family_id,
+    version, business_id, drive_file_id, drive_file_url,
+    document_template_id, client_id, object_id, roadmap_id, stage_id,
+    previous_status, requested_status, final_status, created, reused,
+    changed, uploaded, compensation_attempted, compensation_succeeded,
+    analysis_status, warnings, conflicting_document_ids, retry_safe.
+    Коды по семействам: Entity/relation — DOCUMENT_NOT_FOUND,
+    BUSINESS_NOT_FOUND, CLIENT_NOT_FOUND, OBJECT_NOT_FOUND,
+    ROADMAP_NOT_FOUND, STAGE_NOT_FOUND, DOCUMENT_TEMPLATE_NOT_FOUND,
+    DOCUMENT_ENTITY_RELATION_MISMATCH. Creation/upload —
+    DOCUMENT_REGISTERED, DOCUMENT_UPLOADED, DOCUMENT_REUSED,
+    MULTIPLE_DOCUMENT_DRIVE_FILE_MATCHES,
+    DOCUMENT_RELATION_CONFLICT_ON_REUSE, DRIVE_UPLOAD_FAILED,
+    DRIVE_UPLOAD_COMPENSATED, DOCUMENT_PERSISTENCE_FAILED,
+    DOCUMENT_PERSISTENCE_FAILED_WITH_ORPHANED_FILE_WARNING,
+    DOCUMENT_POST_WRITE_VERIFICATION_FAILED,
+    UNSUPPORTED_DOCUMENT_STORAGE_TYPE, DOCUMENT_TOO_LARGE,
+    INVALID_DOCUMENT_FILENAME, DOCUMENT_FILE_METADATA_INVALID. Admin —
+    DOCUMENT_ADMIN_FIELDS_UPDATED, DOCUMENT_ADMIN_FIELDS_UNCHANGED,
+    INVALID_DOCUMENT_ADMIN_FIELD, DOCUMENT_IMMUTABLE_FIELD_CONFLICT,
+    DOCUMENT_RELATION_UPDATE_REQUIRES_EXPLICIT_ACTION. Status —
+    INVALID_DOCUMENT_STATUS, INVALID_DOCUMENT_TRANSITION,
+    DOCUMENT_RESTORE_REQUIRES_EXPLICIT_ACTION, DOCUMENT_STATUS_UPDATED,
+    DOCUMENT_STATUS_UNCHANGED. Analysis — DOCUMENT_ANALYSIS_NOT_FOUND,
+    DOCUMENT_ANALYSIS_STARTED, DOCUMENT_ANALYSIS_REUSED,
+    DOCUMENT_ANALYSIS_COMPLETED, DOCUMENT_ANALYSIS_FAILED,
+    DOCUMENT_ANALYSIS_UNSUPPORTED, DOCUMENT_CONTENT_NOT_FOUND.
+    Requirements — DOCUMENT_REQUIREMENTS_EVALUATED,
+    DOCUMENT_REQUIREMENT_SATISFIED, DOCUMENT_REQUIREMENT_MISSING,
+    MULTIPLE_DOCUMENT_REQUIREMENT_MATCHES. Ни один код не пересекается
+    по имени с существующими Object/Client/Service/Roadmap/Stage/
+    Organization/Task кодами.
+
+22. Privacy и logging.
+
+    Разрешено логировать: code, Document ID, Document Family ID,
+    Business ID, relation ID, Drive File ID там, где это безопасно,
+    status, MIME type, file size, changed/reused-флаги, статус
+    компенсации, количество/ID конфликтов. Запрещено: сырое тело
+    документа, извлечённый текст, AI summary там, где он
+    чувствителен, Document Name там, где не необходимо, filename там,
+    где он может раскрыть личные данные, номер паспорта, ИИН, телефон,
+    адрес, полное Telegram-сообщение, credentials, токены, сырой Drive
+    URL с access-параметрами, сырой текст исключения в
+    пользовательских сообщениях. Сырое исключение НЕ разрешено
+    показывать пользователю ни при каких обстоятельствах — только
+    безопасный generic fallback; bounded AI-логи остаются обязательными;
+    guard-тесты на чувствительные значения обязательны.
+
+23. Namespace команд.
+
+    Сохраняются все 8 существующих команд: /registerdoc, /doc,
+    /docs4stage, /uploaddoc, /analyzedoc, /docanalysis, /missingdocs,
+    /docsrequired — коллизий нет. /updatedoc для admin-полей и статуса
+    одобряется к добавлению в Phase 37E только если Foundation
+    поддерживает это без проблем. НЕ одобряются сейчас:
+    review/approve/reject команды, relink, new version, list by Task,
+    delete, restore, AI fuzzy mutation.
+
+24. Требование миграции caller'ов.
+
+    Все 8 существующих команд должны в конечном счёте мигрировать на
+    канонические границы. Write-команды (/registerdoc, /uploaddoc)
+    должны вызывать business_builder orchestration — никаких прямых
+    записей document_registry, никакой caller-side генерации ID,
+    никакой caller-side relation policy. Read-команды: /doc использует
+    document_manager read API; /docs4stage, /missingdocs, /docsrequired
+    используют канонический requirement evaluation;
+    /analyzedoc использует orchestration/result adapter без передачи
+    AI контроля над Document lifecycle; /docanalysis остаётся
+    read-only. Telegram владеет только парсингом, confirmation state,
+    безопасным UX и безопасным логированием.
+
+25. Test isolation.
+
+    Блокирующее предусловие Phase 37D: до запуска любого Document-теста
+    в Phase 37D — регистрация всех существующих 4 Document test-файлов
+    в hard socket-block; регистрация каждого нового Document test-файла
+    до написания/запуска его логики; проверка отсутствия
+    Sheets/Drive/Telegram/Railway/HTTP/socket доступа; mock-completeness
+    guard; architecture guards; privacy/logging guards; no-direct-write-
+    from-Telegram guard; PRS-003 precedent сохраняется обязывающим.
+    Phase 37D должна немедленно остановиться, если существующие
+    Document-тесты не проходят под hard socket-block.
+
+26. Production migration.
+
+    PRODUCTION_SCHEMA_MIGRATION_REQUIRED = NO.
+    PRODUCTION_DOCUMENT_ROW_REWRITE_REQUIRED = NO. Существующие два
+    ряда (DREG-001, DREG-002) остаются без изменений, остаются
+    валидными, остаются Version 1 в своих существующих family, сохраняют
+    пустые Roadmap/Stage/Template ссылки, не получают угаданных
+    backfill-значений, не перезагружаются повторно, не переанализируются
+    исключительно ради миграции. Foundation-миграция состоит только из
+    миграции caller'ов/владения.
+
+27. Отклонённые альтернативы.
+
+    Явно отклонены: Telegram как persistence-владелец; document_
+    intelligence как владелец operational Document; knowledge_manager
+    владение operational Documents; Drive File ID как идентичность
+    Document; dedup по filename/title; fuzzy requirement matching;
+    generic первый выбор совпадения; одно статусное поле, смешивающее
+    analysis/review/upload; AI approval/rejection; hard delete;
+    перезапись старых Document version-строк; создание нового реестра
+    версий, когда Family ID + Version уже существуют; создание реестра
+    Document Requirement в Foundation; переписывание существующих
+    production-рядов; добавление Task ID во время очистки владения;
+    превращение полной review-истории в блокирующее требование
+    Foundation.
+
+Причина:
+
+Тот же архитектурный принцип, применённый ADR-013…ADR-019 к границам
+Business/Client/Object/Service/Roadmap-создания, Stage-transition,
+Organization Person↔Role assignment и Task Domain, здесь применяется к
+Document Domain — с существенной особенностью: значительная часть
+логики (валидация связей, Drive-компенсация, AI-изоляция,
+идемпотентность через op_state, bounded-логирование) уже написана
+качественно и production-проверена на двух реальных рядах. Решение
+здесь сознательно НЕ переписывает то, что уже работает правильно
+(document_intelligence.py, resolve_and_validate_links(), Drive
+failure-safety), а формализует владение (единственный persistence-
+владелец вместо записи из Telegram), устраняет дублирование (два
+конкурирующих missing-document алгоритма → один канонический), и
+добавляет структурированный result-контракт — тот же паттерн, что
+ADR-016/017/018/019 уже применили к аналогичным пробелам в других
+доменах.
+
+Статус:
+
+Утверждено для реализации (Phase 37D). Ничего не реализовано в рамках
+этого ADR — только архитектурное решение. document_manager.py не
+создан. Ни один production-caller не мигрирован, ни один код не
+изменён, схема Google Sheets не менялась, существующие два ряда
+DOCUMENT_REGISTRY и DOCUMENT_CONTENT не изменены. GTD Core не
+затронут.
