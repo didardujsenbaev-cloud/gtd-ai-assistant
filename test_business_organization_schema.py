@@ -201,9 +201,14 @@ class TestExistingRegistriesUntouched(unittest.TestCase):
 
     def test_total_registry_count_increased_by_exactly_four(self):
         s = _fresh_sheets()
-        # 20 pre-existing (per Phase 18C-1 baseline) + 4 new = 24.
-        self.assertEqual(len(s.BUSINESS_SHEET_NAMES), 24)
-        self.assertEqual(len(s.BUSINESS_HEADERS), 24)
+        # 20 pre-existing (per Phase 18C-1 baseline) + 4 new (Phase 21A) = 24.
+        # Phase 36C (ADR-019) legitimately added 2 more (task_registry,
+        # task_assignments) — this point-in-time closeout check is
+        # updated here rather than treated as a durable count invariant
+        # (same precedent as the removed git-diff-based
+        # TestAdditiveOnly guard in test_business_organization_commands.py).
+        self.assertEqual(len(s.BUSINESS_SHEET_NAMES), 26)
+        self.assertEqual(len(s.BUSINESS_HEADERS), 26)
 
 
 class TestGTDAndEnvUntouched(unittest.TestCase):

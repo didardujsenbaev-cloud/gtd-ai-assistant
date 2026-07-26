@@ -60,6 +60,9 @@ BUSINESS_SHEET_NAMES: dict[str, str] = {
     "role_registry":               "ROLE_REGISTRY",
     "role_functions":              "ROLE_FUNCTIONS",
     "person_role_assignments":     "PERSON_ROLE_ASSIGNMENTS",
+    # Phase 36C (ADR-019): Task Domain Foundation
+    "task_registry":               "TASK_REGISTRY",
+    "task_assignments":            "TASK_ASSIGNMENTS",
 }
 
 BUSINESS_HEADERS: dict[str, list[str]] = {
@@ -324,6 +327,28 @@ BUSINESS_HEADERS: dict[str, list[str]] = {
         "Assignment ID", "Person ID", "Role ID",
         "Start Date", "End Date", "Assignment Type", "Status", "Notes",
     ],
+    # Phase 36C (ADR-019): Task Domain Foundation. Business Task — a
+    # canonical, business-scoped executable work unit, deliberately
+    # separate from personal GTD Next Actions (see ADR-019 §5) and from
+    # ROADMAP_STAGES (see ADR-019 §6). Responsible Role ID/Assignee
+    # Person ID are cache fields only — task_assignments below is the
+    # sole source of truth for assignment history (ADR-019 §8).
+    "task_registry": [
+        "Task ID", "Business ID", "Title", "Description", "Status",
+        "Priority", "Due Date", "Source", "Idempotency Key",
+        "Client ID", "Object ID", "Service ID", "Roadmap ID", "Stage ID",
+        "Responsible Role ID", "Assignee Person ID",
+        "Created At", "Updated At", "Started At", "Completed At", "Cancelled At",
+        "Created By", "GTD Action ID",
+    ],
+    # Append-only Task assignment history — mirrors PERSON_ROLE_ASSIGNMENTS'
+    # design exactly (ADR-019 §4/§9): one current active row per Task,
+    # reassignment ends the old row and creates a new one, no hard delete.
+    "task_assignments": [
+        "Task Assignment ID", "Task ID", "Responsible Role ID",
+        "Assignee Person ID", "Status", "Start Date", "End Date",
+        "Assignment Type", "Created At", "Updated At",
+    ],
 }
 
 # ID-префиксы для generate_next_id
@@ -355,6 +380,9 @@ _ID_PREFIXES: dict[str, str] = {
     "role_registry":               "ROLE",
     "role_functions":              "FUNC",
     "person_role_assignments":     "PRA",
+    # Phase 36C (ADR-019)
+    "task_registry":               "TSK",
+    "task_assignments":            "TAS",
 }
 
 

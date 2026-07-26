@@ -126,9 +126,19 @@ _OTHER_HARDENED_TEST_FILES = frozenset({
     "test_service_ownership_migration.py",
 })
 
+# Phase 36C (ADR-019 §27): Task Domain test isolation — registered
+# BEFORE any Task test logic is written, per the PRS-003 incident
+# precedent this conftest.py exists to prevent.
+_TASK_DOMAIN_TEST_FILES = frozenset({
+    "test_task_manager.py",
+    "test_business_task_foundation.py",
+    "test_task_architecture_guards.py",
+})
+
 _HARD_SOCKET_BLOCK_TEST_FILES = (
     _CLIENT_DOMAIN_TEST_FILES | _ROADMAP_DOMAIN_TEST_FILES
     | _ORGANIZATION_DOMAIN_TEST_FILES | _OTHER_HARDENED_TEST_FILES
+    | _TASK_DOMAIN_TEST_FILES
 )
 
 

@@ -2769,3 +2769,684 @@ def assign_person_to_role_canonical(
         assignment_id=write_result["assignment_id"], assignment_created=True,
         previous_status="", final_status="active", retry_safe=True,
     )
+
+
+# ─────────────────────────────────────────────────────────────
+# Phase 36C (ADR-019): Task Domain Foundation — the sole cross-domain
+# Task orchestration boundary. task_manager.py remains the persistence-
+# only owner of TASK_REGISTRY/TASK_ASSIGNMENTS (unchanged by this
+# phase's design — mirrors organization_manager.py's role exactly).
+# Everything that crosses from "one Task" / "one Task Assignment" to
+# cross-entity eligibility — Business/Client/Object/Service/Roadmap/
+# Stage existence and consistency, Roadmap/Stage lifecycle eligibility,
+# Organization Person/Role eligibility, creation idempotency, duplicate
+# Assignment policy — lives here instead, the same boundary principle
+# ADR-016/ADR-017/ADR-018 already applied to Roadmap creation, Stage
+# transitions, and Organization Person↔Role assignment. No second
+# implementation of this policy exists anywhere else (see
+# test_task_architecture_guards.py).
+# ─────────────────────────────────────────────────────────────
+
+_TASK_ORDINARY_TRANSITIONS: dict[str, tuple[str, ...]] = {
+    "new":         ("new", "ready", "cancelled", "skipped"),
+    "ready":       ("ready", "in_progress", "waiting", "blocked", "done", "cancelled", "skipped"),
+    "in_progress": ("in_progress", "ready", "waiting", "blocked", "done", "cancelled", "skipped"),
+    "waiting":     ("waiting", "ready", "in_progress", "blocked", "done", "cancelled", "skipped"),
+    "blocked":     ("blocked", "ready", "in_progress", "waiting", "cancelled", "skipped"),
+    "done":        ("done",),
+    "cancelled":   ("cancelled",),
+    "skipped":     ("skipped",),
+}
+
+_TASK_REOPEN_GATED_STATUSES = frozenset({"done", "cancelled", "skipped"})
+
+
+def _task_result(
+    *, ok: bool, code: str, error: str | None, task_id: str = "", business_id: str = "",
+    previous_status: str = "", requested_status: str = "", final_status: str = "",
+    changed: bool = False, assignment_changed: bool = False,
+    task_created: bool = False, task_reused: bool = False,
+    assignment_id: str = "", previous_assignment_id: str = "",
+    warnings: tuple = (), conflicting_task_ids: tuple = (),
+    conflicting_assignment_ids: tuple = (), retry_safe: bool = True,
+) -> dict:
+    """Shared result-builder for every Task orchestration function
+    (ADR-019 §25) — the stable, structured contract every caller reads
+    instead of a bare exception or ad-hoc dict shape."""
+    return {
+        "ok": ok,
+        "code": code,
+        "error": error,
+        "task_id": task_id,
+        "business_id": business_id,
+        "previous_status": previous_status,
+        "requested_status": requested_status,
+        "final_status": final_status,
+        "changed": changed,
+        "assignment_changed": assignment_changed,
+        "task_created": task_created,
+        "task_reused": task_reused,
+        "assignment_id": assignment_id,
+        "previous_assignment_id": previous_assignment_id,
+        "warnings": tuple(warnings),
+        "conflicting_task_ids": tuple(conflicting_task_ids),
+        "conflicting_assignment_ids": tuple(conflicting_assignment_ids),
+        "retry_safe": retry_safe,
+    }
+
+
+def _task_roadmap_stage_eligibility_for_creation(roadmap_id: str, stage_id: str) -> tuple[str, str, str]:
+    """
+    ADR-019 §9: new linked Task creation eligibility. Returns
+    (code, error, resolved_roadmap_id) — code is "" when eligible.
+    Resolves Stage->Roadmap when only stage_id is supplied (Stage
+    canonically derives Roadmap ID, per ADR-019 §7).
+    """
+    from business_core.roadmap_manager import find_stage_by_id, find_roadmap_by_id, normalize_roadmap_status
+
+    resolved_roadmap_id = roadmap_id
+
+    if stage_id:
+        stage = find_stage_by_id(stage_id)
+        if stage is None:
+            return "STAGE_NOT_FOUND", f"Stage {stage_id} не найден", resolved_roadmap_id
+
+        stage_roadmap_id = stage.get("roadmap_id", "")
+        if roadmap_id and stage_roadmap_id != roadmap_id:
+            return (
+                "TASK_ENTITY_RELATION_MISMATCH",
+                f"Stage {stage_id} принадлежит Roadmap {stage_roadmap_id}, а не {roadmap_id}",
+                resolved_roadmap_id,
+            )
+        resolved_roadmap_id = stage_roadmap_id
+
+        if stage.get("status", "") in ("done", "skipped"):
+            return "STAGE_TERMINAL", f"Stage {stage_id} имеет терминальный статус '{stage.get('status', '')}'", resolved_roadmap_id
+
+    if not resolved_roadmap_id:
+        return "", None, resolved_roadmap_id
+
+    roadmap = find_roadmap_by_id(resolved_roadmap_id)
+    if roadmap is None:
+        return "ROADMAP_NOT_FOUND", f"Roadmap {resolved_roadmap_id} не найден", resolved_roadmap_id
+
+    roadmap_status = normalize_roadmap_status(roadmap.get("status", ""))
+    if roadmap_status == "completed":
+        return "ROADMAP_COMPLETED", f"Roadmap {resolved_roadmap_id} завершён — новый связанный Task не может быть создан", resolved_roadmap_id
+    if roadmap_status == "cancelled":
+        return "ROADMAP_CANCELLED", f"Roadmap {resolved_roadmap_id} отменён — новый связанный Task не может быть создан", resolved_roadmap_id
+    # active/on_hold both allow new Task creation (ADR-019 §9/§20) —
+    # on_hold only blocks the in_progress *transition*, not creation.
+    return "", None, resolved_roadmap_id
+
+
+def create_business_task(
+    business_id: str,
+    title: str,
+    *,
+    description: str = "",
+    priority: str = "",
+    due_date: str = "",
+    source: str = "",
+    idempotency_key: str = "",
+    client_id: str = "",
+    object_id: str = "",
+    service_id: str = "",
+    roadmap_id: str = "",
+    stage_id: str = "",
+    created_by: str = "",
+    gtd_action_id: str = "",
+) -> dict:
+    """
+    Phase 36C (ADR-019 §7): the sole canonical Business Task creation
+    orchestration boundary. Any future caller must use this — never
+    task_manager.create_task() directly — so Business/relation
+    validation, Roadmap/Stage lifecycle eligibility, and creation
+    idempotency is enforced exactly once, in exactly one place.
+
+    Validation order (ADR-019 §7, all before any write):
+      A. required business_id
+      B. Business exists (BUSINESS_NOT_FOUND)
+      C. required title
+      D. normalize optional inputs (blank strings, not None)
+      E. validate Client reference (PERSON_NOT_FOUND if supplied and missing)
+      F. validate Object reference (TASK_NOT_FOUND-style existence via
+         object_manager; TASK_ENTITY_RELATION_MISMATCH on Business mismatch)
+      G. validate Service reference (same shape as Object)
+      H. validate Roadmap reference (ROADMAP_NOT_FOUND)
+      I. validate Stage reference (STAGE_NOT_FOUND), derive Roadmap ID
+         from Stage when Roadmap ID is omitted
+      J. cross-validate Stage<->Roadmap (TASK_ENTITY_RELATION_MISMATCH)
+      K. cross-validate Roadmap<->Object/Service where supplied
+         (TASK_ENTITY_RELATION_MISMATCH)
+      L. lifecycle eligibility (ROADMAP_COMPLETED/ROADMAP_CANCELLED/
+         STAGE_TERMINAL)
+      M. idempotency lookup (Business ID + Idempotency Key)
+      N. zero/one/multiple policy (TASK_CREATED/TASK_REUSED/
+         MULTIPLE_TASK_IDEMPOTENCY_MATCHES — never an arbitrary first pick)
+      O. Task ID generated only inside task_manager.create_task(), i.e.
+         only once every validation above has passed
+      P. low-level persistence call
+      Q. structured result (ADR-019 §25)
+
+    No write before all validation passes.
+    """
+    from business_core.task_manager import create_task, find_tasks_by_idempotency_key
+    from business_core.sheets import find_row_by_id
+
+    # A. Required business_id.
+    if not business_id:
+        return _task_result(ok=False, code="BUSINESS_NOT_FOUND", error="business_id обязателен")
+
+    # B. Business existence.
+    if find_row_by_id("biz_registry", business_id) is None:
+        return _task_result(ok=False, code="BUSINESS_NOT_FOUND", error=f"Business {business_id} не найден", business_id=business_id)
+
+    # C. Required title.
+    if not title:
+        return _task_result(ok=False, code="", error="title обязателен", business_id=business_id)
+
+    # D. Normalize optional inputs.
+    client_id = client_id or ""
+    object_id = object_id or ""
+    service_id = service_id or ""
+    roadmap_id = roadmap_id or ""
+    stage_id = stage_id or ""
+
+    # E. Client reference.
+    if client_id:
+        from business_core.person_manager import find_person_by_id
+        person = find_person_by_id(client_id)
+        if person is None:
+            return _task_result(ok=False, code="PERSON_NOT_FOUND", error=f"Client {client_id} не найден", business_id=business_id)
+
+    # F. Object reference.
+    if object_id:
+        from business_core.object_manager import find_object_by_id
+        obj = find_object_by_id(object_id)
+        if obj is None:
+            return _task_result(ok=False, code="TASK_ENTITY_RELATION_MISMATCH", error=f"Object {object_id} не найден", business_id=business_id)
+        if obj.get("biz_id", "") and obj.get("biz_id", "") != business_id:
+            return _task_result(
+                ok=False, code="TASK_ENTITY_RELATION_MISMATCH",
+                error=f"Object {object_id} принадлежит другому Business", business_id=business_id,
+            )
+
+    # G. Service reference.
+    if service_id:
+        from business_core.service_manager import find_service_by_id
+        service = find_service_by_id(service_id)
+        if service is None:
+            return _task_result(ok=False, code="TASK_ENTITY_RELATION_MISMATCH", error=f"Service {service_id} не найден", business_id=business_id)
+        if service.get("biz_id", "") and service.get("biz_id", "") != business_id:
+            return _task_result(
+                ok=False, code="TASK_ENTITY_RELATION_MISMATCH",
+                error=f"Service {service_id} принадлежит другому Business", business_id=business_id,
+            )
+
+    # H/I/J. Roadmap/Stage existence + cross-validation + lifecycle
+    # eligibility (L), all in one pass via the shared helper.
+    eligibility_code, eligibility_error, resolved_roadmap_id = _task_roadmap_stage_eligibility_for_creation(roadmap_id, stage_id)
+    if eligibility_code:
+        return _task_result(ok=False, code=eligibility_code, error=eligibility_error, business_id=business_id)
+    roadmap_id = resolved_roadmap_id
+
+    # K. Roadmap<->Object/Service consistency where supplied.
+    if roadmap_id and (object_id or service_id):
+        from business_core.roadmap_manager import find_roadmap_by_id
+        roadmap = find_roadmap_by_id(roadmap_id)
+        if roadmap is not None:
+            if object_id and roadmap.get("object_id", "") and roadmap.get("object_id", "") != object_id:
+                return _task_result(
+                    ok=False, code="TASK_ENTITY_RELATION_MISMATCH",
+                    error=f"Roadmap {roadmap_id} принадлежит другому Object, не {object_id}", business_id=business_id,
+                )
+            if service_id and roadmap.get("service_id", "") and roadmap.get("service_id", "") != service_id:
+                return _task_result(
+                    ok=False, code="TASK_ENTITY_RELATION_MISMATCH",
+                    error=f"Roadmap {roadmap_id} принадлежит другому Service, не {service_id}", business_id=business_id,
+                )
+
+    # M/N. Idempotency lookup.
+    if idempotency_key:
+        matches = find_tasks_by_idempotency_key(business_id, idempotency_key)
+        if len(matches) > 1:
+            conflicting_ids = tuple(t.get("task_id", "") for t in matches)
+            return _task_result(
+                ok=False, code="MULTIPLE_TASK_IDEMPOTENCY_MATCHES",
+                error=(
+                    f"Найдено {len(matches)} Task для (Business={business_id}, "
+                    f"Idempotency Key={idempotency_key}): {conflicting_ids} — новый Task не создан"
+                ),
+                business_id=business_id, conflicting_task_ids=conflicting_ids, retry_safe=True,
+            )
+        if len(matches) == 1:
+            existing = matches[0]
+            return _task_result(
+                ok=True, code="TASK_REUSED", error=None,
+                task_id=existing.get("task_id", ""), business_id=business_id,
+                task_reused=True, final_status=existing.get("status", ""), retry_safe=True,
+            )
+
+    # O/P. Create — zero matching Task (or no idempotency key supplied).
+    write_result = create_task(
+        business_id, title,
+        description=description, priority=priority, due_date=due_date,
+        source=source, idempotency_key=idempotency_key,
+        client_id=client_id, object_id=object_id, service_id=service_id,
+        roadmap_id=roadmap_id, stage_id=stage_id,
+        created_by=created_by, gtd_action_id=gtd_action_id,
+    )
+    if not write_result["ok"]:
+        return _task_result(
+            ok=False, code=write_result.get("code") or "", error=write_result.get("error"),
+            business_id=business_id, retry_safe=bool(idempotency_key),
+        )
+
+    return _task_result(
+        ok=True, code="TASK_CREATED", error=None,
+        task_id=write_result["task_id"], business_id=business_id,
+        task_created=True, final_status="new", retry_safe=True,
+    )
+
+
+def update_task_admin_fields(task_id: str, updates: dict) -> dict:
+    """
+    Phase 36C (ADR-019 §12/§24): the sole canonical Task admin-field
+    update orchestration boundary. Approved mutable fields: Title,
+    Description, Priority, Due Date, Created By, GTD Action ID.
+    Immutable identity, relation fields, assignment cache fields, and
+    Status are all rejected before any write — enforced by
+    task_manager.update_task_admin_fields() itself (this function is a
+    thin resolve-then-delegate wrapper, since the low-level function
+    already carries the full field-classification policy).
+    """
+    from business_core.task_manager import find_task_by_id, update_task_admin_fields as _low_level_update
+
+    if not task_id:
+        return _task_result(ok=False, code="TASK_NOT_FOUND", error="task_id обязателен")
+
+    task = find_task_by_id(task_id)
+    if task is None:
+        return _task_result(ok=False, code="TASK_NOT_FOUND", error=f"Task {task_id} не найден", task_id=task_id)
+
+    result = _low_level_update(task_id, updates)
+    return _task_result(
+        ok=result["ok"], code=result.get("code", ""), error=result.get("error"),
+        task_id=task_id, business_id=task.get("business_id", ""),
+        changed=result.get("changed", False), retry_safe=True,
+    )
+
+
+def _task_roadmap_eligibility_code_for_transition(roadmap_status: str, target_status: str) -> str | None:
+    """
+    ADR-019 §14/§20: on_hold blocks only the in_progress *transition*,
+    not admin edits or other statuses — mirrors ADR-017 §7's Stage
+    on_hold behavior exactly. completed/cancelled block every ordinary
+    execution transition.
+    """
+    if roadmap_status == "completed":
+        return "ROADMAP_COMPLETED"
+    if roadmap_status == "cancelled":
+        return "ROADMAP_CANCELLED"
+    if roadmap_status == "on_hold" and target_status == "in_progress":
+        return "ROADMAP_ON_HOLD"
+    return None
+
+
+def transition_task_status(task_id: str, target_status: str) -> dict:
+    """
+    Phase 36C (ADR-019 §13/§15/§20): the sole canonical Task-transition
+    orchestration boundary.
+
+    Validation order, all before any write:
+      A. required task_id
+      B. Task exists (TASK_NOT_FOUND)
+      C. target status validation (INVALID_TASK_STATUS)
+      D. linked Roadmap eligibility, only if Roadmap ID is present
+         (ROADMAP_ON_HOLD only for the in_progress target;
+         ROADMAP_COMPLETED/ROADMAP_CANCELLED for any execution
+         transition)
+      E. terminal-state reopen gate (TASK_REOPEN_REQUIRES_EXPLICIT_ACTION
+         for an ordinary attempt to leave done/cancelled/skipped)
+      F. ordinary transition-matrix validation (INVALID_TASK_TRANSITION)
+      G. persist Status (+ Started At/Completed At/Cancelled At timestamp,
+         set-once — ADR-019 §16)
+      H. structured result
+
+    No Stage or Roadmap mutation ever happens here (ADR-019 §14/§20).
+    """
+    from business_core.task_manager import find_task_by_id, update_task_status, TASK_STATUS
+
+    if not task_id:
+        return _task_result(ok=False, code="TASK_NOT_FOUND", error="task_id обязателен")
+
+    task = find_task_by_id(task_id)
+    if task is None:
+        return _task_result(ok=False, code="TASK_NOT_FOUND", error=f"Task {task_id} не найден", task_id=task_id)
+
+    business_id = task.get("business_id", "")
+    previous_status = task.get("status", "")
+
+    if target_status not in TASK_STATUS:
+        return _task_result(
+            ok=False, code="INVALID_TASK_STATUS",
+            error=f"Недопустимый статус '{target_status}'. Допустимые значения: {', '.join(TASK_STATUS)}",
+            task_id=task_id, business_id=business_id,
+            previous_status=previous_status, requested_status=target_status, final_status=previous_status,
+        )
+
+    roadmap_id = task.get("roadmap_id", "")
+    if roadmap_id:
+        from business_core.roadmap_manager import find_roadmap_by_id, normalize_roadmap_status
+        roadmap = find_roadmap_by_id(roadmap_id)
+        if roadmap is not None:
+            roadmap_status = normalize_roadmap_status(roadmap.get("status", ""))
+            eligibility_code = _task_roadmap_eligibility_code_for_transition(roadmap_status, target_status)
+            if eligibility_code:
+                return _task_result(
+                    ok=False, code=eligibility_code,
+                    error=f"Roadmap {roadmap_id} имеет статус '{roadmap_status}' — переход не разрешён",
+                    task_id=task_id, business_id=business_id,
+                    previous_status=previous_status, requested_status=target_status, final_status=previous_status,
+                )
+
+    if previous_status in _TASK_REOPEN_GATED_STATUSES and target_status != previous_status:
+        return _task_result(
+            ok=False, code="TASK_REOPEN_REQUIRES_EXPLICIT_ACTION",
+            error=(
+                f"Task {task_id} имеет статус '{previous_status}' — обычное обновление не может "
+                f"вернуть его в '{target_status}'. Требуется отдельное явное действие reopen (не реализовано)."
+            ),
+            task_id=task_id, business_id=business_id,
+            previous_status=previous_status, requested_status=target_status, final_status=previous_status,
+        )
+
+    allowed_targets = _TASK_ORDINARY_TRANSITIONS.get(previous_status, (previous_status,))
+    if target_status not in allowed_targets:
+        return _task_result(
+            ok=False, code="INVALID_TASK_TRANSITION",
+            error=f"Переход '{previous_status}' → '{target_status}' не разрешён",
+            task_id=task_id, business_id=business_id,
+            previous_status=previous_status, requested_status=target_status, final_status=previous_status,
+        )
+
+    timestamp_field = ""
+    if target_status == "in_progress" and not task.get("started_at", ""):
+        timestamp_field = "Started At"
+    elif target_status == "done":
+        timestamp_field = "Completed At"
+    elif target_status == "cancelled":
+        timestamp_field = "Cancelled At"
+
+    write_result = update_task_status(task_id, target_status, timestamp_field=timestamp_field)
+    if not write_result["ok"]:
+        return _task_result(
+            ok=False, code=write_result.get("code") or "", error=write_result.get("error"),
+            task_id=task_id, business_id=business_id,
+            previous_status=previous_status, requested_status=target_status, final_status=previous_status,
+        )
+
+    changed = write_result["changed"]
+    return _task_result(
+        ok=True, code="TASK_STATUS_UPDATED" if changed else "TASK_STATUS_UNCHANGED", error=None,
+        task_id=task_id, business_id=business_id,
+        previous_status=previous_status, requested_status=target_status,
+        final_status=target_status, changed=changed,
+    )
+
+
+def _task_role_eligible_for_assignment(role: dict) -> tuple[bool, str, str]:
+    """
+    ADR-019 §18: Role eligibility for Task assignment. active is fully
+    eligible; planned is eligible ONLY as a Role-only future
+    responsibility (never as an active executor — enforced separately
+    in assign_task() when a Person is also supplied); paused/archived
+    are blocked outright. Parent Department must exist and not be
+    archived. Returns (eligible, code, error) — code is "" when eligible.
+    """
+    status = role.get("status", "")
+    if status == "paused":
+        return False, "ROLE_PAUSED", f"Role {role['role_id']} приостановлена — назначение не разрешено"
+    if status == "archived":
+        return False, "ROLE_ARCHIVED", f"Role {role['role_id']} архивирована — назначение не разрешено"
+    if status not in ("planned", "active"):
+        return False, "ROLE_NOT_ACTIVE_FOR_TASK_EXECUTION", f"Role {role['role_id']} имеет неизвестный статус '{status}'"
+
+    from business_core.organization_manager import find_department_by_id
+    department = find_department_by_id(role.get("department_id", ""))
+    if department is None:
+        return False, "DEPARTMENT_NOT_FOUND", f"Department {role.get('department_id', '')} не найден"
+    if department.get("status") == "archived":
+        return False, "DEPARTMENT_ARCHIVED", f"Department {role.get('department_id', '')} архивирован"
+
+    return True, "", ""
+
+
+def assign_task(
+    task_id: str,
+    responsible_role_id: str = "",
+    assignee_person_id: str = "",
+    start_date: str = "",
+    assignment_type: str = "primary",
+) -> dict:
+    """
+    Phase 36C (ADR-019 §17-20): the sole canonical Task assignment
+    orchestration boundary — Task resolution, Role/Person eligibility
+    (reusing Organization Domain guarantees, never a second eligibility
+    system), current active Task Assignment invariant, and Task
+    assignment-cache update, all in one deterministic pass, no write
+    before all validation passes.
+
+    Requires at least one of responsible_role_id/assignee_person_id —
+    use unassign_task() to remove an existing assignment.
+    """
+    from business_core.task_manager import (
+        find_task_by_id, list_task_assignments_for_task, create_task_assignment,
+        end_task_assignment, update_task_assignment_cache,
+    )
+    from datetime import datetime
+
+    if not task_id:
+        return _task_result(ok=False, code="TASK_NOT_FOUND", error="task_id обязателен")
+
+    task = find_task_by_id(task_id)
+    if task is None:
+        return _task_result(ok=False, code="TASK_NOT_FOUND", error=f"Task {task_id} не найден", task_id=task_id)
+
+    business_id = task.get("business_id", "")
+
+    if not responsible_role_id and not assignee_person_id:
+        return _task_result(
+            ok=False, code="", error="Требуется хотя бы одно из responsible_role_id/assignee_person_id",
+            task_id=task_id, business_id=business_id,
+        )
+
+    role = None
+    if responsible_role_id:
+        from business_core.organization_manager import find_role_by_id
+        role = find_role_by_id(responsible_role_id)
+        if role is None:
+            return _task_result(ok=False, code="ROLE_NOT_FOUND", error=f"Role {responsible_role_id} не найден", task_id=task_id, business_id=business_id)
+
+        eligible, code, error = _task_role_eligible_for_assignment(role)
+        if not eligible:
+            return _task_result(ok=False, code=code, error=error, task_id=task_id, business_id=business_id)
+
+    if assignee_person_id:
+        from business_core.person_manager import find_person_by_id, is_person_archived, has_person_business_link
+
+        person = find_person_by_id(assignee_person_id)
+        if person is None:
+            return _task_result(ok=False, code="PERSON_NOT_FOUND", error=f"Person {assignee_person_id} не найден", task_id=task_id, business_id=business_id)
+        if is_person_archived(person):
+            return _task_result(
+                ok=False, code="PERSON_ARCHIVED",
+                error=f"Person {assignee_person_id} архивирован — назначение не разрешено",
+                task_id=task_id, business_id=business_id,
+            )
+
+        # A Person assigned as active executor requires an ACTIVE Role
+        # when a Role is also supplied — planned Role is Role-only
+        # (ADR-019 §11/§18).
+        if role is not None and role.get("status", "") == "planned":
+            return _task_result(
+                ok=False, code="ROLE_NOT_ACTIVE_FOR_TASK_EXECUTION",
+                error=f"Role {responsible_role_id} ещё planned — Person не может быть назначен как активный исполнитель",
+                task_id=task_id, business_id=business_id,
+            )
+
+        business_scope_id = role.get("department_id", "") if role is not None else ""
+        department_business_id = ""
+        if role is not None:
+            from business_core.organization_manager import find_department_by_id
+            department = find_department_by_id(role.get("department_id", ""))
+            department_business_id = department.get("business_id", "") if department else ""
+        else:
+            department_business_id = business_id
+
+        if department_business_id:
+            if not has_person_business_link(person, department_business_id):
+                linked_ids = person.get("biz_ids") or []
+                if not linked_ids:
+                    return _task_result(
+                        ok=False, code="PERSON_NOT_LINKED_TO_BUSINESS",
+                        error=f"Person {assignee_person_id} не привязан к бизнесу {department_business_id}",
+                        task_id=task_id, business_id=business_id,
+                    )
+                return _task_result(
+                    ok=False, code="PERSON_TASK_BUSINESS_MISMATCH",
+                    error=f"Person {assignee_person_id} привязан к другому бизнесу, а не к {department_business_id}",
+                    task_id=task_id, business_id=business_id,
+                )
+
+    # Current active Task Assignment invariant (ADR-019 §20).
+    active_assignments = list_task_assignments_for_task(task_id, status="active")
+    if len(active_assignments) > 1:
+        conflicting_ids = tuple(a.get("task_assignment_id", "") for a in active_assignments)
+        return _task_result(
+            ok=False, code="MULTIPLE_ACTIVE_TASK_ASSIGNMENTS_INTEGRITY_ERROR",
+            error=f"Найдено {len(active_assignments)} активных Task Assignment для {task_id}: {conflicting_ids}",
+            task_id=task_id, business_id=business_id,
+            conflicting_assignment_ids=conflicting_ids, retry_safe=True,
+        )
+
+    current = active_assignments[0] if active_assignments else None
+
+    if current is not None and current.get("responsible_role_id", "") == responsible_role_id and current.get("assignee_person_id", "") == assignee_person_id:
+        return _task_result(
+            ok=True, code="TASK_ASSIGNMENT_REUSED", error=None,
+            task_id=task_id, business_id=business_id,
+            assignment_id=current.get("task_assignment_id", ""), retry_safe=True,
+        )
+
+    if not start_date:
+        start_date = datetime.now().strftime("%Y-%m-%d")
+
+    previous_assignment_id = current.get("task_assignment_id", "") if current is not None else ""
+    if current is not None:
+        end_result = end_task_assignment(previous_assignment_id)
+        if not end_result["ok"]:
+            return _task_result(
+                ok=False, code="", error=end_result.get("error"),
+                task_id=task_id, business_id=business_id,
+                previous_assignment_id=previous_assignment_id, retry_safe=True,
+            )
+
+    write_result = create_task_assignment(task_id, responsible_role_id, assignee_person_id, start_date, assignment_type=assignment_type)
+    if not write_result["ok"]:
+        return _task_result(
+            ok=False, code=write_result.get("code") or "", error=write_result.get("error"),
+            task_id=task_id, business_id=business_id,
+            previous_assignment_id=previous_assignment_id, retry_safe=True,
+        )
+
+    cache_result = update_task_assignment_cache(task_id, responsible_role_id, assignee_person_id)
+
+    return _task_result(
+        ok=True, code="TASK_ASSIGNMENT_CREATED" if current is None else "TASK_REASSIGNED", error=None,
+        task_id=task_id, business_id=business_id,
+        assignment_changed=cache_result.get("changed", False),
+        assignment_id=write_result["task_assignment_id"], previous_assignment_id=previous_assignment_id,
+        retry_safe=True,
+    )
+
+
+def unassign_task(task_id: str) -> dict:
+    """
+    Phase 36C (ADR-019 §21): the sole canonical Task-unassignment
+    orchestration boundary. Ends the current active Task Assignment (if
+    any) and clears the Task's assignment cache. Zero active rows is a
+    no-op success — unassigning an already-unassigned Task is
+    idempotent, not an error.
+    """
+    from business_core.task_manager import (
+        find_task_by_id, list_task_assignments_for_task, end_task_assignment, update_task_assignment_cache,
+    )
+
+    if not task_id:
+        return _task_result(ok=False, code="TASK_NOT_FOUND", error="task_id обязателен")
+
+    task = find_task_by_id(task_id)
+    if task is None:
+        return _task_result(ok=False, code="TASK_NOT_FOUND", error=f"Task {task_id} не найден", task_id=task_id)
+
+    business_id = task.get("business_id", "")
+
+    active_assignments = list_task_assignments_for_task(task_id, status="active")
+    if len(active_assignments) > 1:
+        conflicting_ids = tuple(a.get("task_assignment_id", "") for a in active_assignments)
+        return _task_result(
+            ok=False, code="MULTIPLE_ACTIVE_TASK_ASSIGNMENTS_INTEGRITY_ERROR",
+            error=f"Найдено {len(active_assignments)} активных Task Assignment для {task_id}: {conflicting_ids}",
+            task_id=task_id, business_id=business_id,
+            conflicting_assignment_ids=conflicting_ids, retry_safe=True,
+        )
+
+    if not active_assignments:
+        return _task_result(ok=True, code="TASK_UNASSIGNED", error=None, task_id=task_id, business_id=business_id, retry_safe=True)
+
+    current = active_assignments[0]
+    end_result = end_task_assignment(current.get("task_assignment_id", ""))
+    if not end_result["ok"]:
+        return _task_result(
+            ok=False, code="", error=end_result.get("error"),
+            task_id=task_id, business_id=business_id,
+            previous_assignment_id=current.get("task_assignment_id", ""), retry_safe=True,
+        )
+
+    cache_result = update_task_assignment_cache(task_id, "", "")
+
+    return _task_result(
+        ok=True, code="TASK_UNASSIGNED", error=None,
+        task_id=task_id, business_id=business_id,
+        assignment_changed=cache_result.get("changed", False),
+        previous_assignment_id=current.get("task_assignment_id", ""), retry_safe=True,
+    )
+
+
+def task_assignment_cache_is_consistent(task_id: str) -> dict:
+    """
+    Read-only consistency helper (ADR-019 §22): compares a Task's
+    cache fields (Responsible Role ID/Assignee Person ID) against the
+    current active Task Assignment row (the sole source of truth).
+    Never repairs a mismatch automatically — reporting/detection only.
+    """
+    from business_core.task_manager import find_task_by_id, list_task_assignments_for_task
+
+    task = find_task_by_id(task_id)
+    if task is None:
+        return {"ok": False, "consistent": False, "error": f"Task {task_id} не найден"}
+
+    active_assignments = list_task_assignments_for_task(task_id, status="active")
+    if len(active_assignments) > 1:
+        return {"ok": True, "consistent": False, "error": "multiple active Task Assignments"}
+
+    expected_role = active_assignments[0].get("responsible_role_id", "") if active_assignments else ""
+    expected_person = active_assignments[0].get("assignee_person_id", "") if active_assignments else ""
+
+    consistent = (
+        task.get("responsible_role_id", "") == expected_role
+        and task.get("assignee_person_id", "") == expected_person
+    )
+    return {"ok": True, "consistent": consistent, "error": None}
