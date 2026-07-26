@@ -3683,3 +3683,662 @@ ADR-016/017/018/019 уже применили к аналогичным проб
 изменён, схема Google Sheets не менялась, существующие два ряда
 DOCUMENT_REGISTRY и DOCUMENT_CONTENT не изменены. GTD Core не
 затронут.
+
+## ADR-021 — Checklist Domain Architecture Decision (Phase 38B)
+
+Контекст:
+
+Phase 37A выбрала Checklist Domain второй по приоритету после Document
+Domain (теперь формально закрыт). Phase 38A (read-only архитектурный
+аудит) нашла домен на стадии, структурно аналогичной Document Domain
+до ADR-020: существует зрелый, production-проверенный
+reference/template-слой (`checklist_registry`, 14 production-рядов,
+владелец `knowledge_manager.py`, часть общего Knowledge Core наряду с
+SOP/Document Template/FAQ), но НЕ существует никакого operational
+instance-слоя — ни одной строки кода, создающей Checklist instance при
+старте Roadmap, отслеживающей completion отдельных пунктов, вычисляющей
+progress, блокирующей Stage completion или генерирующей Task. Все 14
+production-рядов — самодостаточные Templates: `Items`/`Required
+Items`/`Optional Items` хранятся как один текстовый blob (through
+`;`-разделитель), `Template Stage ID` пуст на всех 14 рядах (реальная
+привязка к Template Stage идёт в обратную сторону — через
+`roadmap_template_stages."Checklist IDs"`), `Status` = `active`
+одинаково у всех, ни один ряд не ссылается ни на один реальный
+Roadmap/Stage/Task/Document. При старте Roadmap (`/startroadmap`)
+список Checklist ID копируется как текст из `roadmap_template_stages` в
+`roadmap_stages` — чистое конфигурационное копирование, без создания
+какой-либо исполняемой сущности. Phase 38A.1 закрыла найденный
+PRS-003-класса test-isolation пробел (13 файлов зарегистрированы в
+hard socket-block) — это блокирующее предусловие Foundation уже
+выполнено. Это решение применяет тот же архитектурный принцип, что
+ADR-013…ADR-020: формализовать существующий reference-слой без
+переписывания того, что уже работает, и спроектировать (но не
+реализовать) недостающий operational-слой с той же дисциплиной
+(единственный persistence-владелец, единственный orchestration-
+владелец, детерминированная идентичность, структурированный
+result-контракт, явные lifecycle-границы, никаких скрытых cross-domain
+мутаций).
+
+Решения:
+
+1. Канонические границы сущностей.
+
+   Checklist Template — переиспользуемое reference-определение.
+   Реестр: `checklist_registry` (без изменений). Идентичность:
+   Checklist ID (существующие значения, включая ручные semantic-slug'и
+   вроде `CHK-IZH-ALM-LEGALIZATION-DOCS-001`, сохраняются без
+   изменений — переименование/миграция не требуется). Владелец
+   persistence: `knowledge_manager.py`, без изменений. Каждый
+   существующий ряд представляет ОДИН целый Checklist Template, а не
+   один пункт. Существующие поля `Items`/`Required Items`/`Optional
+   Items` остаются reference/template-текстом; `checklist_registry` НЕ
+   становится operational execution-реестром.
+
+   Checklist Template Item — переиспользуемое определение одного
+   пункта шаблона. В Foundation НЕ вводится отдельный нормализованный
+   реестр Template Item; существующий текст пунктов остаётся внутри
+   `checklist_registry`; нормализация в отдельные Template Item-
+   идентичности откладывается. Foundation парсит/снимает snapshot
+   существующего текста пунктов детерминированно (см. решение 11), без
+   переписывания текущих 14 Template-рядов.
+
+   Checklist Instance — канонический operational parent entity.
+   Одно исполнение одного Checklist Template. Привязан к одному
+   Business; опционально — к одному Roadmap и одному Stage; может
+   нести производный Object/Service-контекст. Владеет operational
+   lifecycle и агрегированной progress-сводкой. Никогда не заменяет и
+   не изменяет Template.
+
+   Checklist Instance Item — канонический исполняемый пункт.
+   Принадлежит ровно одному Checklist Instance. Хранит snapshot
+   исполняемого текста шаблона (заголовок/описание/порядок/required-
+   флаг), независимый item-статус, метаданные завершения. НЕ становится
+   Task автоматически; НЕ дублирует Document Requirement matching;
+   может позже получить bounded опциональные ссылки на Task/Document/
+   SOP (физически включены в Foundation-схему, но без автоматической
+   генерации/синхронизации — см. решение 8).
+
+   Completion Event / История — в Foundation НЕ вводится отдельный
+   append-only реестр событий завершения; текущий статус и метаданные
+   завершения хранятся непосредственно на Instance Item; append-only
+   аудит-история — явно отложена.
+
+   Evidence — НЕ каноническая сущность файлового хранения. Будущее
+   evidence может ссылаться на Document ID; никакого raw-встраивания
+   файлов; никакой Checklist-владеемой Drive-загрузки; Document Domain
+   остаётся единственным владельцем Document persistence/lifecycle.
+
+2. Владение существующим Template-слоем.
+
+   `knowledge_manager.py` остаётся единственным persistence-владельцем
+   `checklist_registry`, создания/чтения Checklist Template,
+   Template-уровня метаданных — без изменений. Существующий
+   `/newchecklist` остаётся Template-командой; `/linkknowledge`
+   остаётся привязкой knowledge к Template Stage; `/stageknowledge`
+   остаётся read-only отображением. Все три — НЕ operational Checklist
+   команды. Persistence `checklist_registry` НЕ переносится в
+   `checklist_manager.py`.
+
+3. Operational persistence ownership.
+
+   Одобряется будущий модуль `business_core/checklist_manager.py` —
+   единственный persistence-владелец operational Checklist-реестров.
+   Он владеет: точным чтением Checklist Instance/Instance Item по ID;
+   list/filter-чтением; генерацией Instance ID; генерацией Instance
+   Item ID; низкоуровневым созданием instance; низкоуровневым созданием
+   item; низкоуровневой записью статуса; низкоуровневой записью
+   completion-метаданных; проверкой текущего ряда после записи;
+   idempotency-поиском. Он НЕ владеет: производной кросс-domain
+   relation-логикой; политикой парсинга Template; генерацией Task;
+   сопоставлением Document; мутацией Stage; Telegram UX.
+
+4. Operational orchestration ownership.
+
+   Одобряется `business_builder.py` как единственный cross-domain
+   orchestration-владелец Checklist. Он владеет: relation-валидацией;
+   поиском Template; детерминированным парсингом пунктов Template;
+   созданием snapshot Template; instantiation-идемпотентностью;
+   созданием Instance + Items; политикой reuse/conflict; оркестрацией
+   вычисления progress; оркестрацией item-status transition;
+   оркестрацией Checklist-status transition; сборкой структурированного
+   result; compensation-поведением, если создание parent прошло, а
+   создание items — нет.
+
+   Направление зависимостей:
+   `telegram_handlers → business_builder → checklist_manager → sheets`.
+
+   Read-only зависимости разрешены на: `knowledge_manager`,
+   `roadmap_manager`, `service_manager`, `object_manager`,
+   `task_manager`, `document_manager`, `organization_manager`.
+   Обратные зависимости запрещены.
+
+5. Новые operational-реестры (ровно два).
+
+   A. `checklist_instances`: Checklist Instance ID, Business ID,
+      Checklist Template ID, Checklist Title Snapshot, Service ID,
+      Object ID, Roadmap ID, Stage ID, Status, Total Items, Required
+      Items, Completed Items, Required Remaining, Created At, Created
+      By, Started At, Completed At, Cancelled At, Updated At, Notes.
+
+   B. `checklist_instance_items`: Checklist Instance Item ID, Checklist
+      Instance ID, Checklist Template ID, Source Item Key, Item Order,
+      Item Title Snapshot, Item Description Snapshot, Required,
+      Status, Blocked Reason, Skip Reason, Task ID, Document ID, SOP
+      ID, Completed At, Completed By, Created At, Updated At, Notes.
+
+   Task ID/Document ID/SOP ID на Instance Item физически включаются в
+   Foundation-схему как опциональные reference-колонки, но БЕЗ
+   автоматической генерации/линковки/синхронизации в Foundation — они
+   могут оставаться пустыми и заполняются только через явную будущую
+   validated-запись. Никаких generic relation-JSON или comma-
+   separated relation-полей не добавляется — только bounded одиночные
+   ссылки, как во всех предыдущих доменах.
+
+6. Identity-политика.
+
+   Checklist Template: существующий Checklist ID (включая смешанные
+   `CHK-NNN` и semantic-slug форматы) сохраняется без изменений —
+   миграция не требуется.
+
+   Checklist Instance: префикс `CLIN-NNN`. Checklist Instance Item:
+   префикс `CLII-NNN`. Выбраны вместо более коротких `CLI-*`/`CII-*`,
+   потому что `CLI` визуально и мнемонически слишком легко спутать с
+   `CLIENT`-related сокращениями, уже используемыми в человеческом
+   обсуждении домена (Client ID часто сокращают как "CLI" в заметках),
+   а `CII` не несёт очевидной для человека связи с "Checklist
+   Instance Item" без дополнительного контекста; `CLIN`/`CLII`
+   сохраняют однозначную визуальную связь с "Checklist INstance" /
+   "Checklist Instance Item" и не пересекаются ни с одним префиксом,
+   уже занятым в `sheets._ID_PREFIXES` (проверено при аудите: CHK, SOP,
+   DOC, FAQ, BIZ, PRS, OBJ, RM, STAGE, TSK, TAS, ROLE, DEPT, DREG,
+   DFAM и т.д. — коллизий нет). Ровно одна реализация генератора на
+   каждый operational ID; caller-side генерация запрещена; генерация
+   сканирует существующие валидные значения безопасно; некорректные
+   существующие ID игнорируются безопасно, не ломая сканирование;
+   ID генерируются только после валидации и проверки reuse; никакой
+   identity по title; никакого переиспользования filename/document/
+   task-идентичности.
+
+7. Политика парсинга и snapshot Template.
+
+   Детерминированный парсер: разделитель `;` (уже используемый во всех
+   14 production-рядов), опционально `\n` как альтернативный
+   разделитель, если `;` отсутствует в тексте пункта. Порядок пунктов
+   сохраняется по порядку появления в тексте. Пробелы обрезаются;
+   пустые токены игнорируются. НЕ используется AI-парсинг; недостающие
+   пункты НЕ домысливаются; Template-ряды НЕ переписываются. Каждому
+   распарсенному пункту присваивается детерминированный порядковый
+   `Source Item Key` (например, индекс появления в исходном тексте,
+   1-based) — стабильный до тех пор, пока текст Template не изменится
+   (изменение текста Template не переписывает уже существующие Instance
+   Item — они уже сняли snapshot).
+
+   Required/Optional классификация: Required Items и Optional Items
+   разбираются тем же способом и сопоставляются с распарсенными Items
+   ТОЛЬКО через точное текстовое совпадение (после trim) — никакого
+   fuzzy-сопоставления. Безопасный default: все распарсенные Items по
+   умолчанию `required=true`; точное совпадение в Optional Items
+   переопределяет на `required=false`; точное совпадение в Required
+   Items оставляет `required=true`; если один и тот же пункт текста
+   точно совпадает и с Required Items, и с Optional Items одновременно
+   — это противоречивая классификация, и инстанцирование этого
+   Template блокируется кодом
+   `CHECKLIST_TEMPLATE_ITEM_CLASSIFICATION_CONFLICT`. Пустой список
+   Items блокирует инстанцирование
+   (`CHECKLIST_TEMPLATE_ITEMS_EMPTY`). Обоснование default'а
+   "required=true": в текущих production-данных колонки Required
+   Items/Optional Items не заполнены ни у одного из 14 рядов — если бы
+   default был `required=false`, Checklist мог бы быть отмечен
+   завершённым, не выполнив ни одного реального пункта; `required=true`
+   по умолчанию — единственный выбор, который не позволяет тихо
+   потерять важную работу.
+
+   Instance Item снимает snapshot заголовка/описания/порядка/required-
+   флага на момент инстанцирования; последующие правки Template
+   никогда не переписывают уже созданные (активные или исторические)
+   Instance Items — они уже независимы от Template.
+
+8. Instantiation и idempotency-политика.
+
+   Канонический ключ инстанцирования: Business ID + Checklist Template
+   ID + Roadmap ID + Stage ID (пустые Roadmap ID/Stage ID
+   нормализуются как явное "не указано", участвуя в ключе как есть, а
+   не заменяясь угадыванием). Business ID и Checklist Template ID —
+   обязательны; Roadmap ID и Stage ID — опциональны; если указан Stage
+   ID, Roadmap ID выводится/валидируется из него (Stage должен
+   принадлежать этому Roadmap). Ноль совпадений → создаётся один
+   Checklist Instance и все его Items. Одно совместимое совпадение →
+   переиспользуется существующий Instance, код
+   `CHECKLIST_INSTANCE_REUSED`, дубликат items не создаётся. Несколько
+   совпадений → блокируется, код `MULTIPLE_CHECKLIST_INSTANCE_MATCHES`
+   (единственный канонический код для этого случая — синонимов не
+   вводится), возвращаются все конфликтующие Instance ID, никакого
+   first-pick, никаких записей. Никакого dedup по title; никакого
+   dedup по тексту пункта; никакого fuzzy-сопоставления Template;
+   никакого автоматического duplicate-repair. Явный отдельный
+   Idempotency Key НЕ вводится в Foundation — канонический relation-
+   tuple достаточен; внешний idempotency-параметр откладывается.
+
+9. Relation-политика.
+
+   Обязательные: Business ID, Checklist Template ID. Опциональные
+   одиночные ссылки на уровне Instance: Service ID, Object ID, Roadmap
+   ID, Stage ID. Опциональные одиночные ссылки на уровне Item: Task
+   ID, Document ID, SOP ID. Каждый указанный ID должен существовать;
+   same-Business ownership обеспечивается там, где применимо; Stage
+   должен принадлежать Roadmap; Roadmap может выводить Object/Service-
+   контекст; противоречия блокируют (`CHECKLIST_ENTITY_RELATION_
+   MISMATCH`); никакого автоматического repair; никакого перемещения
+   между Business; никакой generic many-to-many связи; relink требует
+   будущего явного действия (`CHECKLIST_RELATION_UPDATE_REQUIRES_
+   EXPLICIT_ACTION`); Foundation не изменяет ряды закрытых доменов.
+   Привязка через Template Stage помогает ВЫБРАТЬ Template, но не
+   является operational-идентичностью.
+
+10. Instance lifecycle.
+
+    Вокабуляр: `draft`, `in_progress`, `blocked`, `completed`,
+    `cancelled`, `archived`. Отдельный статус `ready` НЕ вводится —
+    Instance создаётся сразу валидным и доступным к старту; отдельное
+    промежуточное состояние между "создан" и "начат" не несёт сейчас
+    отличимой семантики и добавило бы переход без реальной причины.
+
+    Матрица переходов:
+    `draft` → `draft`, `in_progress`, `cancelled`, `archived`.
+    `in_progress` → `in_progress`, `blocked`, `completed`, `cancelled`,
+    `archived`.
+    `blocked` → `blocked`, `in_progress`, `cancelled`, `archived`.
+    `completed` → `completed`, `archived`.
+    `cancelled` → `cancelled`, `archived`.
+    `archived` → только `archived`.
+
+    Неизменный переход — успех/no-op. `completed`/`cancelled`/
+    `archived` не могут обычно переоткрываться; restore требует
+    будущего явного действия (`CHECKLIST_RESTORE_REQUIRES_EXPLICIT_
+    ACTION`). Никакой автоматической мутации Stage/Roadmap. Никакой
+    статус не выводится исключительно из timestamp'ов.
+
+11. Item lifecycle.
+
+    Вокабуляр: `pending`, `in_progress`, `blocked`, `done`, `skipped`,
+    `not_applicable`. `done`/`skipped`/`not_applicable` — терминальные
+    для обычного перехода. Матрица: `pending`/`in_progress`/`blocked`
+    свободно переходят друг в друга и в любое терминальное состояние;
+    терминальные состояния переходят только сами в себя обычным путём.
+    Обычное переоткрытие терминального Item не разрешено; explicit
+    restore/reopen — отдельное будущее действие
+    (`CHECKLIST_ITEM_TERMINAL_REOPEN_REQUIRES_EXPLICIT_ACTION`).
+    `blocked` требует `Blocked Reason`
+    (`CHECKLIST_ITEM_REASON_REQUIRED` при отсутствии). `skipped` и
+    `not_applicable` оба используют единое поле `Skip Reason` в
+    Foundation (отдельного `Outcome Reason` не вводится — bounded-
+    схема предпочтительнее двух полей с пересекающейся семантикой).
+    `done` требует `Completed At` и `Completed By`
+    (`CHECKLIST_ITEM_COMPLETION_METADATA_REQUIRED` при отсутствии).
+    Поскольку append-only история статусов отложена, смена активного
+    статуса не сохраняет отдельной истории — только текущее состояние.
+
+12. Completion и progress policy.
+
+    Checklist может перейти в `completed` только если: существует хотя
+    бы один Instance Item; каждый required item — `done` либо
+    `not_applicable` (с обязательной причиной); ни один required item
+    не находится в `pending`/`in_progress`/`blocked`; `skipped` НЕ
+    удовлетворяет required item; optional items могут оставаться в
+    любом нетерминальном состоянии и не блокируют завершение Checklist.
+    `blocked` required item предотвращает завершение
+    (`CHECKLIST_COMPLETION_REQUIREMENTS_NOT_MET`).
+
+    Item-статус — хранимый (canonical truth). Progress — производится
+    каноническим вычислением поверх item-статусов на каждый запрос;
+    Checklist-статус — персистентный (задаётся через transition-API,
+    которая сама проверяет производную completion-готовность перед
+    записью `completed`). Колонки Total Items/Required Items/Completed
+    Items/Required Remaining на `checklist_instances` — верифицированный
+    persisted-кэш, пересчитываемый при каждой мутации item, но
+    каноническая истина остаётся в статусах Instance Items, а не в этом
+    кэше. Ручной override completion в Foundation НЕ разрешён —
+    переход в `completed` всегда проверяется автоматически.
+
+    Total Items = все Instance Items. Required Items = count
+    `required=true`. Completed Items = count `done` + `not_applicable`.
+    Required Remaining = required items, не находящиеся в `done`/
+    `not_applicable`. Blocked Required — производный warning-счётчик
+    (может не персиститься отдельной колонкой). `skipped` required
+    item никогда не считается completed. Никакого caller-side
+    вычисления progress — только orchestration-уровень.
+
+13. Parent/item consistency и compensation.
+
+    Каждый Instance Item принадлежит ровно одному Checklist Instance;
+    Business-контекст выводится из parent; orphan Item не создаётся;
+    Item не может быть перемещён в другой Instance; удаление parent
+    запрещено; hard delete в Foundation отсутствует; создание parent
+    не может быть отрапортовано как успех, если не все распарсенные
+    Items персистированы и верифицированы.
+
+    Compensation-политика: валидация и парсинг выполняются полностью
+    ДО любой записи; parent создаётся только после того, как полный
+    payload items готов; parent и items добавляются; если запись items
+    не удаётся после успешного создания parent — успех НЕ заявляется,
+    возвращается явный код `CHECKLIST_INSTANCE_PARTIAL_PERSISTENCE` с
+    перечислением уже созданных ID; автоматическое удаление уже
+    созданных operational-рядов ЗАПРЕЩЕНО, поскольку в репозитории нет
+    безопасного канонического row-delete примитива для Business Core
+    реестров; повторная попытка должна обнаруживать и переиспользовать/
+    исправлять только через явную orchestration-логику, никогда не
+    создавая тихий дубликат.
+
+14. Task boundary.
+
+    Checklist Instance Item и Task — раздельные канонические сущности.
+    Task ID — только опциональная ссылка. Никакой автоматической
+    генерации Task в Foundation; никакого автоматического создания
+    assignment; никакой двусторонней синхронизации статуса. Завершение
+    Task не завершает автоматически Checklist Item; завершение
+    Checklist Item не завершает автоматически Task. Любая генерация/
+    синхронизация требует отдельного будущего ADR. Checklist Domain
+    может читать точное ID-состояние Task, но не может мутировать Task
+    через скрытые side-эффекты.
+
+15. Stage/Roadmap boundary.
+
+    Checklist Instance может ссылаться на один Roadmap и один Stage;
+    Stage ID может выводить Roadmap ID. Stage/Checklist lifecycle
+    остаются независимыми: Checklist completion не завершает Stage;
+    Stage completion не завершает Checklist; Checklist не блокирует
+    Stage transitions в Foundation. Read-only предупреждения/отчётность
+    могут быть добавлены позже. Автоматическое инстанцирование
+    Checklist при старте Roadmap НЕ входит в Phase 38C: Foundation
+    предоставляет только явный канонический instantiation API;
+    интеграция с `/startroadmap` откладывается в отдельную будущую
+    integration-фазу — это защищает уже закрытое Roadmap/Stage-
+    поведение от скрытых побочных эффектов.
+
+16. Document boundary.
+
+    Checklist Domain не дублирует Document Requirement логику;
+    удовлетворение Document Template остаётся во владении
+    `document_requirements_query.evaluate_scope()`. Document ID может
+    быть опциональной evidence/ссылкой на Instance Item; привязка
+    Document НЕ отмечает Item выполненным автоматически в Foundation;
+    завершение Item не меняет статус Document. Checklist может позже
+    ЧИТАТЬ канонический результат Document requirement evaluation, но
+    не пишет в Document ни при каких обстоятельствах; никакой Drive-
+    загрузки, владеемой Checklist.
+
+17. SOP boundary.
+
+    SOP остаётся Knowledge reference-подсистемой; persistence остаётся
+    в `knowledge_manager.py`. Checklist Instance Item может опционально
+    ссылаться на один SOP ID; ссылка — чисто инструктивная. Никакого
+    SOP completion; никакой мутации SOP-записей со стороны Checklist.
+
+18. Template Stage и текущие скопированные Checklist ID.
+
+    Текущее поведение явно подтверждается неизменным:
+    `roadmap_template_stages` хранит Checklist IDs;
+    `/startroadmap` копирует эту строку в `roadmap_stages` как есть.
+    Это конфигурационное/reference-распространение, а не создание
+    operational Checklist Instance. Текущее поведение остаётся
+    неизменным в Phase 38C. Операционное инстанцирование из этих ID —
+    отдельная будущая явная интеграция. Checklist Domain не должен
+    трактовать скопированные Stage Checklist IDs как исполняемые
+    записи.
+
+19. Template lifecycle.
+
+    Template lifecycle (`active`/`inactive`/`archived`) остаётся
+    отдельным от operational lifecycle и во владении
+    `knowledge_manager.py`. Operational Instance snapshot остаётся
+    стабильным, даже если Template позже станет `inactive`/`archived`.
+    `inactive`/`archived` Template не может создать новый Instance без
+    будущего явного override; уже существующие Instances остаются
+    валидными. Template-статус не мутирует Instance-статус. API
+    переходов Template НЕ реализуется в Phase 38C.
+
+20. Result-контракт.
+
+    Стабильный структурированный результат для каждой operational
+    Checklist-функции: ok, code, error, checklist_instance_id,
+    checklist_template_id, checklist_instance_item_id, business_id,
+    service_id, object_id, roadmap_id, stage_id, task_id, document_id,
+    sop_id, previous_status, requested_status, final_status, created,
+    reused, changed, completed, total_items, required_items,
+    completed_items, required_remaining, blocked_required,
+    conflicting_ids, created_item_ids, warnings, retry_safe. Никогда
+    не содержит сырой exception-объект, сырую строку Sheets или сырой
+    dict, показываемый пользователю в Telegram.
+
+21. Result-код вокабуляр (единственные канонические имена, без
+    синонимов):
+
+    Template: CHECKLIST_TEMPLATE_NOT_FOUND,
+    CHECKLIST_TEMPLATE_INACTIVE, CHECKLIST_TEMPLATE_ARCHIVED,
+    CHECKLIST_TEMPLATE_ITEMS_EMPTY,
+    CHECKLIST_TEMPLATE_ITEM_CLASSIFICATION_CONFLICT,
+    CHECKLIST_TEMPLATE_PARSE_FAILED.
+
+    Отношения: BUSINESS_NOT_FOUND, SERVICE_NOT_FOUND, OBJECT_NOT_FOUND,
+    ROADMAP_NOT_FOUND, STAGE_NOT_FOUND, TASK_NOT_FOUND,
+    DOCUMENT_NOT_FOUND, SOP_NOT_FOUND,
+    CHECKLIST_ENTITY_RELATION_MISMATCH,
+    CHECKLIST_RELATION_UPDATE_REQUIRES_EXPLICIT_ACTION.
+
+    Инстанцирование: CHECKLIST_INSTANCE_CREATED,
+    CHECKLIST_INSTANCE_REUSED, MULTIPLE_CHECKLIST_INSTANCE_MATCHES
+    (единственный канонический код конфликта совпадений —
+    MULTIPLE_CHECKLIST_IDEMPOTENCY_MATCHES не вводится как отдельный
+    синоним), CHECKLIST_INSTANCE_PARTIAL_PERSISTENCE,
+    CHECKLIST_INSTANCE_POST_WRITE_VERIFICATION_FAILED.
+
+    Чтение instance: CHECKLIST_INSTANCE_NOT_FOUND,
+    CHECKLIST_INSTANCE_ITEM_NOT_FOUND.
+
+    Статус Instance: CHECKLIST_STATUS_UPDATED,
+    CHECKLIST_STATUS_UNCHANGED, INVALID_CHECKLIST_STATUS,
+    INVALID_CHECKLIST_STATUS_TRANSITION,
+    CHECKLIST_COMPLETION_REQUIREMENTS_NOT_MET,
+    CHECKLIST_RESTORE_REQUIRES_EXPLICIT_ACTION.
+
+    Статус Item: CHECKLIST_ITEM_STATUS_UPDATED,
+    CHECKLIST_ITEM_STATUS_UNCHANGED, INVALID_CHECKLIST_ITEM_STATUS,
+    INVALID_CHECKLIST_ITEM_STATUS_TRANSITION,
+    CHECKLIST_ITEM_REASON_REQUIRED,
+    CHECKLIST_ITEM_COMPLETION_METADATA_REQUIRED,
+    CHECKLIST_ITEM_TERMINAL_REOPEN_REQUIRES_EXPLICIT_ACTION.
+
+    Admin/update: CHECKLIST_ADMIN_FIELDS_UPDATED,
+    CHECKLIST_ADMIN_FIELDS_UNCHANGED, INVALID_CHECKLIST_ADMIN_FIELD,
+    CHECKLIST_IMMUTABLE_FIELD_CONFLICT,
+    CHECKLIST_ITEM_IMMUTABLE_FIELD_CONFLICT.
+
+    Persistence: CHECKLIST_PERSISTENCE_FAILED,
+    CHECKLIST_ITEM_PERSISTENCE_FAILED.
+
+22. Immutable/mutable поля.
+
+    Checklist Instance неизменны: Checklist Instance ID, Business ID,
+    Checklist Template ID, Created At. Условно неизменны после
+    создания (обычный update их не трогает, relink требует будущего
+    явного действия): Roadmap ID, Stage ID, Service ID, Object ID,
+    Title Snapshot. Обычно изменяемы: Notes; Status — только через
+    transition API.
+
+    Checklist Instance Item неизменны: Checklist Instance Item ID,
+    Checklist Instance ID, Checklist Template ID, Source Item Key,
+    Item Order, Item Title Snapshot, Item Description Snapshot,
+    Required, Created At. Обычно изменяемы через bounded API: Status;
+    Blocked Reason; Skip Reason; Notes; Task ID/Document ID/SOP ID —
+    только через будущее явное link-действие; Completed At/Completed
+    By — управляются исключительно transition-логикой, не generic
+    update. Никаких generic relation-обновлений.
+
+23. Timestamp-политика.
+
+    Instance: Created At — устанавливается один раз; Updated At —
+    только при реальной мутации; Started At — устанавливается при
+    первом переходе в `in_progress`, не перезаписывается повторно;
+    Completed At — устанавливается при успешном переходе в `completed`,
+    неизменен через generic update; Cancelled At — устанавливается при
+    переходе в `cancelled`.
+
+    Item: Created At — один раз; Updated At — только при реальной
+    мутации; Completed At/Completed By — устанавливаются для `done`,
+    не доступны для записи через generic update.
+
+24. Restore/reopen policy.
+
+    Никакого обычного переоткрытия завершённого/отменённого/
+    архивированного Checklist Instance. Никакого обычного
+    переоткрытия done/skipped/not_applicable Item. Restore/reopen —
+    НЕ реализуется в Foundation (`CHECKLIST_RESTORE_IMPLEMENTED = NO`,
+    `CHECKLIST_ITEM_REOPEN_IMPLEMENTED = NO`), но защита ОБЯЗАНА
+    существовать (`CHECKLIST_RESTORE_PROTECTION_REQUIRED = YES`,
+    `CHECKLIST_ITEM_REOPEN_PROTECTION_REQUIRED = YES`) через явные
+    result-коды. Никакого скрытого admin-обхода.
+
+25. Delete/archive policy.
+
+    Hard delete отсутствует в Foundation. `archived` — терминален.
+    `cancelled` — operational-терминален, но может позже архивироваться
+    через ту же transition matrix. Item-ряды никогда не удаляются
+    отдельно. Template-записи не удаляются operational Checklist-кодом.
+    Retention-политика отложена.
+
+26. Privacy и логирование.
+
+    Разрешено логировать: команда/действие, result-код, Checklist
+    Instance ID, Checklist Template ID, Item ID, Business/Service/
+    Object/Roadmap/Stage ID, Task/Document/SOP ID (если есть), статус,
+    progress-счётчики, флаги changed/reused, конфликтующие ID/их
+    количество, retry-safe флаг. Запрещено логировать: Item Title
+    Snapshot, Item Description Snapshot, Notes, Blocked Reason, Skip
+    Reason, содержимое Document, персональные данные, полное Telegram-
+    сообщение, credentials, сырые exceptions, сырые Sheets-ряды.
+    Telegram обязан показывать только безопасные bounded-сообщения.
+
+27. Command scope для будущего Caller UX (Phase 38D).
+
+    Сохраняются без изменений: /newchecklist, /linkknowledge,
+    /stageknowledge — Template/reference-команды. Одобряются к
+    будущему рассмотрению (без коллизий, проверено при аудите):
+    /startchecklist (только instantiation через business_builder),
+    /checklists (read-only отфильтрованный список), /checklist (точный
+    Checklist Instance ID), /updatecheckitem (только item-status
+    transition, без admin/relink/task/document автоматизации),
+    /updatechecklist (status transition ИЛИ admin-обновление Notes,
+    взаимоисключающе — тот же паттерн, что /updatetask и /updatedoc).
+    Команды НЕ реализуются в Phase 38B.
+
+28. Требования к тестам Phase 38C.
+
+    Обязательны до и во время Foundation: все Checklist-тесты
+    зарегистрированы в hard socket-block (уже выполнено Phase 38A.1);
+    mock-completeness guard остаётся обязывающим; никакого живого
+    доступа к Sheets/Drive/Telegram/HTTP; тесты генерации ID; тесты
+    парсера; тесты точной required/optional классификации; тесты
+    relation-валидации; тесты идемпотентности zero/one/multiple; тесты
+    отсутствия title-based dedup; тесты partial-persistence parent/
+    item; тесты вычисления progress; тесты Instance lifecycle; тесты
+    Item lifecycle; тесты обязательности reason; тесты защиты
+    терминального reopen; guard-тесты не-мутации Task/Document/Stage;
+    guard-тесты владения persistence; guard-тесты владения
+    orchestration; guard-тесты отсутствия caller-side генерации ID;
+    privacy/logging guards; проверки production-снимка.
+
+29. Production migration.
+
+    Не переписываются существующие 14 рядов `checklist_registry`;
+    Checklist ID не меняются; существующие Templates не разбиваются на
+    нормализованные Template Item-ряды; колонка Template Stage ID не
+    backfill'ится; скопированные `roadmap_stages` Checklist IDs не
+    конвертируются в operational-ряды. Новые operational-реестры
+    добавляются РЯДОМ с текущими reference-данными. Production
+    migration — только после отдельного явного одобрения, если
+    когда-либо понадобится.
+
+30. Явно исключено из Foundation (Phase 38C):
+
+    нормализованный реестр Checklist Template Item; AI-парсинг
+    шаблонов; автоматическое создание Checklist при старте Roadmap;
+    автоматическое создание Task; двусторонняя синхронизация Task;
+    автоматическое завершение Document; дублирование Document
+    Requirement логики; блокировка Stage; авто-завершение Stage;
+    авто-завершение Checklist из Stage; append-only история статусов;
+    напоминания; WABA/SendPulse/Binotel-интеграция; permissions/RBAC;
+    workflow назначений; комментарии/threading; вложения помимо
+    Document-ссылок; generic many-to-many связи; hard delete;
+    реализация restore/reopen; production migration/backfill.
+
+31. Границы Phase 38C (bounded Foundation scope).
+
+    Разрешено: создать `checklist_manager.py`; добавить схему
+    `checklist_instances`; добавить схему `checklist_instance_items`;
+    добавить канонические ID-генераторы; добавить точные reads/list-
+    helpers; добавить детерминированный Template-парсер; добавить
+    business_builder instantiation orchestration; добавить relation-
+    валидацию; добавить idempotent create/reuse/conflict-поведение;
+    добавить orchestration переходов item и Instance; добавить
+    вычисление progress; добавить структурированный result-контракт;
+    добавить architecture/test guards. Запрещено: изменять Telegram
+    caller UX; деплоить; автоматически интегрировать в
+    `/startroadmap`; генерировать Task; мутировать Document; мутировать
+    Stage/Roadmap lifecycle; мигрировать production Template-ряды.
+
+32. Отклонённые альтернативы.
+
+    A. Считать текущий `checklist_registry` operational execution-
+       реестром — отклонено: нет instance-идентичности, нет item-
+       идентичности, нет completion-полей, нет Roadmap/Stage execution-
+       связи.
+    B. Хранить каждое operational-исполнение как закодированный текст
+       в одном существующем ряду — отклонено: нет детерминированной
+       item-идентичности, нет безопасного progress, нет истории, нет
+       bounded-переходов.
+    C. Сделать Checklist Item идентичным Task — отклонено: Checklist-
+       семантика легче; неназначенные/non-task items валидны;
+       автоматическая генерация Task отложена; Task Domain владеет
+       Task lifecycle.
+    D. Дублировать Document Requirement логику внутри Checklist —
+       отклонено: ADR-020 уже определяет канонический evaluator;
+       дублирующая истина расходилась бы со временем.
+    E. Автоматически мутировать статус Stage из Checklist — отклонено:
+       Stage Domain владеет Stage lifecycle; скрытый каскад запрещён.
+    F. Переписать существующие 14 Templates в нормализованные Item-
+       ряды до Foundation — отклонено: ненужная production migration;
+       текущие ряды можно детерминированно снять как snapshot без
+       переписывания.
+
+Причина:
+
+Тот же архитектурный принцип, применённый ADR-013…ADR-020 к границам
+Business/Client/Object/Service/Roadmap/Stage/Organization/Task/Document,
+здесь применяется к Checklist Domain — с той же особенностью, что и в
+ADR-020: значительная часть reference-слоя (Template-создание,
+Knowledge-привязка к Template Stage, копирование ID при старте
+Roadmap) уже написана и production-проверена, и НЕ переписывается;
+решение формализует владение Template-слоем (единственный владелец
+`knowledge_manager.py`, без изменений) и проектирует недостающий
+operational-слой с нуля, применяя уже проверенные паттерны из ADR-019
+(idempotency zero/one/multiple, parent+child registry shape, transition
+matrix с терминальными состояниями и явной restore-защитой) и ADR-020
+(snapshot-not-live-reference, structured result contract, единственный
+canonical evaluator вместо дублирования, compensation без claim
+ложного успеха). Явно откладывается всё, что создало бы скрытые
+cross-domain побочные эффекты (Task-генерация, Document-мутация,
+Stage-каскад) или потребовало бы production migration прежде, чем
+Foundation вообще может начаться.
+
+Статус:
+
+Утверждено для реализации (Phase 38C) с bounded scope, определённым в
+решении 31. Ничего не реализовано в рамках этого ADR — только
+архитектурное решение. `checklist_manager.py` не создан; `checklist_
+instances`/`checklist_instance_items` не существуют; ни один
+production-caller не мигрирован; ни один код не изменён; схема Google
+Sheets не менялась; существующие 14 рядов `checklist_registry` не
+изменены; `roadmap_template_stages`/`roadmap_stages`/`stage_entity_
+relations` не изменены. GTD Core не затронут. Ни один закрытый домен
+(Object/Client/Service/Roadmap/Stage/Organization/Task/Document) не
+переоткрыт.
