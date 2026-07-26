@@ -2727,3 +2727,445 @@ Phase 35F (Organization Domain Closeout Audit) нашёл два расхожд�
 Статус (Phase 35G): оба расхождения закрыты. §2 выше исправлен, чтобы
 не противоречить фактической реализации. Organization Domain
 identity-политика теперь внутренне согласована.
+
+
+## ADR-019 — Task Domain Architecture Decision (Phase 36B)
+
+Контекст:
+
+Phase 35A и Phase 36A (Task Domain Architecture Audit / Audit Refresh,
+read-only) подтвердили, что канонической Business Task-сущности не
+существует: нет task_manager.py, нет TASK_REGISTRY, нет Task ID, нет
+API назначения/статуса Task. Personal GTD (`/tasks`, Next Actions,
+Waiting, Someday) остаётся однопользовательской системой без Business
+Task ID и без Person/Role assignee — не может служить канонической
+Business Task-сущностью. До Phase 35H единственной блокирующей
+зависимостью было отсутствие закрытого Organization Domain: без
+канонической Person↔Role eligibility Task Domain унаследовал бы те же
+пробелы (archived Person, неактивная Role), которые ADR-018 закрыл для
+Organization. Organization Domain теперь формально закрыт (Phase 35H)
+и предоставляет: canonical `business_builder.
+assign_person_to_role_canonical()`; archived Person блокируется;
+paused/archived Role блокируется для нового назначения; только active
+Role может получить новую Stage-ответственность; Business-scoped Role
+требует Person Business membership; global Role — нет; duplicate
+active Assignment блокируется; ended Assignment неизменяем; Stage→Role
+relation канонична и исторична; Stage Responsible свободный текст
+остаётся исключительно информационным. Это решение — Task Domain's
+собственный ADR, применяющий тот же архитектурный принцип
+Audit→ADR→Foundation→Closeout, который ADR-013…ADR-018 уже применили к
+Service/Object/Client/Roadmap/Stage/Organization.
+
+Решения:
+
+1. Канонические владельцы persistence и orchestration.
+
+   task_manager.py — единственный transactional-владелец TASK_REGISTRY
+   и TASK_ASSIGNMENTS. business_builder.py — единственный
+   cross-domain orchestration-владелец: Task creation, Task status
+   transition, Task relation validation, Task assignment/reassignment,
+   Task lifecycle eligibility, idempotency, structured result
+   assembly. Направление зависимостей: telegram_handlers →
+   business_builder → task_manager → sheets. business_builder может
+   вызывать read-only validation API из person_manager,
+   organization_manager, roadmap_manager, service_manager,
+   object_manager и существующих канонических person-related helpers.
+   task_manager НЕ импортирует business_builder/telegram_handlers.
+   Закрытые домены (Object/Client/Service/Roadmap/Stage/Organization)
+   НЕ импортируют task_manager — зависимость только в одну сторону, от
+   Task к ним, никогда наоборот.
+
+2. Каноническая сущность Business Task.
+
+   Новая каноническая сущность: Business Task. Реестр: task_registry.
+   Идентичность: Task ID, префикс `TSK-` (проверено — не
+   пересекается ни с одним существующим префиксом в _ID_PREFIXES).
+   Task ID глобально уникален.
+
+3. Неизменяемые поля Task.
+
+   Task ID, Business ID, Created At — неизменяемы через обычный
+   update-путь. Entity-reference поля (Client ID, Object ID, Service
+   ID, Roadmap ID, Stage ID) редактируемы только через явную
+   canonical relink-операцию, отдельную от обычного admin-update; в
+   Phase 36C relink-команда НЕ реализуется — foundation допускает
+   установку этих полей только при создании. Обычное admin-обновление
+   не может переписать Business ID. Обычное status-обновление не
+   может переписать relation-поля. Никакого silent переноса Task
+   между Business не существует. Прямые правки листа через caller не
+   допускаются.
+
+4. Каноническая сущность Task Assignment.
+
+   Отдельная каноническая сущность: Task Assignment. Реестр:
+   task_assignments. Идентичность: Task Assignment ID, префикс
+   `TAS-` (проверено — не пересекается ни с одним существующим
+   префиксом). Поля: Task Assignment ID, Task ID, Responsible Role ID,
+   Assignee Person ID, Status, Start Date, End Date, Assignment Type,
+   Created At, Updated At. Изменения назначения сохраняют историю:
+   reassign создаёт новую Assignment-строку и завершает (`Status =
+   ended`) предыдущую текущую строку. Hard delete не вводится. Ровно
+   одна текущая active Assignment-строка на Task. Unassigned Task
+   разрешён через отсутствие активной Assignment-строки (не через
+   специальное значение).
+
+5. Task versus personal GTD.
+
+   Business Task и personal GTD Next Action — раз и навсегда отдельные
+   реестры. `/tasks` остаётся GTD-владением и НЕ изменяется этим или
+   любым Task Domain ADR. Employee Task никогда не создаёт personal
+   GTD-строку автоматически. Общей идентичности нет. Two-way sync в
+   foundation не вводится. Опциональная одно-сторонняя связь: Business
+   Task может хранить опциональное поле GTD Action ID — используется
+   только для Didar-owned Task; GTD остаётся source-of-truth для
+   personal-строки; Task остаётся source-of-truth для business
+   execution state. GTD Action ID включён в foundation-схему как
+   опциональное, по умолчанию пустое поле, без синхронизирующего
+   поведения.
+
+6. Task versus Stage.
+
+   Task и Stage — раздельные сущности. Task может опционально
+   ссылаться максимум на один Stage; один Stage может иметь много
+   Task. Task completion НЕ авто-завершает Stage. Stage completion НЕ
+   авто-закрывает Task. Автоматическая генерация Task из Stage не
+   вводится. Автоматического lifecycle-каскада нет. Task↔Stage
+   automation остаётся отложенным явно вне foundation.
+
+7. Иерархия связей Task с бизнес-сущностями.
+
+   Ровно один обязательный Business ID. Опциональные единичные
+   ссылки: Client ID, Object ID, Service ID, Roadmap ID, Stage ID.
+   Cross-validation: каждая указанная сущность должна существовать;
+   каждая указанная сущность должна принадлежать тому же Business там,
+   где Business-принадлежность применима; если указаны и Stage ID, и
+   Roadmap ID — они должны соответствовать друг другу (Stage ID
+   принадлежит указанному Roadmap ID), иначе
+   TASK_ENTITY_RELATION_MISMATCH; если указаны Roadmap и Object/Service
+   — они должны быть взаимно согласованы (тот же принцип, что
+   `create_roadmap_for_object()` уже проверяет для Roadmap creation);
+   many-to-many Task-связей в foundation нет; Task может существовать
+   только с Business ID и Title (все остальные ссылки опциональны).
+
+8. Схема task_registry (foundation).
+
+   Обязательные поля: Task ID, Business ID, Title, Status, Source,
+   Idempotency Key, Created At, Updated At. Опциональные
+   foundation-поля: Description, Priority, Due Date, Client ID, Object
+   ID, Service ID, Roadmap ID, Stage ID, Responsible Role ID, Assignee
+   Person ID, Completed At, Cancelled At, Created By, GTD Action ID.
+   Отложено (не foundation): Reminder At, Follow-up Date, External ID,
+   recurring-метаданные, dependency graph поля, SLA/escalation поля.
+   Responsible Role ID и Assignee Person ID остаются на Task-строке
+   как cache-поля текущего назначения (для быстрого чтения без join с
+   task_assignments), в дополнение к task_assignments как
+   единственному источнику истины по истории. Cache-поля пишутся
+   только канонической assignment-orchestration функцией — прямая
+   запись caller'ом запрещена. Рассогласование cache с
+   task_assignments должно быть детектируемо (через architecture
+   guard / будущий reporting), но не исправляется автоматически в
+   foundation.
+
+9. Модель назначения Person и Role.
+
+   Task может быть unassigned. Task может иметь только Responsible
+   Role (без Person) — валидная конфигурация "пре-стаффинг/вакантно".
+   Task может иметь Assignee Person без явной Role только если Person
+   eligible как активный, не архивированный, с корректным Business
+   membership — это не вводит вторую систему eligibility, а повторно
+   использует то же Organization-правило. Task может иметь оба поля
+   одновременно. Канонические роли: Responsible Role — durable
+   организационная ответственность (тот же принцип, что Stage
+   Responsibility уже использует); Assignee Person — текущий
+   исполнитель. Если указаны и Role, и Person — Person должен быть
+   eligible для этой Role и её Business (через существующую
+   Organization-проверку, не изобретённую заново). Active-но-vacant
+   Role — валидная конфигурация ответственности; Task может оставаться
+   открытым, пока Role вакантна.
+
+10. Person eligibility для Task.
+
+    Person должен существовать (иначе PERSON_NOT_FOUND). Person не
+    должен быть архивирован для НОВОГО назначения/переназначения
+    (иначе PERSON_ARCHIVED) — как и в Organization Domain, эта
+    проверка применяется только к моменту записи нового назначения,
+    не ретроактивно. Business-scoped Task требует Person Business
+    membership (иначе PERSON_NOT_LINKED_TO_BUSINESS /
+    PERSON_TASK_BUSINESS_MISMATCH — та же пара кодов и то же различие,
+    что ADR-018 §11 уже установил для PERSON_NOT_LINKED_TO_BUSINESS /
+    PERSON_ROLE_BUSINESS_MISMATCH). Архивирование Person после
+    назначения НЕ вызывает автоматическое удаление/отмену исторических
+    Task/Assignment-строк — существующее назначение становится
+    конфигурационным вопросом для reporting/resolution, не ошибкой,
+    требующей немедленного исправления. Employee-реестр не вводится.
+
+11. Role eligibility для Task.
+
+    Для НОВОГО Task-назначения: active Role — разрешена. planned
+    Role — разрешена ТОЛЬКО как Responsible Role для будущих/
+    пре-стаффинг Task (Task остаётся в статусе `new`/`ready`, никогда
+    `in_progress`, пока Role не станет active) — planned Role НЕ
+    разрешена как активно исполняющий Assignee-резолюшн. paused Role —
+    заблокирована для нового назначения (ROLE_PAUSED). archived Role —
+    заблокирована для нового назначения (ROLE_ARCHIVED). Родительский
+    Department должен существовать (DEPARTMENT_NOT_FOUND) и не быть
+    архивирован (DEPARTMENT_ARCHIVED) — те же коды и та же проверка,
+    что ADR-018 §16 уже установило для Stage→Role eligibility.
+    ROLE_NOT_ACTIVE_FOR_TASK_EXECUTION используется когда Role
+    указана как активно исполняющая, но не active (в отличие от
+    planned-как-Responsible-only случая выше).
+
+12. Инвариант текущей Assignment-строки.
+
+    Ноль активных Task Assignment-строк → Task unassigned. Ровно одна
+    активная строка → каноническое текущее назначение. Больше одной
+    активной строки → integrity error
+    (MULTIPLE_ACTIVE_TASK_ASSIGNMENTS_INTEGRITY_ERROR, со всеми
+    конфликтующими ID, без произвольного первого выбора — тот же
+    принцип "no arbitrary first-pick", что ADR-016 §9 и ADR-018 §12
+    уже установили). Reassignment завершает текущую строку и создаёт
+    новую. Повторный идентичный assignment-запрос идемпотентен и
+    переиспользует текущую строку (TASK_ASSIGNMENT_REUSED).
+
+13. Словарь статусов Task Assignment.
+
+    Task Assignment Status: active, ended — минимальный словарь,
+    "paused" НЕ вводится на уровне Assignment. Task execution
+    waiting/blocked принадлежит словарю статусов Task (§14), не
+    Assignment — конфликтовать они не могут, потому что описывают
+    разные вещи (Assignment = "кто отвечает", Task status = "что
+    происходит с работой"). Reassignment/end сохраняют историю
+    (ended-строка никогда не удаляется и не переиспользуется).
+
+14. Словарь статусов Task.
+
+    Отдельный, не переиспользующий GTD или Stage словарь: new, ready,
+    in_progress, waiting, blocked, done, cancelled, skipped. new —
+    зафиксирован, но не готов к работе; ready — готов к исполнению;
+    in_progress — выполняется; waiting — ожидает внешнего ответа/
+    события; blocked — не может продолжаться по внутренней причине;
+    done — завершён; cancelled — более не требуется; skipped —
+    намеренно пропущен в процессном контексте (по аналогии со Stage
+    `skipped`).
+
+15. Матрица переходов Task.
+
+    new → {new, ready, cancelled, skipped}. ready → {ready,
+    in_progress, waiting, blocked, done, cancelled, skipped}.
+    in_progress → {in_progress, ready, waiting, blocked, done,
+    cancelled, skipped}. waiting → {waiting, ready, in_progress,
+    blocked, done, cancelled, skipped}. blocked → {blocked, ready,
+    in_progress, waiting, cancelled, skipped}. done → {done only}.
+    cancelled → {cancelled only}. skipped → {skipped only}. Выход из
+    done/cancelled/skipped через обычный update требует будущего
+    явного reopen/restore-действия (TASK_REOPEN_REQUIRES_EXPLICIT_ACTION
+    — не реализуется в foundation, только код блокировки, тот же
+    принцип, что ROLE_RESTORE_REQUIRES_EXPLICIT_ACTION и
+    STAGE_REOPEN_REQUIRES_EXPLICIT_ACTION). Неизменившийся статус —
+    успех/no-op (TASK_STATUS_UNCHANGED). Неизвестный целевой статус
+    блокируется (INVALID_TASK_STATUS). Недопустимый переход —
+    INVALID_TASK_TRANSITION.
+
+16. Политика временных меток Task.
+
+    Started At: устанавливается при первом переходе в in_progress;
+    никогда не перезаписывается повторно; никогда не сбрасывается
+    молча. Completed At: устанавливается при done; никогда не
+    устанавливается при skipped; никогда не сбрасывается молча.
+    Cancelled At: устанавливается при cancelled; никогда не
+    сбрасывается молча. Отдельное поле Skipped At НЕ вводится в
+    foundation — вместо этого используется Updated At вместе с
+    финальным статусом; отдельная метка может быть добавлена позже,
+    если появится конкретная потребность. Restore/reopen не
+    реализуется в foundation.
+
+17. Семантика Waiting.
+
+    Waiting утверждён как статус Task (не как assignment-атрибут).
+    Waiting означает, что требуется внешний ответ/событие; Task
+    остаётся business-owned; Waiting НЕ подразумевает делегирование.
+    Follow-up Date отделён от Due Date. В foundation сохраняется
+    только сам статус Waiting; поле "Waiting For" (Person ID или
+    свободный текст) и Follow-up Date откладываются — более богатые
+    Waiting-метаданные добавляются позже отдельным решением.
+
+18. Семантика делегирования.
+
+    Delegation утверждён как assignment-метаданные/событие, НЕ как
+    статус Task. Task может одновременно быть: ready и delegated;
+    in_progress и delegated; waiting и delegated; blocked и delegated.
+    Отдельного статуса `delegated` не вводится — это сохраняет
+    словарь статусов Task ортогональным словарю Assignment, как и §13
+    уже устанавливает.
+
+19. Due Date, Reminder, Follow-up, Calendar.
+
+    Due Date входит в foundation-схему. Reminder At зарезервирован как
+    поле, но без автоматизации в foundation. Follow-up Date отложен.
+    Calendar Event — отдельная, не связанная в foundation система.
+    Recurring-автоматизация отложена. Поведение отмены напоминаний
+    откладывается до будущей Automation Domain. Calendar-интеграция НЕ
+    входит в Phase 36C.
+
+20. Roadmap/Stage lifecycle eligibility для Task.
+
+    Новое создание Task, связанного с active Roadmap — разрешено.
+    С on_hold Roadmap — создание/подготовка admin-полей Task
+    разрешена; переход в in_progress блокируется
+    (ROADMAP_ON_HOLD); переходы в ready/waiting/blocked и
+    admin-изменения разрешены (тот же принцип, что ADR-017 §12 уже
+    установило для Stage: on_hold блокирует только исполнительный
+    переход, не административное редактирование). С completed
+    Roadmap — новое создание связанного Task блокируется
+    (ROADMAP_COMPLETED). С cancelled Roadmap — новое создание
+    связанного Task блокируется (ROADMAP_CANCELLED). С terminal Stage
+    (done/skipped) — новое создание связанного Task блокируется
+    (STAGE_TERMINAL). Существующие Task: никакого автоматического
+    cancel/complete-каскада; никакой автоматической мутации Stage;
+    никакой автоматической мутации Roadmap; несоответствия помечаются
+    read-only отчётностью позже (TASK_LIFECYCLE_INCONSISTENCY), не
+    исправляются автоматически.
+
+21. Источники создания Task (foundation).
+
+    Разрешены: канонический API; точная Telegram-команда. Отложены:
+    AI Inbox; автоматическая генерация из Stage; Service/Roadmap
+    templates; Checklist/Document generation; Gmail; Calendar;
+    SendPulse; Binotel; recurring automation; внешние интеграции.
+
+22. Namespace команд.
+
+    Не конфликтует с GTD `/tasks`: /newbctask, /bctasks, /bctask,
+    /updatetask, /assigntask, /reassigntask. Проверено — ни одно имя
+    не пересекается ни с одним зарегистрированным CommandHandler.
+    `/tasks` НЕ изменяется.
+
+23. Идемпотентность создания.
+
+    Первичный ключ: явный Idempotency Key. Будущий внешний ключ:
+    Source + External ID. Title-based dedup НЕ является каноническим
+    (тот же принцип "no arbitrary first-pick", применённый здесь к
+    созданию). Ноль совпадений → create (TASK_CREATED). Ровно одно
+    совпадение → reuse (TASK_REUSED). Больше одного совпадения →
+    integrity error (MULTIPLE_TASK_IDEMPOTENCY_MATCHES), все
+    конфликтующие ID возвращаются, без произвольного выбора. Пустой
+    Idempotency Key: поле опционально на уровне схемы; канонический
+    API для Telegram-пути ВСЕГДА генерирует детерминированный
+    request-scoped ключ; прямые внутренние вызовы могут опустить его
+    только при явном осознанном принятии неидемпотентного создания.
+
+24. Политика admin-update Task.
+
+    Редактируемые простые поля через обычный admin-update: Title,
+    Description, Priority, Due Date, Created By. Entity relation поля
+    (Client ID, Object ID, Service ID, Roadmap ID, Stage ID, GTD Action
+    ID) редактируемы ТОЛЬКО через отдельный явный canonical relink API
+    (не через обычный admin-update) — попытка обычного обновления
+    relation-поля блокируется
+    (TASK_RELATION_UPDATE_REQUIRES_EXPLICIT_ACTION). Business ID
+    никогда не редактируется (TASK_IMMUTABLE_FIELD_CONFLICT). Cache-
+    поля назначения (Responsible Role ID, Assignee Person ID) никогда
+    не редактируются через admin-update — только через каноническую
+    assignment-orchestration. Status редактируется только через
+    transition API, никогда через admin-update.
+
+25. Структурированный result-контракт Task.
+
+    Стабильные поля: ok, code, error, task_id, business_id,
+    previous_status, requested_status, final_status, changed,
+    assignment_changed, task_created, task_reused, assignment_id,
+    previous_assignment_id, warnings, conflicting_task_ids,
+    conflicting_assignment_ids, retry_safe. Коды по семействам:
+    Entity — TASK_NOT_FOUND, BUSINESS_NOT_FOUND, PERSON_NOT_FOUND,
+    PERSON_ARCHIVED, ROLE_NOT_FOUND, ROLE_PAUSED, ROLE_ARCHIVED,
+    DEPARTMENT_NOT_FOUND, DEPARTMENT_ARCHIVED, ROADMAP_NOT_FOUND,
+    STAGE_NOT_FOUND, TASK_ENTITY_RELATION_MISMATCH. Creation —
+    TASK_CREATED, TASK_REUSED, MULTIPLE_TASK_IDEMPOTENCY_MATCHES.
+    Status — INVALID_TASK_STATUS, INVALID_TASK_TRANSITION,
+    TASK_REOPEN_REQUIRES_EXPLICIT_ACTION, TASK_STATUS_UPDATED,
+    TASK_STATUS_UNCHANGED. Assignment — TASK_ASSIGNMENT_CREATED,
+    TASK_ASSIGNMENT_REUSED, TASK_REASSIGNED, TASK_UNASSIGNED,
+    MULTIPLE_ACTIVE_TASK_ASSIGNMENTS_INTEGRITY_ERROR. Lifecycle —
+    ROADMAP_ON_HOLD, ROADMAP_COMPLETED, ROADMAP_CANCELLED,
+    STAGE_TERMINAL, TASK_LIFECYCLE_INCONSISTENCY. Mutation —
+    TASK_IMMUTABLE_FIELD_CONFLICT,
+    TASK_RELATION_UPDATE_REQUIRES_EXPLICIT_ACTION. Ни один код не
+    пересекается по имени с существующими Object/Client/Service/
+    Roadmap/Stage/Organization кодами (проверено).
+
+26. Privacy и logging.
+
+    Разрешено логировать: code, Task ID, Business ID, Roadmap ID,
+    Stage ID, Person ID, Role ID, Assignment ID, значения статусов,
+    changed/reused-флаги. Запрещено: Title там, где не необходимо,
+    Description, Notes, телефонные номера, документы, полное
+    Telegram-сообщение, credentials/токены, чувствительные личные
+    детали. Русскоязычный пользовательский текст остаётся
+    исключительно в telegram_handlers.py, никогда в task_manager.py
+    или business_builder.py — тот же принцип, что уже применяется во
+    всех закрытых доменах.
+
+27. Test isolation.
+
+    Все Task-тесты регистрируются в hard socket-block немедленно при
+    создании файла, ДО написания какой-либо логики. Mock-completeness
+    guard обязателен. Никакого Google/Drive/Telegram/Railway/HTTP/
+    socket доступа ни в одном Task-тесте. Architecture guards для
+    ownership, для GTD-разделения и для запрета изменения `/tasks`.
+    Ни один тест не создаёт production-строки. Production snapshot
+    до/после каждой фазы. PRS-003 precedent остаётся обязывающим —
+    каждый новый Task-тестовый файл регистрируется в момент создания,
+    не постфактум.
+
+28. Production migration.
+
+    PRODUCTION_SCHEMA_MIGRATION_REQUIRED = YES — создаются два новых
+    листа, task_registry и task_assignments.
+    PRODUCTION_DATA_REWRITE_REQUIRED = NO — существующих Business
+    Task-данных не существует (greenfield), никакой GTD-миграции,
+    никакого rewrite Stage/Organization данных. Foundation
+    провижионирует только пустые реестры с заголовками, без строк
+    данных.
+
+29. Область работ Phase 36C.
+
+    Авторизовано реализовать вместе: схема task_registry; схема
+    task_assignments; task_manager persistence; business_builder
+    orchestration; creation/idempotency; Task transitions; Task
+    Assignment current-row/history поведение; entity validation; hard
+    socket-block; architecture guards; тесты. НЕ авторизовано в Phase
+    36C: Telegram UX сверх минимального test-plumbing (полноценный
+    caller UX — предмет Phase 36D); deployment; AI routing; reminders/
+    calendar; automatic Task↔Stage updates; Task generation из
+    templates/documents/checklists; внешние интеграции; Permission
+    Domain.
+
+Причина:
+
+Тот же архитектурный принцип, применённый ADR-013…ADR-018 к границам
+Business/Client/Object/Service/Roadmap-создания, Stage-transition и
+Organization Person↔Role assignment, здесь впервые применяется к
+совершенно новой сущности — Business Task — потому что она нигде не
+существовала раньше и требует полного набора решений, а не только
+закрытия пробела. Phase 35A/36A показали: (1) канонической Task-
+сущности не существует; (2) personal GTD структурно непригоден как её
+замена (нет Business ID, нет Person/Role assignee, single-user); (3)
+единственная блокирующая зависимость — закрытый Organization Domain —
+теперь удовлетворена. Решение здесь сознательно переиспользует уже
+проверенные паттерны вместо изобретения новых: canonical assignment
+orchestration (как ADR-018 §15), no-arbitrary-first-pick duplicate
+policy (как ADR-016 §9 / ADR-018 §12), non-cascading lifecycle
+(как ADR-017 §2 / ADR-018 §16), terminal-state-requires-explicit-
+reopen (как ADR-017 §6 / ADR-018 §6), и permanently-informational
+free-text boundary (как Stage Responsible в ADR-018 §19) — Task Domain
+не вводит ни одного нового архитектурного принципа, только применяет
+уже утверждённые к новой сущности.
+
+Статус:
+
+Утверждено для реализации (Phase 36C). Ничего не реализовано в рамках
+этого ADR — только архитектурное решение. task_registry и
+task_assignments не созданы. Ни один production-caller не мигрирован,
+ни один код не изменён, схема Google Sheets не менялась. GTD Core
+(`/tasks`, inbox_processor.py, telegram_bot.py, project_planner.py,
+calendar_sync.py) не затронут.
