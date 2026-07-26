@@ -5931,7 +5931,7 @@ async def newchecklist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await _reply(update, "\n".join(lines))
     except Exception as e:
         log.error(f"newchecklist_cmd error: {e}")
-        await _reply(update, f"❌ Ошибка: {e}")
+        await _reply(update, "❌ Не удалось создать чек-лист.")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -6096,7 +6096,7 @@ async def linkknowledge_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         )
     except Exception as e:
         log.error(f"linkknowledge_cmd error: {e}")
-        await _reply(update, f"❌ Ошибка: {e}")
+        await _reply(update, "❌ Не удалось привязать knowledge.")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -6188,7 +6188,524 @@ async def stageknowledge_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     except Exception as e:
         log.error(f"stageknowledge_cmd error: {e}")
-        await _reply(update, f"❌ Ошибка: {e}")
+        await _reply(update, "❌ Не удалось получить knowledge.")
+
+
+# ─────────────────────────────────────────────────────────────
+# Phase 38D (ADR-021 §9-§20): Checklist Domain — operational caller UX.
+# /newchecklist /linkknowledge /stageknowledge (above) remain Template/
+# reference commands, unchanged in meaning — knowledge_manager.py
+# stays the Checklist Template persistence owner. The five commands
+# below are thin wrappers over business_builder's Checklist
+# orchestration functions (instantiate_checklist/
+# transition_checklist_status/transition_checklist_item_status/
+# update_checklist_admin_fields) and checklist_manager's read-only APIs
+# (find_checklist_instance_by_id/list_checklist_instances/
+# list_checklist_instance_items) — no business logic beyond what those
+# functions already return. Centralized result-code -> Russian message
+# mapping below mirrors the Phase 36D Task / Phase 37E Document UX
+# pattern exactly.
+# ─────────────────────────────────────────────────────────────
+
+_CHECKLIST_INSTANCE_STATUS_RU: dict[str, str] = {
+    "draft": "Черновик", "in_progress": "В работе", "blocked": "Заблокирован",
+    "completed": "Завершён", "cancelled": "Отменён", "archived": "В архиве",
+}
+
+_CHECKLIST_ITEM_STATUS_RU: dict[str, str] = {
+    "pending": "Ожидает", "in_progress": "В работе", "blocked": "Заблокирован",
+    "done": "Выполнено", "skipped": "Пропущено", "not_applicable": "Не применимо",
+}
+
+
+def _checklist_status_ru(status: str) -> str:
+    """Russian label + raw machine status, always both — never only
+    the translation, so debugging never loses the exact stored value."""
+    return f"{_CHECKLIST_INSTANCE_STATUS_RU.get(status, status)} ({status})"
+
+
+def _checklist_item_status_ru(status: str) -> str:
+    return f"{_CHECKLIST_ITEM_STATUS_RU.get(status, status)} ({status})"
+
+
+def _checklist_instantiation_message(result: dict) -> str:
+    """Render any business_builder.instantiate_checklist() result into
+    a single Russian Telegram message. Never exposes the raw result
+    dict or a traceback."""
+    code = result.get("code", "")
+
+    if code == "CHECKLIST_INSTANCE_CREATED":
+        lines = [
+            "✅ Checklist Instance создан",
+            f"Checklist Instance ID: {result.get('checklist_instance_id', '')}",
+            f"Checklist Template ID: {result.get('checklist_template_id', '')}",
+            f"Статус: {_checklist_status_ru(result.get('final_status', ''))}",
+            f"Пунктов: {result.get('total_items', 0)} (обязательных: {result.get('required_items', 0)})",
+        ]
+        for key, label in (
+            ("business_id", "Business ID"), ("service_id", "Service ID"), ("object_id", "Object ID"),
+            ("roadmap_id", "Roadmap ID"), ("stage_id", "Stage ID"),
+        ):
+            if result.get(key):
+                lines.append(f"{label}: {result[key]}")
+        return "\n".join(lines)
+
+    if code == "CHECKLIST_INSTANCE_REUSED":
+        return "\n".join([
+            "♻️ Checklist Instance с этим ключом уже существует — использована существующая запись",
+            f"Checklist Instance ID: {result.get('checklist_instance_id', '')}",
+            f"Статус: {_checklist_status_ru(result.get('final_status', ''))}",
+        ])
+
+    if code == "CHECKLIST_TEMPLATE_NOT_FOUND":
+        return f"❌ Checklist Template не найден: {result.get('error') or ''}"
+
+    if code == "CHECKLIST_TEMPLATE_INACTIVE":
+        return "❌ Checklist Template неактивен."
+
+    if code == "CHECKLIST_TEMPLATE_ARCHIVED":
+        return "❌ Checklist Template архивирован."
+
+    if code == "INVALID_CHECKLIST_TEMPLATE_STATUS":
+        return "❌ Недопустимый статус Checklist Template."
+
+    if code == "CHECKLIST_TEMPLATE_ITEMS_EMPTY":
+        return "❌ У Checklist Template нет пунктов."
+
+    if code == "CHECKLIST_TEMPLATE_ITEM_CLASSIFICATION_CONFLICT":
+        return f"❌ Конфликт классификации пунктов Template: {result.get('error') or ''}"
+
+    if code == "CHECKLIST_TEMPLATE_PARSE_FAILED":
+        return "❌ Не удалось разобрать пункты Checklist Template."
+
+    if code == "BUSINESS_NOT_FOUND":
+        return f"❌ Business не найден: {result.get('error') or ''}"
+
+    if code == "SERVICE_NOT_FOUND":
+        return "❌ Указанный Service не найден."
+
+    if code == "OBJECT_NOT_FOUND":
+        return "❌ Указанный Object не найден."
+
+    if code == "ROADMAP_NOT_FOUND":
+        return "❌ Указанный Roadmap не найден."
+
+    if code == "STAGE_NOT_FOUND":
+        return "❌ Указанный Stage не найден."
+
+    if code == "CHECKLIST_ENTITY_RELATION_MISMATCH":
+        return f"❌ Несогласованные ссылки на сущности: {result.get('error') or 'см. логи'}"
+
+    if code == "MULTIPLE_CHECKLIST_INSTANCE_MATCHES":
+        ids = ", ".join(result.get("conflicting_ids", ())) or "—"
+        return "\n".join([
+            "⚠️ Обнаружен конфликт целостности данных",
+            f"Найдено несколько Checklist Instance с одним ключом: {ids}",
+            "Новый Instance не создан — автоматический выбор одного из них не выполняется.",
+        ])
+
+    if code == "CHECKLIST_INSTANCE_PARTIAL_PERSISTENCE":
+        return "\n".join([
+            "⚠️ Checklist Instance создан частично — часть пунктов не сохранена.",
+            f"Checklist Instance ID: {result.get('checklist_instance_id', '')}",
+            "Требуется ручная проверка.",
+        ])
+
+    if code == "CHECKLIST_INSTANCE_POST_WRITE_VERIFICATION_FAILED":
+        return "\n".join([
+            "⚠️ Checklist Instance записан, но пост-проверка записи не прошла.",
+            "Требуется ручная проверка.",
+        ])
+
+    if code == "CHECKLIST_PERSISTENCE_FAILED":
+        return "❌ Не удалось создать Checklist Instance."
+
+    log.warning(f"_checklist_instantiation_message: unmapped code={code!r} business_id={result.get('business_id', '')}")
+    return "❌ Не удалось создать Checklist Instance."
+
+
+def _checklist_item_transition_message(result: dict, item_id: str) -> str:
+    """Render any business_builder.transition_checklist_item_status() result."""
+    code = result.get("code", "")
+    previous_status = result.get("previous_status", "")
+    requested_status = result.get("requested_status", "")
+
+    if code == "CHECKLIST_ITEM_STATUS_UPDATED":
+        return "\n".join([
+            "✅ Статус пункта Checklist изменён",
+            f"Item ID: {item_id}",
+            f"Был: {_checklist_item_status_ru(previous_status)}",
+            f"Стал: {_checklist_item_status_ru(result.get('final_status', ''))}",
+        ])
+
+    if code == "CHECKLIST_ITEM_STATUS_UNCHANGED":
+        return f"ℹ️ Пункт {item_id} уже имеет статус {_checklist_item_status_ru(previous_status)} — изменений нет."
+
+    if code == "CHECKLIST_INSTANCE_ITEM_NOT_FOUND":
+        return f"❌ Пункт {item_id} не найден."
+
+    if code == "INVALID_CHECKLIST_ITEM_STATUS":
+        from business_core.checklist_manager import CHECKLIST_ITEM_STATUS
+        return f"❌ Недопустимый статус. Допустимые значения: {', '.join(CHECKLIST_ITEM_STATUS)}"
+
+    if code == "INVALID_CHECKLIST_ITEM_STATUS_TRANSITION":
+        return f"❌ Переход {_checklist_item_status_ru(previous_status)} → {_checklist_item_status_ru(requested_status)} не разрешён."
+
+    if code == "CHECKLIST_ITEM_REASON_REQUIRED":
+        return f"❌ {result.get('error') or 'Для этого статуса требуется указать причину.'}"
+
+    if code == "CHECKLIST_ITEM_COMPLETION_METADATA_REQUIRED":
+        return f"❌ {result.get('error') or 'Для статуса done требуется completed_by.'}"
+
+    if code == "CHECKLIST_ITEM_TERMINAL_REOPEN_REQUIRES_EXPLICIT_ACTION":
+        return "\n".join([
+            "🔒 Пункт Checklist уже завершён",
+            f"Item ID: {item_id}",
+            f"Текущий статус: {_checklist_item_status_ru(previous_status)}",
+            "Такой пункт нельзя вернуть в работу обычной командой изменения статуса. "
+            "Отдельное явное действие reopen пока не реализовано.",
+        ])
+
+    if code == "CHECKLIST_PERSISTENCE_FAILED":
+        return "❌ Не удалось обновить статус пункта Checklist."
+
+    if code == "CHECKLIST_INSTANCE_POST_WRITE_VERIFICATION_FAILED":
+        return "⚠️ Статус пункта записан, но пост-проверка записи не прошла."
+
+    log.warning(f"_checklist_item_transition_message: unmapped code={code!r} item_id={item_id}")
+    return f"❌ Ошибка ({code or 'unknown'}): {result.get('error') or 'см. логи'}"
+
+
+def _checklist_instance_transition_message(result: dict, instance_id: str) -> str:
+    """Render any business_builder.transition_checklist_status() result."""
+    code = result.get("code", "")
+    previous_status = result.get("previous_status", "")
+    requested_status = result.get("requested_status", "")
+
+    if code == "CHECKLIST_STATUS_UPDATED":
+        return "\n".join([
+            "✅ Статус Checklist Instance изменён",
+            f"Checklist Instance ID: {instance_id}",
+            f"Был: {_checklist_status_ru(previous_status)}",
+            f"Стал: {_checklist_status_ru(result.get('final_status', ''))}",
+        ])
+
+    if code == "CHECKLIST_STATUS_UNCHANGED":
+        return f"ℹ️ Checklist Instance {instance_id} уже имеет статус {_checklist_status_ru(previous_status)} — изменений нет."
+
+    if code == "CHECKLIST_INSTANCE_NOT_FOUND":
+        return f"❌ Checklist Instance {instance_id} не найден."
+
+    if code == "INVALID_CHECKLIST_STATUS":
+        from business_core.checklist_manager import CHECKLIST_INSTANCE_STATUS
+        return f"❌ Недопустимый статус. Допустимые значения: {', '.join(CHECKLIST_INSTANCE_STATUS)}"
+
+    if code == "INVALID_CHECKLIST_STATUS_TRANSITION":
+        return f"❌ Переход {_checklist_status_ru(previous_status)} → {_checklist_status_ru(requested_status)} не разрешён."
+
+    if code == "CHECKLIST_COMPLETION_REQUIREMENTS_NOT_MET":
+        remaining = result.get("required_remaining", 0)
+        return f"❌ Не все обязательные пункты Checklist завершены (осталось: {remaining})."
+
+    if code == "CHECKLIST_RESTORE_REQUIRES_EXPLICIT_ACTION":
+        return "\n".join([
+            "🔒 Checklist Instance уже завершён",
+            f"Checklist Instance ID: {instance_id}",
+            f"Текущий статус: {_checklist_status_ru(previous_status)}",
+            "Такой Checklist нельзя вернуть в обычный оборот обычной командой изменения статуса. "
+            "Отдельное явное действие restore пока не реализовано.",
+        ])
+
+    if code == "CHECKLIST_PERSISTENCE_FAILED":
+        return "❌ Не удалось обновить статус Checklist Instance."
+
+    if code == "CHECKLIST_INSTANCE_POST_WRITE_VERIFICATION_FAILED":
+        return "⚠️ Статус записан, но пост-проверка записи не прошла."
+
+    log.warning(f"_checklist_instance_transition_message: unmapped code={code!r} instance_id={instance_id}")
+    return f"❌ Ошибка ({code or 'unknown'}): {result.get('error') or 'см. логи'}"
+
+
+def _checklist_admin_message(result: dict, instance_id: str) -> str:
+    """Render any business_builder.update_checklist_admin_fields() result."""
+    code = result.get("code", "")
+
+    if code == "CHECKLIST_ADMIN_FIELDS_UPDATED":
+        return f"✅ Checklist Instance {instance_id} обновлён."
+
+    if code == "CHECKLIST_ADMIN_FIELDS_UNCHANGED":
+        return f"ℹ️ Checklist Instance {instance_id} — изменений нет (значения совпадают)."
+
+    if code == "CHECKLIST_INSTANCE_NOT_FOUND":
+        return f"❌ Checklist Instance {instance_id} не найден."
+
+    if code == "INVALID_CHECKLIST_ADMIN_FIELD":
+        return f"❌ Недопустимое поле для /updatechecklist: {result.get('error') or ''}"
+
+    if code == "CHECKLIST_IMMUTABLE_FIELD_CONFLICT":
+        return f"❌ Указанные поля являются неизменяемой идентичностью Checklist Instance: {result.get('error') or ''}"
+
+    if code == "CHECKLIST_RELATION_UPDATE_REQUIRES_EXPLICIT_ACTION":
+        return "❌ Изменение связей через /updatechecklist не поддерживается."
+
+    if code == "CHECKLIST_PERSISTENCE_FAILED":
+        return "❌ Не удалось обновить Checklist Instance."
+
+    log.warning(f"_checklist_admin_message: unmapped code={code!r} instance_id={instance_id}")
+    return f"❌ Ошибка ({code or 'unknown'}): {result.get('error') or 'см. логи'}"
+
+
+async def startchecklist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /startchecklist business_id=BIZ-001 checklist_template_id=CHK-001
+                     [roadmap_id=RM-001] [stage_id=STAGE-001]
+                     [service_id=SVC-001] [object_id=OBJ-001]
+                     [created_by=...] [notes=...]
+
+    Explicit instantiation of one operational Checklist Instance from
+    one Checklist Template. Idempotent — repeated calls with the same
+    Business+Template+Roadmap+Stage reuse the existing Instance rather
+    than creating a duplicate (ADR-021 §10), so no confirmation flow
+    is needed, mirroring /newbctask's own idempotency-key design.
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg())
+        return
+
+    raw = " ".join(context.args or [])
+    args = _parse_kv_args(raw)
+    business_id = args.get("business_id", "")
+    checklist_template_id = args.get("checklist_template_id", "")
+
+    if not business_id or not checklist_template_id:
+        await _reply(
+            update,
+            "❌ Укажи business_id и checklist_template_id.\n\nПример:\n"
+            "`/startchecklist business_id=BIZ-001 checklist_template_id=CHK-001`",
+        )
+        return
+
+    try:
+        from business_core.business_builder import instantiate_checklist
+
+        result = instantiate_checklist(
+            business_id, checklist_template_id,
+            service_id=args.get("service_id", ""), object_id=args.get("object_id", ""),
+            roadmap_id=args.get("roadmap_id", ""), stage_id=args.get("stage_id", ""),
+            created_by=args.get("created_by", "") or _telegram_username(update),
+            notes=args.get("notes", ""),
+        )
+        await _reply(update, _checklist_instantiation_message(result))
+    except Exception as e:
+        log.error(f"startchecklist_cmd error: {e}")
+        await _reply(update, "❌ Не удалось запустить Checklist.")
+
+
+_CHECKLISTS_LIST_MAX_SHOWN = 20
+
+
+async def checklists_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /checklists [business_id=BIZ-001] [checklist_template_id=CHK-001]
+                [service_id=...] [object_id=...] [roadmap_id=...]
+                [stage_id=...] [status=in_progress]
+
+    Read-only, bounded, filtered list of Checklist Instances.
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg())
+        return
+
+    raw = " ".join(context.args or [])
+    args = _parse_kv_args(raw)
+
+    try:
+        from business_core.checklist_manager import list_checklist_instances
+
+        instances = list_checklist_instances(business_id=args.get("business_id", ""), status=args.get("status", ""))
+        for key, field in (
+            ("checklist_template_id", "Checklist Template ID"), ("service_id", "Service ID"),
+            ("object_id", "Object ID"), ("roadmap_id", "Roadmap ID"), ("stage_id", "Stage ID"),
+        ):
+            if args.get(key):
+                instances = [i for i in instances if i.get(field, "") == args[key]]
+
+        if not instances:
+            await _reply(update, "ℹ️ Checklist Instances не найдены.")
+            return
+
+        lines = [f"📋 Checklist Instances ({len(instances)})", ""]
+        for inst in instances[:_CHECKLISTS_LIST_MAX_SHOWN]:
+            lines.append(
+                f"{inst.get('Checklist Instance ID', '')} — {inst.get('Checklist Title Snapshot', '')} "
+                f"[{_checklist_status_ru(inst.get('Status', ''))}] "
+                f"{inst.get('Completed Items', '0')}/{inst.get('Total Items', '0')}"
+            )
+        if len(instances) > _CHECKLISTS_LIST_MAX_SHOWN:
+            lines.append(f"\n… показаны первые {_CHECKLISTS_LIST_MAX_SHOWN} из {len(instances)}.")
+
+        await _reply(update, "\n".join(lines))
+    except Exception as e:
+        log.error(f"checklists_cmd error: {e}")
+        await _reply(update, "❌ Не удалось получить список Checklist.")
+
+
+async def checklist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /checklist checklist_instance_id=CLIN-001
+
+    Read-only, exact-ID detail: parent status/progress + bounded item
+    list. Never shows Notes, Blocked Reason, Skip Reason, or raw rows.
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg())
+        return
+
+    raw = " ".join(context.args or [])
+    args = _parse_kv_args(raw)
+    instance_id = args.get("checklist_instance_id") or args.get("_pos0", "")
+
+    if not instance_id:
+        await _reply(update, "❌ Укажи checklist_instance_id.\n\nПример: /checklist checklist_instance_id=CLIN-001")
+        return
+
+    try:
+        from business_core.checklist_manager import find_checklist_instance_by_id, list_checklist_instance_items
+
+        instance = find_checklist_instance_by_id(instance_id)
+        if instance is None:
+            await _reply(update, f"❌ Checklist Instance {instance_id} не найден.")
+            return
+
+        items = list_checklist_instance_items(instance_id=instance_id)
+
+        lines = [
+            f"📋 Checklist Instance {instance.get('Checklist Instance ID', '')}",
+            "",
+            f"Template: {instance.get('Checklist Template ID', '')}",
+            f"Название: {instance.get('Checklist Title Snapshot', '')}",
+            f"Статус: {_checklist_status_ru(instance.get('Status', ''))}",
+            f"Business: {instance.get('Business ID', '') or '—'}",
+            f"Service: {instance.get('Service ID', '') or '—'}",
+            f"Object: {instance.get('Object ID', '') or '—'}",
+            f"Roadmap: {instance.get('Roadmap ID', '') or '—'}",
+            f"Stage: {instance.get('Stage ID', '') or '—'}",
+            f"Прогресс: {instance.get('Completed Items', '0')}/{instance.get('Total Items', '0')} "
+            f"(обязательных осталось: {instance.get('Required Remaining', '0')})",
+            "",
+            f"Пунктов: {len(items)}",
+        ]
+        for item in sorted(items, key=lambda i: int(i.get("Item Order") or 0)):
+            required_label = "обязательный" if item.get("Required", "") == "true" else "опциональный"
+            done_marker = "✅" if item.get("Status", "") in ("done", "not_applicable") else "▫️"
+            lines.append(
+                f"{done_marker} {item.get('Checklist Instance Item ID', '')} "
+                f"[{item.get('Item Order', '')}] {item.get('Item Title Snapshot', '')} "
+                f"({required_label}, {_checklist_item_status_ru(item.get('Status', ''))})"
+            )
+
+        await _reply(update, "\n".join(lines))
+    except Exception as e:
+        log.error(f"checklist_cmd error: {e}")
+        await _reply(update, "❌ Не удалось получить Checklist Instance.")
+
+
+async def updatecheckitem_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /updatecheckitem checklist_instance_item_id=CLII-001 status=done
+                      [completed_by=...] [blocked_reason=...] [skip_reason=...]
+
+    Item-status transition only — no admin/relink/task/document
+    automation.
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg())
+        return
+
+    raw = " ".join(context.args or [])
+    args = _parse_kv_args(raw)
+    item_id = args.get("checklist_instance_item_id", "")
+    status = args.get("status", "")
+
+    if not item_id or not status:
+        await _reply(
+            update,
+            "❌ Укажи checklist_instance_item_id и status.\n\nПример:\n"
+            "`/updatecheckitem checklist_instance_item_id=CLII-001 status=done completed_by=...`",
+        )
+        return
+
+    try:
+        from business_core.business_builder import transition_checklist_item_status
+
+        result = transition_checklist_item_status(
+            item_id, status,
+            blocked_reason=args.get("blocked_reason", ""),
+            skip_reason=args.get("skip_reason", ""),
+            completed_by=args.get("completed_by", "") or _telegram_username(update),
+        )
+        await _reply(update, _checklist_item_transition_message(result, item_id))
+    except Exception as e:
+        log.error(f"updatecheckitem_cmd error: {e}")
+        await _reply(update, "❌ Не удалось обновить пункт Checklist.")
+
+
+async def updatechecklist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /updatechecklist checklist_instance_id=CLIN-001 status=in_progress
+    /updatechecklist checklist_instance_id=CLIN-001 notes=...
+
+    Status and Notes are never mixed in one call — mirrors /updatetask's
+    and /updatedoc's foundation UX exactly, so transition policy and
+    admin policy never share a single ambiguous write.
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg())
+        return
+
+    raw = " ".join(context.args or [])
+    args = _parse_kv_args(raw)
+    instance_id = args.get("checklist_instance_id", "")
+
+    if not instance_id:
+        await _reply(
+            update,
+            "❌ Укажи checklist_instance_id.\n\nПример:\n"
+            "`/updatechecklist checklist_instance_id=CLIN-001 status=in_progress`\n"
+            "`/updatechecklist checklist_instance_id=CLIN-001 notes=...`",
+        )
+        return
+
+    has_status = "status" in args
+    has_notes = "notes" in args
+
+    if has_status and has_notes:
+        await _reply(
+            update,
+            "❌ Нельзя одновременно менять статус и Notes.\n"
+            "Отправь две отдельные команды:\n"
+            "`/updatechecklist checklist_instance_id=... status=...`\n"
+            "`/updatechecklist checklist_instance_id=... notes=...`",
+        )
+        return
+
+    if not has_status and not has_notes:
+        await _reply(update, "❌ Укажи либо status=..., либо notes=....")
+        return
+
+    try:
+        if has_status:
+            from business_core.business_builder import transition_checklist_status
+            result = transition_checklist_status(instance_id, args["status"])
+            await _reply(update, _checklist_instance_transition_message(result, instance_id))
+            return
+
+        from business_core.business_builder import update_checklist_admin_fields
+        result = update_checklist_admin_fields(instance_id, {"Notes": args["notes"]})
+        await _reply(update, _checklist_admin_message(result, instance_id))
+    except Exception as e:
+        log.error(f"updatechecklist_cmd error: {e}")
+        await _reply(update, "❌ Не удалось обновить Checklist Instance.")
 
 
 async def milestones_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -7760,6 +8277,12 @@ def register_business_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("newfaq",           newfaq_cmd))
     app.add_handler(CommandHandler("linkknowledge",    linkknowledge_cmd))
     app.add_handler(CommandHandler("stageknowledge",   stageknowledge_cmd))
+    # Phase 38D (ADR-021): Checklist Domain — operational commands.
+    app.add_handler(CommandHandler("startchecklist",   startchecklist_cmd))
+    app.add_handler(CommandHandler("checklists",       checklists_cmd))
+    app.add_handler(CommandHandler("checklist",        checklist_cmd))
+    app.add_handler(CommandHandler("updatecheckitem",  updatecheckitem_cmd))
+    app.add_handler(CommandHandler("updatechecklist",  updatechecklist_cmd))
     # Phase 8D
     app.add_handler(CommandHandler("milestones",       milestones_cmd))
     # Phase 11B

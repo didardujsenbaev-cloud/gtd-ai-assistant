@@ -184,6 +184,7 @@ _CHECKLIST_KNOWLEDGE_TEST_FILES = frozenset({
     "test_checklist_manager.py",
     "test_business_checklist_foundation.py",
     "test_checklist_architecture_guards.py",
+    "test_checklist_caller_ux.py",
 })
 
 _HARD_SOCKET_BLOCK_TEST_FILES = (

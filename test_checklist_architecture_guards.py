@@ -225,22 +225,6 @@ class TestGtdFilesDoNotImportChecklistDomain(unittest.TestCase):
             self.assertNotIn("checklist_manager", found, f"{filename} must not import checklist_manager")
 
 
-class TestNoTelegramWritesOrRegistrationYet(unittest.TestCase):
-
-    def test_no_checklist_command_registered_yet(self):
-        """Phase 38C is Foundation-only — no new Telegram command may
-        exist until Phase 38D."""
-        path = BUSINESS_CORE / "telegram_handlers.py"
-        src = path.read_text(encoding="utf-8")
-        for forbidden in ("startchecklist", "updatecheckitem", "updatechecklist"):
-            self.assertNotIn(f'CommandHandler("{forbidden}"', src)
-
-    def test_telegram_handlers_does_not_import_checklist_manager(self):
-        path = BUSINESS_CORE / "telegram_handlers.py"
-        found = _imported_module_names(path) & {"checklist_manager"}
-        self.assertEqual(found, set())
-
-
 class TestNoFuzzyMatchingOrTitleDedup(unittest.TestCase):
 
     def test_instantiate_checklist_never_looks_up_by_title(self):
@@ -373,8 +357,221 @@ class TestChecklistTestsHaveHardSocketBlock(unittest.TestCase):
             "test_checklist_manager.py",
             "test_business_checklist_foundation.py",
             "test_checklist_architecture_guards.py",
+            "test_checklist_caller_ux.py",
         ):
             self.assertIn(filename, conftest_src, f"{filename} must be registered in conftest.py's hard socket-block set")
+
+
+# ─────────────────────────────────────────────────────────────
+# Phase 38D (ADR-021 §16): Checklist caller (Telegram) architecture
+# guards. Mirrors the Phase 36D Task / Phase 37E Document caller guard
+# pattern exactly.
+# ─────────────────────────────────────────────────────────────
+
+_CHECKLIST_COMMANDS = (
+    "startchecklist_cmd", "checklists_cmd", "checklist_cmd",
+    "updatecheckitem_cmd", "updatechecklist_cmd",
+)
+
+
+def _th_function_body(fn_name: str) -> str:
+    return _function_body(BUSINESS_CORE / "telegram_handlers.py", fn_name)
+
+
+class TestChecklistCommandsCallOnlyCanonicalOrchestration(unittest.TestCase):
+
+    def test_no_low_level_checklist_manager_write_calls_in_mutating_commands(self):
+        forbidden = (
+            "checklist_manager.create_checklist_instance(", "checklist_manager.create_checklist_instance_items(",
+            "checklist_manager.update_checklist_instance_status(", "checklist_manager.update_checklist_instance_item_status(",
+            "checklist_manager.update_checklist_instance_admin_fields(", "checklist_manager.update_checklist_instance_progress(",
+        )
+        for fn_name in ("startchecklist_cmd", "updatecheckitem_cmd", "updatechecklist_cmd"):
+            body = _th_function_body(fn_name)
+            for call in forbidden:
+                self.assertNotIn(call, body, f"{fn_name} must not call low-level {call.rstrip('(')} directly")
+
+    def test_startchecklist_calls_instantiate_checklist_only(self):
+        body = _th_function_body("startchecklist_cmd")
+        self.assertIn("instantiate_checklist(", body)
+
+    def test_updatecheckitem_calls_transition_only(self):
+        body = _th_function_body("updatecheckitem_cmd")
+        self.assertIn("transition_checklist_item_status(", body)
+
+    def test_updatechecklist_uses_transition_and_admin_apis_only(self):
+        body = _th_function_body("updatechecklist_cmd")
+        self.assertIn("transition_checklist_status(", body)
+        self.assertIn("update_checklist_admin_fields(", body)
+
+    def test_checklists_reads_list_helper_only(self):
+        body = _th_function_body("checklists_cmd")
+        self.assertIn("list_checklist_instances(", body)
+        for forbidden in ("instantiate_checklist(", "transition_checklist_status(", "transition_checklist_item_status("):
+            self.assertNotIn(forbidden, body)
+
+    def test_checklist_detail_reads_exact_helpers_only(self):
+        body = _th_function_body("checklist_cmd")
+        self.assertIn("find_checklist_instance_by_id(", body)
+        self.assertIn("list_checklist_instance_items(", body)
+        for forbidden in ("instantiate_checklist(", "transition_checklist_status(", "transition_checklist_item_status("):
+            self.assertNotIn(forbidden, body)
+
+
+class TestNoCallerSideGenerationOrPolicy(unittest.TestCase):
+
+    def test_no_caller_side_id_generation(self):
+        for fn_name in _CHECKLIST_COMMANDS:
+            body = _th_function_body(fn_name)
+            self.assertNotIn('"CLIN-"', body)
+            self.assertNotIn('"CLII-"', body)
+            self.assertNotIn("generate_next_id(", body)
+            self.assertNotIn("generate_next_ids(", body)
+
+    def test_no_caller_side_template_parsing(self):
+        for fn_name in _CHECKLIST_COMMANDS:
+            body = _th_function_body(fn_name)
+            self.assertNotIn("parse_checklist_template_items(", body)
+            self.assertNotIn("_split_checklist_text(", body)
+
+    def test_no_caller_side_relation_derivation(self):
+        for fn_name in _CHECKLIST_COMMANDS:
+            body = _th_function_body(fn_name)
+            self.assertNotIn("_validate_checklist_relations(", body)
+            self.assertNotIn("read_business_sheet(", body)
+
+    def test_no_caller_side_transition_matrix(self):
+        for fn_name in _CHECKLIST_COMMANDS:
+            body = _th_function_body(fn_name)
+            self.assertNotIn("_CHECKLIST_INSTANCE_ORDINARY_TRANSITIONS", body)
+            self.assertNotIn("_CHECKLIST_ITEM_ORDINARY_TRANSITIONS", body)
+
+    def test_no_caller_side_progress_policy(self):
+        for fn_name in _CHECKLIST_COMMANDS:
+            body = _th_function_body(fn_name)
+            self.assertNotIn("_compute_checklist_progress(", body)
+
+    def test_no_task_document_stage_roadmap_mutation_calls(self):
+        for fn_name in _CHECKLIST_COMMANDS:
+            body = _th_function_body(fn_name)
+            for forbidden in (
+                "create_business_task(", "transition_task_status(",
+                "register_document(", "transition_document_status(",
+                "update_stage_status_in_sheet(", "recalculate_roadmap_progress(",
+            ):
+                self.assertNotIn(forbidden, body, f"{fn_name} must not mutate Task/Document/Stage/Roadmap ({forbidden!r} found)")
+
+
+class TestChecklistCommandRegistration(unittest.TestCase):
+
+    def test_all_eight_commands_registered_exactly_once(self):
+        path = BUSINESS_CORE / "telegram_handlers.py"
+        src = path.read_text(encoding="utf-8")
+        for name in (
+            "newchecklist", "linkknowledge", "stageknowledge",
+            "startchecklist", "checklists", "checklist", "updatecheckitem", "updatechecklist",
+        ):
+            self.assertEqual(
+                src.count(f'CommandHandler("{name}"'), 1,
+                f"/{name} must be registered exactly once",
+            )
+
+    def test_no_namespace_collision_with_existing_commands(self):
+        import re
+        path = BUSINESS_CORE / "telegram_handlers.py"
+        src = path.read_text(encoding="utf-8")
+        all_registered = re.findall(r'CommandHandler\("([a-zA-Z0-9_]+)"', src)
+        counts: dict[str, int] = {}
+        for name in all_registered:
+            counts[name] = counts.get(name, 0) + 1
+        checklist_names = {
+            "startchecklist", "checklists", "checklist", "updatecheckitem", "updatechecklist",
+        }
+        for name in checklist_names:
+            self.assertEqual(counts.get(name, 0), 1, f"/{name} must appear exactly once across all registrations")
+
+    def test_tasks_command_unchanged(self):
+        path = WORKSPACE / "telegram_bot.py"
+        src = path.read_text(encoding="utf-8")
+        self.assertIn('CommandHandler("tasks", show_tasks)', src)
+
+    def test_no_document_command_collision(self):
+        path = BUSINESS_CORE / "telegram_handlers.py"
+        src = path.read_text(encoding="utf-8")
+        document_names = {"registerdoc", "doc", "docs4stage", "uploaddoc", "analyzedoc", "docanalysis", "missingdocs", "docsrequired", "updatedoc"}
+        checklist_names = {"startchecklist", "checklists", "checklist", "updatecheckitem", "updatechecklist"}
+        self.assertEqual(document_names & checklist_names, set())
+
+
+class TestChecklistUxHelpersDefinedOnce(unittest.TestCase):
+
+    def test_helpers_defined_exactly_once(self):
+        path = BUSINESS_CORE / "telegram_handlers.py"
+        src = path.read_text(encoding="utf-8")
+        for fn in (
+            "_checklist_instantiation_message", "_checklist_item_transition_message",
+            "_checklist_instance_transition_message", "_checklist_admin_message",
+            "_checklist_status_ru", "_checklist_item_status_ru",
+        ):
+            self.assertEqual(src.count(f"def {fn}("), 1, f"{fn} must be defined exactly once")
+
+    def test_helpers_are_callable(self):
+        import business_core.telegram_handlers as th
+        for fn in (
+            "_checklist_instantiation_message", "_checklist_item_transition_message",
+            "_checklist_instance_transition_message", "_checklist_admin_message",
+            "_checklist_status_ru", "_checklist_item_status_ru",
+        ):
+            self.assertTrue(callable(getattr(th, fn, None)))
+
+
+class TestNoSensitiveChecklistFieldsLogged(unittest.TestCase):
+
+    _DISALLOWED_LOG_TOKENS = ("Notes", "Blocked Reason", "Skip Reason", "Item Title Snapshot", "Item Description Snapshot", "update.message.text")
+
+    def test_checklist_handlers_do_not_log_disallowed_fields(self):
+        for fn_name in _CHECKLIST_COMMANDS + ("newchecklist_cmd", "linkknowledge_cmd", "stageknowledge_cmd"):
+            body = _th_function_body(fn_name)
+            log_lines = [line for line in body.splitlines() if "log.error(" in line or "log.warning(" in line or "log.info(" in line]
+            for line in log_lines:
+                for token in self._DISALLOWED_LOG_TOKENS:
+                    self.assertNotIn(token, line, f"{fn_name} logs disallowed token {token!r}: {line}")
+
+
+class TestNoRawExceptionInChecklistCommands(unittest.TestCase):
+
+    def test_no_raw_exception_interpolation(self):
+        for fn_name in _CHECKLIST_COMMANDS + ("newchecklist_cmd", "linkknowledge_cmd", "stageknowledge_cmd"):
+            body = _th_function_body(fn_name)
+            self.assertNotIn("Ошибка: {e}", body)
+            self.assertNotIn("str(e)", body)
+
+
+class TestParserValidationOrdering(unittest.TestCase):
+    """Insufficient arguments must return before any orchestration call
+    — verified structurally: the orchestration import/call must appear
+    strictly after the required-argument early-return in source order."""
+
+    def test_startchecklist_validates_before_orchestration(self):
+        body = _th_function_body("startchecklist_cmd")
+        validation_idx = body.index("if not business_id or not checklist_template_id")
+        orchestration_idx = body.index("instantiate_checklist(")
+        self.assertLess(validation_idx, orchestration_idx)
+
+    def test_updatecheckitem_validates_before_orchestration(self):
+        body = _th_function_body("updatecheckitem_cmd")
+        validation_idx = body.index("if not item_id or not status")
+        orchestration_idx = body.index("transition_checklist_item_status(")
+        self.assertLess(validation_idx, orchestration_idx)
+
+    def test_updatechecklist_validates_before_orchestration(self):
+        body = _th_function_body("updatechecklist_cmd")
+        validation_idx = body.index("if not instance_id")
+        orchestration_idx = min(
+            i for i in (body.find("transition_checklist_status("), body.find("update_checklist_admin_fields("))
+            if i != -1
+        )
+        self.assertLess(validation_idx, orchestration_idx)
 
 
 if __name__ == "__main__":

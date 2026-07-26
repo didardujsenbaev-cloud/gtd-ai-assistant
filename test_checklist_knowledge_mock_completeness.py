@@ -51,6 +51,7 @@ _CHECKLIST_FOUNDATION_TEST_FILES = frozenset({
     "test_checklist_manager.py",
     "test_business_checklist_foundation.py",
     "test_checklist_architecture_guards.py",
+    "test_checklist_caller_ux.py",
 })
 
 _ALL_RELEVANT_TEST_FILES = _SEED_TEST_FILES | _KNOWLEDGE_TEST_FILES | _CHECKLIST_FOUNDATION_TEST_FILES
