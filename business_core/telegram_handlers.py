@@ -6779,6 +6779,601 @@ async def stageresponsibility_cmd(update: Update, context: ContextTypes.DEFAULT_
         await _reply(update, "❌ Ошибка при получении статуса ответственности за этап.")
 
 
+# ─────────────────────────────────────────────────────────────
+# Phase 36D (ADR-019 §4/§14-16): Task Domain — /newbctask /bctasks
+# /bctask /updatetask /assigntask /reassigntask /unassigntask.
+# Additive only — GTD's own /tasks (telegram_bot.py) is never touched.
+#
+# Thin wrappers over business_core.business_builder's Task orchestration
+# functions (create_business_task/update_task_admin_fields/
+# transition_task_status/assign_task/unassign_task) and
+# business_core.task_manager's read-only APIs (find_task_by_id/
+# list_tasks/task_assignment_cache_is_consistent) — no business logic
+# beyond what those functions already return (ENGINEERING_STANDARDS.md,
+# Module Standards). Centralized result-code -> Russian message mapping
+# below mirrors the Phase 35E Organization UX pattern exactly.
+# ─────────────────────────────────────────────────────────────
+
+_TASK_STATUS_RU: dict[str, str] = {
+    "new": "Новая", "ready": "Готова к работе", "in_progress": "В работе",
+    "waiting": "Ожидает", "blocked": "Заблокирована", "done": "Выполнена",
+    "cancelled": "Отменена", "skipped": "Пропущена",
+}
+
+_TASK_ASSIGNMENT_STATUS_RU: dict[str, str] = {
+    "active": "Активно", "ended": "Завершено",
+}
+
+
+def _task_status_ru(status: str) -> str:
+    """Russian label + raw machine status, always both — never only
+    the translation, so debugging never loses the exact stored value."""
+    return f"{_TASK_STATUS_RU.get(status, status)} ({status})"
+
+
+def _task_creation_message(result: dict) -> str:
+    """
+    Render any business_builder.create_business_task() result into a
+    single Russian Telegram message. Never exposes the raw result dict
+    or a traceback.
+    """
+    code = result.get("code", "")
+
+    if code == "TASK_CREATED":
+        return "\n".join([
+            "✅ Task создан",
+            f"Task ID: `{result.get('task_id', '')}`",
+            f"Business ID: `{result.get('business_id', '')}`",
+            f"Статус: {_task_status_ru(result.get('final_status', 'new'))}",
+        ])
+
+    if code == "TASK_REUSED":
+        return "\n".join([
+            "ℹ️ Task уже существует — переиспользован по Idempotency Key",
+            f"Task ID: `{result.get('task_id', '')}`",
+            f"Статус: {_task_status_ru(result.get('final_status', ''))}",
+        ])
+
+    if code == "BUSINESS_NOT_FOUND":
+        return f"❌ Business `{result.get('business_id', '')}` не найден."
+
+    if code == "TASK_ENTITY_RELATION_MISMATCH":
+        return f"❌ Несогласованные ссылки на сущности: {result.get('error') or 'см. логи'}"
+
+    if code == "ROADMAP_NOT_FOUND":
+        return "❌ Указанный Roadmap не найден."
+
+    if code == "STAGE_NOT_FOUND":
+        return "❌ Указанный Stage не найден."
+
+    if code == "ROADMAP_COMPLETED":
+        return "❌ Roadmap уже завершён — новый связанный Task не может быть создан."
+
+    if code == "ROADMAP_CANCELLED":
+        return "❌ Roadmap отменён — новый связанный Task не может быть создан."
+
+    if code == "STAGE_TERMINAL":
+        return "❌ Stage имеет терминальный статус (done/skipped) — новый связанный Task не может быть создан."
+
+    if code == "MULTIPLE_TASK_IDEMPOTENCY_MATCHES":
+        ids = ", ".join(f"`{t}`" for t in result.get("conflicting_task_ids", ())) or "—"
+        return "\n".join([
+            "⚠️ Обнаружен конфликт целостности данных",
+            f"Найдено несколько Task с одним Idempotency Key: {ids}",
+            "Новый Task не создан — автоматический выбор одного из них не выполняется.",
+        ])
+
+    log.warning(f"_task_creation_message: unmapped code={code!r} business_id={result.get('business_id', '')}")
+    return f"❌ Ошибка ({code or 'unknown'}): {result.get('error') or 'см. логи'}"
+
+
+def _task_admin_message(result: dict, task_id: str) -> str:
+    """Render any business_builder.update_task_admin_fields() result."""
+    code = result.get("code", "")
+
+    if code == "TASK_ADMIN_FIELDS_UPDATED":
+        return f"✅ Task `{task_id}` обновлён."
+
+    if code == "TASK_ADMIN_FIELDS_UNCHANGED":
+        return f"ℹ️ Task `{task_id}` — изменений нет (значения совпадают)."
+
+    if code == "TASK_NOT_FOUND":
+        return f"❌ Task `{task_id}` не найден."
+
+    if code == "TASK_IMMUTABLE_FIELD_CONFLICT":
+        return f"❌ Указанные поля являются неизменяемой идентичностью Task: {result.get('error') or ''}"
+
+    if code == "TASK_RELATION_UPDATE_REQUIRES_EXPLICIT_ACTION":
+        return "❌ Изменение связей (Client/Object/Service/Roadmap/Stage ID) через /updatetask не поддерживается."
+
+    if code == "INVALID_TASK_ADMIN_FIELD":
+        return f"❌ Недопустимое поле для /updatetask: {result.get('error') or ''}"
+
+    log.warning(f"_task_admin_message: unmapped code={code!r} task_id={task_id}")
+    return f"❌ Ошибка ({code or 'unknown'}): {result.get('error') or 'см. логи'}"
+
+
+def _task_transition_message(result: dict, task_id: str) -> str:
+    """Render any business_builder.transition_task_status() result."""
+    code = result.get("code", "")
+    previous_status = result.get("previous_status", "")
+    requested_status = result.get("requested_status", "")
+
+    if code == "TASK_STATUS_UPDATED":
+        return "\n".join([
+            "✅ Статус Task изменён",
+            f"Task ID: `{task_id}`",
+            f"Был: {_task_status_ru(previous_status)}",
+            f"Стал: {_task_status_ru(result.get('final_status', ''))}",
+        ])
+
+    if code == "TASK_STATUS_UNCHANGED":
+        return f"ℹ️ Task `{task_id}` уже имеет статус {_task_status_ru(previous_status)} — изменений нет."
+
+    if code == "TASK_NOT_FOUND":
+        return f"❌ Task `{task_id}` не найден."
+
+    if code == "INVALID_TASK_STATUS":
+        from business_core.task_manager import TASK_STATUS
+        return f"❌ Недопустимый статус. Допустимые значения: `{', '.join(TASK_STATUS)}`"
+
+    if code == "INVALID_TASK_TRANSITION":
+        return (
+            f"❌ Переход {_task_status_ru(previous_status)} → {_task_status_ru(requested_status)} не разрешён."
+        )
+
+    if code == "TASK_REOPEN_REQUIRES_EXPLICIT_ACTION":
+        return "\n".join([
+            "🔒 Task уже завершён",
+            f"Task ID: `{task_id}`",
+            f"Текущий статус: {_task_status_ru(previous_status)}",
+            "Такой Task нельзя вернуть в работу обычной командой изменения статуса. "
+            "Отдельное явное действие reopen пока не реализовано.",
+        ])
+
+    if code == "ROADMAP_ON_HOLD":
+        return "⏸️ Roadmap этого Task приостановлен (on_hold) — переход в «В работе» сейчас не разрешён."
+
+    if code == "ROADMAP_COMPLETED":
+        return "✅ Roadmap этого Task уже завершён — изменение статуса заблокировано."
+
+    if code == "ROADMAP_CANCELLED":
+        return "❌ Roadmap этого Task отменён — изменение статуса заблокировано."
+
+    log.warning(f"_task_transition_message: unmapped code={code!r} task_id={task_id}")
+    return f"❌ Ошибка ({code or 'unknown'}): {result.get('error') or 'см. логи'}"
+
+
+def _task_assignment_message(result: dict, task_id: str) -> str:
+    """
+    Render any business_builder.assign_task()/unassign_task() result.
+    Shared by /assigntask, /reassigntask, and /unassigntask — the
+    distinct outcomes (created/reused/reassigned/unassigned) are
+    already carried in `code` by the orchestrator, never re-derived
+    here.
+    """
+    code = result.get("code", "")
+
+    if code == "TASK_ASSIGNMENT_CREATED":
+        return "\n".join([
+            "✅ Task назначен",
+            f"Task ID: `{task_id}`",
+            f"Assignment ID: `{result.get('assignment_id', '')}`",
+        ])
+
+    if code == "TASK_ASSIGNMENT_REUSED":
+        return "\n".join([
+            "ℹ️ Уже назначен — активное назначение уже существует",
+            f"Task ID: `{task_id}`",
+            f"Assignment ID: `{result.get('assignment_id', '')}`",
+        ])
+
+    if code == "TASK_REASSIGNED":
+        return "\n".join([
+            "✅ Task переназначен",
+            f"Task ID: `{task_id}`",
+            f"Было: `{result.get('previous_assignment_id') or '—'}`",
+            f"Стало: `{result.get('assignment_id', '')}`",
+        ])
+
+    if code == "TASK_UNASSIGNED":
+        return f"✅ Task `{task_id}` снят с назначения."
+
+    if code == "TASK_NOT_FOUND":
+        return f"❌ Task `{task_id}` не найден."
+
+    if code == "ROLE_NOT_FOUND":
+        return "❌ Указанная Role не найдена."
+
+    if code == "ROLE_PAUSED":
+        return "❌ Role приостановлена (paused) — назначение не разрешено."
+
+    if code == "ROLE_ARCHIVED":
+        return "❌ Role архивирована — назначение не разрешено."
+
+    if code == "ROLE_NOT_ACTIVE_FOR_TASK_EXECUTION":
+        return "❌ Role ещё planned — Person не может быть назначен как активный исполнитель, пока Role не станет active."
+
+    if code == "DEPARTMENT_NOT_FOUND":
+        return "❌ Department этой Role не найден."
+
+    if code == "DEPARTMENT_ARCHIVED":
+        return "❌ Department этой Role архивирован — назначение не разрешено."
+
+    if code == "PERSON_NOT_FOUND":
+        return "❌ Указанный Person не найден."
+
+    if code == "PERSON_ARCHIVED":
+        return "❌ Person архивирован — назначение не разрешено."
+
+    if code == "PERSON_NOT_LINKED_TO_BUSINESS":
+        return "❌ Person не привязан к бизнесу этого Task."
+
+    if code == "PERSON_TASK_BUSINESS_MISMATCH":
+        return "❌ Person привязан к другому бизнесу, не к бизнесу этого Task."
+
+    if code == "MULTIPLE_ACTIVE_TASK_ASSIGNMENTS_INTEGRITY_ERROR":
+        ids = ", ".join(f"`{a}`" for a in result.get("conflicting_assignment_ids", ())) or "—"
+        return "\n".join([
+            "⚠️ Обнаружен конфликт целостности данных",
+            f"Task ID: `{task_id}`",
+            f"Найдено несколько активных Task Assignment одновременно: {ids}",
+            "Изменений не выполнено — автоматический выбор одного из них не выполняется.",
+        ])
+
+    log.warning(f"_task_assignment_message: unmapped code={code!r} task_id={task_id}")
+    return f"❌ Ошибка ({code or 'unknown'}): {result.get('error') or 'см. логи'}"
+
+
+def _task_detail_lines(task: dict) -> list[str]:
+    """
+    Read-only rendering of one Task's full detail for /bctask,
+    including the assignment-cache consistency state. Never repairs an
+    inconsistency, never silently picks among multiple active
+    Assignments — only displays what the read-only helpers report.
+    """
+    from business_core.task_manager import get_current_task_assignment
+    from business_core import business_builder as bb
+
+    consistency = bb.task_assignment_cache_is_consistent(task["task_id"])
+
+    lines = [
+        f"📌 Task {task['task_id']}",
+        "",
+        f"Business ID: `{task['business_id']}`",
+        f"Title: {task['title']}",
+        f"Статус: {_task_status_ru(task['status'])}",
+    ]
+    if task.get("priority"):
+        lines.append(f"Priority: {task['priority']}")
+    if task.get("due_date"):
+        lines.append(f"Due Date: {task['due_date']}")
+    for label, key in (
+        ("Client ID", "client_id"), ("Object ID", "object_id"), ("Service ID", "service_id"),
+        ("Roadmap ID", "roadmap_id"), ("Stage ID", "stage_id"),
+    ):
+        if task.get(key):
+            lines.append(f"{label}: `{task[key]}`")
+
+    lines.append(f"Responsible Role ID: `{task.get('responsible_role_id') or '—'}`")
+    lines.append(f"Assignee Person ID: `{task.get('assignee_person_id') or '—'}`")
+
+    current = get_current_task_assignment(task["task_id"])
+    if current:
+        lines.append(f"Active Assignment ID: `{current['task_assignment_id']}`")
+
+    if not consistency.get("ok"):
+        lines.append("⚠️ Не удалось проверить согласованность назначения.")
+    elif consistency.get("consistent"):
+        lines.append("✅ Assignment cache согласован")
+    else:
+        lines.append("⚠️ Assignment cache РАССОГЛАСОВАН с историей — требуется проверка (не исправляется автоматически)")
+
+    for label, key in (
+        ("Created At", "created_at"), ("Updated At", "updated_at"),
+        ("Started At", "started_at"), ("Completed At", "completed_at"), ("Cancelled At", "cancelled_at"),
+    ):
+        if task.get(key):
+            lines.append(f"{label}: {task[key]}")
+
+    if task.get("source"):
+        lines.append(f"Source: {task['source']}")
+    if task.get("created_by"):
+        lines.append(f"Created By: {task['created_by']}")
+    if task.get("gtd_action_id"):
+        lines.append(f"GTD Action ID: `{task['gtd_action_id']}`")
+
+    return lines
+
+
+async def newbctask_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /newbctask business_id=BIZ-001 title="..." [status=new]
+               [source=telegram] [idempotency_key=...]
+               [client_id=...] [object_id=...] [service_id=...]
+               [roadmap_id=...] [stage_id=...] [priority=...] [due_date=...]
+
+    Idempotency Key defaults to a deterministic, request-scoped value
+    derived from the Telegram update ID when omitted — never a blank
+    key on this path (ADR-019 §10/§23).
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg())
+        return
+
+    raw = " ".join(context.args or [])
+    args = _parse_kv_args(raw)
+    business_id = args.get("business_id", "")
+    title = args.get("title", "")
+
+    if not business_id or not title:
+        await _reply(update,
+            "❌ Укажи business_id и title.\n\nПример:\n"
+            '`/newbctask business_id=BIZ-001 title="Подготовить документы"`'
+        )
+        return
+
+    try:
+        from business_core.business_builder import create_business_task
+
+        idempotency_key = args.get("idempotency_key", "") or f"tg-{update.update_id}"
+        result = create_business_task(
+            business_id, title,
+            description=args.get("description", ""),
+            priority=args.get("priority", ""),
+            due_date=args.get("due_date", ""),
+            source=args.get("source", "telegram"),
+            idempotency_key=idempotency_key,
+            client_id=args.get("client_id", ""),
+            object_id=args.get("object_id", ""),
+            service_id=args.get("service_id", ""),
+            roadmap_id=args.get("roadmap_id", ""),
+            stage_id=args.get("stage_id", ""),
+            created_by=str(update.effective_user.id) if update.effective_user else "",
+        )
+        await _reply(update, _task_creation_message(result))
+    except Exception as e:
+        log.error(f"newbctask_cmd error: {e}")
+        await _reply(update, "❌ Ошибка при создании Task.")
+
+
+async def bctasks_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /bctasks [business_id=BIZ-001] [status=ready] [roadmap_id=RM-001]
+             [stage_id=STAGE-001] [role_id=ROLE-001] [person_id=PRS-001]
+
+    Read-only. Exact filters only — no fuzzy matching. Never reads
+    personal GTD Next Actions.
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg())
+        return
+
+    raw = " ".join(context.args or [])
+    args = _parse_kv_args(raw)
+
+    try:
+        from business_core.task_manager import list_tasks
+
+        tasks = list_tasks(
+            business_id=args.get("business_id", ""), status=args.get("status", ""),
+            roadmap_id=args.get("roadmap_id", ""), stage_id=args.get("stage_id", ""),
+            role_id=args.get("role_id", ""), person_id=args.get("person_id", ""),
+        )
+
+        if not tasks:
+            await _reply(update, "📋 *Business Tasks*\n\nПусто. Создай первый: /newbctask")
+            return
+
+        lines = [f"📋 *Business Tasks* ({len(tasks)} шт.)\n"]
+        for t in tasks[:30]:
+            line = f"`{t['task_id']}` {t['title']} — {_task_status_ru(t['status'])}"
+            if t.get("due_date"):
+                line += f" (до {t['due_date']})"
+            lines.append(line)
+        await _reply(update, "\n".join(lines))
+    except Exception as e:
+        log.error(f"bctasks_cmd error: {e}")
+        await _reply(update, "❌ Ошибка при получении списка Task.")
+
+
+async def bctask_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /bctask task_id=TSK-001
+
+    Read-only exact-ID Task detail, including assignment-cache
+    consistency state.
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg())
+        return
+
+    raw = " ".join(context.args or [])
+    args = _parse_kv_args(raw)
+    task_id = args.get("task_id") or args.get("_pos0", "")
+
+    if not task_id:
+        await _reply(update, "❌ Укажи task_id.\n\nПример: /bctask task_id=TSK-001")
+        return
+
+    try:
+        from business_core.task_manager import find_task_by_id
+
+        task = find_task_by_id(task_id)
+        if not task:
+            await _reply(update, f"❌ Task {task_id} не найден.")
+            return
+
+        await _reply(update, "\n".join(_task_detail_lines(task)))
+    except Exception as e:
+        log.error(f"bctask_cmd error: {e}")
+        await _reply(update, "❌ Ошибка при получении карточки Task.")
+
+
+async def updatetask_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /updatetask task_id=TSK-001 priority=high due_date=2026-08-01
+    /updatetask task_id=TSK-001 status=in_progress
+
+    Status and admin fields are never mixed in one call — Phase 36D
+    foundation UX rejects a combined update and asks for two separate
+    commands, so admin-field policy and transition policy never share
+    a single ambiguous write (ADR-019 §12).
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg())
+        return
+
+    raw = " ".join(context.args or [])
+    args = _parse_kv_args(raw)
+    task_id = args.get("task_id", "")
+
+    if not task_id:
+        await _reply(update, "❌ Укажи task_id.\n\nПример:\n"
+            "`/updatetask task_id=TSK-001 priority=high`\n"
+            "`/updatetask task_id=TSK-001 status=in_progress`"
+        )
+        return
+
+    admin_keys = {"title", "description", "priority", "due_date", "created_by", "gtd_action_id"}
+    has_status = "status" in args
+    has_admin = any(k in args for k in admin_keys)
+
+    if has_status and has_admin:
+        await _reply(update,
+            "❌ Нельзя одновременно менять статус и admin-поля.\n"
+            "Отправь две отдельные команды:\n"
+            "`/updatetask task_id=... status=...`\n"
+            "`/updatetask task_id=... priority=... due_date=...`"
+        )
+        return
+
+    if not has_status and not has_admin:
+        await _reply(update, "❌ Укажи либо status=..., либо admin-поля (priority/due_date/title/description/created_by/gtd_action_id).")
+        return
+
+    try:
+        if has_status:
+            from business_core.business_builder import transition_task_status
+            result = transition_task_status(task_id, args["status"])
+            await _reply(update, _task_transition_message(result, task_id))
+            return
+
+        from business_core.business_builder import update_task_admin_fields
+
+        field_key_map = {
+            "title": "Title", "description": "Description", "priority": "Priority",
+            "due_date": "Due Date", "created_by": "Created By", "gtd_action_id": "GTD Action ID",
+        }
+        updates = {field_key_map[k]: v for k, v in args.items() if k in admin_keys}
+        result = update_task_admin_fields(task_id, updates)
+        await _reply(update, _task_admin_message(result, task_id))
+    except Exception as e:
+        log.error(f"updatetask_cmd error: {e}")
+        await _reply(update, "❌ Ошибка при обновлении Task.")
+
+
+async def assigntask_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /assigntask task_id=TSK-001 [role_id=ROLE-001] [person_id=PRS-001]
+                [assignment_type=primary]
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg())
+        return
+
+    raw = " ".join(context.args or [])
+    args = _parse_kv_args(raw)
+    task_id = args.get("task_id", "")
+    role_id = args.get("role_id", "")
+    person_id = args.get("person_id", "")
+
+    if not task_id or (not role_id and not person_id):
+        await _reply(update,
+            "❌ Укажи task_id и хотя бы одно из role_id/person_id.\n\nПример:\n"
+            "`/assigntask task_id=TSK-001 role_id=ROLE-001 person_id=PRS-001`"
+        )
+        return
+
+    try:
+        from business_core.business_builder import assign_task
+
+        result = assign_task(
+            task_id, responsible_role_id=role_id, assignee_person_id=person_id,
+            assignment_type=args.get("assignment_type", "primary"),
+        )
+        await _reply(update, _task_assignment_message(result, task_id))
+    except Exception as e:
+        log.error(f"assigntask_cmd error: {e}")
+        await _reply(update, "❌ Ошибка при назначении Task.")
+
+
+async def reassigntask_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /reassigntask task_id=TSK-001 [role_id=ROLE-002] [person_id=PRS-002]
+                  [assignment_type=primary]
+
+    Uses the same canonical assign_task() orchestration as /assigntask —
+    it already distinguishes created/reused/reassigned via `code`
+    (ADR-019 §20), so this command is a thin syntactic alias with no
+    separate policy of its own.
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg())
+        return
+
+    raw = " ".join(context.args or [])
+    args = _parse_kv_args(raw)
+    task_id = args.get("task_id", "")
+    role_id = args.get("role_id", "")
+    person_id = args.get("person_id", "")
+
+    if not task_id or (not role_id and not person_id):
+        await _reply(update,
+            "❌ Укажи task_id и хотя бы одно из role_id/person_id.\n\nПример:\n"
+            "`/reassigntask task_id=TSK-001 role_id=ROLE-002`"
+        )
+        return
+
+    try:
+        from business_core.business_builder import assign_task
+
+        result = assign_task(
+            task_id, responsible_role_id=role_id, assignee_person_id=person_id,
+            assignment_type=args.get("assignment_type", "primary"),
+        )
+        await _reply(update, _task_assignment_message(result, task_id))
+    except Exception as e:
+        log.error(f"reassigntask_cmd error: {e}")
+        await _reply(update, "❌ Ошибка при переназначении Task.")
+
+
+async def unassigntask_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /unassigntask task_id=TSK-001
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg())
+        return
+
+    raw = " ".join(context.args or [])
+    args = _parse_kv_args(raw)
+    task_id = args.get("task_id") or args.get("_pos0", "")
+
+    if not task_id:
+        await _reply(update, "❌ Укажи task_id.\n\nПример: /unassigntask task_id=TSK-001")
+        return
+
+    try:
+        from business_core.business_builder import unassign_task
+
+        result = unassign_task(task_id)
+        await _reply(update, _task_assignment_message(result, task_id))
+    except Exception as e:
+        log.error(f"unassigntask_cmd error: {e}")
+        await _reply(update, "❌ Ошибка при снятии назначения Task.")
+
+
 def register_business_handlers(app: Application) -> None:
     """
     Зарегистрировать все Business Core handlers в приложении.
@@ -6973,6 +7568,15 @@ def register_business_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("assignstagerole",   assignstagerole_cmd))
     app.add_handler(CommandHandler("reassignstagerole", reassignstagerole_cmd))
     app.add_handler(CommandHandler("stageresponsibility", stageresponsibility_cmd))
+    # Phase 36D: Task Domain (ADR-019) — deliberately NOT "/tasks", which
+    # remains GTD-owned (telegram_bot.py's show_tasks()).
+    app.add_handler(CommandHandler("newbctask",      newbctask_cmd))
+    app.add_handler(CommandHandler("bctasks",        bctasks_cmd))
+    app.add_handler(CommandHandler("bctask",         bctask_cmd))
+    app.add_handler(CommandHandler("updatetask",     updatetask_cmd))
+    app.add_handler(CommandHandler("assigntask",     assigntask_cmd))
+    app.add_handler(CommandHandler("reassigntask",   reassigntask_cmd))
+    app.add_handler(CommandHandler("unassigntask",   unassigntask_cmd))
 
     # Callback handler для кнопок подтверждения бизнес-контекста (Фаза 5B)
     app.add_handler(CallbackQueryHandler(bc_ctx_callback, pattern=r"^bc_ctx:"))
@@ -6985,5 +7589,6 @@ def register_business_handlers(app: Application) -> None:
         "/milestones /report "
         "/newdept /newrole /roles /roledetails /assignrole "
         "/assignstagerole /reassignstagerole /stageresponsibility "
+        "/newbctask /bctasks /bctask /updatetask /assigntask /reassigntask /unassigntask "
         "+ bc_ctx callback (Фаза 5B)"
     )

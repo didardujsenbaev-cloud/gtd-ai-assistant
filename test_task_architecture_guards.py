@@ -172,13 +172,35 @@ class TestTasksCommandUnchangedAndGtdOwned(unittest.TestCase):
         src = path.read_text(encoding="utf-8")
         self.assertNotIn('CommandHandler("tasks"', src)
 
-    def test_no_business_task_command_collision(self):
+    def test_business_task_commands_registered_exactly_once(self):
+        """Phase 36D: each Business Task command is registered exactly
+        once — no duplicate CommandHandler registration."""
         path = BUSINESS_CORE / "telegram_handlers.py"
-        if not path.exists():
-            return
         src = path.read_text(encoding="utf-8")
-        for name in ("newbctask", "bctasks", "bctask", "updatetask", "assigntask", "reassigntask"):
-            self.assertNotIn(f'CommandHandler("{name}"', src, f"/{name} unexpectedly already registered")
+        for name in ("newbctask", "bctasks", "bctask", "updatetask", "assigntask", "reassigntask", "unassigntask"):
+            self.assertEqual(
+                src.count(f'CommandHandler("{name}"'), 1,
+                f"/{name} must be registered exactly once",
+            )
+
+    def test_business_task_commands_do_not_collide_with_tasks(self):
+        path = BUSINESS_CORE / "telegram_handlers.py"
+        src = path.read_text(encoding="utf-8")
+        self.assertNotIn('CommandHandler("tasks"', src)
+
+    def test_business_task_commands_do_not_collide_with_existing_commands(self):
+        """No new Business Task command name duplicates a pre-existing,
+        unrelated command's exact string registration."""
+        path = BUSINESS_CORE / "telegram_handlers.py"
+        src = path.read_text(encoding="utf-8")
+        new_names = {"newbctask", "bctasks", "bctask", "updatetask", "assigntask", "reassigntask", "unassigntask"}
+        import re
+        all_registered = re.findall(r'CommandHandler\("([a-zA-Z_]+)"', src)
+        counts = {}
+        for name in all_registered:
+            counts[name] = counts.get(name, 0) + 1
+        for name in new_names:
+            self.assertEqual(counts.get(name, 0), 1, f"/{name} must appear exactly once across all registrations")
 
 
 class TestNoTaskStageOrRoadmapWritePath(unittest.TestCase):
@@ -270,6 +292,109 @@ class TestSensitiveTaskValuesAreNotLogged(unittest.TestCase):
             for line in log_lines:
                 for token in self._DISALLOWED_LOG_TOKENS:
                     self.assertNotIn(token, line, f"{fn_name} logs disallowed token {token!r}: {line}")
+
+
+# ─────────────────────────────────────────────────────────────
+# Phase 36D (ADR-019 §18): Task caller (Telegram) architecture guards.
+# ─────────────────────────────────────────────────────────────
+
+_TASK_COMMANDS = (
+    "newbctask_cmd", "bctasks_cmd", "bctask_cmd", "updatetask_cmd",
+    "assigntask_cmd", "reassigntask_cmd", "unassigntask_cmd",
+)
+
+
+def _th_function_body(fn_name: str) -> str:
+    path = BUSINESS_CORE / "telegram_handlers.py"
+    src = path.read_text(encoding="utf-8")
+    start = src.index(f"async def {fn_name}")
+    rest = src[start + 10:]
+    candidates = [i for i in (rest.find("\nasync def "), rest.find("\ndef ")) if i != -1]
+    end = start + 10 + min(candidates) if candidates else len(src)
+    return src[start:end]
+
+
+class TestTaskCommandsCallOnlyCanonicalOrchestration(unittest.TestCase):
+
+    def test_no_low_level_task_manager_write_calls(self):
+        forbidden = (
+            "task_manager.create_task(", "task_manager.update_task_admin_fields(",
+            "task_manager.update_task_status(", "task_manager.update_task_assignment_cache(",
+            "task_manager.create_task_assignment(", "task_manager.end_task_assignment(",
+        )
+        for fn_name in _TASK_COMMANDS:
+            body = _th_function_body(fn_name)
+            for call in forbidden:
+                self.assertNotIn(call, body, f"{fn_name} must not call low-level {call.rstrip('(')} directly")
+
+    def test_only_read_only_task_manager_functions_called(self):
+        allowed_reads = ("find_task_by_id", "list_tasks", "get_current_task_assignment", "TASK_STATUS")
+        for fn_name in ("bctasks_cmd", "bctask_cmd"):
+            body = _th_function_body(fn_name)
+            self.assertTrue(
+                any(f"task_manager.{name}" in body or f"import {name}" in body for name in allowed_reads),
+                f"{fn_name} should use a read-only task_manager API",
+            )
+
+    def test_no_policy_duplication_in_telegram(self):
+        """Telegram commands must not re-derive eligibility/transition/
+        idempotency policy — every branch must come from the
+        orchestrator's own result code."""
+        for fn_name in _TASK_COMMANDS:
+            body = _th_function_body(fn_name)
+            for snippet in (
+                '== "paused"', '== "archived"', '== "planned"',
+                "is_person_archived", "find_department_by_id", "find_role_by_id",
+                "_TASK_ORDINARY_TRANSITIONS",
+            ):
+                self.assertNotIn(snippet, body, f"{fn_name} must not re-derive policy ({snippet})")
+
+
+class TestCentralizedTaskUXMappingExists(unittest.TestCase):
+
+    def test_mapping_functions_exist(self):
+        import business_core.telegram_handlers as th
+        for fn in ("_task_creation_message", "_task_admin_message", "_task_transition_message", "_task_assignment_message"):
+            self.assertTrue(callable(getattr(th, fn, None)))
+
+    def test_mapping_functions_defined_exactly_once(self):
+        path = BUSINESS_CORE / "telegram_handlers.py"
+        src = path.read_text(encoding="utf-8")
+        for fn in ("_task_creation_message", "_task_admin_message", "_task_transition_message", "_task_assignment_message"):
+            self.assertEqual(src.count(f"def {fn}("), 1)
+
+    def test_assign_and_reassign_use_same_shared_mapping(self):
+        assign_body = _th_function_body("assigntask_cmd")
+        reassign_body = _th_function_body("reassigntask_cmd")
+        self.assertIn("_task_assignment_message(", assign_body)
+        self.assertIn("_task_assignment_message(", reassign_body)
+
+
+class TestUnknownTaskCodeSafeFallback(unittest.TestCase):
+
+    def test_all_mapping_functions_have_fallback(self):
+        import business_core.telegram_handlers as th
+        self.assertIn("❌", th._task_creation_message({"ok": False, "code": "XXX", "error": "x"}))
+        self.assertIn("❌", th._task_admin_message({"ok": False, "code": "XXX", "error": "x"}, "TSK-001"))
+        self.assertIn("❌", th._task_transition_message({"ok": False, "code": "XXX", "error": "x"}, "TSK-001"))
+        self.assertIn("❌", th._task_assignment_message({"ok": False, "code": "XXX", "error": "x"}, "TSK-001"))
+
+
+class TestNoAiOrGtdIntegrationIntroduced(unittest.TestCase):
+
+    def test_task_commands_do_not_import_gtd_or_ai_modules(self):
+        for fn_name in _TASK_COMMANDS:
+            body = _th_function_body(fn_name)
+            for forbidden in ("inbox_processor", "openai", "anthropic", "read_next_actions"):
+                self.assertNotIn(forbidden, body, f"{fn_name} must not reference {forbidden}")
+
+
+class TestTaskCallerTestsHaveHardSocketBlock(unittest.TestCase):
+
+    def test_phase_36d_test_files_registered(self):
+        conftest_src = (WORKSPACE / "conftest.py").read_text(encoding="utf-8")
+        for filename in ("test_business_task_commands.py", "test_task_caller_ux.py"):
+            self.assertIn(filename, conftest_src)
 
 
 if __name__ == "__main__":

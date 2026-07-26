@@ -133,6 +133,10 @@ _TASK_DOMAIN_TEST_FILES = frozenset({
     "test_task_manager.py",
     "test_business_task_foundation.py",
     "test_task_architecture_guards.py",
+    # Phase 36D (ADR-019 §20): Task caller UX test files, registered
+    # BEFORE any test logic was written, per the same PRS-003 precedent.
+    "test_business_task_commands.py",
+    "test_task_caller_ux.py",
 })
 
 _HARD_SOCKET_BLOCK_TEST_FILES = (

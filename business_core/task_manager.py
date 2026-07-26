@@ -109,6 +109,76 @@ def _task_row_to_dict(row_num: int, v: dict) -> dict:
     }
 
 
+def list_tasks(
+    business_id: str = "",
+    status: str = "",
+    roadmap_id: str = "",
+    stage_id: str = "",
+    role_id: str = "",
+    person_id: str = "",
+) -> list[dict]:
+    """
+    Read-only. Все Task, опционально отфильтрованные по любой комбинации
+    Business ID/Status/Roadmap ID/Stage ID/Responsible Role ID/Assignee
+    Person ID (cache-поле, не история). Exact-match filters only — нет
+    fuzzy/partial matching. Пустые фильтры не исключают ни одну строку.
+
+    Phase 36D (ADR-019 §6): единственный read API, который /bctasks
+    вызывает — сам не содержит cross-entity policy, только фильтрацию
+    уже персистентных значений.
+    """
+    try:
+        from business_core.sheets import get_business_sheet, get_header_index_map
+
+        sheet = get_business_sheet("task_registry")
+        all_values = sheet.get_all_values()
+        if len(all_values) < 2:
+            return []
+
+        headers = all_values[0]
+        idx = get_header_index_map(headers)
+
+        def _g(row, h):
+            i = idx.get(h)
+            return row[i].strip() if (i is not None and i < len(row)) else ""
+
+        results = []
+        for row in all_values[1:]:
+            if not row or not row[0].strip():
+                continue
+            if business_id and _g(row, "Business ID") != business_id:
+                continue
+            if status and _g(row, "Status") != status:
+                continue
+            if roadmap_id and _g(row, "Roadmap ID") != roadmap_id:
+                continue
+            if stage_id and _g(row, "Stage ID") != stage_id:
+                continue
+            if role_id and _g(row, "Responsible Role ID") != role_id:
+                continue
+            if person_id and _g(row, "Assignee Person ID") != person_id:
+                continue
+            results.append(_task_row_to_dict(0, {f: _g(row, f) for f in _TASK_FIELDS}))
+        return results
+    except Exception as exc:
+        log.warning(f"list_tasks() error: {exc}")
+        return []
+
+
+def get_current_task_assignment(task_id: str) -> Optional[dict]:
+    """
+    Read-only. Единственная current active Task Assignment для Task,
+    если ровно одна существует — None если ноль или больше одной
+    (caller'у нужно отдельно проверить len(list_task_assignments_for_task(...))
+    для интеграционного конфликта, эта функция намеренно не выбирает
+    произвольную первую строку при множественном конфликте).
+    """
+    active = list_task_assignments_for_task(task_id, status="active")
+    if len(active) != 1:
+        return None
+    return active[0]
+
+
 def find_task_by_id(task_id: str) -> Optional[dict]:
     """Найти Task по ID. Read-only."""
     found = _find_task_row(task_id)
