@@ -3450,3 +3450,411 @@ def task_assignment_cache_is_consistent(task_id: str) -> dict:
         and task.get("assignee_person_id", "") == expected_person
     )
     return {"ok": True, "consistent": consistent, "error": None}
+
+
+# ─────────────────────────────────────────────────────────────
+# Phase 37D (ADR-020): Document Domain Foundation — the sole
+# cross-domain Document orchestration boundary. document_manager.py
+# remains the persistence-only owner of DOCUMENT_REGISTRY (mirrors
+# task_manager.py's role exactly — ADR-019 precedent). Everything that
+# crosses from "one Document" to cross-entity eligibility — Business/
+# Client/Object/Roadmap/Stage/Template existence and consistency, Drive
+# upload sequencing and compensation, Drive-File-ID reuse policy,
+# lifecycle transitions — lives here instead, the same boundary
+# principle ADR-016/017/018/019 already applied elsewhere. No second
+# implementation of this policy exists anywhere else (see
+# test_document_architecture_guards.py).
+# ─────────────────────────────────────────────────────────────
+
+_DOCUMENT_ORDINARY_TRANSITIONS: dict[str, tuple[str, ...]] = {
+    "uploaded":     ("uploaded", "under_review", "archived", "superseded"),
+    "under_review": ("under_review", "approved", "rejected", "uploaded", "archived", "superseded"),
+    "approved":     ("approved", "archived", "superseded"),
+    "rejected":     ("rejected", "under_review", "uploaded", "archived", "superseded"),
+    "superseded":   ("superseded",),
+    "archived":     ("archived",),
+}
+
+_DOCUMENT_REOPEN_GATED_STATUSES = frozenset({"superseded", "archived"})
+
+
+def _document_result(
+    *, ok: bool, code: str, error: str | None,
+    document_id: str = "", document_family_id: str = "", version: str = "",
+    business_id: str = "", drive_file_id: str = "", drive_file_url: str = "",
+    document_template_id: str = "", client_id: str = "", object_id: str = "",
+    roadmap_id: str = "", stage_id: str = "",
+    previous_status: str = "", requested_status: str = "", final_status: str = "",
+    created: bool = False, reused: bool = False, changed: bool = False, uploaded: bool = False,
+    compensation_attempted: bool = False, compensation_succeeded: bool = False,
+    analysis_status: str = "", warnings: tuple = (), conflicting_document_ids: tuple = (),
+    retry_safe: bool = True,
+) -> dict:
+    """Shared result-builder for every Document orchestration function
+    (ADR-020 §21/§8 of business_builder.py's design) — the stable,
+    structured contract every caller reads instead of a bare exception
+    or ad-hoc dict shape. Never carries a raw exception object."""
+    return {
+        "ok": ok, "code": code, "error": error,
+        "document_id": document_id, "document_family_id": document_family_id, "version": version,
+        "business_id": business_id, "drive_file_id": drive_file_id, "drive_file_url": drive_file_url,
+        "document_template_id": document_template_id, "client_id": client_id, "object_id": object_id,
+        "roadmap_id": roadmap_id, "stage_id": stage_id,
+        "previous_status": previous_status, "requested_status": requested_status, "final_status": final_status,
+        "created": created, "reused": reused, "changed": changed, "uploaded": uploaded,
+        "compensation_attempted": compensation_attempted, "compensation_succeeded": compensation_succeeded,
+        "analysis_status": analysis_status, "warnings": tuple(warnings),
+        "conflicting_document_ids": tuple(conflicting_document_ids), "retry_safe": retry_safe,
+    }
+
+
+def _validate_document_relations(
+    business_id: str, client_id: str = "", object_id: str = "",
+    roadmap_id: str = "", stage_id: str = "", document_template_id: str = "",
+) -> dict:
+    """
+    ADR-020 §9: canonical cross-domain Document relation-validation
+    path, all before any write. Validation order (all before any
+    write):
+      A. required business_id
+      B. Business exists
+      D. normalize optional references
+      E-I. validate Client/Object/Roadmap/Stage/Template, most-specific-
+           first, deriving broader references from more-specific ones
+      J/K. cross-check all supplied/derived references for contradictions
+      L. return normalized canonical relation set
+
+    Reuses business_core.document_registry_manager.resolve_and_validate_links()
+    — the existing, production-proven cross-entity validator (Phase
+    15A) — rather than re-implementing the same chain a second time.
+    (Document Name requirement (C) is checked separately by the caller,
+    since it isn't a relation.)
+
+    Returns:
+        {"ok": bool, "code": str, "error": str | None, "resolved": dict | None}
+    """
+    from business_core.document_registry_manager import resolve_and_validate_links
+
+    if not business_id:
+        return {"ok": False, "code": "BUSINESS_NOT_FOUND", "error": "business_id обязателен", "resolved": None}
+
+    # B. Business existence is checked inside resolve_and_validate_links()
+    # itself (against biz_registry via read_business_sheet) — not
+    # duplicated here with a second primitive, which would risk the
+    # exact two-implementations-of-one-check drift this ADR exists to
+    # close elsewhere.
+    result = resolve_and_validate_links(
+        business_id=business_id, client_id=client_id, object_id=object_id,
+        roadmap_id=roadmap_id, stage_id=stage_id, document_template_id=document_template_id,
+    )
+    if not result["ok"]:
+        code = "BUSINESS_NOT_FOUND" if result["error"] == f"Business {business_id} не найден." else "DOCUMENT_ENTITY_RELATION_MISMATCH"
+        return {"ok": False, "code": code, "error": result["error"], "resolved": None}
+
+    return {"ok": True, "code": "", "error": None, "resolved": result["resolved"]}
+
+
+def register_document(
+    business_id: str,
+    document_name: str,
+    drive_file_id: str,
+    *,
+    file_name: str = "",
+    mime_type: str = "",
+    drive_file_url: str = "",
+    client_id: str = "",
+    object_id: str = "",
+    roadmap_id: str = "",
+    stage_id: str = "",
+    document_template_id: str = "",
+    uploaded_by: str = "",
+    notes: str = "",
+) -> dict:
+    """
+    Phase 37D (ADR-020 §10): the sole canonical register-existing-file
+    orchestration boundary — Mode A of the one canonical creation
+    model. Callers must supply already-read authoritative Drive
+    metadata (file_name/mime_type/drive_file_url) — this function does
+    not itself call the Drive adapter, so it stays testable without any
+    live Drive dependency; the Telegram caller is responsible for
+    reading Drive metadata before calling this.
+
+    Validation order, all before any write:
+      A. required business_id / Document Name
+      B. relation validation (_validate_document_relations)
+      C. Drive File ID reuse lookup (zero/one/multiple policy)
+      D. Document ID/Family ID generation only after A-C pass
+      E. low-level persistence
+      F. post-write verification
+      G. structured result
+    """
+    from business_core.document_manager import find_documents_by_drive_file_id, find_document_by_id, create_document
+
+    if not business_id:
+        return _document_result(ok=False, code="BUSINESS_NOT_FOUND", error="business_id обязателен")
+    if not document_name:
+        return _document_result(ok=False, code="", error="document_name обязателен", business_id=business_id)
+
+    relation_result = _validate_document_relations(
+        business_id, client_id=client_id, object_id=object_id,
+        roadmap_id=roadmap_id, stage_id=stage_id, document_template_id=document_template_id,
+    )
+    if not relation_result["ok"]:
+        return _document_result(ok=False, code=relation_result["code"], error=relation_result["error"], business_id=business_id)
+    resolved = relation_result["resolved"]
+
+    # Drive File ID reuse policy (ADR-020 §10).
+    if drive_file_id:
+        matches = find_documents_by_drive_file_id(drive_file_id)
+        if len(matches) > 1:
+            conflicting_ids = tuple(m["document_id"] for m in matches)
+            return _document_result(
+                ok=False, code="MULTIPLE_DOCUMENT_DRIVE_FILE_MATCHES",
+                error=f"Найдено несколько Document с Drive File ID {drive_file_id}: {conflicting_ids}",
+                business_id=business_id, drive_file_id=drive_file_id,
+                conflicting_document_ids=conflicting_ids, retry_safe=True,
+            )
+        if len(matches) == 1:
+            existing = matches[0]
+            compatible = (
+                existing["business_id"] == resolved["business_id"]
+                and (not resolved["client_id"] or existing["client_id"] == resolved["client_id"])
+                and (not resolved["object_id"] or existing["object_id"] == resolved["object_id"])
+                and (not resolved["roadmap_id"] or existing["roadmap_id"] == resolved["roadmap_id"])
+                and (not resolved["stage_id"] or existing["stage_id"] == resolved["stage_id"])
+            )
+            if not compatible:
+                return _document_result(
+                    ok=False, code="DOCUMENT_RELATION_CONFLICT_ON_REUSE",
+                    error=f"Document {existing['document_id']} с этим Drive File ID уже существует с другими связями",
+                    business_id=business_id, drive_file_id=drive_file_id, document_id=existing["document_id"],
+                )
+            return _document_result(
+                ok=True, code="DOCUMENT_REUSED", error=None,
+                document_id=existing["document_id"], document_family_id=existing["document_family_id"],
+                version=existing["version"], business_id=business_id, drive_file_id=drive_file_id,
+                reused=True, final_status=existing["status"], retry_safe=True,
+            )
+
+    write_result = create_document(
+        business_id, document_name,
+        client_id=resolved["client_id"], object_id=resolved["object_id"],
+        roadmap_id=resolved["roadmap_id"], stage_id=resolved["stage_id"],
+        document_template_id=resolved["document_template_id"],
+        drive_file_id=drive_file_id, drive_file_url=drive_file_url,
+        file_name=file_name, mime_type=mime_type, uploaded_by=uploaded_by, notes=notes,
+    )
+    if not write_result["ok"]:
+        return _document_result(
+            ok=False, code="DOCUMENT_PERSISTENCE_FAILED", error=write_result.get("error"),
+            business_id=business_id, retry_safe=True,
+        )
+
+    document_id = write_result["document_id"]
+    saved = find_document_by_id(document_id)
+    if saved is None:
+        return _document_result(
+            ok=False, code="DOCUMENT_POST_WRITE_VERIFICATION_FAILED",
+            error="Документ записан, но не удалось перечитать его для подтверждения",
+            document_id=document_id, business_id=business_id, retry_safe=False,
+        )
+
+    # Post-write verification (ADR-020 §8): never claim success on a
+    # field mismatch between what was submitted and what was actually
+    # persisted, even if the row itself was found — a missing row or a
+    # mismatched row both mean "manual verification required", never a
+    # second automatic write/upload.
+    expected = {
+        "business_id": business_id, "client_id": resolved["client_id"], "object_id": resolved["object_id"],
+        "roadmap_id": resolved["roadmap_id"], "stage_id": resolved["stage_id"],
+        "document_template_id": resolved["document_template_id"], "document_name": document_name,
+        "status": "uploaded", "drive_file_id": drive_file_id, "drive_file_url": drive_file_url,
+        "file_name": file_name, "mime_type": mime_type,
+    }
+    mismatches = {k: {"expected": v, "actual": saved.get(k)} for k, v in expected.items() if saved.get(k) != v}
+    if mismatches:
+        log.error(f"register_document({document_id}) post-write verification mismatch: {mismatches}")
+        return _document_result(
+            ok=False, code="DOCUMENT_POST_WRITE_VERIFICATION_FAILED",
+            error="Документ записан, но проверка после записи не прошла (расхождение полей)",
+            document_id=document_id, business_id=business_id, retry_safe=False,
+        )
+
+    return _document_result(
+        ok=True, code="DOCUMENT_REGISTERED", error=None,
+        document_id=saved["document_id"], document_family_id=saved["document_family_id"], version=saved["version"],
+        business_id=business_id, drive_file_id=drive_file_id, drive_file_url=drive_file_url,
+        document_template_id=resolved["document_template_id"], client_id=resolved["client_id"],
+        object_id=resolved["object_id"], roadmap_id=resolved["roadmap_id"], stage_id=resolved["stage_id"],
+        created=True, final_status="uploaded", retry_safe=True,
+    )
+
+
+def upload_and_register_document(
+    business_id: str,
+    document_name: str,
+    drive_file_id: str,
+    file_name: str,
+    mime_type: str,
+    drive_file_url: str,
+    *,
+    client_id: str = "",
+    object_id: str = "",
+    roadmap_id: str = "",
+    stage_id: str = "",
+    document_template_id: str = "",
+    uploaded_by: str = "",
+    notes: str = "",
+) -> dict:
+    """
+    Phase 37D (ADR-020 §11): the canonical persistence-and-compensation
+    half of Mode B (Telegram-file upload). The actual Drive upload and
+    Telegram file download stay in telegram_handlers.py (both require
+    `await`, which this synchronous function cannot do) — the caller
+    must call the Drive adapter itself, obtain authoritative Drive
+    metadata, and pass it in here already-uploaded. This function then
+    owns the Drive-File-ID reuse check, low-level persistence, post-
+    write verification, and (via its return code) tells the caller
+    whether Drive-side compensation (trashing the just-uploaded file)
+    is needed — the actual trash call stays in telegram_handlers.py
+    since it also requires `await`.
+
+    This intentionally reuses register_document()'s exact reuse/
+    creation/verification logic — Mode A and Mode B converge on the
+    same low-level creation model (ADR-020 §7/§13), the only difference
+    being who performed the Drive upload before calling in.
+    """
+    result = register_document(
+        business_id, document_name, drive_file_id,
+        file_name=file_name, mime_type=mime_type, drive_file_url=drive_file_url,
+        client_id=client_id, object_id=object_id, roadmap_id=roadmap_id, stage_id=stage_id,
+        document_template_id=document_template_id, uploaded_by=uploaded_by, notes=notes,
+    )
+    if result["code"] == "DOCUMENT_REGISTERED":
+        return _document_result(
+            ok=True, code="DOCUMENT_UPLOADED", error=None,
+            document_id=result["document_id"], document_family_id=result["document_family_id"], version=result["version"],
+            business_id=business_id, drive_file_id=drive_file_id, drive_file_url=drive_file_url,
+            document_template_id=result["document_template_id"], client_id=result["client_id"],
+            object_id=result["object_id"], roadmap_id=result["roadmap_id"], stage_id=result["stage_id"],
+            created=True, uploaded=True, final_status="uploaded", retry_safe=True,
+        )
+    if result["code"] == "DOCUMENT_POST_WRITE_VERIFICATION_FAILED":
+        return _document_result(
+            ok=False, code="DOCUMENT_POST_WRITE_VERIFICATION_FAILED", error=result["error"],
+            document_id=result["document_id"], business_id=business_id, drive_file_id=drive_file_id,
+            uploaded=True, retry_safe=False,
+        )
+    if result["code"] == "DOCUMENT_PERSISTENCE_FAILED":
+        # Caller (telegram_handlers.py) is responsible for attempting
+        # Drive compensation and reporting DRIVE_UPLOAD_COMPENSATED /
+        # DOCUMENT_PERSISTENCE_FAILED_WITH_ORPHANED_FILE_WARNING based
+        # on whether that compensation succeeds — this function cannot
+        # itself await the Drive trash call.
+        return _document_result(
+            ok=False, code="DOCUMENT_PERSISTENCE_FAILED", error=result["error"],
+            business_id=business_id, drive_file_id=drive_file_id, uploaded=True,
+            compensation_attempted=False, retry_safe=True,
+        )
+    return result
+
+
+def update_document_admin_fields(document_id: str, updates: dict) -> dict:
+    """
+    Phase 37D (ADR-020 §14/§20): the sole canonical Document admin-field
+    update orchestration boundary. Approved mutable fields: Document
+    Name, Notes. Immutable identity, version/family, relation, Drive/
+    upload-metadata, Status, and review fields are all rejected before
+    any write — enforced by document_manager.update_document_admin_fields()
+    itself (this function is a thin resolve-then-delegate wrapper).
+    """
+    from business_core.document_manager import find_document_by_id, update_document_admin_fields as _low_level_update
+
+    if not document_id:
+        return _document_result(ok=False, code="DOCUMENT_NOT_FOUND", error="document_id обязателен")
+
+    document = find_document_by_id(document_id)
+    if document is None:
+        return _document_result(ok=False, code="DOCUMENT_NOT_FOUND", error=f"Document {document_id} не найден", document_id=document_id)
+
+    result = _low_level_update(document_id, updates)
+    return _document_result(
+        ok=result["ok"], code=result.get("code", ""), error=result.get("error"),
+        document_id=document_id, business_id=document.get("business_id", ""),
+        changed=result.get("changed", False), retry_safe=True,
+    )
+
+
+def transition_document_status(document_id: str, target_status: str) -> dict:
+    """
+    Phase 37D (ADR-020 §15/§11/§12): the sole canonical Document-
+    transition orchestration boundary.
+
+    Validation order, all before any write:
+      A. required document_id
+      B. Document exists (DOCUMENT_NOT_FOUND)
+      C. target status validation (INVALID_DOCUMENT_STATUS)
+      D. terminal-state reopen gate (DOCUMENT_RESTORE_REQUIRES_EXPLICIT_ACTION
+         for an ordinary attempt to leave superseded/archived)
+      E. ordinary transition-matrix validation (INVALID_DOCUMENT_TRANSITION)
+      F. persist Status
+      G. structured result
+
+    No review-field mutation, no AI mutation, no Drive mutation, no
+    relation mutation, no Stage/Roadmap/Task mutation happens here.
+    """
+    from business_core.document_manager import find_document_by_id, update_document_status, DOCUMENT_STATUS
+
+    if not document_id:
+        return _document_result(ok=False, code="DOCUMENT_NOT_FOUND", error="document_id обязателен")
+
+    document = find_document_by_id(document_id)
+    if document is None:
+        return _document_result(ok=False, code="DOCUMENT_NOT_FOUND", error=f"Document {document_id} не найден", document_id=document_id)
+
+    business_id = document.get("business_id", "")
+    previous_status = document.get("status", "")
+
+    if target_status not in DOCUMENT_STATUS:
+        return _document_result(
+            ok=False, code="INVALID_DOCUMENT_STATUS",
+            error=f"Недопустимый статус '{target_status}'. Допустимые значения: {', '.join(DOCUMENT_STATUS)}",
+            document_id=document_id, business_id=business_id,
+            previous_status=previous_status, requested_status=target_status, final_status=previous_status,
+        )
+
+    if previous_status in _DOCUMENT_REOPEN_GATED_STATUSES and target_status != previous_status:
+        return _document_result(
+            ok=False, code="DOCUMENT_RESTORE_REQUIRES_EXPLICIT_ACTION",
+            error=(
+                f"Document {document_id} имеет статус '{previous_status}' — обычное обновление не может "
+                f"вернуть его в '{target_status}'. Требуется отдельное явное действие restore (не реализовано)."
+            ),
+            document_id=document_id, business_id=business_id,
+            previous_status=previous_status, requested_status=target_status, final_status=previous_status,
+        )
+
+    allowed_targets = _DOCUMENT_ORDINARY_TRANSITIONS.get(previous_status, (previous_status,))
+    if target_status not in allowed_targets:
+        return _document_result(
+            ok=False, code="INVALID_DOCUMENT_TRANSITION",
+            error=f"Переход '{previous_status}' → '{target_status}' не разрешён",
+            document_id=document_id, business_id=business_id,
+            previous_status=previous_status, requested_status=target_status, final_status=previous_status,
+        )
+
+    write_result = update_document_status(document_id, target_status)
+    if not write_result["ok"]:
+        return _document_result(
+            ok=False, code=write_result.get("code") or "", error=write_result.get("error"),
+            document_id=document_id, business_id=business_id,
+            previous_status=previous_status, requested_status=target_status, final_status=previous_status,
+        )
+
+    changed = write_result["changed"]
+    return _document_result(
+        ok=True, code="DOCUMENT_STATUS_UPDATED" if changed else "DOCUMENT_STATUS_UNCHANGED", error=None,
+        document_id=document_id, business_id=business_id,
+        previous_status=previous_status, requested_status=target_status,
+        final_status=target_status, changed=changed,
+    )

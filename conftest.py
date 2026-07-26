@@ -139,10 +139,25 @@ _TASK_DOMAIN_TEST_FILES = frozenset({
     "test_task_caller_ux.py",
 })
 
+# Phase 37D (ADR-020 §27/§2): Document Domain — Phase 37B's audit found
+# all 4 of these pre-existing files missing from this registry (the
+# same PRS-003-class gap Phase 35B/36C found for Organization/Task) —
+# closed here, BEFORE any new Document test logic was written, per
+# ADR-020's explicit blocking Phase 37D prerequisite.
+_DOCUMENT_DOMAIN_TEST_FILES = frozenset({
+    "test_business_document_registry.py",
+    "test_business_document_upload.py",
+    "test_business_document_intelligence.py",
+    "test_business_document_requirements.py",
+    "test_document_manager.py",
+    "test_business_document_foundation.py",
+    "test_document_architecture_guards.py",
+})
+
 _HARD_SOCKET_BLOCK_TEST_FILES = (
     _CLIENT_DOMAIN_TEST_FILES | _ROADMAP_DOMAIN_TEST_FILES
     | _ORGANIZATION_DOMAIN_TEST_FILES | _OTHER_HARDENED_TEST_FILES
-    | _TASK_DOMAIN_TEST_FILES
+    | _TASK_DOMAIN_TEST_FILES | _DOCUMENT_DOMAIN_TEST_FILES
 )
 
 

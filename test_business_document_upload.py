@@ -823,8 +823,8 @@ class TestUploadDocConfirmStep(unittest.TestCase):
         self.assertEqual(result, ConversationHandler.END)
         append_mock.assert_called_once()  # the row WAS written; only the re-read failed
         reply = update.message.reply_text.call_args[0][0]
-        self.assertIn("Document registered, but post-write verification failed.", reply)
-        self.assertIn("Manual verification is required.", reply)
+        self.assertIn("пост-проверка записи не прошла", reply)
+        self.assertIn("ручная проверка", reply.lower())
         self.assertIn("Document ID: DREG-001", reply)
         self.assertIn("Drive File ID: NEWFILE1", reply)
         self.assertNotIn("✅ Документ загружен и зарегистрирован", reply)
@@ -845,8 +845,8 @@ class TestUploadDocConfirmStep(unittest.TestCase):
         self.assertEqual(result, ConversationHandler.END)
         append_mock.assert_called_once()
         reply = update.message.reply_text.call_args[0][0]
-        self.assertIn("Document registered, but post-write verification failed.", reply)
-        self.assertIn("Manual verification is required.", reply)
+        self.assertIn("пост-проверка записи не прошла", reply)
+        self.assertIn("ручная проверка", reply.lower())
         self.assertNotIn("✅ Документ загружен и зарегистрирован", reply)
         trash_mock.assert_not_called()  # row may exist — never trash the Drive file here
         self.assertNotIn("ud_confirmed_snapshot", context.user_data)

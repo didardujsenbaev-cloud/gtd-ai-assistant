@@ -47,6 +47,14 @@ def _fresh_drm():
     return drm
 
 
+def _fresh_dm():
+    for key in list(sys.modules.keys()):
+        if "business_core" in key:
+            del sys.modules[key]
+    import business_core.document_manager as dm
+    return dm
+
+
 def _fresh_th():
     for key in list(sys.modules.keys()):
         if "business_core" in key:
@@ -136,33 +144,33 @@ class TestIdGeneration(unittest.TestCase):
         self.assertEqual(doc_id, "DREG-001")
 
     def test_family_id_generation_empty_sheet(self):
-        drm = _fresh_drm()
+        dm = _fresh_dm()
         sheet = _make_doc_sheet()
         with patch("business_core.sheets.get_business_sheet", return_value=sheet):
-            fam_id = drm.generate_next_family_id()
+            fam_id = dm.generate_next_family_id()
         self.assertEqual(fam_id, "DFAM-001")
 
     def test_family_id_continues_from_existing(self):
-        drm = _fresh_drm()
+        dm = _fresh_dm()
         idx = {h: i for i, h in enumerate(DOC_HEADERS)}
         row = [""] * len(DOC_HEADERS)
         row[idx["Document Family ID"]] = "DFAM-005"
         sheet = _make_doc_sheet(existing_rows=[row])
         with patch("business_core.sheets.get_business_sheet", return_value=sheet):
-            fam_id = drm.generate_next_family_id()
+            fam_id = dm.generate_next_family_id()
         self.assertEqual(fam_id, "DFAM-006")
 
     def test_family_id_generator_scans_family_column_not_column_one(self):
         """Document ID (column 1) and Document Family ID are independent
         counters — a high Document ID number must not affect Family ID."""
-        drm = _fresh_drm()
+        dm = _fresh_dm()
         idx = {h: i for i, h in enumerate(DOC_HEADERS)}
         row = [""] * len(DOC_HEADERS)
         row[idx["Document ID"]] = "DREG-099"
         row[idx["Document Family ID"]] = "DFAM-001"
         sheet = _make_doc_sheet(existing_rows=[row])
         with patch("business_core.sheets.get_business_sheet", return_value=sheet):
-            fam_id = drm.generate_next_family_id()
+            fam_id = dm.generate_next_family_id()
         self.assertEqual(fam_id, "DFAM-002")
 
 
@@ -414,6 +422,8 @@ class TestRegisterDocConfirm(unittest.TestCase):
 
         async def run():
             with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
+                 patch("business_core.sheets.read_business_sheet", side_effect=_read_business_sheet_side_effect), \
+                 patch("business_core.object_manager.find_object_by_id", side_effect=_find_object_by_id_side_effect), \
                  patch("business_core.sheets.get_business_sheet", return_value=sheet), \
                  patch("business_core.sheets.find_row_by_id",
                        return_value=(2, _dummy_saved_row())):
@@ -433,18 +443,21 @@ class TestRegisterDocConfirm(unittest.TestCase):
         that is an existing, unavoidable characteristic of the shared
         primitive used by every write command in this codebase (editclient,
         Stage Management, ...), not a second ID-generation read. Total
-        expected get_business_sheet calls for one confirm: 2 (one for
-        ID generation, one inside append_business_row)."""
+        expected get_business_sheet calls for one confirm: 3 (one for
+        the Phase 37D Drive-File-ID reuse lookup — ADR-020 §10, new this
+        phase — one for ID generation, one inside append_business_row)."""
         th, context = self._walk_to_confirm()
         sheet = _make_doc_sheet()
         update = _upd("✅ Подтвердить")
 
         async def run():
             with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
+                 patch("business_core.sheets.read_business_sheet", side_effect=_read_business_sheet_side_effect), \
+                 patch("business_core.object_manager.find_object_by_id", side_effect=_find_object_by_id_side_effect), \
                  patch("business_core.sheets.get_business_sheet", return_value=sheet) as mock_get_sheet, \
                  patch("business_core.sheets.find_row_by_id", return_value=(2, _dummy_saved_row())):
                 await th.registerdoc_confirm(update, context)
-                self.assertEqual(mock_get_sheet.call_count, 2)
+                self.assertEqual(mock_get_sheet.call_count, 3)
                 for call in mock_get_sheet.call_args_list:
                     self.assertEqual(call.args[0], "document_registry")
 
@@ -462,6 +475,8 @@ class TestRegisterDocConfirm(unittest.TestCase):
 
         async def run():
             with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
+                 patch("business_core.sheets.read_business_sheet", side_effect=_read_business_sheet_side_effect), \
+                 patch("business_core.object_manager.find_object_by_id", side_effect=_find_object_by_id_side_effect), \
                  patch("business_core.sheets.get_business_sheet", return_value=sheet), \
                  patch("business_core.sheets.find_row_by_id", return_value=(2, _dummy_saved_row())):
                 await th.registerdoc_confirm(update, context)
@@ -480,6 +495,8 @@ class TestRegisterDocConfirm(unittest.TestCase):
 
         async def run():
             with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
+                 patch("business_core.sheets.read_business_sheet", side_effect=_read_business_sheet_side_effect), \
+                 patch("business_core.object_manager.find_object_by_id", side_effect=_find_object_by_id_side_effect), \
                  patch("business_core.sheets.get_business_sheet", return_value=sheet), \
                  patch("business_core.sheets.find_row_by_id", return_value=(2, _dummy_saved_row())):
                 await th.registerdoc_confirm(update, context)
@@ -496,6 +513,8 @@ class TestRegisterDocConfirm(unittest.TestCase):
 
         async def run():
             with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
+                 patch("business_core.sheets.read_business_sheet", side_effect=_read_business_sheet_side_effect), \
+                 patch("business_core.object_manager.find_object_by_id", side_effect=_find_object_by_id_side_effect), \
                  patch("business_core.sheets.get_business_sheet", return_value=sheet), \
                  patch("business_core.sheets.find_row_by_id", return_value=(2, _dummy_saved_row())):
                 await th.registerdoc_confirm(update, context)
@@ -529,6 +548,8 @@ class TestRegisterDocConfirm(unittest.TestCase):
 
         async def run():
             with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
+                 patch("business_core.sheets.read_business_sheet", side_effect=_read_business_sheet_side_effect), \
+                 patch("business_core.object_manager.find_object_by_id", side_effect=_find_object_by_id_side_effect), \
                  patch("business_core.sheets.get_business_sheet", return_value=sheet) as mock_get_sheet, \
                  patch("business_core.sheets.find_row_by_id", return_value=(2, _dummy_saved_row())), \
                  patch("integrations.google_drive_adapter.get_drive_service") as mock_drive_service, \
@@ -633,6 +654,9 @@ class TestOldRegistriesUntouched(unittest.TestCase):
 
         async def confirm():
             with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
+                 patch("business_core.sheets.read_business_sheet", side_effect=_read_business_sheet_side_effect), \
+                 patch("business_core.object_manager.find_object_by_id", side_effect=_find_object_by_id_side_effect), \
+                 patch("business_core.person_manager.find_person_by_id", return_value={"biz_ids": ["BIZ-001"]}), \
                  patch("business_core.sheets.get_business_sheet", return_value=sheet) as mock_get_sheet, \
                  patch("business_core.sheets.find_row_by_id",
                        return_value=(2, _dummy_saved_row(**{"Roadmap ID": "RM-001", "Stage ID": "STAGE-001"}))):

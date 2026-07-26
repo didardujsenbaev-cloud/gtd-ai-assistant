@@ -1,113 +1,25 @@
 """
-Phase 15A: Document Registry Foundation.
+Document Registry — pure read-only relation/folder-resolution helpers
+(Phase 15A/15B, narrowed by Phase 37D per ADR-020 §3/§4).
 
-Scope (see DOCUMENT_REGISTRY_ARCHITECTURE.md for the full design):
-  - Register ONE already-existing Drive file against optional
-    Client/Object/Roadmap/Stage/Document Template links.
-  - No upload-from-Telegram, no review workflow, no versioning beyond
-    "every /registerdoc call creates a new family at version 1", no
-    bulk operations, no automatic Drive file moves.
+Phase 37D moved every persistence-adjacent function (Document ID/
+Document Family ID generation, the canonical operational status
+vocabulary) into business_core/document_manager.py — the sole
+persistence owner of DOCUMENT_REGISTRY after this phase. This module
+now contains ONLY read-only cross-entity validation and Drive-folder
+resolution helpers; it writes nothing, and architecture guards
+(test_document_architecture_guards.py) prove it cannot write
+document_registry.
 
-Status model (Phase 15A only two values are writable):
-    uploaded, archived
-Reserved for Phase 15B (validated here as "not yet allowed", not
-silently accepted): under_review, approved, rejected, superseded.
-
-ID strategy: "DOC" is already used live by document_template_registry
-(Document Template ID). Document Registry uses "DREG" for Document ID
-(via the existing generate_next_id() — scans column 1, no change
-needed there) and "DFAM" for Document Family ID, which needs its own
-generator below because generate_next_id() only ever scans column 1
-of a sheet, and Document Family ID is not that sheet's first column.
+Do not add a write path here — document_manager.py is the sole
+persistence owner (ADR-020 §3).
 """
 
 from __future__ import annotations
 
 import logging
-import re
-from datetime import datetime
 
 log = logging.getLogger(__name__)
-
-DOCUMENT_STATUS_ALLOWED = ("uploaded", "archived")
-DOCUMENT_STATUS_RESERVED = ("under_review", "approved", "rejected", "superseded")
-
-
-def _now() -> str:
-    return datetime.now().strftime("%Y-%m-%d %H:%M")
-
-
-def compute_next_document_and_family_ids(all_values: list) -> tuple[str, str]:
-    """
-    Phase 15A safety refinement: compute BOTH the next Document ID
-    (DREG-xxx) and Document Family ID (DFAM-xxx) from a single
-    already-fetched `all_values` snapshot of DOCUMENT_REGISTRY.
-
-    Used by registerdoc_confirm() so ID generation happens exactly
-    once, from one sheet read, inside the same confirm execution that
-    writes the row — never as two separate reads (one per prefix) that
-    could observe different sheet states.
-    """
-    doc_pattern = re.compile(r"^DREG-(\d+)$", re.IGNORECASE)
-    fam_pattern = re.compile(r"^DFAM-(\d+)$", re.IGNORECASE)
-
-    if not all_values:
-        return "DREG-001", "DFAM-001"
-
-    headers = all_values[0]
-    doc_col = headers.index("Document ID") if "Document ID" in headers else 0
-    fam_col = headers.index("Document Family ID") if "Document Family ID" in headers else None
-
-    doc_numbers, fam_numbers = [], []
-    for row in all_values[1:]:
-        if doc_col < len(row) and row[doc_col]:
-            m = doc_pattern.match(row[doc_col])
-            if m:
-                doc_numbers.append(int(m.group(1)))
-        if fam_col is not None and fam_col < len(row) and row[fam_col]:
-            m = fam_pattern.match(row[fam_col])
-            if m:
-                fam_numbers.append(int(m.group(1)))
-
-    next_doc = max(doc_numbers, default=0) + 1
-    next_fam = max(fam_numbers, default=0) + 1
-    return f"DREG-{next_doc:03d}", f"DFAM-{next_fam:03d}"
-
-
-def generate_next_family_id() -> str:
-    """
-    DFAM-001, DFAM-002, ... — scans the 'Document Family ID' column of
-    DOCUMENT_REGISTRY specifically (not column 1, so generate_next_id()
-    cannot be reused directly for this one column).
-    """
-    from business_core.sheets import get_business_sheet, get_header_index_map
-
-    prefix = "DFAM"
-    try:
-        sheet = get_business_sheet("document_registry")
-        all_values = sheet.get_all_values()
-    except Exception as exc:
-        log.warning(f"generate_next_family_id: не удалось прочитать DOCUMENT_REGISTRY: {exc}")
-        return f"{prefix}-001"
-
-    if len(all_values) < 2:
-        return f"{prefix}-001"
-
-    idx = get_header_index_map(all_values[0])
-    fam_col = idx.get("Document Family ID")
-    if fam_col is None:
-        return f"{prefix}-001"
-
-    pattern = re.compile(rf"^{prefix}-(\d+)$", re.IGNORECASE)
-    numbers = []
-    for row in all_values[1:]:
-        if fam_col < len(row) and row[fam_col]:
-            m = pattern.match(row[fam_col])
-            if m:
-                numbers.append(int(m.group(1)))
-
-    next_num = max(numbers, default=0) + 1
-    return f"{prefix}-{next_num:03d}"
 
 
 def resolve_and_validate_links(
@@ -346,6 +258,25 @@ def compute_stage_document_status(stage_id: str) -> dict:
     ID-based match against Document Template IDs linked to the stage
     (Phase 8C knowledge binding), NOT keyword matching against filenames
     (that heuristic lived in the now-superseded material_manager.py).
+
+    ADR-020 §16/§17 designates document_requirements_query.
+    evaluate_scope() the sole canonical missing-document evaluator and
+    calls this function "legacy", to be removed or converted into a
+    thin adapter over evaluate_scope() where safe. Phase 37D attempted
+    that conversion and found it NOT safely convertible under this
+    phase's existing test mocks: document_requirements.py (the engine
+    evaluate_scope() delegates to) reads via sheets.find_row_by_id(),
+    not sheets.read_business_sheet() — a different primitive than the
+    one /docs4stage's existing tests mock — so swapping the
+    implementation would require reworking those tests' mocking
+    strategy, which is out of this phase's bounded scope (ADR-020 §38:
+    "do not rewrite already-sound components"; this one just isn't
+    provably safe to touch yet). This function therefore remains its
+    own independent, deterministic, exact-ID-matching algorithm for
+    now — DEFERRED, not resolved: Phase 37E (full caller migration)
+    should retire this function in favor of calling evaluate_scope()
+    directly from docs4stage_cmd, with correspondingly reworked test
+    mocks for the Requirements engine's actual read primitives.
 
     Returns:
         {

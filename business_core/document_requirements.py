@@ -53,15 +53,20 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-# Only "uploaded" documents count toward a requirement today.
-# document_registry_manager.DOCUMENT_STATUS_ALLOWED also permits
-# "archived", but an archived document is explicitly no longer a live/
-# current one and must not satisfy a requirement. under_review/
-# approved/rejected/superseded are RESERVED in document_registry_manager
-# (never written by any current code path) — accepted here for forward
-# compatibility only if that module ever starts writing them; today no
-# live data ever has these values.
-SATISFYING_STATUSES = frozenset({"uploaded"})
+# Phase 37D (ADR-020 §16): "uploaded", "under_review", and "approved"
+# all satisfy a requirement — a document doesn't stop being "the
+# document that was asked for" just because it's awaiting or has
+# passed review. "archived" is explicitly no longer a live/current
+# document and must not satisfy a requirement. "rejected" never
+# satisfies. "superseded" satisfies only historically (handled
+# separately, not via this set — see _current_valid_documents_for()).
+# No current code path writes anything beyond "uploaded"/"archived"
+# yet (document_manager.DOCUMENT_STATUS is the full 6-value vocabulary,
+# but the lifecycle transition orchestration that would produce
+# "under_review"/"approved" data is Foundation-only for now, per
+# ADR-020 §14 — full review UX is deferred) — this set is forward-
+# compatible with that data the moment it exists.
+SATISFYING_STATUSES = frozenset({"uploaded", "under_review", "approved"})
 
 STATUS_PRESENT = "present"
 STATUS_MISSING = "missing"

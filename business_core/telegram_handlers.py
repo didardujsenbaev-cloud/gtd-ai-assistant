@@ -3625,70 +3625,45 @@ async def registerdoc_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE
         return ConversationHandler.END
 
     try:
-        from business_core.sheets import (
-            append_business_row, find_row_by_id,
-            get_business_sheet, row_from_header_map,
+        # Phase 37D (ADR-020 §10/§19): register_document() is now the
+        # sole canonical creation path — this handler no longer
+        # generates IDs or appends the final row itself.
+        from business_core.business_builder import register_document
+
+        result = register_document(
+            snap["business_id"], snap["document_name"], snap["drive_file_id"],
+            file_name=snap["file_name"], mime_type=snap["mime_type"],
+            drive_file_url=snap.get("web_view_link", ""),
+            client_id=snap["client_id"], object_id=snap["object_id"],
+            roadmap_id=snap["roadmap_id"], stage_id=snap["stage_id"],
+            document_template_id=snap["document_template_id"],
+            uploaded_by=_telegram_username(update), notes=snap["notes"],
         )
-        from business_core.document_registry_manager import compute_next_document_and_family_ids
 
-        # Phase 15A safety refinement: ONE read of the sheet, both IDs
-        # (DREG + DFAM) computed from that single snapshot, immediately
-        # before the one append — no separate reads per prefix that
-        # could observe different sheet states between them.
-        sheet = get_business_sheet("document_registry")
-        all_values = sheet.get_all_values()
-        headers = all_values[0] if all_values else []
-        document_id, family_id = compute_next_document_and_family_ids(all_values)
-
-        now = _now_utc_str()
-        row = row_from_header_map(headers, {
-            "Document ID": document_id,
-            "Document Family ID": family_id,
-            "Version": "1",
-            "Business ID": snap["business_id"],
-            "Client ID": snap["client_id"],
-            "Object ID": snap["object_id"],
-            "Roadmap ID": snap["roadmap_id"],
-            "Stage ID": snap["stage_id"],
-            "Document Template ID": snap["document_template_id"],
-            "Document Name": snap["document_name"],
-            "Status": "uploaded",
-            "Drive File ID": snap["drive_file_id"],
-            "Drive File URL": snap.get("web_view_link", ""),
-            "File Name": snap["file_name"],
-            "Mime Type": snap["mime_type"],
-            "Uploaded At": now,
-            "Uploaded By": _telegram_username(update),
-            "Notes": snap["notes"],
-            "Created At": now,
-            "Updated At": now,
-        })
-        # Единственная запись — либо строка полностью появляется, либо
-        # (при исключении) не появляется вовсе; нет промежуточного
-        # состояния с частично записанной строкой.
-        append_business_row("document_registry", row)
-
-        found = find_row_by_id("document_registry", document_id)
-        if not found:
+        if result["ok"]:
+            await update.message.reply_text(
+                f"✅ Документ зарегистрирован\n\n"
+                f"Document ID: {result['document_id']}\n"
+                f"Document Family ID: {result['document_family_id']}\n"
+                f"Название: {snap['document_name']}\n"
+                f"Статус: {result['final_status']}\n"
+                f"Файл: {snap['file_name']}",
+                reply_markup=ReplyKeyboardRemove(),
+            )
+        elif result["code"] == "DOCUMENT_POST_WRITE_VERIFICATION_FAILED":
             await update.message.reply_text(
                 "⚠️ Строка записана, но не удалось перечитать её для подтверждения.",
                 reply_markup=ReplyKeyboardRemove(),
             )
         else:
-            _, saved_row = found
+            log.error(f"registerdoc_confirm: code={result['code']} error={result['error']}")
             await update.message.reply_text(
-                f"✅ Документ зарегистрирован\n\n"
-                f"Document ID: {saved_row.get('Document ID')}\n"
-                f"Document Family ID: {saved_row.get('Document Family ID')}\n"
-                f"Название: {saved_row.get('Document Name')}\n"
-                f"Статус: {saved_row.get('Status')}\n"
-                f"Файл: {saved_row.get('File Name')}",
-                reply_markup=ReplyKeyboardRemove(),
+                "❌ Не удалось сохранить документ.", reply_markup=ReplyKeyboardRemove(),
             )
 
     except Exception as e:
         log.error(f"registerdoc_confirm error: {e}")
-        await update.message.reply_text(f"❌ Ошибка сохранения: {e}", reply_markup=ReplyKeyboardRemove())
+        await update.message.reply_text("❌ Ошибка сохранения документа.", reply_markup=ReplyKeyboardRemove())
 
     context.user_data.pop("regdoc_confirmed_snapshot", None)
     return ConversationHandler.END
@@ -4188,56 +4163,35 @@ async def uploaddoc_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         real_mime = meta["mime_type"]
         web_view_link = meta["web_view_link"]
 
-        from business_core.sheets import (
-            append_business_row, find_row_by_id,
-            get_business_sheet, row_from_header_map,
+        # Phase 37D (ADR-020 §11/§19): upload_and_register_document()
+        # is now the sole canonical persistence-and-verification path
+        # for this mode — this handler only performs the Drive upload/
+        # download (both require `await`) and the compensation trash
+        # call (also `await`), driven by the structured result's code.
+        from business_core.business_builder import upload_and_register_document
+
+        result = upload_and_register_document(
+            snap["business_id"], snap["document_name"], drive_file_id,
+            real_name, real_mime, web_view_link,
+            client_id=snap["client_id"], object_id=snap["object_id"],
+            roadmap_id=snap["roadmap_id"], stage_id=snap["stage_id"],
+            document_template_id=snap["document_template_id"],
+            uploaded_by=snap["uploaded_by"], notes=snap["notes"],
         )
-        from business_core.document_registry_manager import compute_next_document_and_family_ids
 
-        sheet = get_business_sheet("document_registry")
-        all_values = sheet.get_all_values()
-        headers = all_values[0] if all_values else []
-        document_id, family_id = compute_next_document_and_family_ids(all_values)
-
-        now = _now_utc_str()
-        row = row_from_header_map(headers, {
-            "Document ID": document_id,
-            "Document Family ID": family_id,
-            "Version": "1",
-            "Business ID": snap["business_id"],
-            "Client ID": snap["client_id"],
-            "Object ID": snap["object_id"],
-            "Roadmap ID": snap["roadmap_id"],
-            "Stage ID": snap["stage_id"],
-            "Document Template ID": snap["document_template_id"],
-            "Document Name": snap["document_name"],
-            "Status": "uploaded",
-            "Drive File ID": drive_file_id,
-            "Drive File URL": web_view_link,
-            "File Name": real_name,
-            "Mime Type": real_mime,
-            "Uploaded At": now,
-            "Uploaded By": snap["uploaded_by"],
-            "Notes": snap["notes"],
-            "Created At": now,
-            "Updated At": now,
-        })
-
-        try:
-            append_business_row("document_registry", row)
-        except Exception as e:
-            log.error(f"uploaddoc_confirm: DOCUMENT_REGISTRY write failed: {e}")
+        if result["code"] == "DOCUMENT_PERSISTENCE_FAILED":
+            log.error(f"uploaddoc_confirm: DOCUMENT_REGISTRY write failed: {result['error']}")
             cleanup = trash_file(service, drive_file_id)
             if cleanup.get("ok"):
                 await update.message.reply_text(
-                    f"❌ Не удалось сохранить запись в DOCUMENT_REGISTRY: {e}\n"
+                    "❌ Не удалось сохранить запись в DOCUMENT_REGISTRY.\n"
                     "Загруженный файл в Google Drive перемещён в корзину (компенсация выполнена) — "
                     "запись не создана.",
                     reply_markup=ReplyKeyboardRemove(),
                 )
             else:
                 await update.message.reply_text(
-                    f"❌ Не удалось сохранить запись в DOCUMENT_REGISTRY: {e}\n"
+                    "❌ Не удалось сохранить запись в DOCUMENT_REGISTRY.\n"
                     f"⚠️ Очистка Drive-файла НЕ удалась: {cleanup.get('error')}\n"
                     f"Orphan Drive File ID: {drive_file_id}\n"
                     f"Drive URL: {web_view_link or '(нет ссылки)'}\n"
@@ -4247,72 +4201,44 @@ async def uploaddoc_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             context.user_data.pop("ud_confirmed_snapshot", None)
             return ConversationHandler.END
 
-        # Post-write verification: re-read and compare against the
-        # immutable snapshot + authoritative Drive metadata. A missing
-        # row or any mismatch NEVER triggers a second write/upload — the
-        # row may already exist, so we also never trash the Drive file
-        # here (only a registry-write EXCEPTION, handled above, does
-        # that). We report a distinct manual-verification result and
-        # end the operation as terminal (no return to "pending").
-        expected = {
-            "Document ID": document_id, "Document Family ID": family_id, "Version": "1",
-            "Business ID": snap["business_id"], "Client ID": snap["client_id"],
-            "Object ID": snap["object_id"], "Roadmap ID": snap["roadmap_id"],
-            "Stage ID": snap["stage_id"], "Document Template ID": snap["document_template_id"],
-            "Document Name": snap["document_name"], "Status": "uploaded",
-            "Drive File ID": drive_file_id, "Drive File URL": web_view_link,
-            "File Name": real_name, "Mime Type": real_mime,
-        }
-        found = find_row_by_id("document_registry", document_id)
-        if not found:
+        if result["code"] == "DOCUMENT_POST_WRITE_VERIFICATION_FAILED":
             log.error(
-                f"uploaddoc_confirm: post-write re-read did not find {document_id} "
-                f"(expected={expected})"
+                f"uploaddoc_confirm: post-write verification failed "
+                f"document_id={result.get('document_id', '')} drive_file_id={drive_file_id}"
             )
             snap["op_state"] = "verification_failed"
             await update.message.reply_text(
-                "⚠️ Document registered, but post-write verification failed.\n"
-                "Manual verification is required.\n"
-                f"Document ID: {document_id}\n"
+                "⚠️ Документ был записан, но пост-проверка записи не прошла.\n"
+                "Требуется ручная проверка.\n"
+                f"Document ID: {result.get('document_id', '')}\n"
                 f"Drive File ID: {drive_file_id}",
                 reply_markup=ReplyKeyboardRemove(),
             )
             context.user_data.pop("ud_confirmed_snapshot", None)
             return ConversationHandler.END
 
-        _, saved_row = found
-        mismatches = {k: {"expected": v, "actual": saved_row.get(k)}
-                      for k, v in expected.items() if saved_row.get(k) != v}
-        if mismatches:
-            log.error(
-                f"uploaddoc_confirm: post-write verification mismatch for {document_id}: {mismatches}"
-            )
-            snap["op_state"] = "verification_failed"
-            await update.message.reply_text(
-                "⚠️ Document registered, but post-write verification failed.\n"
-                "Manual verification is required.\n"
-                f"Document ID: {document_id}\n"
-                f"Drive File ID: {drive_file_id}",
-                reply_markup=ReplyKeyboardRemove(),
-            )
+        if not result["ok"]:
+            log.error(f"uploaddoc_confirm: code={result['code']} error={result['error']}")
+            await update.message.reply_text("❌ Не удалось сохранить документ.", reply_markup=ReplyKeyboardRemove())
             context.user_data.pop("ud_confirmed_snapshot", None)
             return ConversationHandler.END
 
+        document_id = result["document_id"]
         await update.message.reply_text(
             f"✅ Документ загружен и зарегистрирован\n\n"
-            f"Document ID: {saved_row.get('Document ID')}\n"
-            f"Document Family ID: {saved_row.get('Document Family ID')}\n"
-            f"Version: {saved_row.get('Version')}\n"
-            f"Название: {saved_row.get('Document Name')}\n"
-            f"Файл: {saved_row.get('File Name')}\n"
-            f"Drive URL: {saved_row.get('Drive File URL')}\n"
-            f"Business ID: {saved_row.get('Business ID') or '—'}\n"
-            f"Client ID: {saved_row.get('Client ID') or '—'}\n"
-            f"Object ID: {saved_row.get('Object ID') or '—'}\n"
-            f"Roadmap ID: {saved_row.get('Roadmap ID') or '—'}\n"
-            f"Stage ID: {saved_row.get('Stage ID') or '—'}\n"
-            f"Document Template ID: {saved_row.get('Document Template ID') or '—'}\n"
-            f"Статус: {saved_row.get('Status')}",
+            f"Document ID: {document_id}\n"
+            f"Document Family ID: {result['document_family_id']}\n"
+            f"Version: {result['version']}\n"
+            f"Название: {snap['document_name']}\n"
+            f"Файл: {real_name}\n"
+            f"Drive URL: {web_view_link}\n"
+            f"Business ID: {result['business_id'] or '—'}\n"
+            f"Client ID: {result['client_id'] or '—'}\n"
+            f"Object ID: {result['object_id'] or '—'}\n"
+            f"Roadmap ID: {result['roadmap_id'] or '—'}\n"
+            f"Stage ID: {result['stage_id'] or '—'}\n"
+            f"Document Template ID: {result['document_template_id'] or '—'}\n"
+            f"Статус: {result['final_status']}",
             reply_markup=ReplyKeyboardRemove(),
         )
 
@@ -4325,7 +4251,7 @@ async def uploaddoc_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     except Exception as e:
         log.error(f"uploaddoc_confirm error: {e}")
-        await update.message.reply_text(f"❌ Ошибка: {e}", reply_markup=ReplyKeyboardRemove())
+        await update.message.reply_text("❌ Ошибка при загрузке документа.", reply_markup=ReplyKeyboardRemove())
     finally:
         if tmp_path and os.path.exists(tmp_path):
             try:
