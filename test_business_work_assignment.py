@@ -128,6 +128,7 @@ class TestResolveNormalResolution(unittest.TestCase):
              patch("business_core.stage_entity_relations.get_relations_for_stage",
                    return_value=(ACTIVE_ROLE_RELATION,)), \
              patch("business_core.organization_manager.find_role_by_id", return_value=dict(ACTIVE_ROLE)), \
+             patch("business_core.organization_manager.find_department_by_id", return_value=dict(ACTIVE_DEPARTMENT)), \
              patch("business_core.organization_manager.list_assignments_for_role",
                    return_value=[dict(ACTIVE_ASSIGNMENT)]):
             result = wam.resolve_stage_responsibility("STAGE-001")
@@ -148,6 +149,7 @@ class TestResolveNormalResolution(unittest.TestCase):
              patch("business_core.stage_entity_relations.get_relations_for_stage",
                    return_value=(ACTIVE_ROLE_RELATION,)), \
              patch("business_core.organization_manager.find_role_by_id", return_value=dict(ACTIVE_ROLE)), \
+             patch("business_core.organization_manager.find_department_by_id", return_value=dict(ACTIVE_DEPARTMENT)), \
              patch("business_core.organization_manager.list_assignments_for_role",
                    return_value=[primary, temp]):
             result = wam.resolve_stage_responsibility("STAGE-001")
@@ -165,6 +167,7 @@ class TestResolveNormalResolution(unittest.TestCase):
              patch("business_core.stage_entity_relations.get_relations_for_stage",
                    return_value=(ACTIVE_ROLE_RELATION,)), \
              patch("business_core.organization_manager.find_role_by_id", return_value=dict(ACTIVE_ROLE)), \
+             patch("business_core.organization_manager.find_department_by_id", return_value=dict(ACTIVE_DEPARTMENT)), \
              patch("business_core.organization_manager.list_assignments_for_role",
                    return_value=[backup, primary]):
             result = wam.resolve_stage_responsibility("STAGE-001")
@@ -232,6 +235,50 @@ class TestResolveArchivedRole(unittest.TestCase):
         self.assertEqual(result["status"], "configuration_error")
         self.assertTrue(any("ROLE-001" in e for e in result["errors"]))
 
+    def test_configuration_error_when_role_paused(self):
+        """Phase 35D/35E (ADR-018 §16/§23): a paused Role folds into the
+        same configuration_error bucket as archived — distinguished only
+        via the diagnostic errors text, never a new RESOLUTION_STATUS
+        value."""
+        wam = _fresh_wam()
+        with patch("business_core.sheets.find_row_by_id", return_value=(2, {})), \
+             patch("business_core.stage_entity_relations.get_relations_for_stage",
+                   return_value=(ACTIVE_ROLE_RELATION,)), \
+             patch("business_core.organization_manager.find_role_by_id", return_value=dict(PAUSED_ROLE)):
+            result = wam.resolve_stage_responsibility("STAGE-001")
+
+        self.assertEqual(result["status"], "configuration_error")
+        self.assertEqual(result["role_id"], "ROLE-001")
+        self.assertTrue(any("паузе" in e or "paused" in e for e in result["errors"]))
+
+    def test_configuration_error_when_department_not_found(self):
+        """Phase 35E: parent Department non-existence surfaces via the
+        same configuration_error bucket for an existing relation."""
+        wam = _fresh_wam()
+        with patch("business_core.sheets.find_row_by_id", return_value=(2, {})), \
+             patch("business_core.stage_entity_relations.get_relations_for_stage",
+                   return_value=(ACTIVE_ROLE_RELATION,)), \
+             patch("business_core.organization_manager.find_role_by_id", return_value=dict(ACTIVE_ROLE)), \
+             patch("business_core.organization_manager.find_department_by_id", return_value=None):
+            result = wam.resolve_stage_responsibility("STAGE-001")
+
+        self.assertEqual(result["status"], "configuration_error")
+        self.assertEqual(result["role_id"], "ROLE-001")
+        self.assertTrue(any("DEPT-001" in e for e in result["errors"]))
+
+    def test_configuration_error_when_department_archived(self):
+        wam = _fresh_wam()
+        with patch("business_core.sheets.find_row_by_id", return_value=(2, {})), \
+             patch("business_core.stage_entity_relations.get_relations_for_stage",
+                   return_value=(ACTIVE_ROLE_RELATION,)), \
+             patch("business_core.organization_manager.find_role_by_id", return_value=dict(ACTIVE_ROLE)), \
+             patch("business_core.organization_manager.find_department_by_id", return_value=dict(ARCHIVED_DEPARTMENT)):
+            result = wam.resolve_stage_responsibility("STAGE-001")
+
+        self.assertEqual(result["status"], "configuration_error")
+        self.assertEqual(result["role_id"], "ROLE-001")
+        self.assertTrue(any("DEPT-001" in e for e in result["errors"]))
+
 
 # ─────────────────────────────────────────────────────────────
 # resolve_stage_responsibility: vacant role
@@ -245,6 +292,7 @@ class TestResolveVacantRole(unittest.TestCase):
              patch("business_core.stage_entity_relations.get_relations_for_stage",
                    return_value=(ACTIVE_ROLE_RELATION,)), \
              patch("business_core.organization_manager.find_role_by_id", return_value=dict(ACTIVE_ROLE)), \
+             patch("business_core.organization_manager.find_department_by_id", return_value=dict(ACTIVE_DEPARTMENT)), \
              patch("business_core.organization_manager.list_assignments_for_role", return_value=[]):
             result = wam.resolve_stage_responsibility("STAGE-001")
 
@@ -260,6 +308,7 @@ class TestResolveVacantRole(unittest.TestCase):
              patch("business_core.stage_entity_relations.get_relations_for_stage",
                    return_value=(ACTIVE_ROLE_RELATION,)), \
              patch("business_core.organization_manager.find_role_by_id", return_value=dict(ACTIVE_ROLE)), \
+             patch("business_core.organization_manager.find_department_by_id", return_value=dict(ACTIVE_DEPARTMENT)), \
              patch("business_core.organization_manager.list_assignments_for_role", return_value=[]) as mock_list:
             wam.resolve_stage_responsibility("STAGE-001")
 

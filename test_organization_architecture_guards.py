@@ -48,6 +48,18 @@ def _imported_module_names(path: Path) -> set[str]:
     return names
 
 
+def _function_body(src: str, fn_name: str) -> str:
+    """Extract one top-level `async def fn_name`'s source body, bounded
+    by the next top-level `def `/`async def ` (or EOF for the last
+    function in the file — e.g. stageresponsibility_cmd, which precedes
+    the synchronous register_business_handlers())."""
+    start = src.index(f"async def {fn_name}")
+    rest = src[start + 10:]
+    candidates = [i for i in (rest.find("\nasync def "), rest.find("\ndef ")) if i != -1]
+    end = start + 10 + min(candidates) if candidates else len(src)
+    return src[start:end]
+
+
 def _files_writing_registry(candidate_files: list[Path], sheet_keys: set[str]) -> set[str]:
     hits: set[str] = set()
     for path in candidate_files:
@@ -212,6 +224,148 @@ class TestNoGtdCoreCoupling(unittest.TestCase):
             path = BUSINESS_CORE / filename
             found = _imported_module_names(path) & GTD_FORBIDDEN
             self.assertEqual(found, set(), f"{filename} must not import GTD-owned modules: {found}")
+
+
+# ─────────────────────────────────────────────────────────────
+# Phase 35E (ADR-018 §17-§20): centralized Organization result-code UX
+# mapping guards.
+# ─────────────────────────────────────────────────────────────
+
+class TestCentralizedOrganizationUXMappingExists(unittest.TestCase):
+    """Phase 35E: exactly one centralized result-code -> Russian message
+    mapping function exists for each of the Person<->Role assignment and
+    Stage->Role code families — no ad-hoc per-caller message
+    construction duplicating them."""
+
+    def test_mapping_functions_exist(self):
+        import business_core.telegram_handlers as th
+        self.assertTrue(callable(getattr(th, "_organization_assignment_message", None)))
+        self.assertTrue(callable(getattr(th, "_stage_role_message", None)))
+
+    def test_mapping_functions_defined_only_once(self):
+        path = BUSINESS_CORE / "telegram_handlers.py"
+        src = path.read_text(encoding="utf-8")
+        for fn in ("_organization_assignment_message", "_stage_role_message"):
+            self.assertEqual(
+                src.count(f"def {fn}("), 1,
+                f"{fn} must be defined exactly once in telegram_handlers.py",
+            )
+
+    def test_assignrole_uses_centralized_mapping(self):
+        path = BUSINESS_CORE / "telegram_handlers.py"
+        src = path.read_text(encoding="utf-8")
+        start = src.index("async def assignrole_cmd")
+        end = src.index("\nasync def ", start + 10)
+        body = src[start:end]
+        self.assertIn("_organization_assignment_message(", body)
+
+    def test_assignstagerole_and_reassignstagerole_use_centralized_mapping(self):
+        path = BUSINESS_CORE / "telegram_handlers.py"
+        src = path.read_text(encoding="utf-8")
+        for fn_name in ("assignstagerole_cmd", "reassignstagerole_cmd"):
+            start = src.index(f"async def {fn_name}")
+            end = src.index("\nasync def ", start + 10)
+            body = src[start:end]
+            self.assertIn("_stage_role_message(", body)
+
+
+class TestAssignRoleDoesNotImplementEligibilityRules(unittest.TestCase):
+    """ADR-018 §17: /assignrole must not re-derive Person/Role/
+    Department eligibility itself — every branch it takes must come
+    from the orchestrator's own result code."""
+
+    def _assignrole_body(self) -> str:
+        path = BUSINESS_CORE / "telegram_handlers.py"
+        src = path.read_text(encoding="utf-8")
+        start = src.index("async def assignrole_cmd")
+        end = src.index("\nasync def ", start + 10)
+        return src[start:end]
+
+    def test_no_direct_low_level_assignment_call(self):
+        body = self._assignrole_body()
+        self.assertNotIn("organization_manager.assign_person_to_role(", body)
+
+    def test_no_eligibility_re_derivation(self):
+        body = self._assignrole_body()
+        for snippet in ("is_person_archived", "find_department_by_id", '== "paused"', '== "archived"'):
+            self.assertNotIn(snippet, body)
+
+
+class TestStageRoleCommandsDoNotImplementRoleLifecyclePolicy(unittest.TestCase):
+    """ADR-018 §16: /assignstagerole and /reassignstagerole must not
+    re-derive Role-lifecycle eligibility (that lives solely in
+    work_assignment_manager._role_eligible_for_stage_assignment())."""
+
+    def test_no_role_status_branching_in_stage_role_commands(self):
+        path = BUSINESS_CORE / "telegram_handlers.py"
+        src = path.read_text(encoding="utf-8")
+        for fn_name in ("assignstagerole_cmd", "reassignstagerole_cmd"):
+            start = src.index(f"async def {fn_name}")
+            end = src.index("\nasync def ", start + 10)
+            body = src[start:end]
+            for snippet in ('role["status"]', "_role_eligible_for_stage_assignment", "find_department_by_id"):
+                self.assertNotIn(snippet, body)
+
+
+class TestNoDirectLowLevelPersistenceCallsFromTelegram(unittest.TestCase):
+    """ADR-018: no Organization-facing Telegram command may call
+    low-level Organization/Stage-relation persistence primitives
+    directly — always through the canonical manager/orchestration
+    function."""
+
+    def test_no_direct_sheet_primitives_in_organization_commands(self):
+        path = BUSINESS_CORE / "telegram_handlers.py"
+        src = path.read_text(encoding="utf-8")
+        for fn_name in (
+            "newdept_cmd", "newrole_cmd", "roles_cmd", "roledetails_cmd",
+            "assignrole_cmd", "assignstagerole_cmd", "reassignstagerole_cmd",
+            "stageresponsibility_cmd",
+        ):
+            body = _function_body(src, fn_name)
+            for forbidden in ("get_business_sheet(", "append_business_row(", "batch_append_business_rows(", "update_cell("):
+                self.assertNotIn(forbidden, body, f"{fn_name} must not call {forbidden.rstrip('(')} directly")
+
+
+class TestUnknownResultCodeHasSafeFallback(unittest.TestCase):
+    """Phase 35E: an unmapped/future result code must never crash or
+    render a raw dict — both mapping functions fall through to a safe,
+    logged, generic message."""
+
+    def test_organization_assignment_message_unknown_code_fallback(self):
+        import business_core.telegram_handlers as th
+        result = {"ok": False, "code": "TOTALLY_NEW_CODE", "error": "detail"}
+        msg = th._organization_assignment_message(result, "PRS-001", "ROLE-001")
+        self.assertIn("❌", msg)
+        self.assertNotIn("Traceback", msg)
+
+    def test_stage_role_message_unknown_code_fallback(self):
+        import business_core.telegram_handlers as th
+        result = {"ok": False, "code": "TOTALLY_NEW_CODE", "error": "detail"}
+        msg = th._stage_role_message(result, "STAGE-001", "ROLE-001")
+        self.assertIn("❌", msg)
+        self.assertNotIn("Traceback", msg)
+
+
+class TestSensitiveOrganizationValuesAreNotLogged(unittest.TestCase):
+    """Phase 35E §7: Organization command handlers must never log
+    phone numbers, Notes, Purpose, Main Result, full message bodies, or
+    credentials — only IDs/codes/status/flags."""
+
+    _DISALLOWED_LOG_TOKENS = ("Notes", "Purpose", "Main Result", "phone", "update.message.text")
+
+    def test_organization_commands_do_not_log_disallowed_fields(self):
+        path = BUSINESS_CORE / "telegram_handlers.py"
+        src = path.read_text(encoding="utf-8")
+        for fn_name in (
+            "newdept_cmd", "newrole_cmd", "roles_cmd", "roledetails_cmd",
+            "assignrole_cmd", "assignstagerole_cmd", "reassignstagerole_cmd",
+            "stageresponsibility_cmd",
+        ):
+            body = _function_body(src, fn_name)
+            log_calls = [line for line in body.splitlines() if "log.error(" in line or "log.warning(" in line or "log.info(" in line]
+            for line in log_calls:
+                for token in self._DISALLOWED_LOG_TOKENS:
+                    self.assertNotIn(token, line, f"{fn_name} logs disallowed token {token!r}: {line}")
 
 
 if __name__ == "__main__":

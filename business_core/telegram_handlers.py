@@ -6150,6 +6150,189 @@ async def version_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 # ─────────────────────────────────────────────────────────────
+# Phase 35E (ADR-018 §17-§20): centralized Organization result-code ->
+# Russian message mapping. Presentation only — every branch reacts to a
+# field business_builder.assign_person_to_role_canonical() /
+# work_assignment_manager.assign_role_to_stage() / reassign_stage_role()
+# already computed; nothing here re-derives eligibility, re-checks
+# archived/paused status, or picks among duplicates. Mirrors the
+# Phase 34C/34D Stage-transition UX pattern
+# (_stage_transition_failure_message()) applied to the Organization
+# Domain's Person<->Role assignment and Stage->Role codes. An unmapped
+# code gets a safe generic fallback (code + IDs only, never a raw
+# exception or the result dict) plus a logged warning for triage.
+# ─────────────────────────────────────────────────────────────
+
+def _organization_assignment_message(result: dict, person_id: str, role_id: str) -> str:
+    """
+    Render any business_builder.assign_person_to_role_canonical() result
+    (ok=True or ok=False) into a single Russian Telegram message. Never
+    exposes the raw result dict or a traceback.
+    """
+    code = result.get("code", "")
+
+    if code == "ASSIGNMENT_CREATED":
+        return "\n".join([
+            "✅ Назначение создано",
+            f"Person ID: `{person_id}`",
+            f"Role ID: `{role_id}`",
+            f"Assignment ID: `{result.get('assignment_id', '')}`",
+        ])
+
+    if code == "ASSIGNMENT_REUSED":
+        return "\n".join([
+            "ℹ️ Уже назначен — активное назначение уже существует",
+            f"Person ID: `{person_id}`",
+            f"Role ID: `{role_id}`",
+            f"Assignment ID: `{result.get('assignment_id', '')}` (новая запись не создана)",
+        ])
+
+    if code == "PERSON_NOT_FOUND":
+        return f"❌ Person `{person_id}` не найден."
+
+    if code == "PERSON_ARCHIVED":
+        return "\n".join([
+            "❌ Person архивирован",
+            f"Person ID: `{person_id}`",
+            "Архивированный Person не может получить назначение на Role.",
+        ])
+
+    if code == "ROLE_NOT_FOUND":
+        return f"❌ Role `{role_id}` не найдена."
+
+    if code == "ROLE_PAUSED":
+        return "\n".join([
+            "❌ Role приостановлена (paused)",
+            f"Role ID: `{role_id}`",
+            "Приостановленная Role не может получить новое назначение Person.",
+        ])
+
+    if code == "ROLE_ARCHIVED":
+        return "\n".join([
+            "❌ Role архивирована",
+            f"Role ID: `{role_id}`",
+            "Архивированная Role не может получить новое назначение Person.",
+        ])
+
+    if code == "DEPARTMENT_NOT_FOUND":
+        return "\n".join([
+            "❌ Department этой Role не найден",
+            f"Role ID: `{role_id}`",
+        ])
+
+    if code == "DEPARTMENT_ARCHIVED":
+        return "\n".join([
+            "❌ Department этой Role архивирован",
+            f"Department ID: `{result.get('department_id', '')}`",
+            "Родительский Department архивирован — назначение не разрешено.",
+        ])
+
+    if code == "PERSON_NOT_LINKED_TO_BUSINESS":
+        return "\n".join([
+            "❌ Person не привязан к бизнесу этой Role",
+            f"Person ID: `{person_id}`",
+            f"Role ID: `{role_id}`",
+        ])
+
+    if code == "PERSON_ROLE_BUSINESS_MISMATCH":
+        return "\n".join([
+            "❌ Person привязан к другому бизнесу",
+            f"Person ID: `{person_id}`",
+            "Person не привязан к бизнесу этой Role.",
+        ])
+
+    if code == "MULTIPLE_ACTIVE_ASSIGNMENTS_INTEGRITY_ERROR":
+        ids = ", ".join(f"`{a}`" for a in result.get("conflicting_assignment_ids", ())) or "—"
+        return "\n".join([
+            "⚠️ Обнаружен конфликт целостности данных",
+            f"Person ID: `{person_id}`",
+            f"Role ID: `{role_id}`",
+            f"Найдено несколько активных Assignment одновременно: {ids}",
+            "Новое назначение не создано — требуется ручная проверка данных, "
+            "автоматический выбор одного из них не выполняется.",
+        ])
+
+    if code == "ASSIGNMENT_ENDED_IMMUTABLE":
+        return "❌ Это назначение уже завершено (ended) — изменить его статус нельзя."
+
+    if code == "INVALID_ROLE_STATUS":
+        return f"❌ Role `{role_id}` имеет недопустимый статус."
+
+    if code == "INVALID_ASSIGNMENT_STATUS":
+        return "❌ Недопустимый статус назначения."
+
+    log.warning(f"_organization_assignment_message: unmapped code={code!r} person_id={person_id} role_id={role_id}")
+    return f"❌ Ошибка ({code or 'unknown'}): {result.get('error') or 'см. логи'}"
+
+
+def _stage_role_message(result: dict, stage_id: str, role_id: str) -> str:
+    """
+    Render any work_assignment_manager.assign_role_to_stage() /
+    reassign_stage_role() result into a single Russian Telegram message.
+    Never exposes the raw result dict or a traceback.
+    """
+    code = result.get("code", "")
+
+    if code == "STAGE_ROLE_ASSIGNED":
+        return "\n".join([
+            "✅ Role назначена на этап",
+            f"Stage ID: `{stage_id}`",
+            f"Role ID: `{role_id}`",
+            f"Relation ID: `{result.get('relation_id') or result.get('new_relation_id', '')}`",
+        ])
+
+    if code == "STAGE_ROLE_REUSED":
+        return "\n".join([
+            f"ℹ️ Этап `{stage_id}` уже назначен на роль `{role_id}`",
+            "Изменений нет, повтор безопасен.",
+        ])
+
+    if code == "STAGE_ROLE_REASSIGNED":
+        return "\n".join([
+            "✅ Role этапа изменена",
+            f"Stage ID: `{stage_id}`",
+            f"Была: `{result.get('old_relation_id') or '—'}`",
+            f"Стала: `{result.get('new_relation_id', '')}` (role `{role_id}`)",
+        ])
+
+    if code == "STAGE_NOT_FOUND":
+        return f"❌ Этап `{stage_id}` не найден."
+
+    if code == "ROLE_NOT_FOUND":
+        return f"❌ Role `{role_id}` не найдена."
+
+    if code == "ROLE_NOT_ACTIVE_FOR_STAGE_ASSIGNMENT":
+        return "\n".join([
+            "❌ Role не активна",
+            f"Role ID: `{role_id}`",
+            "Только Role со статусом active может получить ответственность за этап.",
+        ])
+
+    if code == "DEPARTMENT_NOT_FOUND":
+        return "\n".join([
+            "❌ Department этой Role не найден",
+            f"Role ID: `{role_id}`",
+        ])
+
+    if code == "DEPARTMENT_ARCHIVED":
+        return "\n".join([
+            "❌ Department этой Role архивирован",
+            f"Role ID: `{role_id}`",
+        ])
+
+    if code == "MULTIPLE_ACTIVE_STAGE_ROLE_RELATIONS_INTEGRITY_ERROR":
+        return "\n".join([
+            "⚠️ Обнаружен конфликт целостности данных",
+            f"Stage ID: `{stage_id}`",
+            "У этапа уже есть активная Role-relation — используй /reassignstagerole. "
+            "Автоматический выбор одной из relations не выполняется.",
+        ])
+
+    log.warning(f"_stage_role_message: unmapped code={code!r} stage_id={stage_id} role_id={role_id}")
+    return f"❌ Ошибка ({code or 'unknown'}): {result.get('error') or 'см. логи'}"
+
+
+# ─────────────────────────────────────────────────────────────
 # Phase 21F: Organization Layer — /newdept /newrole /roles /roledetails
 # /assignrole. Additive only — no existing command touched.
 #
@@ -6197,7 +6380,7 @@ async def newdept_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await _reply(update, "\n".join(lines))
     except Exception as e:
         log.error(f"newdept_cmd error: {e}")
-        await _reply(update, f"❌ Ошибка: {e}")
+        await _reply(update, "❌ Ошибка при создании Department.")
 
 
 async def newrole_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -6252,7 +6435,7 @@ async def newrole_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await _reply(update, "\n".join(lines))
     except Exception as e:
         log.error(f"newrole_cmd error: {e}")
-        await _reply(update, f"❌ Ошибка: {e}")
+        await _reply(update, "❌ Ошибка при создании Role.")
 
 
 async def roles_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -6285,7 +6468,7 @@ async def roles_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await _reply(update, "\n".join(lines))
     except Exception as e:
         log.error(f"roles_cmd error: {e}")
-        await _reply(update, f"❌ Ошибка: {e}")
+        await _reply(update, "❌ Ошибка при получении списка Roles.")
 
 
 async def roledetails_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -6338,7 +6521,7 @@ async def roledetails_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await _reply(update, "\n".join(lines))
     except Exception as e:
         log.error(f"roledetails_cmd error: {e}")
-        await _reply(update, f"❌ Ошибка: {e}")
+        await _reply(update, "❌ Ошибка при получении карточки Role.")
 
 
 async def assignrole_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -6381,27 +6564,10 @@ async def assignrole_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             person_id, role_id, start_date,
             assignment_type=args.get("assignment_type", "primary"),
         )
-        if not result["ok"]:
-            await _reply(update, f"❌ Ошибка ({result['code']}): {result['error']}")
-            return
-
-        if result["code"] == "ASSIGNMENT_REUSED":
-            await _reply(update, "\n".join([
-                "✅ Уже назначен (активное назначение уже существует)",
-                f"Assignment ID: `{result['assignment_id']}`",
-                f"{person_id} → {role_id}",
-            ]))
-            return
-
-        await _reply(update, "\n".join([
-            "✅ Назначение создано",
-            f"Assignment ID: `{result['assignment_id']}`",
-            f"{person_id} → {role_id}",
-            f"С {start_date}",
-        ]))
+        await _reply(update, _organization_assignment_message(result, person_id, role_id))
     except Exception as e:
         log.error(f"assignrole_cmd error: {e}")
-        await _reply(update, f"❌ Ошибка: {e}")
+        await _reply(update, "❌ Ошибка при назначении Person на Role.")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -6438,19 +6604,10 @@ async def assignstagerole_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
         from business_core.work_assignment_manager import assign_role_to_stage
 
         result = assign_role_to_stage(stage_id, role_id)
-        if not result["ok"]:
-            await _reply(update, f"❌ Ошибка: {result['error']}")
-            return
-
-        await _reply(update, "\n".join([
-            "✅ Role назначена на этап",
-            f"Stage: `{stage_id}`",
-            f"Role: `{role_id}`",
-            f"Relation ID: `{result['relation_id']}`",
-        ]))
+        await _reply(update, _stage_role_message(result, stage_id, role_id))
     except Exception as e:
         log.error(f"assignstagerole_cmd error: {e}")
-        await _reply(update, f"❌ Ошибка: {e}")
+        await _reply(update, "❌ Ошибка при назначении Role на этап.")
 
 
 async def reassignstagerole_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -6485,36 +6642,28 @@ async def reassignstagerole_cmd(update: Update, context: ContextTypes.DEFAULT_TY
 
         result = reassign_stage_role(stage_id, role_id)
 
-        if result["ok"] and result["changed"]:
-            await _reply(update, "\n".join([
-                "✅ Role этапа изменена",
-                f"Stage: `{stage_id}`",
-                f"Была: `{result['old_relation_id'] or '—'}`",
-                f"Стала: `{result['new_relation_id']}` (role `{role_id}`)",
-            ]))
-            return
-
-        if result["ok"] and not result["changed"]:
-            await _reply(update,
-                f"ℹ️ Этап `{stage_id}` уже назначен на роль `{role_id}` "
-                "(изменений нет, повтор безопасен)."
-            )
-            return
-
+        # The one outcome _stage_role_message() doesn't cover: the old
+        # relation was already deactivated but the new one failed to
+        # create (changed=True, ok=False) — a genuine partial-failure
+        # state specific to reassign's two-step write, distinct from
+        # any single result code.
         if not result["ok"] and result["changed"]:
+            log.warning(
+                f"reassignstagerole_cmd partial failure: stage_id={stage_id} role_id={role_id} "
+                f"old_relation_id={result['old_relation_id']} error={result.get('error')}"
+            )
             await _reply(update, "\n".join([
                 "⚠️ Смена роли выполнена частично",
-                f"Stage: `{stage_id}`",
+                f"Stage ID: `{stage_id}`",
                 f"Старая relation деактивирована: `{result['old_relation_id']}`",
-                f"Не удалось создать новую: {result['error']}",
-                "Повтор команды безопасен.",
+                "Не удалось создать новую — повтор команды безопасен.",
             ]))
             return
 
-        await _reply(update, f"❌ Ошибка: {result['error']}")
+        await _reply(update, _stage_role_message(result, stage_id, role_id))
     except Exception as e:
         log.error(f"reassignstagerole_cmd error: {e}")
-        await _reply(update, f"❌ Ошибка: {e}")
+        await _reply(update, "❌ Ошибка при смене Role этапа.")
 
 
 async def stageresponsibility_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

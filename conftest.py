@@ -98,6 +98,10 @@ _ROADMAP_DOMAIN_TEST_FILES = frozenset({
 
 # Phase 35C (ADR-018 §24): Phase 35B's Organization Domain audit found
 # all 9 of these files missing from this registry — closed here.
+# Phase 35E: pre-change verification found test_business_work_execution_
+# commands.py (Phase 22D's /assignstagerole /reassignstagerole
+# /stageresponsibility caller tests) also missing — same fully-mocked
+# shape as the Phase 35D find, added here for the same reason.
 _ORGANIZATION_DOMAIN_TEST_FILES = frozenset({
     "test_business_organization_commands.py",
     "test_business_organization_department_role.py",
@@ -107,10 +111,12 @@ _ORGANIZATION_DOMAIN_TEST_FILES = frozenset({
     "test_business_organization_schema.py",
     "test_business_organization_seed.py",
     "test_business_work_assignment.py",
+    "test_business_work_execution_commands.py",
     "test_business_work_execution_integration.py",
     "test_inbox_bridge.py",
     "test_organization_foundation.py",
     "test_organization_architecture_guards.py",
+    "test_organization_caller_ux.py",
 })
 
 # Phase 32A (Service Domain re-audit) found a masked live-network call

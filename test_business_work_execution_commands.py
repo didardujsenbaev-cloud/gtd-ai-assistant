@@ -66,7 +66,7 @@ class TestAssignStageRoleCommand(unittest.TestCase):
         async def run():
             with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
                  patch("business_core.work_assignment_manager.assign_role_to_stage",
-                       return_value={"ok": True, "relation_id": "REL-050", "error": None}):
+                       return_value={"ok": True, "relation_id": "REL-050", "code": "STAGE_ROLE_ASSIGNED", "error": None}):
                 await th.assignstagerole_cmd(upd, ctx)
 
         _run(run())
@@ -180,7 +180,7 @@ class TestReassignStageRoleCommand(unittest.TestCase):
                  patch("business_core.work_assignment_manager.reassign_stage_role",
                        return_value={"ok": True, "changed": True,
                                      "old_relation_id": "REL-010", "new_relation_id": "REL-020",
-                                     "error": None}):
+                                     "code": "STAGE_ROLE_REASSIGNED", "error": None}):
                 await th.reassignstagerole_cmd(upd, ctx)
 
         _run(run())
@@ -202,7 +202,7 @@ class TestReassignStageRoleCommand(unittest.TestCase):
                  patch("business_core.work_assignment_manager.reassign_stage_role",
                        return_value={"ok": True, "changed": False,
                                      "old_relation_id": "REL-010", "new_relation_id": "REL-010",
-                                     "error": None}):
+                                     "code": "STAGE_ROLE_REUSED", "error": None}):
                 await th.reassignstagerole_cmd(upd, ctx)
 
         _run(run())
@@ -230,8 +230,11 @@ class TestReassignStageRoleCommand(unittest.TestCase):
         reply = upd.message.reply_text.call_args[0][0]
         self.assertIn("⚠️", reply)
         self.assertIn("REL-010", reply)
-        self.assertIn("Sheets API timeout", reply)
-        self.assertIn("Повтор", reply)
+        # Phase 35E (privacy/logging §7): the raw low-level error text is
+        # no longer echoed into the Telegram reply — only IDs, a safe
+        # generic message, and a log line (checked separately below).
+        self.assertNotIn("Sheets API timeout", reply)
+        self.assertIn("повтор", reply.lower())
 
     def test_validation_error(self):
         th = _fresh_th()

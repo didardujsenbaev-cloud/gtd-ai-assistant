@@ -214,6 +214,36 @@ def resolve_stage_responsibility(stage_id: str) -> dict:
             errors=(f"Role '{role_id}' приостановлена (paused)",),
         )
 
+    # Phase 35E (ADR-018 §16, display-only extension): the parent
+    # Department's existence/status was already an eligibility gate for
+    # NEW/REASSIGNED Stage responsibility (assign_role_to_stage/
+    # reassign_stage_role) — this read-only resolution path now surfaces
+    # the same fact for an EXISTING relation too, so /stageresponsibility
+    # can distinguish it. Folded into "configuration_error" like the
+    # Role-status cases above; RESOLUTION_STATUS stays a locked 4-value
+    # enum.
+    try:
+        from business_core.organization_manager import find_department_by_id
+
+        department = find_department_by_id(role.get("department_id", ""))
+    except Exception as exc:
+        log.error(f"resolve_stage_responsibility({stage_id}) department lookup error: {exc}")
+        return _resolution_result(
+            status="configuration_error", stage_id=stage_id, role_id=role_id, relation_id=relation_id,
+            errors=(str(exc),),
+        )
+
+    if department is None:
+        return _resolution_result(
+            status="configuration_error", stage_id=stage_id, role_id=role_id, relation_id=relation_id,
+            errors=(f"Department '{role.get('department_id', '')}' не найден",),
+        )
+    if department.get("status") == "archived":
+        return _resolution_result(
+            status="configuration_error", stage_id=stage_id, role_id=role_id, relation_id=relation_id,
+            errors=(f"Department '{role.get('department_id', '')}' архивирован",),
+        )
+
     assignments = list_assignments_for_role(role_id, status="active")
 
     if not assignments:
