@@ -3490,6 +3490,196 @@ async def unblockstage_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE
 DOCUMENT_REGISTRY_REQUIRED_ARGS = ("business", "name", "drive")
 
 
+# ─────────────────────────────────────────────────────────────
+# Phase 37E (ADR-020 §22-26): Document Domain — centralized caller UX.
+#
+# Every Document command below renders orchestration results (business_
+# builder.register_document/upload_and_register_document/
+# update_document_admin_fields/transition_document_status) through the
+# helpers in this section — never inline per-command Russian text for
+# a result code, and never a raw exception/result dict to the user.
+# Mirrors the Phase 35E Organization / Phase 36D Task UX pattern
+# exactly.
+# ─────────────────────────────────────────────────────────────
+
+_DOCUMENT_STATUS_RU: dict[str, str] = {
+    "uploaded": "Загружен", "under_review": "На проверке", "approved": "Утверждён",
+    "rejected": "Отклонён", "superseded": "Заменён", "archived": "В архиве",
+}
+
+_DOCUMENT_ANALYSIS_STATUS_RU: dict[str, str] = {
+    "pending": "Ожидает анализа", "processing": "Анализируется",
+    "completed": "Проанализирован", "unsupported": "Формат не поддерживается",
+    "failed": "Ошибка анализа",
+}
+
+
+def _document_status_ru(status: str) -> str:
+    """Russian label + raw machine status, always both — never only
+    the translation, so debugging never loses the exact stored value."""
+    return f"{_DOCUMENT_STATUS_RU.get(status, status)} ({status})"
+
+
+def _document_analysis_status_ru(status: str) -> str:
+    return f"{_DOCUMENT_ANALYSIS_STATUS_RU.get(status, status)} ({status})"
+
+
+def _document_creation_message(result: dict, *, document_name: str = "", file_name: str = "", drive_file_url: str = "") -> str:
+    """
+    Render any business_builder.register_document()/
+    upload_and_register_document() result into a single Russian
+    Telegram message. Shared by /registerdoc's and /uploaddoc's
+    confirm steps — the distinct outcomes (created/reused/uploaded/
+    every validation, duplicate, and persistence error) are already
+    carried in `code` by the orchestrator, never re-derived here.
+    Never exposes the raw result dict or a traceback.
+    """
+    code = result.get("code", "")
+
+    if result.get("ok") and code in ("DOCUMENT_REGISTERED", "DOCUMENT_UPLOADED"):
+        verb = "загружен и зарегистрирован" if result.get("uploaded") else "зарегистрирован"
+        lines = [
+            f"✅ Документ {verb}",
+            "",
+            f"Document ID: {result.get('document_id', '')}",
+            f"Document Family ID: {result.get('document_family_id', '')}",
+        ]
+        if result.get("version"):
+            lines.append(f"Version: {result['version']}")
+        if document_name:
+            lines.append(f"Название: {document_name}")
+        if file_name:
+            lines.append(f"Файл: {file_name}")
+        if drive_file_url:
+            lines.append(f"Drive URL: {drive_file_url}")
+        for key, label in (
+            ("business_id", "Business ID"), ("client_id", "Client ID"),
+            ("object_id", "Object ID"), ("roadmap_id", "Roadmap ID"),
+            ("stage_id", "Stage ID"), ("document_template_id", "Document Template ID"),
+        ):
+            if result.get(key):
+                lines.append(f"{label}: {result[key]}")
+        lines.append(f"Статус: {_document_status_ru(result.get('final_status', ''))}")
+        return "\n".join(lines)
+
+    if code == "DOCUMENT_REUSED":
+        return "\n".join([
+            "♻️ Документ с этим Drive-файлом уже зарегистрирован — использована существующая запись",
+            f"Document ID: {result.get('document_id', '')}",
+            f"Document Family ID: {result.get('document_family_id', '')}",
+            f"Статус: {_document_status_ru(result.get('final_status', ''))}",
+        ])
+
+    if code == "BUSINESS_NOT_FOUND":
+        return f"❌ Business не найден: {result.get('error') or ''}"
+
+    if code == "DOCUMENT_ENTITY_RELATION_MISMATCH":
+        return f"❌ Несогласованные ссылки на сущности: {result.get('error') or 'см. логи'}"
+
+    if code == "MULTIPLE_DOCUMENT_DRIVE_FILE_MATCHES":
+        ids = ", ".join(result.get("conflicting_document_ids", ())) or "—"
+        return "\n".join([
+            "⚠️ Обнаружен конфликт целостности данных",
+            f"Найдено несколько Document с одним Drive File ID: {ids}",
+            "Новый Document не создан — автоматический выбор одного из них не выполняется.",
+        ])
+
+    if code == "DOCUMENT_RELATION_CONFLICT_ON_REUSE":
+        return (
+            "❌ Документ с этим Drive File ID уже существует с другими связями.\n"
+            f"Document ID: {result.get('document_id', '')}"
+        )
+
+    if code == "DOCUMENT_POST_WRITE_VERIFICATION_FAILED":
+        lines = [
+            "⚠️ Документ записан, но пост-проверка записи не прошла.",
+            "Требуется ручная проверка.",
+        ]
+        if result.get("document_id"):
+            lines.append(f"Document ID: {result['document_id']}")
+        if result.get("drive_file_id"):
+            lines.append(f"Drive File ID: {result['drive_file_id']}")
+        return "\n".join(lines)
+
+    if code == "DOCUMENT_PERSISTENCE_FAILED":
+        return "❌ Не удалось сохранить документ."
+
+    log.warning(f"_document_creation_message: unmapped code={code!r} business_id={result.get('business_id', '')}")
+    return "❌ Не удалось сохранить документ."
+
+
+def _document_admin_message(result: dict, document_id: str) -> str:
+    """Render any business_builder.update_document_admin_fields() result."""
+    code = result.get("code", "")
+
+    if code == "DOCUMENT_ADMIN_FIELDS_UPDATED":
+        return f"✅ Document {document_id} обновлён."
+
+    if code == "DOCUMENT_ADMIN_FIELDS_UNCHANGED":
+        return f"ℹ️ Document {document_id} — изменений нет (значения совпадают)."
+
+    if code == "DOCUMENT_NOT_FOUND":
+        return f"❌ Document {document_id} не найден."
+
+    if code == "DOCUMENT_IMMUTABLE_FIELD_CONFLICT":
+        return f"❌ Указанные поля являются неизменяемой идентичностью Document: {result.get('error') or ''}"
+
+    if code == "DOCUMENT_VERSION_FIELD_IMMUTABLE":
+        return "❌ Version неизменяем после создания."
+
+    if code == "DOCUMENT_FAMILY_FIELD_IMMUTABLE":
+        return "❌ Document Family ID неизменяем после создания."
+
+    if code == "DOCUMENT_RELATION_UPDATE_REQUIRES_EXPLICIT_ACTION":
+        return "❌ Изменение связей (Client/Object/Roadmap/Stage/Template ID) через /updatedoc не поддерживается."
+
+    if code == "INVALID_DOCUMENT_ADMIN_FIELD":
+        return f"❌ Недопустимое поле для /updatedoc: {result.get('error') or ''}"
+
+    log.warning(f"_document_admin_message: unmapped code={code!r} document_id={document_id}")
+    return f"❌ Ошибка ({code or 'unknown'}): {result.get('error') or 'см. логи'}"
+
+
+def _document_transition_message(result: dict, document_id: str) -> str:
+    """Render any business_builder.transition_document_status() result."""
+    code = result.get("code", "")
+    previous_status = result.get("previous_status", "")
+    requested_status = result.get("requested_status", "")
+
+    if code == "DOCUMENT_STATUS_UPDATED":
+        return "\n".join([
+            "✅ Статус Document изменён",
+            f"Document ID: {document_id}",
+            f"Был: {_document_status_ru(previous_status)}",
+            f"Стал: {_document_status_ru(result.get('final_status', ''))}",
+        ])
+
+    if code == "DOCUMENT_STATUS_UNCHANGED":
+        return f"ℹ️ Document {document_id} уже имеет статус {_document_status_ru(previous_status)} — изменений нет."
+
+    if code == "DOCUMENT_NOT_FOUND":
+        return f"❌ Document {document_id} не найден."
+
+    if code == "INVALID_DOCUMENT_STATUS":
+        from business_core.document_manager import DOCUMENT_STATUS
+        return f"❌ Недопустимый статус. Допустимые значения: {', '.join(DOCUMENT_STATUS)}"
+
+    if code == "INVALID_DOCUMENT_TRANSITION":
+        return f"❌ Переход {_document_status_ru(previous_status)} → {_document_status_ru(requested_status)} не разрешён."
+
+    if code == "DOCUMENT_RESTORE_REQUIRES_EXPLICIT_ACTION":
+        return "\n".join([
+            "🔒 Document имеет терминальный статус",
+            f"Document ID: {document_id}",
+            f"Текущий статус: {_document_status_ru(previous_status)}",
+            "Такой Document нельзя вернуть в обычный оборот обычной командой изменения статуса. "
+            "Отдельное явное действие restore пока не реализовано.",
+        ])
+
+    log.warning(f"_document_transition_message: unmapped code={code!r} document_id={document_id}")
+    return f"❌ Ошибка ({code or 'unknown'}): {result.get('error') or 'см. логи'}"
+
+
 async def registerdoc_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """
     /registerdoc business=BIZ-001 name="Технический паспорт" drive=<file_id_or_url>
@@ -3552,7 +3742,7 @@ async def registerdoc_start(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     except Exception as e:
         log.error(f"registerdoc_start error: {e}")
-        await update.message.reply_text(f"❌ Ошибка: {e}")
+        await update.message.reply_text("❌ Не удалось начать регистрацию документа.")
         return ConversationHandler.END
 
     resolved = validation["resolved"]
@@ -3640,26 +3830,12 @@ async def registerdoc_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE
             uploaded_by=_telegram_username(update), notes=snap["notes"],
         )
 
-        if result["ok"]:
-            await update.message.reply_text(
-                f"✅ Документ зарегистрирован\n\n"
-                f"Document ID: {result['document_id']}\n"
-                f"Document Family ID: {result['document_family_id']}\n"
-                f"Название: {snap['document_name']}\n"
-                f"Статус: {result['final_status']}\n"
-                f"Файл: {snap['file_name']}",
-                reply_markup=ReplyKeyboardRemove(),
-            )
-        elif result["code"] == "DOCUMENT_POST_WRITE_VERIFICATION_FAILED":
-            await update.message.reply_text(
-                "⚠️ Строка записана, но не удалось перечитать её для подтверждения.",
-                reply_markup=ReplyKeyboardRemove(),
-            )
-        else:
+        if not result["ok"]:
             log.error(f"registerdoc_confirm: code={result['code']} error={result['error']}")
-            await update.message.reply_text(
-                "❌ Не удалось сохранить документ.", reply_markup=ReplyKeyboardRemove(),
-            )
+        await update.message.reply_text(
+            _document_creation_message(result, document_name=snap["document_name"], file_name=snap["file_name"]),
+            reply_markup=ReplyKeyboardRemove(),
+        )
 
     except Exception as e:
         log.error(f"registerdoc_confirm error: {e}")
@@ -3705,33 +3881,34 @@ async def doc_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     try:
-        from business_core.sheets import find_row_by_id
-        found = find_row_by_id("document_registry", document_id)
-        if not found:
+        # Phase 37E (ADR-020 §7/§19): exact-ID lookup only, through the
+        # sole document_registry read owner — never a raw Sheets read,
+        # never fuzzy matching.
+        from business_core.document_manager import find_document_by_id
+        doc = find_document_by_id(document_id)
+        if doc is None:
             await _reply(update, f"❌ Документ {document_id} не найден.")
             return
-        _, row = found
         lines = [
-            f"📄 Документ {row.get('Document ID', '')}",
+            f"📄 Документ {doc.get('document_id', '')}",
             "",
-            f"Family: {row.get('Document Family ID', '')} (v{row.get('Version', '')})",
-            f"Название: {row.get('Document Name', '')}",
-            f"Статус: {row.get('Status', '')}",
-            f"Business: {row.get('Business ID', '') or '—'}",
-            f"Client: {row.get('Client ID', '') or '—'}",
-            f"Object: {row.get('Object ID', '') or '—'}",
-            f"Roadmap: {row.get('Roadmap ID', '') or '—'}",
-            f"Stage: {row.get('Stage ID', '') or '—'}",
-            f"Document Template: {row.get('Document Template ID', '') or '—'}",
-            f"Файл: {row.get('File Name', '')} ({row.get('Mime Type', '')})",
-            f"Drive: {row.get('Drive File URL', '')}",
-            f"Загружен: {row.get('Uploaded At', '')} ({row.get('Uploaded By', '')})",
-            f"Notes: {row.get('Notes', '') or '—'}",
+            f"Family: {doc.get('document_family_id', '')} (v{doc.get('version', '')})",
+            f"Название: {doc.get('document_name', '')}",
+            f"Статус: {_document_status_ru(doc.get('status', ''))}",
+            f"Business: {doc.get('business_id', '') or '—'}",
+            f"Client: {doc.get('client_id', '') or '—'}",
+            f"Object: {doc.get('object_id', '') or '—'}",
+            f"Roadmap: {doc.get('roadmap_id', '') or '—'}",
+            f"Stage: {doc.get('stage_id', '') or '—'}",
+            f"Document Template: {doc.get('document_template_id', '') or '—'}",
+            f"Файл: {doc.get('file_name', '')} ({doc.get('mime_type', '')})",
+            f"Drive: {'есть' if doc.get('drive_file_id') else '—'}",
+            f"Загружен: {doc.get('uploaded_at', '')} ({doc.get('uploaded_by', '')})",
         ]
         await _reply(update, "\n".join(lines))
     except Exception as e:
         log.error(f"doc_cmd error: {e}")
-        await _reply(update, f"❌ Ошибка: {e}")
+        await _reply(update, "❌ Не удалось получить документ.")
 
 
 async def docs4stage_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3782,7 +3959,71 @@ async def docs4stage_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await _reply(update, "\n".join(lines))
     except Exception as e:
         log.error(f"docs4stage_cmd error: {e}")
-        await _reply(update, f"❌ Ошибка: {e}")
+        await _reply(update, "❌ Не удалось получить требования этапа.")
+
+
+async def updatedoc_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /updatedoc document_id=DREG-001 name="..." notes="..."
+    /updatedoc document_id=DREG-001 status=under_review
+
+    Phase 37E (ADR-020 §14/§15/§20): status and admin fields are never
+    mixed in one call — mirrors /updatetask's Phase 36D foundation UX
+    exactly, so admin-field policy and transition policy never share a
+    single ambiguous write. No relink, no review fields, no Drive-field
+    repair, no restore.
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg())
+        return
+
+    raw = " ".join(context.args or [])
+    args = _parse_kv_args(raw)
+    document_id = args.get("document_id", "")
+
+    if not document_id:
+        await _reply(
+            update,
+            "❌ Укажи document_id.\n\nПример:\n"
+            '`/updatedoc document_id=DREG-001 name="..." notes="..."`\n'
+            "`/updatedoc document_id=DREG-001 status=under_review`",
+        )
+        return
+
+    admin_keys = {"name", "notes"}
+    has_status = "status" in args
+    has_admin = any(k in args for k in admin_keys)
+
+    if has_status and has_admin:
+        await _reply(
+            update,
+            "❌ Нельзя одновременно менять статус и admin-поля.\n"
+            "Отправь две отдельные команды:\n"
+            "`/updatedoc document_id=... status=...`\n"
+            '`/updatedoc document_id=... name="..." notes="..."`',
+        )
+        return
+
+    if not has_status and not has_admin:
+        await _reply(update, "❌ Укажи либо status=..., либо admin-поля (name/notes).")
+        return
+
+    try:
+        if has_status:
+            from business_core.business_builder import transition_document_status
+            result = transition_document_status(document_id, args["status"])
+            await _reply(update, _document_transition_message(result, document_id))
+            return
+
+        from business_core.business_builder import update_document_admin_fields
+
+        field_key_map = {"name": "Document Name", "notes": "Notes"}
+        updates = {field_key_map[k]: v for k, v in args.items() if k in admin_keys}
+        result = update_document_admin_fields(document_id, updates)
+        await _reply(update, _document_admin_message(result, document_id))
+    except Exception as e:
+        log.error(f"updatedoc_cmd error: {e}")
+        await _reply(update, "❌ Не удалось обновить документ.")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -3960,7 +4201,7 @@ async def uploaddoc_receive_details(update: Update, context: ContextTypes.DEFAUL
 
     except Exception as e:
         log.error(f"uploaddoc_receive_details error: {e}")
-        await update.message.reply_text(f"❌ Ошибка: {e}")
+        await update.message.reply_text("❌ Не удалось подготовить загрузку документа.")
         context.user_data.pop("ud", None)
         return ConversationHandler.END
 
@@ -4089,7 +4330,7 @@ async def uploaddoc_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         except Exception as e:
             log.error(f"uploaddoc_confirm: Telegram download error: {e}")
             await update.message.reply_text(
-                f"❌ Не удалось скачать файл из Telegram: {e}",
+                "❌ Не удалось скачать файл из Telegram.",
                 reply_markup=ReplyKeyboardRemove(),
             )
             context.user_data.pop("ud_confirmed_snapshot", None)
@@ -4113,7 +4354,7 @@ async def uploaddoc_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         except Exception as e:
             log.error(f"uploaddoc_confirm: Drive upload error: {e}")
             await update.message.reply_text(
-                f"❌ Ошибка загрузки в Google Drive: {e}",
+                "❌ Ошибка загрузки в Google Drive.",
                 reply_markup=ReplyKeyboardRemove(),
             )
             context.user_data.pop("ud_confirmed_snapshot", None)
@@ -4208,37 +4449,25 @@ async def uploaddoc_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             )
             snap["op_state"] = "verification_failed"
             await update.message.reply_text(
-                "⚠️ Документ был записан, но пост-проверка записи не прошла.\n"
-                "Требуется ручная проверка.\n"
-                f"Document ID: {result.get('document_id', '')}\n"
-                f"Drive File ID: {drive_file_id}",
-                reply_markup=ReplyKeyboardRemove(),
+                _document_creation_message(result), reply_markup=ReplyKeyboardRemove(),
             )
             context.user_data.pop("ud_confirmed_snapshot", None)
             return ConversationHandler.END
 
         if not result["ok"]:
             log.error(f"uploaddoc_confirm: code={result['code']} error={result['error']}")
-            await update.message.reply_text("❌ Не удалось сохранить документ.", reply_markup=ReplyKeyboardRemove())
+            await update.message.reply_text(
+                _document_creation_message(result), reply_markup=ReplyKeyboardRemove(),
+            )
             context.user_data.pop("ud_confirmed_snapshot", None)
             return ConversationHandler.END
 
         document_id = result["document_id"]
         await update.message.reply_text(
-            f"✅ Документ загружен и зарегистрирован\n\n"
-            f"Document ID: {document_id}\n"
-            f"Document Family ID: {result['document_family_id']}\n"
-            f"Version: {result['version']}\n"
-            f"Название: {snap['document_name']}\n"
-            f"Файл: {real_name}\n"
-            f"Drive URL: {web_view_link}\n"
-            f"Business ID: {result['business_id'] or '—'}\n"
-            f"Client ID: {result['client_id'] or '—'}\n"
-            f"Object ID: {result['object_id'] or '—'}\n"
-            f"Roadmap ID: {result['roadmap_id'] or '—'}\n"
-            f"Stage ID: {result['stage_id'] or '—'}\n"
-            f"Document Template ID: {result['document_template_id'] or '—'}\n"
-            f"Статус: {result['final_status']}",
+            _document_creation_message(
+                result, document_name=snap["document_name"],
+                file_name=real_name, drive_file_url=web_view_link,
+            ),
             reply_markup=ReplyKeyboardRemove(),
         )
 
@@ -4417,7 +4646,7 @@ async def analyzedoc_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     except Exception as e:
         log.error(f"analyzedoc_cmd error: {e}")
-        await _reply(update, f"❌ Ошибка: {e}", parse_mode=None)
+        await _reply(update, "❌ Не удалось запустить анализ документа.", parse_mode=None)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -4621,7 +4850,7 @@ async def docanalysis_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     except Exception as e:
         log.error(f"docanalysis_cmd error: {e}")
-        await _reply(update, f"❌ Ошибка: {e}", parse_mode=None)
+        await _reply(update, "❌ Не удалось получить результат анализа.", parse_mode=None)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -4817,7 +5046,7 @@ async def missingdocs_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     except Exception as e:
         log.error(f"missingdocs_cmd error: {e}")
-        await _reply(update, f"❌ Ошибка: {e}", parse_mode=None)
+        await _reply(update, "❌ Не удалось получить недостающие документы.", parse_mode=None)
 
 
 async def docsrequired_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -4879,7 +5108,7 @@ async def docsrequired_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     except Exception as e:
         log.error(f"docsrequired_cmd error: {e}")
-        await _reply(update, f"❌ Ошибка: {e}", parse_mode=None)
+        await _reply(update, "❌ Не удалось получить требования к документам.", parse_mode=None)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -7424,6 +7653,7 @@ def register_business_handlers(app: Application) -> None:
     ))
     app.add_handler(CommandHandler("doc", doc_cmd))
     app.add_handler(CommandHandler("docs4stage", docs4stage_cmd))
+    app.add_handler(CommandHandler("updatedoc", updatedoc_cmd))
 
     # Phase 15B: Telegram Document Upload Foundation
     app.add_handler(ConversationHandler(

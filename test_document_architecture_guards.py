@@ -430,5 +430,272 @@ class TestDocumentTestsHaveHardSocketBlock(unittest.TestCase):
             self.assertIn(filename, conftest_src, f"{filename} must be registered in conftest.py's hard socket-block set")
 
 
+# ─────────────────────────────────────────────────────────────
+# Phase 37E (ADR-020 §16): Document caller (Telegram) architecture
+# guards. Mirrors the Phase 36D Task caller guard pattern exactly.
+# ─────────────────────────────────────────────────────────────
+
+_DOCUMENT_WRITE_COMMANDS_ASYNC = ("registerdoc_confirm", "uploaddoc_confirm", "updatedoc_cmd")
+_DOCUMENT_ALL_COMMANDS_ASYNC = (
+    "registerdoc_start", "registerdoc_confirm", "doc_cmd", "docs4stage_cmd", "updatedoc_cmd",
+    "uploaddoc_start", "uploaddoc_receive_file", "uploaddoc_receive_details", "uploaddoc_confirm",
+    "analyzedoc_cmd", "docanalysis_cmd", "missingdocs_cmd", "docsrequired_cmd",
+)
+
+
+def _th_function_body(fn_name: str, is_async: bool = True) -> str:
+    return _function_body(BUSINESS_CORE / "telegram_handlers.py", fn_name, is_async=is_async)
+
+
+class TestDocumentWriteCommandsCallOnlyCanonicalOrchestration(unittest.TestCase):
+
+    def test_no_low_level_document_manager_write_calls_in_handlers(self):
+        forbidden = (
+            "document_manager.create_document(", "document_manager.update_document_admin_fields(",
+            "document_manager.update_document_status(",
+        )
+        for fn_name in _DOCUMENT_WRITE_COMMANDS_ASYNC:
+            body = _th_function_body(fn_name)
+            for call in forbidden:
+                self.assertNotIn(call, body, f"{fn_name} must not call low-level {call.rstrip('(')} directly")
+
+    def test_no_direct_document_registry_sheets_write_in_handlers(self):
+        for fn_name in _DOCUMENT_ALL_COMMANDS_ASYNC:
+            body = _th_function_body(fn_name)
+            self.assertNotIn('append_business_row("document_registry"', body)
+            self.assertNotIn("compute_next_document_and_family_ids(", body)
+
+    def test_registerdoc_confirm_calls_register_document(self):
+        body = _th_function_body("registerdoc_confirm")
+        self.assertIn("register_document(", body)
+
+    def test_uploaddoc_confirm_calls_upload_and_register_document(self):
+        body = _th_function_body("uploaddoc_confirm")
+        self.assertIn("upload_and_register_document(", body)
+
+    def test_updatedoc_cmd_calls_admin_and_transition_orchestration(self):
+        body = _th_function_body("updatedoc_cmd")
+        self.assertIn("update_document_admin_fields(", body)
+        self.assertIn("transition_document_status(", body)
+
+
+class TestNoCallerSideIdGenerationOrRelationPolicy(unittest.TestCase):
+
+    def test_no_caller_side_id_generation(self):
+        for fn_name in _DOCUMENT_ALL_COMMANDS_ASYNC:
+            body = _th_function_body(fn_name)
+            self.assertNotIn("generate_next_family_id(", body)
+            self.assertNotIn('"DREG-"', body)
+
+    def test_no_telegram_relation_policy_duplication(self):
+        """Relation-consistency logic (Stage->Roadmap->Object->Client
+        contradiction checks) must never be re-derived in Telegram —
+        only resolve_and_validate_links()/register_document() decide."""
+        for fn_name in _DOCUMENT_ALL_COMMANDS_ASYNC:
+            body = _th_function_body(fn_name)
+            self.assertNotIn("Противоречие:", body)
+
+    def test_no_telegram_drive_compensation_policy_duplication(self):
+        """The only place allowed to decide compensation SUCCESS/FAILURE
+        wording from a trash_file() result is uploaddoc_confirm itself
+        (it must await the Drive call) — no other handler may re-derive
+        this policy."""
+        for fn_name in _DOCUMENT_ALL_COMMANDS_ASYNC:
+            if fn_name == "uploaddoc_confirm":
+                continue
+            body = _th_function_body(fn_name)
+            self.assertNotIn("trash_file(", body)
+
+
+class TestDocCommandExactIdOnly(unittest.TestCase):
+
+    def test_doc_cmd_uses_document_manager_find_by_id(self):
+        body = _th_function_body("doc_cmd")
+        self.assertIn("find_document_by_id(", body)
+        self.assertNotIn("sheets.find_row_by_id", body)
+
+    def test_doc_cmd_has_no_fuzzy_or_listing_fallback(self):
+        body = _th_function_body("doc_cmd")
+        for forbidden in ("get_all_values(", "for row in", "startswith("):
+            self.assertNotIn(forbidden, body)
+
+    def test_doc_cmd_does_not_expose_raw_drive_url_or_notes(self):
+        body = _th_function_body("doc_cmd")
+        self.assertNotIn("Drive File URL", body)
+        self.assertNotIn("'notes'", body.lower().replace('"', "'"))
+
+
+class TestRequirementCommandsConvergeOnCanonicalEvaluator(unittest.TestCase):
+
+    def test_docs4stage_docsrequired_missingdocs_converge(self):
+        self.assertIn("compute_stage_document_status", _th_function_body("docs4stage_cmd"))
+        self.assertIn("evaluate_scope", _th_function_body("missingdocs_cmd"))
+        self.assertIn("evaluate_scope", _th_function_body("docsrequired_cmd"))
+
+
+class TestAiCallerCannotMutateOperationalStatus(unittest.TestCase):
+
+    def test_analyzedoc_cmd_never_writes_status(self):
+        body = _th_function_body("analyzedoc_cmd")
+        for forbidden in (
+            "update_document_status(", "transition_document_status(",
+            "update_document_admin_fields(", 'Status"] =',
+        ):
+            self.assertNotIn(forbidden, body, f"analyzedoc_cmd must not mutate operational Document status ({forbidden!r} found)")
+
+    def test_docanalysis_cmd_is_read_only(self):
+        body = _th_function_body("docanalysis_cmd")
+        for forbidden in (
+            "update_document_status(", "transition_document_status(",
+            "update_document_admin_fields(", "append_business_row(",
+        ):
+            self.assertNotIn(forbidden, body)
+
+
+class TestDocumentCallerUxHelpersDefinedOnce(unittest.TestCase):
+
+    def test_helpers_defined_exactly_once(self):
+        path = BUSINESS_CORE / "telegram_handlers.py"
+        src = path.read_text(encoding="utf-8")
+        for fn in (
+            "_document_creation_message", "_document_admin_message",
+            "_document_transition_message", "_document_status_ru",
+            "_document_analysis_status_ru",
+        ):
+            self.assertEqual(src.count(f"def {fn}("), 1, f"{fn} must be defined exactly once")
+
+    def test_helpers_are_callable(self):
+        import business_core.telegram_handlers as th
+        for fn in (
+            "_document_creation_message", "_document_admin_message",
+            "_document_transition_message", "_document_status_ru",
+            "_document_analysis_status_ru",
+        ):
+            self.assertTrue(callable(getattr(th, fn, None)))
+
+
+class TestAllKnownDocumentResultCodesMapped(unittest.TestCase):
+
+    def test_creation_message_covers_all_foundation_codes(self):
+        import business_core.telegram_handlers as th
+        codes = (
+            "DOCUMENT_REGISTERED", "DOCUMENT_UPLOADED", "DOCUMENT_REUSED",
+            "BUSINESS_NOT_FOUND", "DOCUMENT_ENTITY_RELATION_MISMATCH",
+            "MULTIPLE_DOCUMENT_DRIVE_FILE_MATCHES", "DOCUMENT_RELATION_CONFLICT_ON_REUSE",
+            "DOCUMENT_PERSISTENCE_FAILED", "DOCUMENT_POST_WRITE_VERIFICATION_FAILED",
+        )
+        for code in codes:
+            result = {
+                "ok": code in ("DOCUMENT_REGISTERED", "DOCUMENT_UPLOADED", "DOCUMENT_REUSED"), "code": code, "error": "x",
+                "conflicting_document_ids": ("DREG-001",),
+            }
+            msg = th._document_creation_message(result)
+            self.assertTrue(msg)
+            if code == "DOCUMENT_REUSED":
+                expected_marker = "♻️"
+            elif code == "MULTIPLE_DOCUMENT_DRIVE_FILE_MATCHES":
+                expected_marker = "⚠️"
+            elif code == "DOCUMENT_POST_WRITE_VERIFICATION_FAILED":
+                expected_marker = "⚠️"
+            elif not result["ok"]:
+                expected_marker = "❌"
+            else:
+                expected_marker = "✅"
+            self.assertIn(expected_marker, msg)
+
+    def test_admin_message_covers_all_foundation_codes(self):
+        import business_core.telegram_handlers as th
+        codes = (
+            "DOCUMENT_ADMIN_FIELDS_UPDATED", "DOCUMENT_ADMIN_FIELDS_UNCHANGED",
+            "INVALID_DOCUMENT_ADMIN_FIELD", "DOCUMENT_IMMUTABLE_FIELD_CONFLICT",
+            "DOCUMENT_VERSION_FIELD_IMMUTABLE", "DOCUMENT_FAMILY_FIELD_IMMUTABLE",
+            "DOCUMENT_RELATION_UPDATE_REQUIRES_EXPLICIT_ACTION", "DOCUMENT_NOT_FOUND",
+        )
+        for code in codes:
+            result = {"ok": code == "DOCUMENT_ADMIN_FIELDS_UPDATED" or code == "DOCUMENT_ADMIN_FIELDS_UNCHANGED", "code": code, "error": "x"}
+            msg = th._document_admin_message(result, "DREG-001")
+            self.assertTrue(msg)
+
+    def test_transition_message_covers_all_foundation_codes(self):
+        import business_core.telegram_handlers as th
+        codes = (
+            "DOCUMENT_STATUS_UPDATED", "DOCUMENT_STATUS_UNCHANGED", "DOCUMENT_NOT_FOUND",
+            "INVALID_DOCUMENT_STATUS", "INVALID_DOCUMENT_TRANSITION",
+            "DOCUMENT_RESTORE_REQUIRES_EXPLICIT_ACTION",
+        )
+        for code in codes:
+            result = {
+                "ok": code in ("DOCUMENT_STATUS_UPDATED", "DOCUMENT_STATUS_UNCHANGED"),
+                "code": code, "error": "x", "previous_status": "uploaded", "requested_status": "under_review",
+            }
+            msg = th._document_transition_message(result, "DREG-001")
+            self.assertTrue(msg)
+
+
+class TestNoSensitiveDocumentFieldsLogged(unittest.TestCase):
+
+    _DISALLOWED_LOG_TOKENS = ("Notes", "extracted", "AI Summary", "phone", "update.message.text")
+
+    def test_document_handlers_do_not_log_disallowed_fields(self):
+        path = BUSINESS_CORE / "telegram_handlers.py"
+        src = path.read_text(encoding="utf-8")
+        for fn_name in _DOCUMENT_ALL_COMMANDS_ASYNC:
+            body = _th_function_body(fn_name)
+            log_lines = [line for line in body.splitlines() if "log.error(" in line or "log.warning(" in line or "log.info(" in line]
+            for line in log_lines:
+                for token in self._DISALLOWED_LOG_TOKENS:
+                    self.assertNotIn(token, line, f"{fn_name} logs disallowed token {token!r}: {line}")
+
+
+class TestGtdTasksCommandUnchanged(unittest.TestCase):
+
+    def test_tasks_command_still_registered_in_telegram_bot(self):
+        path = WORKSPACE / "telegram_bot.py"
+        src = path.read_text(encoding="utf-8")
+        self.assertIn('CommandHandler("tasks", show_tasks)', src)
+
+    def test_business_core_does_not_register_tasks_command(self):
+        path = BUSINESS_CORE / "telegram_handlers.py"
+        src = path.read_text(encoding="utf-8")
+        self.assertNotIn('CommandHandler("tasks"', src)
+
+
+class TestDocumentCommandsRegisteredExactlyOnce(unittest.TestCase):
+
+    def test_all_document_commands_registered_exactly_once(self):
+        path = BUSINESS_CORE / "telegram_handlers.py"
+        src = path.read_text(encoding="utf-8")
+        for name in (
+            "registerdoc", "doc", "docs4stage", "uploaddoc", "analyzedoc",
+            "docanalysis", "missingdocs", "docsrequired", "updatedoc",
+        ):
+            self.assertEqual(
+                src.count(f'CommandHandler("{name}"'), 1,
+                f"/{name} must be registered exactly once",
+            )
+
+    def test_no_namespace_collision_with_existing_commands(self):
+        import re
+        path = BUSINESS_CORE / "telegram_handlers.py"
+        src = path.read_text(encoding="utf-8")
+        all_registered = re.findall(r'CommandHandler\("([a-zA-Z0-9_]+)"', src)
+        counts: dict[str, int] = {}
+        for name in all_registered:
+            counts[name] = counts.get(name, 0) + 1
+        document_names = {
+            "registerdoc", "doc", "docs4stage", "uploaddoc", "analyzedoc",
+            "docanalysis", "missingdocs", "docsrequired", "updatedoc",
+        }
+        for name in document_names:
+            self.assertEqual(counts.get(name, 0), 1, f"/{name} must appear exactly once across all registrations")
+
+
+class TestPhase37ECallerTestsHaveHardSocketBlock(unittest.TestCase):
+
+    def test_phase_37e_test_file_registered(self):
+        conftest_src = (WORKSPACE / "conftest.py").read_text(encoding="utf-8")
+        self.assertIn("test_document_caller_ux.py", conftest_src)
+
+
 if __name__ == "__main__":
     unittest.main()
