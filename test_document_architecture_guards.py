@@ -12,7 +12,7 @@ AST/source inspection, no network, no Google Sheets.
   Telegram has direct document_registry write / caller-side ID gen == NO
   Closed domains import document_manager                      == NO
   Canonical requirement evaluator                              == document_requirements_query.evaluate_scope()
-  compute_stage_document_status() falsely claimed as adapter  == NO (documented independent/deferred)
+  compute_stage_document_status() is a genuine thin adapter    == YES (Phase 37D.1)
   No fuzzy matching / filename dedup / arbitrary first-pick    == YES
   Relation fields not admin-editable                            == YES
   Operational vs AI status kept separate, no AI status mutation == YES
@@ -254,25 +254,81 @@ class TestCanonicalRequirementEvaluator(unittest.TestCase):
         import business_core.document_requirements_query as drq
         self.assertTrue(callable(getattr(drq, "evaluate_scope", None)))
 
-    def test_compute_stage_document_status_documented_as_independent_not_adapter(self):
-        """ADR-020 §16/§17 designate evaluate_scope() as sole canonical
-        evaluator, but converting compute_stage_document_status() into a
-        thin adapter over it was found unsafe under current test mocking
-        (find_row_by_id vs read_business_sheet primitive mismatch) and
-        was explicitly deferred, not silently abandoned. This guard
-        fails if a future edit claims the conversion happened without
-        actually doing it — the docstring must say so honestly."""
+    def test_compute_stage_document_status_is_a_real_adapter(self):
+        """Phase 37D.1 (ADR-020 §16/§17): compute_stage_document_status()
+        must genuinely delegate to evaluate_scope() — not merely claim
+        to in prose. A real delegation calls it as a plain expression
+        (assigned to a name or passed as an argument), not just
+        mentioned in a docstring."""
         body = _function_body(BUSINESS_CORE / "document_registry_manager.py", "compute_stage_document_status")
-        # A real delegation would call it as a plain expression, not just
-        # mention it in prose — check for an actual invocation pattern.
-        self.assertFalse(
-            any("return evaluate_scope(" in line or "= evaluate_scope(" in line for line in body.splitlines()),
-            "compute_stage_document_status must not silently call evaluate_scope() without the deferred conversion actually being done",
-        )
         self.assertTrue(
-            "defer" in body.lower() or "Phase 37E" in body,
-            "compute_stage_document_status() must document its independent-status as a deliberate, deferred decision",
+            any(
+                "= evaluate_scope(" in line or "return evaluate_scope(" in line
+                for line in body.splitlines()
+            ),
+            "compute_stage_document_status must actually call evaluate_scope() — an adapter that only talks about delegating isn't one",
         )
+
+    def test_compute_stage_document_status_has_no_independent_matching_policy(self):
+        """The adapter must not re-implement template/document matching,
+        satisfaction-status filtering, or scan document_registry rows
+        itself — all of that lives solely in evaluate_scope()'s engine
+        (business_core/document_requirements.py)."""
+        body = _function_body(BUSINESS_CORE / "document_registry_manager.py", "compute_stage_document_status")
+        for forbidden in (
+            "SATISFYING_STATUSES", "documents_by_template", "read_business_sheet(",
+            '.split(",")', "Document Template IDs",
+        ):
+            self.assertNotIn(forbidden, body, f"compute_stage_document_status must not reimplement matching policy ({forbidden!r} found)")
+
+    def test_no_duplicate_satisfying_statuses_constant_in_legacy_manager(self):
+        path = BUSINESS_CORE / "document_registry_manager.py"
+        src = path.read_text(encoding="utf-8")
+        self.assertNotIn("SATISFYING_STATUSES", src)
+
+    def test_get_documents_for_stage_remains_a_simple_read_not_an_evaluator(self):
+        """get_documents_for_stage() may only be a plain document-list
+        read API — no template comparison, no status filtering, no
+        requirement computation."""
+        body = _function_body(BUSINESS_CORE / "document_registry_manager.py", "get_documents_for_stage")
+        for forbidden in ("Document Template ID", "SATISFYING_STATUSES", "missing", "matched"):
+            self.assertNotIn(forbidden, body, f"get_documents_for_stage must stay a simple read API ({forbidden!r} found)")
+
+
+class TestCallersConvergeOnCanonicalEvaluator(unittest.TestCase):
+
+    def test_docs4stage_uses_compute_stage_document_status_adapter(self):
+        body = _function_body(BUSINESS_CORE / "telegram_handlers.py", "docs4stage_cmd", is_async=True)
+        self.assertIn("compute_stage_document_status", body)
+
+    def test_missingdocs_uses_evaluate_scope(self):
+        body = _function_body(BUSINESS_CORE / "telegram_handlers.py", "missingdocs_cmd", is_async=True)
+        self.assertIn("evaluate_scope", body)
+
+    def test_docsrequired_uses_evaluate_scope(self):
+        body = _function_body(BUSINESS_CORE / "telegram_handlers.py", "docsrequired_cmd", is_async=True)
+        self.assertIn("evaluate_scope", body)
+
+    def test_no_telegram_side_requirement_calculation(self):
+        """None of the three commands may independently compare
+        Document Template IDs against registered documents — all
+        computation must come from the canonical evaluator's result."""
+        for fn_name, is_async in (("docs4stage_cmd", True), ("missingdocs_cmd", True), ("docsrequired_cmd", True)):
+            body = _function_body(BUSINESS_CORE / "telegram_handlers.py", fn_name, is_async=is_async)
+            self.assertNotIn("SATISFYING_STATUSES", body)
+            self.assertNotIn("documents_by_template", body)
+
+
+class TestNoFirstPickInRequirementMatching(unittest.TestCase):
+
+    def test_current_valid_documents_returns_all_matches_not_first_pick(self):
+        path = BUSINESS_CORE / "document_requirements.py"
+        src = path.read_text(encoding="utf-8")
+        start = src.index("def _current_valid_documents_for(")
+        end = src.index("\ndef ", start + 10)
+        body = src[start:end]
+        self.assertNotIn("[0]", body)
+        self.assertIn("return tuple(", body)
 
 
 class TestNoFuzzyMatchingOrTitleDedup(unittest.TestCase):

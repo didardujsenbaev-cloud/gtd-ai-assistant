@@ -254,84 +254,76 @@ def get_documents_for_stage(stage_id: str) -> list[dict]:
 
 def compute_stage_document_status(stage_id: str) -> dict:
     """
-    Phase 15A required-vs-uploaded computation for one stage — exact
-    ID-based match against Document Template IDs linked to the stage
-    (Phase 8C knowledge binding), NOT keyword matching against filenames
-    (that heuristic lived in the now-superseded material_manager.py).
+    Phase 37D.1 (ADR-020 §16/§17): thin compatibility adapter over
+    document_requirements_query.evaluate_scope() — the sole canonical
+    missing-document evaluator. This function contains no independent
+    template/document matching policy of its own; it only translates
+    evaluate_scope()'s ScopeEvaluationResult into the exact legacy
+    dict shape /docs4stage already renders, so that caller is
+    unaffected by this consolidation.
 
-    ADR-020 §16/§17 designates document_requirements_query.
-    evaluate_scope() the sole canonical missing-document evaluator and
-    calls this function "legacy", to be removed or converted into a
-    thin adapter over evaluate_scope() where safe. Phase 37D attempted
-    that conversion and found it NOT safely convertible under this
-    phase's existing test mocks: document_requirements.py (the engine
-    evaluate_scope() delegates to) reads via sheets.find_row_by_id(),
-    not sheets.read_business_sheet() — a different primitive than the
-    one /docs4stage's existing tests mock — so swapping the
-    implementation would require reworking those tests' mocking
-    strategy, which is out of this phase's bounded scope (ADR-020 §38:
-    "do not rewrite already-sound components"; this one just isn't
-    provably safe to touch yet). This function therefore remains its
-    own independent, deterministic, exact-ID-matching algorithm for
-    now — DEFERRED, not resolved: Phase 37E (full caller migration)
-    should retire this function in favor of calling evaluate_scope()
-    directly from docs4stage_cmd, with correspondingly reworked test
-    mocks for the Requirements engine's actual read primitives.
+    Because evaluate_scope() is now authoritative, this adapter
+    inherits its richer, ADR-020-correct semantics instead of the old
+    ID-only match: a document only counts if its Status is a live,
+    accepted one (see business_core.document_requirements' own
+    satisfying-status policy — never rejected/archived/superseded)
+    and matching is Roadmap-scoped with Document Family/Version
+    current-row resolution (see
+    business_core.document_requirements._current_valid_documents_for()
+    for the exact rule) rather than the old stage-scoped, status-blind
+    ID match. Every duplicate match is retained; nothing is
+    arbitrarily first-picked (evaluate_scope()'s own contract).
 
-    Returns:
+    Returns the same shape as before Phase 37D.1:
         {
             "stage_id": str,
-            "template_ids_required": list[str],   # from ROADMAP_STAGES."Document Template IDs"
-            "matched": list[str],                  # template IDs with >=1 registered document
-            "missing": list[str],                  # template IDs with 0 registered documents
-            "unmatched_documents": list[dict],      # registered docs with no/foreign template ID
-            "matchable": bool,                      # False if the stage has no Document Template
-                                                      # IDs at all — "не сопоставлено", not a guess
+            "template_ids_required": list[str],
+            "matched": list[str],
+            "missing": list[str],
+            "unmatched_documents": list[dict],
+            "matchable": bool,
         }
     """
-    from business_core.sheets import read_business_sheet
+    from business_core.document_requirements_query import evaluate_scope
 
-    stages = read_business_sheet("roadmap_stages")
-    stage = next((s for s in stages if s.get("Stage ID", "") == stage_id), None)
-    if stage is None:
+    result = evaluate_scope("stage", stage_id)
+
+    if not result.exists:
         return {
             "stage_id": stage_id, "matchable": False,
             "template_ids_required": [], "matched": [], "missing": [],
             "unmatched_documents": [],
         }
 
-    raw_template_ids = stage.get("Document Template IDs", "")
-    template_ids_required = [t.strip() for t in raw_template_ids.split(",") if t.strip()]
+    summary = result.summary
 
-    documents = get_documents_for_stage(stage_id)
-
-    if not template_ids_required:
+    if not summary.items and not summary.has_configuration_errors:
         return {
             "stage_id": stage_id,
             "matchable": False,
             "template_ids_required": [],
             "matched": [],
             "missing": [],
-            "unmatched_documents": documents,
+            "unmatched_documents": get_documents_for_stage(stage_id),
         }
 
-    documents_by_template = {}
-    unmatched_documents = []
-    for d in documents:
-        tid = d.get("Document Template ID", "")
-        if tid and tid in template_ids_required:
-            documents_by_template.setdefault(tid, []).append(d)
-        else:
-            unmatched_documents.append(d)
+    order: list[str] = []
+    satisfied_by_template: dict[str, bool] = {}
+    for item in summary.items:
+        tid = item.requirement.document_template_id
+        if tid not in satisfied_by_template:
+            order.append(tid)
+            satisfied_by_template[tid] = False
+        satisfied_by_template[tid] = satisfied_by_template[tid] or item.is_satisfied
 
-    matched = [t for t in template_ids_required if t in documents_by_template]
-    missing = [t for t in template_ids_required if t not in documents_by_template]
+    matched = [t for t in order if satisfied_by_template[t]]
+    missing = [t for t in order if not satisfied_by_template[t]]
 
     return {
         "stage_id": stage_id,
         "matchable": True,
-        "template_ids_required": template_ids_required,
+        "template_ids_required": order,
         "matched": matched,
         "missing": missing,
-        "unmatched_documents": unmatched_documents,
+        "unmatched_documents": get_documents_for_stage(stage_id),
     }

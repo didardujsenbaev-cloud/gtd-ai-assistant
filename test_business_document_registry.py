@@ -600,14 +600,54 @@ class TestDocCmd(unittest.TestCase):
         self.assertIn("не найден", msg)
 
 
+def _scope_result(exists, items=(), has_configuration_errors=False):
+    """Phase 37D.1: build a real ScopeEvaluationResult/RequirementsSummary
+    so docs4stage_cmd's underlying adapter (compute_stage_document_status)
+    is exercised against the exact canonical evaluator boundary
+    (document_requirements_query.evaluate_scope) it now calls — mocking
+    at this boundary, rather than at internal Sheets primitives the
+    engine happens to use today, is what "the actual canonical
+    post-change call site" means per Phase 37D.1's brief."""
+    from business_core.document_requirements_query import ScopeEvaluationResult
+    from business_core.document_requirements import RequirementsSummary
+
+    if not exists:
+        return ScopeEvaluationResult(scope_type="stage", scope_id="STAGE-XXX", exists=False, summary=None)
+
+    total_required = sum(1 for i in items if i.requirement.required)
+    satisfied_required = sum(1 for i in items if i.requirement.required and i.is_satisfied)
+    missing_required = total_required - satisfied_required
+    blocking_missing = sum(1 for i in items if i.is_blocking)
+    summary = RequirementsSummary(
+        scope_type="stage", scope_id="STAGE-001", items=tuple(items),
+        total_required=total_required, satisfied_required=satisfied_required,
+        missing_required=missing_required, blocking_missing=blocking_missing,
+        optional_missing=0,
+        completion_percentage=100.0 if total_required == 0 else round(satisfied_required / total_required * 100, 2),
+        is_complete=(missing_required == 0 and blocking_missing == 0 and not has_configuration_errors),
+        has_configuration_errors=has_configuration_errors,
+    )
+    return ScopeEvaluationResult(scope_type="stage", scope_id="STAGE-001", exists=True, summary=summary)
+
+
 class TestDocs4StageCmd(unittest.TestCase):
     def test_list_by_stage_id_with_missing_requirement(self):
         th = _fresh_th()
+        from business_core.document_requirements import DocumentRequirement, DocumentRequirementStatus, STATUS_MISSING
+
+        req = DocumentRequirement(
+            requirement_id="STAGE-001:DOC-IZH-KP-001", document_template_id="DOC-IZH-KP-001",
+            name="DOC-IZH-KP-001", scope_id="STAGE-001", stage_id="STAGE-001", roadmap_id="RM-001",
+        )
+        item = DocumentRequirementStatus(requirement=req, matched_document_ids=(), matched_count=0, status=STATUS_MISSING)
+        result = _scope_result(exists=True, items=(item,))
+
         update, context = _upd("/docs4stage stage_id=STAGE-001"), _ctx(args=["stage_id=STAGE-001"])
 
         async def run():
             with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
-                 patch("business_core.sheets.read_business_sheet", side_effect=_read_business_sheet_side_effect), patch("business_core.object_manager.find_object_by_id", side_effect=_find_object_by_id_side_effect):
+                 patch("business_core.document_requirements_query.evaluate_scope", return_value=result), \
+                 patch("business_core.sheets.read_business_sheet", side_effect=_read_business_sheet_side_effect):
                 await th.docs4stage_cmd(update, context)
 
         asyncio.run(run())
@@ -616,23 +656,63 @@ class TestDocs4StageCmd(unittest.TestCase):
 
     def test_unmatchable_stage_shows_explicit_not_matched(self):
         th = _fresh_th()
-        stage_no_template = [{"Stage ID": "STAGE-002", "Roadmap ID": "RM-001", "Document Template IDs": ""}]
-
-        def _side_effect(sheet_key, *a, **kw):
-            if sheet_key == "roadmap_stages":
-                return stage_no_template
-            return _read_business_sheet_side_effect(sheet_key, *a, **kw)
+        result = _scope_result(exists=True, items=())
 
         update, context = _upd("/docs4stage stage_id=STAGE-002"), _ctx(args=["stage_id=STAGE-002"])
 
         async def run():
             with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
-                 patch("business_core.sheets.read_business_sheet", side_effect=_side_effect):
+                 patch("business_core.document_requirements_query.evaluate_scope", return_value=result), \
+                 patch("business_core.sheets.read_business_sheet", side_effect=_read_business_sheet_side_effect):
                 await th.docs4stage_cmd(update, context)
 
         asyncio.run(run())
         msg = update.message.reply_text.call_args[0][0]
         self.assertIn("не сопоставлен", msg)
+
+    def test_stage_not_found_treated_as_not_matchable(self):
+        """result.exists=False (stage genuinely missing from its
+        registry) must render the same 'not matched' branch as zero
+        configured requirements — docs4stage_cmd has always collapsed
+        both cases, preserved here."""
+        th = _fresh_th()
+        result = _scope_result(exists=False)
+
+        update, context = _upd("/docs4stage stage_id=STAGE-404"), _ctx(args=["stage_id=STAGE-404"])
+
+        async def run():
+            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
+                 patch("business_core.document_requirements_query.evaluate_scope", return_value=result), \
+                 patch("business_core.sheets.read_business_sheet", side_effect=_read_business_sheet_side_effect):
+                await th.docs4stage_cmd(update, context)
+
+        asyncio.run(run())
+        msg = update.message.reply_text.call_args[0][0]
+        self.assertIn("не сопоставлен", msg)
+
+    def test_satisfied_requirement_shown_as_matched_not_missing(self):
+        th = _fresh_th()
+        from business_core.document_requirements import DocumentRequirement, DocumentRequirementStatus, STATUS_PRESENT
+
+        req = DocumentRequirement(
+            requirement_id="STAGE-001:DOC-IZH-KP-001", document_template_id="DOC-IZH-KP-001",
+            name="DOC-IZH-KP-001", scope_id="STAGE-001", stage_id="STAGE-001", roadmap_id="RM-001",
+        )
+        item = DocumentRequirementStatus(requirement=req, matched_document_ids=("DREG-001",), matched_count=1, status=STATUS_PRESENT)
+        result = _scope_result(exists=True, items=(item,))
+
+        update, context = _upd("/docs4stage stage_id=STAGE-001"), _ctx(args=["stage_id=STAGE-001"])
+
+        async def run():
+            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
+                 patch("business_core.document_requirements_query.evaluate_scope", return_value=result), \
+                 patch("business_core.sheets.read_business_sheet", side_effect=_read_business_sheet_side_effect):
+                await th.docs4stage_cmd(update, context)
+
+        asyncio.run(run())
+        msg = update.message.reply_text.call_args[0][0]
+        self.assertIn("Отсутствующих требований нет.", msg)
+        self.assertNotIn("Отсутствует:", msg)
 
 
 class TestOldRegistriesUntouched(unittest.TestCase):
