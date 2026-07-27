@@ -1191,6 +1191,10 @@ class TestStagesCommand(unittest.TestCase):
             self.assertIn("RM-001", msg)
             self.assertIn("Первичный анализ объекта", msg)
             self.assertIn("Проверка документов клиента", msg)
+            # Stage ID must be shown for every stage so the user can copy it
+            # directly into /stage or /updatestage without guessing it.
+            self.assertIn("STAGE-001", msg)
+            self.assertIn("STAGE-002", msg)
 
         asyncio.run(run())
 
@@ -1219,6 +1223,151 @@ class TestStagesCommand(unittest.TestCase):
             self.assertIn("❌", msg)
 
         asyncio.run(run())
+
+
+class TestStageAndUpdatestageParamNaming(unittest.TestCase):
+    """Follow-up to TestStagesCommand: /stages must expose a copyable
+    Stage ID for every stage, and /stage + /updatestage must accept and
+    document exactly that same parameter name (stage_id) — no
+    "stageid"/other spelling anywhere in their usage hints."""
+
+    def test_stage_cmd_reads_by_stage_id_param(self):
+        import asyncio
+        from unittest.mock import AsyncMock
+
+        async def run():
+            for key in list(sys.modules.keys()):
+                if "business_core" in key:
+                    del sys.modules[key]
+            from business_core.telegram_handlers import stage_cmd
+
+            stage = {
+                "stage_id": "STAGE-001", "roadmap_id": "RM-001", "order": "1",
+                "name": "Первичный анализ объекта", "status": "pending",
+                "responsible": "", "start_date": "", "due_date": "",
+                "completed_at": "", "priority": "", "blocking_reason": "",
+                "docs_required": "", "checklist_ids": "", "notes": "",
+            }
+
+            update  = MagicMock()
+            context = MagicMock()
+            context.args = ["stage_id=STAGE-001"]
+            update.message.text = "/stage stage_id=STAGE-001"
+            update.message.reply_text = AsyncMock()
+            update.effective_chat.id  = 123
+
+            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
+                 patch("business_core.roadmap_manager.find_stage_by_id", return_value=stage) as mock_find:
+                await stage_cmd(update, context)
+
+            mock_find.assert_called_once_with("STAGE-001")
+            msg = update.message.reply_text.call_args[0][0]
+            self.assertIn("STAGE-001", msg)
+
+        asyncio.run(run())
+
+    def test_stage_cmd_missing_stage_id_hint_uses_stage_id(self):
+        import asyncio
+        from unittest.mock import AsyncMock
+
+        async def run():
+            for key in list(sys.modules.keys()):
+                if "business_core" in key:
+                    del sys.modules[key]
+            from business_core.telegram_handlers import stage_cmd
+
+            update  = MagicMock()
+            context = MagicMock()
+            context.args = []
+            update.message.text = "/stage"
+            update.message.reply_text = AsyncMock()
+            update.effective_chat.id  = 123
+
+            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+                await stage_cmd(update, context)
+
+            msg = update.message.reply_text.call_args[0][0]
+            self.assertIn("stage_id", msg)
+            self.assertNotIn("stageid", msg)
+
+        asyncio.run(run())
+
+    def test_updatestage_cmd_missing_args_hint_uses_stage_id(self):
+        import asyncio
+        from unittest.mock import AsyncMock
+
+        async def run():
+            for key in list(sys.modules.keys()):
+                if "business_core" in key:
+                    del sys.modules[key]
+            from business_core.telegram_handlers import updatestage_cmd
+
+            update  = MagicMock()
+            context = MagicMock()
+            context.args = []
+            update.message.text = "/updatestage"
+            update.message.reply_text = AsyncMock()
+            update.effective_chat.id  = 123
+
+            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+                await updatestage_cmd(update, context)
+
+            msg = update.message.reply_text.call_args[0][0]
+            self.assertIn("stage_id", msg.replace("\\_", "_"))
+            self.assertNotIn("stageid", msg)
+
+        asyncio.run(run())
+
+    def test_updatestage_cmd_accepts_stage_id_param(self):
+        import asyncio
+        from unittest.mock import AsyncMock
+
+        async def run():
+            for key in list(sys.modules.keys()):
+                if "business_core" in key:
+                    del sys.modules[key]
+            from business_core.telegram_handlers import updatestage_cmd
+
+            update  = MagicMock()
+            context = MagicMock()
+            context.args = ["stage_id=STAGE-001", "status=done"]
+            update.message.text = "/updatestage stage_id=STAGE-001 status=done"
+            update.message.reply_text = AsyncMock()
+            update.effective_chat.id  = 123
+
+            result = {
+                "ok": True, "code": "STAGE_STATUS_UPDATED", "stage_id": "STAGE-001",
+                "roadmap_id": "RM-001", "previous_status": "pending", "requested_status": "done",
+                "final_status": "done", "changed": True, "partial_success": False, "retry_safe": True,
+                "roadmap_status_before": "active", "roadmap_status_after": "active",
+                "downstream_failures": (),
+            }
+            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
+                 patch("business_core.business_builder.transition_stage_status", return_value=result) as mock_transition:
+                await updatestage_cmd(update, context)
+
+            mock_transition.assert_called_once()
+            self.assertEqual(mock_transition.call_args[0][0], "STAGE-001")
+
+        asyncio.run(run())
+
+    def test_stages_stage_and_updatestage_hints_use_the_same_param_name(self):
+        """Static consistency check across all three commands' source —
+        every usage hint referring to the stage identifier must spell it
+        stage_id, never stageid or any other variant."""
+        path = Path(__file__).parent / "business_core" / "telegram_handlers.py"
+        src = path.read_text(encoding="utf-8")
+
+        def _body(fn_name: str) -> str:
+            start = src.index(f"async def {fn_name}(")
+            rest = src[start + 10:]
+            candidates = [i for i in (rest.find("\nasync def "), rest.find("\ndef ")) if i != -1]
+            end = start + 10 + (min(candidates) if candidates else len(rest))
+            return src[start:end]
+
+        for fn_name in ("stages_cmd", "stage_cmd", "updatestage_cmd"):
+            body = _body(fn_name)
+            self.assertNotIn("stageid", body.lower().replace("stage_id", ""))
 
 
 # ────────────────────────────────────────────────────────────

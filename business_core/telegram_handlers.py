@@ -2675,6 +2675,7 @@ async def stages_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                 if s.get("due_date"):
                     line += f" _(до {s['due_date']})_"
                 lines.append(line)
+                lines.append(f"   ID: {s.get('stage_id', '') or '—'}")
 
         await _reply(update, "\n".join(lines))
 
