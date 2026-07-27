@@ -5975,3 +5975,717 @@ offers` не существует; ни один production-caller не мигр
 один код не изменён; схема Google Sheets не менялась; GTD Core не
 затронут. Ни один закрытый домен (Object/Client/Service/Roadmap/Stage/
 Organization/Task/Document/Checklist/Payment) не переоткрыт.
+
+
+## ADR-024 — Lead / Sales Funnel Domain Architecture Decision (Phase 41B)
+
+### 0. Контекст
+
+Phase 41A (Next Domain Selection Audit) переоценила Lead/Sales Funnel
+после закрытия Payment и Commercial Offer Domains и подтвердила: это
+единственный оставшийся кандидат, закрывающий реальный, ранее не
+покрытый участок бизнес-жизненного цикла — pre-Client этап продаж.
+Person/Client Domain (закрыт) начинает жизненный цикл сразу с готового
+Client-контакта; отдельной pre-Client сущности не существует. При этом
+production-данные подтверждают: все 3 существующих Person-записи уже
+типизированы как "клиент"/"клиент по узаконению" — pre-client записей
+нет вообще, миграция не требуется.
+
+Ключевая архитектурная находка Phase 41A: Person уже содержит
+разрозненные lead-подобные поля ("Источник", "История", "Следующее
+касание", "Тип касания", "Заметка касания", "Статус отношений",
+"Теплота"), плюс полностью нерабочий (orphaned) код
+`relationship_capital.py` (`RelationshipTouch`/`create_touch_record()`)
+— никогда не подключённый ни к одной команде и несовместимый по схеме
+с самим реестром `relationship_capital`. Это ADR явно фиксирует: Lead
+Domain НЕ трогает ни одно из этих полей, не мигрирует их и не
+переиспользует orphaned-код — Lead представляет собой полностью новую,
+чистую сущность, ссылающуюся на Person только опционально и только для
+чтения (после конверсии).
+
+Это ADR утверждает архитектуру Lead Domain Foundation (Phase 41C) —
+один операционный реестр `leads`, Lead-only (без Deal), явная граница
+идемпотентности vs. duplicate detection, безопасная conversion-модель
+без автоматического создания Client.
+
+### 1. Канонический entity
+
+**Lead** — единственная каноническая сущность Foundation. Представляет
+pre-Client коммерческого прospect'а. Принадлежит одному Business.
+Хранит контактные снапшоты и sales-состояние. Может ссылаться на
+Service, Channel, Assigned Person. Может позже связаться с уже
+существующим Client. Остаётся читаемым после конверсии. НЕ является
+Person subtype, НЕ является Client, НЕ является Deal, НЕ является
+Commercial Offer, НЕ является Roadmap, НЕ является Payment-сущностью.
+
+```
+LEAD_IS_CANONICAL_PRE_CLIENT_ENTITY = YES
+LEAD_IS_SEPARATE_FROM_PERSON = YES
+LEAD_IS_SEPARATE_FROM_CLIENT = YES
+LEAD_IS_NOT_DEAL = YES
+LEAD_IS_NOT_COMMERCIAL_OFFER = YES
+LEAD_IS_NOT_ROADMAP = YES
+LEAD_IS_NOT_PAYMENT_ENTITY = YES
+```
+
+### 2. Решение Lead-only
+
+Утверждено: один Lead entity, без отдельного Deal в Foundation.
+
+Обоснование: post-conversion opportunity lifecycle уже полностью
+представлен цепочкой Object → Roadmap → Commercial Offer → Payment (все
+закрыты и работают). Deal дублировал бы уже существующую операционную
+истину post-conversion. Lead закрывает исключительно pre-Client пробел.
+
+```
+LEAD_DEAL_ENTITY_REQUIRED_IN_FOUNDATION = NO
+```
+
+### 3. Дизайн реестра
+
+Утверждён ровно один Foundation registry: **`leads`**.
+
+```
+Lead ID
+Business ID
+Caller Idempotency Key
+Contact Name Snapshot
+Phone Snapshot
+WhatsApp Snapshot
+Email Snapshot
+Company Snapshot
+Service ID
+Source
+Channel ID
+Status
+Qualification Notes
+Disposition Reason
+Expected Value
+Currency
+Next Follow-up At
+Last Contacted At
+Assigned Person ID
+Converted Client ID
+Converted At
+Converted By
+Created At
+Created By
+Updated At
+Archived At
+Notes
+```
+
+Отклонение от предложенного набора: поле `Loss Reason` из задания
+переименовано в **`Disposition Reason`** (решение 20 ниже) — используется
+и для `unqualified`, и для `lost`, чтобы не называть все unqualified
+Leads "проигранными" ложно.
+
+Явно НЕ добавлено: Deal ID, Object ID, Roadmap ID, Commercial Offer ID,
+Payment Obligation ID, Task ID, Interaction history JSON,
+comma-separated relation-поля, generic relation JSON, Campaign/UTM-поля,
+automatic Client-creation поля, скрытые Person-type поля.
+
+```
+LEAD_REGISTRY_APPROVED = YES
+```
+
+### 4. Identity policy
+
+```
+Lead ID: LED-NNN
+```
+
+Проверка коллизий: среди всех существующих `_ID_PREFIXES` (включая
+`OFR`/`OFS`/`PMT`/`POB`/`PTXN` из Payment/Offer) — `LED` не пересекается
+ни с одним. Ровно один генератор, живёт в `lead_manager.py`. Никакой
+caller-side генерации. Malformed ID безопасно игнорируются. ID
+генерируются только после полной валидации и idempotency-проверки.
+Никакой name/phone/email-based identity. Никакого повторного
+использования Person/Client ID.
+
+```
+LED_IDENTITY_APPROVED = YES
+```
+
+### 5. Persistence ownership
+
+`business_core/lead_manager.py` — единственный persistence owner для
+`leads`. Владеет: точечные reads, ограниченные list/filter reads,
+генерацию LED, низкоуровневое создание строки, низкоуровневую
+персистентность lifecycle-переходов, низкоуровневую персистентность
+admin/update-полей, idempotency-lookup примитивы, точные normalized-
+contact duplicate-lookup примитивы, immutable-field enforcement,
+проверку после записи.
+
+НЕ владеет: cross-domain relation-валидацией, бизнес-решениями по
+нормализации контактов сверх утверждённого canonical helper (сама
+нормализация — orchestration-функция business_builder, вызываемая ДО
+записи; manager лишь хранит уже нормализованное значение), lifecycle
+policy, qualification policy, conversion policy, duplicate auto-merge,
+Telegram UX, созданием/мутацией Client, мутацией Service/Organization,
+raw exception rendering.
+
+```
+LEAD_MANAGER_IS_APPROVED_PERSISTENCE_OWNER = YES
+```
+
+### 6. Orchestration ownership
+
+`business_builder.py` — единственный cross-domain owner Lead-
+оркестрации. Владеет: валидацию обязательных полей, нормализацию
+контактных снапшотов (phone/WhatsApp/email), relation-валидацию,
+создание Lead, idempotency zero/one/multiple handling, политику
+exact-contact duplicate warning, lifecycle-переходы, qualification/
+unqualification, lost-переход, conversion к существующему Client,
+обновления follow-up, обновления assignment, structured result
+assembly.
+
+Направление зависимостей:
+
+```
+telegram_handlers
+  → business_builder
+    → lead_manager
+      → sheets
+```
+
+Без обратной зависимости.
+
+```
+BUSINESS_BUILDER_IS_APPROVED_LEAD_ORCHESTRATION_OWNER = YES
+```
+
+### 7. Contact identity policy
+
+Обязательно: `Contact Name Snapshot`. Плюс хотя бы одно из: `Phone
+Snapshot`, `WhatsApp Snapshot`, `Email Snapshot`. Опционально: `Company
+Snapshot`. Имя — trimmed, ограничено по длине. Phone/WhatsApp —
+канонически нормализуются. Email — консервативно нормализуется. Raw
+контактные снапшоты хранятся как бизнес-данные, но никогда не
+логируются. Никакого fuzzy name matching. Никакого auto-merge.
+
+Phone и WhatsApp могут нормализоваться к одному и тому же
+каноническому номеру, но остаются раздельными исходными полями;
+duplicate detection может рассматривать совпадающие нормализованные
+значения Phone/WhatsApp как совпадение контактного канала — но одно
+поле никогда молча не схлопывается в другое.
+
+```
+LEAD_CONTACT_NAME_IS_REQUIRED = YES
+LEAD_CONTACT_CHANNEL_IS_REQUIRED = YES
+```
+
+### 8. Contact normalization
+
+**Phone/WhatsApp**: trim; удаление безопасных форматирующих символов
+(пробелы, скобки, дефисы); сохранение ведущего `+` при наличии;
+канонический вид — только цифры плюс опциональный ведущий `+`; явно
+некорректные значения блокируются; страна НЕ выводится автоматически;
+казахстанский `+7` НЕ подставляется молча; никакого substring/fuzzy
+сопоставления.
+
+**Email**: trim; понижение регистра (предпочтительно всего значения для
+точного сравнения дублей); ровно один `@`; ограниченная длина; никакой
+сложной проверки deliverability; никакой исходящей верификации.
+
+**Name/Company**: trimmed, ограничены по длине, никогда не используются
+для identity.
+
+```
+LEAD_PHONE_NORMALIZATION_IS_APPROVED = YES
+LEAD_WHATSAPP_NORMALIZATION_IS_APPROVED = YES
+LEAD_EMAIL_NORMALIZATION_IS_APPROVED = YES
+```
+
+### 9. Contact duplicate detection
+
+Отдельный механизм, НЕ идемпотентность. Точное совпадение только по
+нормализованным Phone/WhatsApp/Email; область действия — в пределах
+одного Business; ноль совпадений — без предупреждения; одно или более
+совпадений — возвращаются ВСЕ совпадающие Lead ID; никогда не
+auto-reuse; никогда не auto-merge; никогда не first-pick; никакого
+fuzzy name matching; никакого сопоставления по названию компании;
+никакого кросс-Business сопоставления.
+
+Выбрана модель: **A. warning-only** (не blocking). Обоснование: один и
+тот же контакт может законно оставить несколько разных заявок для
+разных услуг или периодов; детерминированная идемпотентность уже
+предотвращает retry-дубли; предупреждение информирует caller, не
+портя историю продаж принудительным блоком.
+
+```
+LEAD_CONTACT_DUPLICATE_WARNING_IS_APPROVED = YES
+LEAD_CONTACT_DUPLICATE_AUTO_MERGE_IS_ALLOWED = NO
+LEAD_FUZZY_NAME_DEDUP_IS_ALLOWED = NO
+```
+
+### 10. Idempotency policy
+
+Primary key: `Business ID` + `Caller Idempotency Key`. Caller key
+обязателен; zero creates; один совместимый match — reuse; несколько
+matches — блок с полным списком конфликтующих Lead ID; несовместимый
+payload с тем же ключом — блок; никакого first-pick; никакого
+contact-channel-based reuse; никакого name-based reuse; никакого
+amount/date/source-based dedup. ID генерируется только после проверки
+идемпотентности.
+
+Идемпотентность и duplicate detection принципиально разделены: первая
+защищает от повторных запросов одного и того же caller (retry-safe
+создание), вторая — информационное предупреждение о потенциально том
+же человеке через другой канал/повод обращения.
+
+```
+LEAD_IDEMPOTENCY_IS_DISTINCT_FROM_DUPLICATE_DETECTION = YES
+```
+
+### 11. Source/Channel policy
+
+`Source` — опциональный ограниченный scalar-строка; не controlled
+vocabulary; не отдельный реестр в Foundation; никогда не используется
+как identity; никакого Campaign/UTM-движка. `Channel ID` — опциональная
+read-only связь с существующим `channel_registry`; точная проверка
+существования; никакой мутации канала; никакого runtime-поведения
+интеграции.
+
+Source не обязателен — его отсутствие не блокирует создание Lead.
+
+```
+LEAD_SOURCE_REGISTRY_REQUIRED_IN_FOUNDATION = NO
+LEAD_CHANNEL_IS_REFERENCE_ONLY = YES
+```
+
+### 12. Relation policy
+
+Обязательно: `Business ID`. Опционально: `Service ID`, `Channel ID`,
+`Assigned Person ID`, `Converted Client ID` (только через conversion).
+Правила: Business должен существовать; Service существует при указании;
+Channel существует при указании; Assigned Person существует и
+принадлежит Business там, где текущие canonical данные это
+поддерживают; Converted Client существует, является валидным Client и
+принадлежит тому же Business. Никакой Object-связи. Никакой
+Roadmap-связи. Никакой Commercial Offer-связи. Никакой Payment-связи.
+Никакой Task-связи. Никакого auto-repair. Никакого движения между
+Business. Никакой мутации любого связанного домена.
+
+### 13. Expected Value policy
+
+Включено, но ограничено и явно некономично: опциональные `Expected
+Value` + `Currency`. Оба поля — либо вместе пусты, либо вместе
+заполнены. `Expected Value` — некономичная оценка продаж, никогда не
+становится agreed-price истиной. Decimal only, ровно 2 дробных знака,
+значение `> 0`, явная 3-буквенная валюта в верхнем регистре, никакой
+FX-конвертации, никакого автоматического переноса в Commercial Offer
+или Payment, никакой валидации против диапазона цены Service.
+
+```
+LEAD_EXPECTED_VALUE_IS_INCLUDED = YES
+LEAD_EXPECTED_VALUE_IS_CANONICAL_COMMERCIAL_AMOUNT = NO
+LEAD_EXPECTED_VALUE_USES_DECIMAL = YES
+```
+
+### 14. Follow-up policy
+
+`Next Follow-up At` — опционально. `Last Contacted At` — опционально.
+`Assigned Person ID` — опционально. `Qualification Notes` — опционально.
+`Notes` — опционально. Никакого автоматического создания Task. Никакого
+Reminder-реестра. Никакого scheduler. Никакой Calendar-интеграции.
+Никакой мутации Task. "follow-up due" — derived at read-time, никогда
+не хранится отдельным полем. Таймстампы — детерминированный ISO
+datetime формат, никакой timezone-неоднозначности.
+
+`Last Contacted At` может обновляться независимо от lifecycle через
+ограниченный Lead update API — обновление этого поля само по себе НЕ
+меняет Status; lifecycle остаётся явным отдельным действием.
+
+```
+LEAD_FOLLOW_UP_IS_STORED_ON_LEAD = YES
+LEAD_AUTOMATIC_TASK_CREATION_IS_FOUNDATION_SCOPE = NO
+```
+
+### 15. Interaction-history boundary
+
+Никакого Interaction registry в Foundation. Никакого переиспользования
+`RelationshipTouch`. Никакой записи в `relationship_capital`. Никакой
+таблицы истории сообщений/звонков. Никакого счётчика попыток контакта.
+Lead Foundation хранит только: `Last Contacted At`, `Next Follow-up At`,
+опциональные `Qualification Notes`. Полноценный Interaction Domain
+остаётся отложенным.
+
+```
+LEAD_INTERACTION_REGISTRY_IS_FOUNDATION_SCOPE = NO
+```
+
+### 16. Lifecycle vocabulary
+
+```
+new
+contacted
+qualified
+unqualified
+converted
+lost
+archived
+```
+
+Не добавлены: `won`, `follow_up_due`, `nurturing`, `dormant`,
+`customer`, `offer_sent`, `paid` — все они либо derived (follow_up_due),
+либо дублируют `converted` (won), либо принадлежат другим доменам.
+
+```
+LEAD_STATUS_VOCABULARY_IS_APPROVED = YES
+```
+
+### 17. Lifecycle matrix
+
+```
+new:          new, contacted, qualified, unqualified, lost, converted, archived
+contacted:    contacted, qualified, unqualified, lost, converted, archived
+qualified:    qualified, contacted, unqualified, lost, converted, archived
+unqualified:  unqualified, archived
+converted:    converted, archived
+lost:         lost, archived
+archived:     archived (только)
+```
+
+Прямой `new → converted` РАЗРЕШЁН: некоторые заявки могут иметь уже
+существующего Client на момент захвата (например, повторное обращение
+существующего клиента через новый канал, до того как это распознано
+вручную) — conversion остаётся явной и валидируется точно так же, как
+из любого другого статуса.
+
+Правила: тот же статус — no-op; `archived` терминален; никакого
+ordinary restore; никакого hard delete; никакого `converted → active`;
+никакого reopen из `lost`/`unqualified`. Будущее повторное обращение
+создаёт НОВУЮ запись Lead, не reopen старой.
+
+```
+LEAD_TRANSITION_MATRIX_IS_APPROVED = YES
+```
+
+### 18. Qualification policy
+
+`qualified` — явный переход, `Qualification Notes` не обязательны.
+`unqualified` — явный переход, требует причину.
+
+Решено: поле переименовано из `Loss Reason` в **`Disposition Reason`**,
+используется и для `unqualified`, и для `lost` — единое поле,
+избегающее ложного называния всех unqualified Leads "проигранными".
+Причина обязательна для обоих терминальных исходов, никогда не
+логируется, отдельного дублирующего поля причины нет.
+
+```
+LEAD_DISPOSITION_REASON_IS_REQUIRED = YES
+```
+
+### 19. Conversion policy
+
+Lead может перейти в `converted`. `Converted Client ID` обязателен.
+`Converted By` обязателен. `Converted At` устанавливается один раз.
+Целевой Client должен уже существовать, быть валидным Client и
+принадлежать тому же Business. Никакого автоматического создания
+Person. Никакой мутации Client. Никакого обновления Person `Тип`.
+Никакого создания Object/Roadmap/Commercial Offer. Никакого создания
+Payment. Converted Lead остаётся читаемым и исторически нетронутым.
+Будущие обновления ограничены Notes/archive согласно admin policy.
+
+Выбрана модель: **A. lifecycle conversion естественно идемпотентна по
+текущему статусу и целевому Client, без отдельного хранимого ключа.**
+Повторная попытка конвертации в тот же Client — безопасный no-op.
+Попытка конвертации в ДРУГОЙ Client после того, как Lead уже
+конвертирован, блокируется (`LEAD_CONVERSION_TARGET_CONFLICT`). Второе
+поле идентичности не требуется.
+
+```
+LEAD_AUTOMATIC_CLIENT_CREATION_IS_FOUNDATION_SCOPE = NO
+LEAD_CONVERSION_REQUIRES_EXISTING_CLIENT = YES
+LEAD_CONVERSION_MUTATES_CLIENT = NO
+```
+
+### 20. Converted Lead immutability
+
+После конвертации неизменны: Business ID, контактные снапшоты, Service
+ID, Source, Channel ID, Assigned Person ID, Expected Value/Currency,
+Converted Client ID, метаданные конверсии, Created At/By, Caller
+Idempotency Key. Разрешено после конверсии: Notes, archive, Updated At.
+Никакого generic update bypass.
+
+```
+CONVERTED_LEAD_IS_IMMUTABLE = YES
+```
+
+### 21. Lost/unqualified policy
+
+Причина (`Disposition Reason`) обязательна; сохраняется один раз при
+переходе; никакого reopen; новое обращение того же контакта создаёт
+новый Lead; exact-contact duplicate warning может ссылаться на
+исторический lost/unqualified Lead, но не auto-reuse его.
+
+### 22. Archive policy
+
+Archive терминален. Никакого hard delete. Никакого ordinary restore.
+Точный-ID read по-прежнему возвращает архивированную запись.
+Архивированные записи исключены из активных списков по умолчанию.
+Никакого каскада. Никакой мутации связанного домена.
+
+```
+LEAD_HARD_DELETE_IS_FOUNDATION_SCOPE = NO
+LEAD_RESTORE_REOPEN_IS_FOUNDATION_SCOPE = NO
+```
+
+### 23. Update policy
+
+Изменяемые поля, пока Lead активен (`new`/`contacted`/`qualified`):
+Contact Name/Phone/WhatsApp/Email/Company Snapshot, Service ID, Source,
+Channel ID, Qualification Notes, Expected Value, Currency, Next
+Follow-up At, Last Contacted At, Assigned Person ID, Notes. Все
+переданные значения перепроверяются. Identity/Business/Caller
+Idempotency Key/Status/conversion/audit-поля блокируются. После
+терминального disposition (unqualified/lost/converted/archived) —
+изменяемы только Notes; исправления контактных данных должны
+происходить до терминального перехода; будущее обращение создаёт новый
+Lead. No-op сохраняет Updated At неизменным.
+
+### 24. Person/Client overlap boundary
+
+Явно зафиксировано: поля Person/Client остаются нетронутыми; никакой
+миграции из `people_registry`; никакого dual-write в Person; поля
+Lead's Source/Follow-up/Contact применяются ТОЛЬКО к pre-conversion
+sales-истории; после конверсии поля Lead остаются историческими
+снапшотами; текущее отслеживание отношений с Client продолжается
+исключительно в Person/Client; никакой синхронизации между Lead и
+Person; никакого переиспользования персистентности `person_manager`;
+никакой мутации Person `Тип`, `Источник`, `История`, `Следующее
+касание` или полей отношений.
+
+```
+LEAD_PERSON_FIELDS_ARE_MUTATED = NO
+LEAD_MIGRATION_FROM_PEOPLE_REGISTRY_REQUIRED = NO
+```
+
+### 25. relationship_capital boundary
+
+Явно утверждено: orphaned-модель `RelationshipTouch` не переиспользуется;
+реестр `relationship_capital` не записывается; никакого TCH ID;
+никакой миграции; никакой очистки в Phase 41C. Будущий Interaction
+Domain может отдельно решить судьбу этого orphaned-кода — вне рамок
+этого ADR.
+
+```
+RELATIONSHIP_CAPITAL_IS_REUSED_BY_LEAD = NO
+```
+
+### 26. Структурированный result contract
+
+```
+ok, code, error,
+lead_id, business_id, service_id, channel_id, assigned_person_id, converted_client_id,
+previous_status, requested_status, final_status,
+created, reused, changed,
+contacted, qualified, unqualified, converted, lost, archived,
+expected_value, currency, next_follow_up_at, last_contacted_at,
+duplicate_contact_ids, conflicting_ids, warnings, retry_safe
+```
+
+`expected_value`/`currency`/`next_follow_up_at`/`last_contacted_at`
+включены — вызывающей стороне нужны безопасные операционные выводы, и
+это не чувствительные контактные данные. Никаких phone/email/name/
+company-полей в result contract. Каждое поле присутствует всегда.
+Никакого raw exception. Никакого raw row. Никакого Telegram-
+специфичного текста в Foundation.
+
+```
+LEAD_RESULT_CONTRACT_APPROVED = YES
+```
+
+### 27. Result-code vocabulary
+
+Утверждены как канонические (без синонимов), реализуются в Phase 41C
+только там, где есть реальный runtime-вызов:
+
+```
+Создание/idempotency:
+  LEAD_CREATED
+  LEAD_REUSED
+  LEAD_NOT_FOUND
+  MULTIPLE_LEAD_MATCHES
+  LEAD_IDEMPOTENCY_REQUIRED
+  LEAD_IDEMPOTENCY_CONFLICT
+  LEAD_PERSISTENCE_FAILED
+  LEAD_POST_WRITE_VERIFICATION_FAILED
+
+Validation:
+  LEAD_CONTACT_NAME_REQUIRED
+  LEAD_CONTACT_CHANNEL_REQUIRED
+  INVALID_LEAD_PHONE
+  INVALID_LEAD_WHATSAPP
+  INVALID_LEAD_EMAIL
+  INVALID_LEAD_EXPECTED_VALUE
+  INVALID_LEAD_EXPECTED_VALUE_SCALE
+  LEAD_EXPECTED_VALUE_MUST_BE_POSITIVE
+  INVALID_LEAD_CURRENCY
+  INVALID_LEAD_DATETIME
+  LEAD_DISPOSITION_REASON_REQUIRED
+
+Relations:
+  BUSINESS_NOT_FOUND
+  SERVICE_NOT_FOUND
+  CHANNEL_NOT_FOUND
+  PERSON_NOT_FOUND
+  CLIENT_NOT_FOUND
+  LEAD_RELATION_MISMATCH
+
+Duplicates:
+  LEAD_CONTACT_DUPLICATE_WARNING
+
+Lifecycle:
+  INVALID_LEAD_STATUS
+  INVALID_LEAD_TRANSITION
+  LEAD_STATUS_UPDATED
+  LEAD_STATUS_UNCHANGED
+  LEAD_CONTACTED
+  LEAD_QUALIFIED
+  LEAD_UNQUALIFIED
+  LEAD_CONVERTED
+  LEAD_LOST
+  LEAD_ARCHIVED
+  LEAD_CONVERSION_CLIENT_REQUIRED
+  LEAD_CONVERSION_ACTOR_REQUIRED
+  LEAD_CONVERSION_TARGET_CONFLICT
+  LEAD_RESTORE_REQUIRES_EXPLICIT_ACTION
+
+Admin update:
+  LEAD_UPDATED
+  LEAD_UPDATE_UNCHANGED
+  LEAD_IMMUTABLE
+```
+
+Phase 41C не обязан реализовывать коды без реального runtime-callable
+в bounded scope (тот же принцип, что закрыл находку Phase 37F).
+
+### 28. Privacy и логирование
+
+Разрешено в логах: Lead ID, Business ID, Service/Channel/Assigned
+Person/Converted Client ID, result code, статус, count и ID дублей,
+ожидаемая валюта/значение только при необходимости, флаги
+created/reused/changed, `retry_safe`.
+
+Запрещено в логах: Contact Name Snapshot, Phone Snapshot, WhatsApp
+Snapshot, Email Snapshot, Company Snapshot, Qualification Notes,
+Disposition Reason, Notes, полное тело Telegram-сообщения, raw row, raw
+exception, credentials/токены.
+
+```
+LEAD_PRIVACY_LOGGING_POLICY_APPROVED = YES
+```
+
+### 29. Тестовые требования для Phase 41C
+
+Обязательные изолированные категории: schema (точные заголовки `leads`,
+отсутствие мутации существующей схемы); identity (генерация LED,
+malformed игнорируются, отсутствие caller-side генерации, генерация
+после validation/idempotency); contact validation (обязательность
+имени, обязательность хотя бы одного канала, нормализация phone/
+WhatsApp/email, отсутствие вывода кода страны, ограниченные поля);
+idempotency (zero/one/multiple, совместимый reuse, несовместимый
+conflict, отсутствие contact-based/fuzzy/name-based reuse, отсутствие
+first-pick); duplicate warning (точное совпадение normalized phone/
+WhatsApp/email, несколько совпадающих ID, только предупреждение, без
+auto-merge, без кросс-Business детекции); relations (Business/Service/
+Channel/Assigned Person/Converted Client, same-Business, отсутствие
+мутации связанных доменов); expected value (Decimal, scale,
+positivity, явная валюта, both-or-neither, некономичность, отсутствие
+переноса в Offer/Payment); follow-up (детерминированный datetime,
+derived due-статус, отсутствие мутации Task/Reminder/Calendar);
+lifecycle (все разрешённые переходы, все запрещённые переходы, no-op,
+disposition reason, валидация conversion, конфликт конверсионной цели,
+отсутствие reopen, archive терминален); conversion (только существующий
+Client, отсутствие создания Client, отсутствие мутации Person, повторная
+конверсия в тот же Client — no-op, конверсия в другой Client после уже
+состоявшейся — блок, читаемость Lead после конверсии, неизменность
+после конверсии); updates (изменяемость активных полей, неизменность
+терминальных, политика Notes, no-op таймстампы, блокировка identity/
+audit полей); boundaries (отсутствие Deal, отсутствие Interaction
+registry, отсутствие записи в relationship_capital, отсутствие мутации
+Object/Roadmap/Offer/Payment/Task, отсутствие auto-create Client,
+отсутствие миграции people_registry); isolation (все Lead-тесты — hard
+socket-block, mock-completeness guard, отсутствие live Sheets/Drive/
+Telegram/Railway/HTTP/socket).
+
+### 30. Production migration policy
+
+Никакой миграции. Никакого backfill из `people_registry`. Никаких
+legacy Lead-строк. Существующие Client остаются без изменений. Реестр
+Lead начинается пустым. Никакого создания production Lead-строк во
+время тестов Phase 41C. Никакого изменения схемы Person. Никакой
+очистки `relationship_capital`.
+
+### 31. Bounded scope Phase 41C
+
+Phase 41C реализует ТОЛЬКО: одну схему registry `leads` (в коде); LED
+identity; `lead_manager.py`; нормализацию контактов; опциональную
+нормализацию Expected Value/currency; детерминированную нормализацию
+datetime; точные reads и ограниченные фильтры; создание Lead;
+idempotency; exact-contact duplicate warning; обновления активного
+Lead; lifecycle-переходы; conversion к существующему Client;
+follow-up-поля; assignment-связь; immutability; структурированный
+result contract; architecture/isolation guards; тесты.
+
+Явно запрещено в Phase 41C: Telegram caller UX; деплой; Deal-сущность;
+автоматическое создание Client; миграция people_registry; изменения
+схемы Person; связь с Object/Roadmap/Commercial Offer; создание Offer;
+создание Payment; создание Task; интеграция Reminder/Calendar;
+Interaction registry; изменения relationship_capital; Campaign/UTM-
+модель; внешние CRM-интеграции; hard delete; restore/reopen.
+
+### 32. Отклонённые альтернативы
+
+**A. Lead как Person subtype.** Отклонено: переоткрывает Client Domain
+и перегружает семантику типа Person.
+
+**B. Lead как Client с другим статусом.** Отклонено: теряет pre-Client
+границу и смешивает владение жизненным циклом.
+
+**C. Автоматическое создание Client при конверсии.** Отклонено:
+переоткрывает закрытую персистентность Client и вносит риск
+дублирования клиентов.
+
+**D. Lead + Deal в Foundation.** Отклонено: Deal дублирует
+post-conversion жизненный цикл Roadmap/Offer/Payment.
+
+**E. Auto-merge по контактному каналу.** Отклонено: один и тот же
+контакт может законно иметь несколько Lead.
+
+**F. Fuzzy name dedup.** Отклонено: недетерминированно и небезопасно.
+
+**G. Полная история Interaction в Lead Foundation.** Отклонено:
+отдельный домен, больший объём.
+
+**H. Campaign/UTM-атрибуция в Foundation.** Отклонено: нет
+доказательств в репозитории.
+
+**I. Автоматическое создание Task/Reminder.** Отклонено: переоткрыло
+бы Task или ввело бы Automation-объём.
+
+**J. Миграция из people_registry.** Отклонено: существующие строки —
+это Client, поля Source неструктурированы, надёжного backfill не
+существует.
+
+### 33. Cross-ADR consistency
+
+Проверено на отсутствие противоречий с решениями по Client, Organization
+ADR-018, Task ADR-019, Document ADR-020, Checklist ADR-021, Payment
+ADR-022, Commercial Offer ADR-023, Service/Object/Roadmap/Stage
+closed-domain решениями. Ни один закрытый домен не мутируется Lead
+Foundation — Lead ссылается на их ID только для чтения/валидации
+существования, тем же паттерном, что уже используют все предыдущие
+домены этого engagement.
+
+### 34. Статус
+
+Утверждено для реализации (Phase 41C) с bounded scope, определённым в
+решении 31. Ничего не реализовано в рамках этого ADR — только
+архитектурное решение. `lead_manager.py` не создан; `leads` не
+существует; ни один production-caller не мигрирован; ни один код не
+изменён; схема Google Sheets не менялась; GTD Core не затронут. Ни один
+закрытый домен (Object/Client/Service/Roadmap/Stage/Organization/Task/
+Document/Checklist/Payment/Commercial Offer) не переоткрыт.
