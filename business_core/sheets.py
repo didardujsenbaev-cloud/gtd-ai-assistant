@@ -71,6 +71,8 @@ BUSINESS_SHEET_NAMES: dict[str, str] = {
     "commercial_milestone_templates": "COMMERCIAL_MILESTONE_TEMPLATES",
     "payment_obligations":            "PAYMENT_OBLIGATIONS",
     "payment_transactions":           "PAYMENT_TRANSACTIONS",
+    # Phase 40C (ADR-023): Commercial Offer Domain Foundation.
+    "commercial_offers":              "COMMERCIAL_OFFERS",
 }
 
 BUSINESS_HEADERS: dict[str, list[str]] = {
@@ -414,6 +416,25 @@ BUSINESS_HEADERS: dict[str, list[str]] = {
         "Confirmed At", "Confirmed By", "Reversed At", "Reversed By",
         "Created At", "Created By", "Updated At", "Notes",
     ],
+    # Phase 40C (ADR-023): Commercial Offer Domain Foundation. One
+    # registry — immutable version rows grouped by Offer Series ID,
+    # never rewritten after creation except lifecycle metadata/Notes
+    # (ADR-023 §2/§16). No line-item registry, no Contract/Invoice
+    # fields, no payment status.
+    "commercial_offers": [
+        "Commercial Offer ID", "Offer Series ID", "Previous Commercial Offer ID",
+        "Version Number", "Business ID", "Client ID", "Object ID", "Service ID",
+        "Roadmap ID", "Offer Document ID", "Title Snapshot", "Scope Snapshot",
+        "Quoted Amount", "Currency", "Valid Until", "Status",
+        "Caller Idempotency Key",
+        "Created At", "Created By", "Updated At",
+        "Sent At", "Sent By",
+        "Accepted At", "Accepted By",
+        "Rejected At", "Rejected By", "Rejection Reason",
+        "Expired At",
+        "Cancelled At", "Cancelled By", "Cancellation Reason",
+        "Archived At", "Notes",
+    ],
 }
 
 # ID-префиксы для generate_next_id
@@ -459,6 +480,12 @@ _ID_PREFIXES: dict[str, str] = {
     "commercial_milestone_templates": "PMT",
     "payment_obligations":            "POB",
     "payment_transactions":           "PTXN",
+    # Phase 40C (ADR-023): checked against every existing prefix above —
+    # no collisions. Two identity prefixes share this one registry:
+    # OFR-NNN (Commercial Offer, per version row) and OFS-NNN (Offer
+    # Series) — generate_next_id() is called with an explicit prefix
+    # override for OFS since both identities live in the same sheet.
+    "commercial_offers":              "OFR",
 }
 
 

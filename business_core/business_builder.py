@@ -5818,3 +5818,873 @@ def update_payment_transaction_admin_fields(payment_transaction_id: str, updates
         payment_transaction_id=payment_transaction_id, business_id=txn.get("Business ID", ""),
         payment_obligation_id=txn.get("Payment Obligation ID", ""), changed=result.get("changed", False), retry_safe=True,
     )
+
+
+# ─────────────────────────────────────────────────────────────
+# Phase 40C (ADR-023): Commercial Offer Domain orchestration.
+#
+# business_builder.py is the sole cross-domain Commercial Offer
+# orchestration owner: amount/currency/date/snapshot normalization,
+# relation validation, Offer creation, revision, lifecycle transitions,
+# latest-version/branching integrity, idempotency zero/one/multiple
+# handling, structured result assembly. business_core.offer_manager.py
+# (persistence) is called from here — never the reverse. No Telegram
+# caller exists yet (Phase 40D); nothing here is called by
+# telegram_handlers.py in this phase. Payment Domain (payment_manager.py,
+# business_builder's own Payment orchestration section) is never
+# imported or modified by any function below — Commercial Offer amount/
+# currency codes are entirely Offer-local, never Payment codes
+# (ADR-023 §10).
+# ─────────────────────────────────────────────────────────────
+
+from datetime import date as _date
+
+_OFFER_CURRENCY_CODE_RE = re.compile(r"^[A-Z]{3}$")
+_OFFER_TITLE_MAX_LENGTH = 300
+_OFFER_SCOPE_MAX_LENGTH = 10000
+
+_COMMERCIAL_OFFER_ORDINARY_TRANSITIONS: dict[str, tuple[str, ...]] = {
+    "draft":     ("draft", "sent", "cancelled", "archived"),
+    "sent":      ("sent", "accepted", "rejected", "expired", "cancelled", "archived"),
+    "accepted":  ("accepted", "archived"),
+    "rejected":  ("rejected", "archived"),
+    "expired":   ("expired", "archived"),
+    "cancelled": ("cancelled", "archived"),
+    "archived":  ("archived",),
+}
+
+
+def _offer_result(
+    *, ok: bool, code: str, error: str | None,
+    commercial_offer_id: str = "", offer_series_id: str = "", previous_commercial_offer_id: str = "",
+    version_number: int = 0,
+    business_id: str = "", client_id: str = "", object_id: str = "", service_id: str = "",
+    roadmap_id: str = "", document_id: str = "",
+    amount: str = "", currency: str = "", valid_until: str = "",
+    previous_status: str = "", requested_status: str = "", final_status: str = "",
+    created: bool = False, reused: bool = False, changed: bool = False, revised: bool = False,
+    sent: bool = False, accepted: bool = False, rejected: bool = False,
+    expired: bool = False, cancelled: bool = False, archived: bool = False,
+    conflicting_ids: tuple = (), warnings: tuple = (), retry_safe: bool = True,
+) -> dict:
+    """Shared result-builder for every Commercial Offer orchestration
+    function (ADR-023 §30) — the stable, structured contract every
+    caller reads instead of a bare exception or ad-hoc dict shape.
+    Never carries a raw exception object or a raw Sheets row."""
+    return {
+        "ok": ok, "code": code, "error": error,
+        "commercial_offer_id": commercial_offer_id, "offer_series_id": offer_series_id,
+        "previous_commercial_offer_id": previous_commercial_offer_id, "version_number": version_number,
+        "business_id": business_id, "client_id": client_id, "object_id": object_id, "service_id": service_id,
+        "roadmap_id": roadmap_id, "document_id": document_id,
+        "amount": amount, "currency": currency, "valid_until": valid_until,
+        "previous_status": previous_status, "requested_status": requested_status, "final_status": final_status,
+        "created": created, "reused": reused, "changed": changed, "revised": revised,
+        "sent": sent, "accepted": accepted, "rejected": rejected,
+        "expired": expired, "cancelled": cancelled, "archived": archived,
+        "conflicting_ids": tuple(conflicting_ids), "warnings": tuple(warnings), "retry_safe": retry_safe,
+    }
+
+
+def normalize_commercial_offer_amount(raw) -> dict:
+    """
+    Phase 40C (ADR-023 §10): Offer-local canonical Decimal amount
+    normalization — deliberately not calling business_builder.
+    normalize_payment_amount() so that Commercial Offer never emits a
+    Payment-domain code (ADR-023 §7's explicit requirement). Same
+    Decimal discipline as Payment: float rejected, canonical 2-
+    fractional-digit string, no scientific notation, no thousands
+    separators, no silent rounding.
+
+    Returns:
+        {"ok": bool, "code": str, "error": str | None, "amount": Decimal | None, "normalized": str}
+    """
+    if isinstance(raw, float):
+        return {"ok": False, "code": "INVALID_COMMERCIAL_OFFER_AMOUNT", "error": "Сумма не может быть float — используйте Decimal или строку", "amount": None, "normalized": ""}
+    if raw is None or raw == "":
+        return {"ok": False, "code": "INVALID_COMMERCIAL_OFFER_AMOUNT", "error": "Сумма обязательна", "amount": None, "normalized": ""}
+
+    text = str(raw).strip()
+    if not text:
+        return {"ok": False, "code": "INVALID_COMMERCIAL_OFFER_AMOUNT", "error": "Сумма обязательна", "amount": None, "normalized": ""}
+    if "," in text:
+        return {"ok": False, "code": "INVALID_COMMERCIAL_OFFER_AMOUNT", "error": "Сумма не может содержать разделители тысяч (',')", "amount": None, "normalized": ""}
+    if "e" in text.lower():
+        return {"ok": False, "code": "INVALID_COMMERCIAL_OFFER_AMOUNT", "error": "Сумма не может использовать экспоненциальную запись", "amount": None, "normalized": ""}
+
+    try:
+        value = Decimal(text)
+    except InvalidOperation:
+        return {"ok": False, "code": "INVALID_COMMERCIAL_OFFER_AMOUNT", "error": f"Не удаётся разобрать сумму '{raw}'", "amount": None, "normalized": ""}
+
+    exponent = value.as_tuple().exponent
+    if isinstance(exponent, int) and exponent < -2:
+        return {"ok": False, "code": "INVALID_COMMERCIAL_OFFER_AMOUNT_SCALE", "error": "Сумма не может иметь более 2 знаков после запятой", "amount": None, "normalized": ""}
+
+    if value <= 0:
+        return {"ok": False, "code": "COMMERCIAL_OFFER_AMOUNT_MUST_BE_POSITIVE", "error": "Сумма должна быть больше нуля", "amount": None, "normalized": ""}
+
+    quantized = value.quantize(Decimal("0.01"))
+    return {"ok": True, "code": "", "error": None, "amount": quantized, "normalized": str(quantized)}
+
+
+def normalize_commercial_offer_currency(raw) -> dict:
+    """Phase 40C (ADR-023 §11): Offer-local currency normalization.
+    Required, uppercased, exactly 3 ASCII letters — same shape as
+    Payment's, deliberately not shared, to keep Offer-specific codes."""
+    if raw is None:
+        return {"ok": False, "code": "INVALID_COMMERCIAL_OFFER_CURRENCY", "error": "Валюта обязательна", "currency": ""}
+    text = str(raw).strip().upper()
+    if not text:
+        return {"ok": False, "code": "INVALID_COMMERCIAL_OFFER_CURRENCY", "error": "Валюта обязательна", "currency": ""}
+    if not _OFFER_CURRENCY_CODE_RE.match(text):
+        return {"ok": False, "code": "INVALID_COMMERCIAL_OFFER_CURRENCY", "error": f"Недопустимый код валюты '{raw}' — требуется 3 буквы ASCII в верхнем регистре", "currency": ""}
+    return {"ok": True, "code": "", "error": None, "currency": text}
+
+
+def normalize_commercial_offer_valid_until(raw, *, reference_date: _date | None = None) -> dict:
+    """
+    Phase 40C (ADR-023 §9): deterministic ISO date validation for
+    Valid Until. `reference_date` may be injected for deterministic
+    tests; defaults to today (UTC date) otherwise. Must not be earlier
+    than the reference date — same-day is allowed.
+
+    Returns:
+        {"ok": bool, "code": str, "error": str | None, "valid_until": str}
+    """
+    if not raw:
+        return {"ok": False, "code": "INVALID_COMMERCIAL_OFFER_VALID_UNTIL", "error": "valid_until обязателен", "valid_until": ""}
+    text = str(raw).strip()
+    try:
+        parsed = datetime.strptime(text, "%Y-%m-%d").date()
+    except ValueError:
+        return {"ok": False, "code": "INVALID_COMMERCIAL_OFFER_VALID_UNTIL", "error": f"Некорректная дата '{raw}' — требуется формат YYYY-MM-DD", "valid_until": ""}
+
+    from datetime import timezone as _timezone
+    today = reference_date or datetime.now(_timezone.utc).date()
+    if parsed < today:
+        return {"ok": False, "code": "COMMERCIAL_OFFER_VALID_UNTIL_IN_PAST", "error": f"valid_until ({text}) не может быть раньше сегодняшней даты ({today.isoformat()})", "valid_until": ""}
+
+    return {"ok": True, "code": "", "error": None, "valid_until": text}
+
+
+def _validate_commercial_offer_snapshots(title_snapshot: str, scope_snapshot: str) -> dict:
+    """Phase 40C (ADR-023 §10): Title/Scope Snapshot required, trimmed,
+    bounded length. Never logs Scope Snapshot content — callers must
+    only ever log length/presence, never the text itself."""
+    title = (title_snapshot or "").strip()
+    scope = (scope_snapshot or "").strip()
+
+    if not title:
+        return {"ok": False, "code": "COMMERCIAL_OFFER_TITLE_REQUIRED", "error": "title_snapshot обязателен", "title": "", "scope": ""}
+    if len(title) > _OFFER_TITLE_MAX_LENGTH:
+        return {"ok": False, "code": "COMMERCIAL_OFFER_TITLE_REQUIRED", "error": f"title_snapshot превышает {_OFFER_TITLE_MAX_LENGTH} символов", "title": "", "scope": ""}
+    if not scope:
+        return {"ok": False, "code": "COMMERCIAL_OFFER_SCOPE_REQUIRED", "error": "scope_snapshot обязателен", "title": "", "scope": ""}
+    if len(scope) > _OFFER_SCOPE_MAX_LENGTH:
+        return {"ok": False, "code": "COMMERCIAL_OFFER_SCOPE_REQUIRED", "error": f"scope_snapshot превышает {_OFFER_SCOPE_MAX_LENGTH} символов", "title": "", "scope": ""}
+
+    return {"ok": True, "code": "", "error": None, "title": title, "scope": scope}
+
+
+def _validate_commercial_offer_relations(
+    business_id: str, client_id: str,
+    *, object_id: str = "", service_id: str = "", roadmap_id: str = "", offer_document_id: str = "",
+) -> dict:
+    """
+    Phase 40C (ADR-023 §11): canonical cross-domain Commercial Offer
+    relation-validation path, all before any write. At least one of
+    Object/Service/Roadmap is required (COMMERCIAL_OFFER_CONTEXT_
+    REQUIRED otherwise) — an Offer with only Business+Client has no
+    commercial context. Resolution mirrors _validate_payment_
+    obligation_relations() exactly, applied to Offer's own relation set.
+
+    Returns:
+        {"ok": bool, "code": str, "error": str | None, "resolved": dict | None}
+    """
+    from business_core.sheets import read_business_sheet
+
+    if not business_id:
+        return {"ok": False, "code": "BUSINESS_NOT_FOUND", "error": "business_id обязателен", "resolved": None}
+    biz_rows = read_business_sheet("biz_registry")
+    if not any(b.get("ID", "") == business_id for b in biz_rows):
+        return {"ok": False, "code": "BUSINESS_NOT_FOUND", "error": f"Business {business_id} не найден", "resolved": None}
+
+    if not client_id:
+        return {"ok": False, "code": "CLIENT_NOT_FOUND", "error": "client_id обязателен", "resolved": None}
+    from business_core.person_manager import find_person_by_id, is_person_archived, is_client_person, has_person_business_link
+    client = find_person_by_id(client_id)
+    if client is None:
+        return {"ok": False, "code": "CLIENT_NOT_FOUND", "error": f"Client {client_id} не найден", "resolved": None}
+    if is_person_archived(client):
+        return {"ok": False, "code": "CLIENT_NOT_FOUND", "error": f"Client {client_id} архивирован", "resolved": None}
+    if not is_client_person(client):
+        return {"ok": False, "code": "CLIENT_NOT_FOUND", "error": f"{client_id} не является Client", "resolved": None}
+    if not has_person_business_link(client, business_id):
+        return {"ok": False, "code": "COMMERCIAL_OFFER_RELATION_MISMATCH", "error": f"Client {client_id} не связан с Business {business_id}", "resolved": None}
+
+    if not (object_id or service_id or roadmap_id):
+        return {"ok": False, "code": "COMMERCIAL_OFFER_CONTEXT_REQUIRED", "error": "Требуется хотя бы одно: object_id, service_id или roadmap_id", "resolved": None}
+
+    resolved_object_id = object_id
+    resolved_service_id = service_id
+    resolved_roadmap_id = roadmap_id
+
+    if resolved_roadmap_id:
+        roadmaps = read_business_sheet("roadmaps")
+        rm = next((r for r in roadmaps if r.get("Roadmap ID", "") == resolved_roadmap_id), None)
+        if rm is None:
+            return {"ok": False, "code": "ROADMAP_NOT_FOUND", "error": f"Roadmap {resolved_roadmap_id} не найден", "resolved": None}
+        rm_biz_id = rm.get("Business ID", "")
+        if rm_biz_id and rm_biz_id != business_id:
+            return {
+                "ok": False, "code": "COMMERCIAL_OFFER_RELATION_MISMATCH",
+                "error": f"Roadmap {resolved_roadmap_id} принадлежит бизнесу {rm_biz_id}, а указан Business {business_id}",
+                "resolved": None,
+            }
+        rm_object_id = rm.get("Object ID", "")
+        if resolved_object_id and rm_object_id and resolved_object_id != rm_object_id:
+            return {
+                "ok": False, "code": "COMMERCIAL_OFFER_RELATION_MISMATCH",
+                "error": f"Roadmap {resolved_roadmap_id} связан с Object {rm_object_id}, а указан Object {resolved_object_id}",
+                "resolved": None,
+            }
+        resolved_object_id = resolved_object_id or rm_object_id
+        rm_service_id = rm.get("Service ID", "")
+        if resolved_service_id and rm_service_id and resolved_service_id != rm_service_id:
+            return {
+                "ok": False, "code": "COMMERCIAL_OFFER_RELATION_MISMATCH",
+                "error": f"Roadmap {resolved_roadmap_id} связан с Service {rm_service_id}, а указан Service {resolved_service_id}",
+                "resolved": None,
+            }
+        resolved_service_id = resolved_service_id or rm_service_id
+
+    if resolved_object_id:
+        from business_core.object_manager import find_object_by_id
+        obj = find_object_by_id(resolved_object_id)
+        if obj is None:
+            return {"ok": False, "code": "OBJECT_NOT_FOUND", "error": f"Object {resolved_object_id} не найден", "resolved": None}
+        obj_biz_id = obj.get("biz_id", "")
+        if obj_biz_id and obj_biz_id != business_id:
+            return {
+                "ok": False, "code": "COMMERCIAL_OFFER_RELATION_MISMATCH",
+                "error": f"Object {resolved_object_id} принадлежит бизнесу {obj_biz_id}, а указан Business {business_id}",
+                "resolved": None,
+            }
+
+    if resolved_service_id:
+        from business_core.service_manager import find_service_by_id
+        svc = find_service_by_id(resolved_service_id)
+        if svc is None:
+            return {"ok": False, "code": "SERVICE_NOT_FOUND", "error": f"Service {resolved_service_id} не найден", "resolved": None}
+        svc_biz_id = svc.get("biz_id", "")
+        if svc_biz_id and svc_biz_id != business_id:
+            return {
+                "ok": False, "code": "COMMERCIAL_OFFER_RELATION_MISMATCH",
+                "error": f"Service {resolved_service_id} принадлежит бизнесу {svc_biz_id}, а указан Business {business_id}",
+                "resolved": None,
+            }
+
+    if offer_document_id:
+        from business_core.document_manager import find_document_by_id
+        doc = find_document_by_id(offer_document_id)
+        if doc is None:
+            return {"ok": False, "code": "DOCUMENT_NOT_FOUND", "error": f"Document {offer_document_id} не найден", "resolved": None}
+        if doc.get("business_id", "") != business_id:
+            return {
+                "ok": False, "code": "COMMERCIAL_OFFER_RELATION_MISMATCH",
+                "error": f"Document {offer_document_id} принадлежит другому Business",
+                "resolved": None,
+            }
+
+    return {
+        "ok": True, "code": "", "error": None,
+        "resolved": {
+            "business_id": business_id, "client_id": client_id,
+            "object_id": resolved_object_id, "service_id": resolved_service_id,
+            "roadmap_id": resolved_roadmap_id, "offer_document_id": offer_document_id,
+        },
+    }
+
+
+def create_commercial_offer(
+    business_id: str, client_id: str, title_snapshot: str, scope_snapshot: str,
+    quoted_amount, currency: str, valid_until: str,
+    *, object_id: str = "", service_id: str = "", roadmap_id: str = "",
+    offer_document_id: str = "", caller_idempotency_key: str = "",
+    created_by: str = "", notes: str = "",
+) -> dict:
+    """
+    Phase 40C (ADR-023 §12/§13): the sole canonical Commercial Offer
+    creation orchestration boundary — always creates Version 1 of a
+    new Offer Series.
+
+    Validation order, all before any write:
+      A. required inputs
+      B. amount/currency/date/snapshot normalization
+      C. relation validation (Business/Client/context/Document)
+      D. idempotency lookup (zero/one/multiple)
+      E. Offer Series ID + Commercial Offer ID generated only after A-D pass
+      F. low-level persistence
+      G. post-write verification
+      H. structured result
+    """
+    from business_core.offer_manager import (
+        find_commercial_offers_by_idempotency_key, generate_next_series_id,
+        create_commercial_offer as om_create_offer, find_commercial_offer_by_id,
+    )
+
+    if not business_id:
+        return _offer_result(ok=False, code="BUSINESS_NOT_FOUND", error="business_id обязателен")
+    if not client_id:
+        return _offer_result(ok=False, code="CLIENT_NOT_FOUND", error="client_id обязателен", business_id=business_id)
+    if not caller_idempotency_key:
+        return _offer_result(ok=False, code="COMMERCIAL_OFFER_IDEMPOTENCY_REQUIRED", error="caller_idempotency_key обязателен", business_id=business_id, client_id=client_id)
+
+    amount_result = normalize_commercial_offer_amount(quoted_amount)
+    if not amount_result["ok"]:
+        return _offer_result(ok=False, code=amount_result["code"], error=amount_result["error"], business_id=business_id, client_id=client_id)
+    normalized_amount = amount_result["normalized"]
+
+    currency_result = normalize_commercial_offer_currency(currency)
+    if not currency_result["ok"]:
+        return _offer_result(ok=False, code=currency_result["code"], error=currency_result["error"], business_id=business_id, client_id=client_id)
+    normalized_currency = currency_result["currency"]
+
+    valid_until_result = normalize_commercial_offer_valid_until(valid_until)
+    if not valid_until_result["ok"]:
+        return _offer_result(ok=False, code=valid_until_result["code"], error=valid_until_result["error"], business_id=business_id, client_id=client_id)
+    normalized_valid_until = valid_until_result["valid_until"]
+
+    snapshot_result = _validate_commercial_offer_snapshots(title_snapshot, scope_snapshot)
+    if not snapshot_result["ok"]:
+        return _offer_result(ok=False, code=snapshot_result["code"], error=snapshot_result["error"], business_id=business_id, client_id=client_id)
+    normalized_title = snapshot_result["title"]
+    normalized_scope = snapshot_result["scope"]
+
+    relation_result = _validate_commercial_offer_relations(
+        business_id, client_id, object_id=object_id, service_id=service_id,
+        roadmap_id=roadmap_id, offer_document_id=offer_document_id,
+    )
+    if not relation_result["ok"]:
+        return _offer_result(ok=False, code=relation_result["code"], error=relation_result["error"], business_id=business_id, client_id=client_id)
+    resolved = relation_result["resolved"]
+
+    matches = find_commercial_offers_by_idempotency_key(business_id, caller_idempotency_key)
+    if len(matches) > 1:
+        conflicting_ids = tuple(m["Commercial Offer ID"] for m in matches)
+        return _offer_result(
+            ok=False, code="MULTIPLE_COMMERCIAL_OFFER_MATCHES",
+            error=f"Найдено несколько Commercial Offer с этим ключом: {conflicting_ids}",
+            business_id=business_id, client_id=client_id, conflicting_ids=conflicting_ids, retry_safe=True,
+        )
+    if len(matches) == 1:
+        existing = matches[0]
+        return _offer_result(
+            ok=True, code="COMMERCIAL_OFFER_REUSED", error=None,
+            commercial_offer_id=existing["Commercial Offer ID"], offer_series_id=existing.get("Offer Series ID", ""),
+            version_number=int(existing.get("Version Number") or 0),
+            business_id=business_id, client_id=client_id,
+            object_id=existing.get("Object ID", ""), service_id=existing.get("Service ID", ""),
+            roadmap_id=existing.get("Roadmap ID", ""), document_id=existing.get("Offer Document ID", ""),
+            amount=existing.get("Quoted Amount", ""), currency=existing.get("Currency", ""),
+            valid_until=existing.get("Valid Until", ""),
+            final_status=existing.get("Status", ""), reused=True, retry_safe=True,
+        )
+
+    series_id = generate_next_series_id()
+
+    create_result = om_create_offer(
+        series_id, "", 1, business_id, client_id, normalized_title, normalized_scope,
+        normalized_amount, normalized_currency, normalized_valid_until,
+        object_id=resolved["object_id"], service_id=resolved["service_id"], roadmap_id=resolved["roadmap_id"],
+        offer_document_id=resolved["offer_document_id"], caller_idempotency_key=caller_idempotency_key,
+        created_by=created_by, notes=notes,
+    )
+    if not create_result["ok"]:
+        return _offer_result(ok=False, code="COMMERCIAL_OFFER_PERSISTENCE_FAILED", error=create_result.get("error"), business_id=business_id, client_id=client_id, retry_safe=True)
+    offer_id = create_result["commercial_offer_id"]
+
+    saved = find_commercial_offer_by_id(offer_id)
+    if saved is None:
+        return _offer_result(
+            ok=False, code="COMMERCIAL_OFFER_POST_WRITE_VERIFICATION_FAILED",
+            error="Commercial Offer записан, но проверка после записи не прошла",
+            commercial_offer_id=offer_id, offer_series_id=series_id, business_id=business_id, client_id=client_id, retry_safe=False,
+        )
+
+    return _offer_result(
+        ok=True, code="COMMERCIAL_OFFER_CREATED", error=None,
+        commercial_offer_id=offer_id, offer_series_id=series_id, version_number=1,
+        business_id=business_id, client_id=client_id,
+        object_id=resolved["object_id"], service_id=resolved["service_id"], roadmap_id=resolved["roadmap_id"],
+        document_id=resolved["offer_document_id"],
+        amount=normalized_amount, currency=normalized_currency, valid_until=normalized_valid_until,
+        final_status="draft", created=True, retry_safe=True,
+    )
+
+
+def revise_commercial_offer(
+    source_commercial_offer_id: str, caller_idempotency_key: str, created_by: str,
+    *, title_snapshot: str = "", scope_snapshot: str = "", quoted_amount=None,
+    currency: str = "", valid_until: str = "",
+    object_id: str = "", service_id: str = "", roadmap_id: str = "",
+    offer_document_id: str = "", notes: str = "",
+) -> dict:
+    """
+    Phase 40C (ADR-023 §16/§17/§19): the sole canonical Commercial
+    Offer revision orchestration boundary — creates version N+1 in the
+    same Offer Series from an existing (must be latest) version.
+    Branching is blocked: exactly one next version per current latest.
+    """
+    from business_core.offer_manager import (
+        find_commercial_offer_by_id, find_latest_commercial_offer_in_series,
+        find_commercial_offers_by_idempotency_key, list_commercial_offers_by_series,
+        create_commercial_offer as om_create_offer,
+    )
+
+    if not source_commercial_offer_id:
+        return _offer_result(ok=False, code="COMMERCIAL_OFFER_NOT_FOUND", error="source_commercial_offer_id обязателен")
+    if not caller_idempotency_key:
+        return _offer_result(ok=False, code="COMMERCIAL_OFFER_IDEMPOTENCY_REQUIRED", error="caller_idempotency_key обязателен")
+
+    source = find_commercial_offer_by_id(source_commercial_offer_id)
+    if source is None:
+        return _offer_result(ok=False, code="COMMERCIAL_OFFER_NOT_FOUND", error=f"Commercial Offer {source_commercial_offer_id} не найден")
+
+    business_id = source.get("Business ID", "")
+    series_id = source.get("Offer Series ID", "")
+
+    latest_result = find_latest_commercial_offer_in_series(series_id)
+    if not latest_result["ok"]:
+        return _offer_result(ok=False, code=latest_result["code"], error=latest_result["error"], business_id=business_id, offer_series_id=series_id)
+    latest = latest_result["offer"]
+    if latest["Commercial Offer ID"] != source_commercial_offer_id:
+        return _offer_result(
+            ok=False, code="COMMERCIAL_OFFER_NOT_LATEST_VERSION",
+            error=f"Commercial Offer {source_commercial_offer_id} не является последней версией серии {series_id}",
+            business_id=business_id, offer_series_id=series_id, commercial_offer_id=source_commercial_offer_id,
+        )
+
+    # Branching prevention: no other row may already reference this
+    # source as its Previous Commercial Offer ID.
+    siblings = [
+        r for r in list_commercial_offers_by_series(series_id)
+        if r.get("Previous Commercial Offer ID", "") == source_commercial_offer_id
+    ]
+    if siblings:
+        conflicting_ids = tuple(r["Commercial Offer ID"] for r in siblings)
+        return _offer_result(
+            ok=False, code="COMMERCIAL_OFFER_SERIES_INTEGRITY_ERROR",
+            error=f"Уже существует ревизия(и) от {source_commercial_offer_id}: {conflicting_ids}",
+            business_id=business_id, offer_series_id=series_id, conflicting_ids=conflicting_ids, retry_safe=True,
+        )
+
+    matches = find_commercial_offers_by_idempotency_key(business_id, caller_idempotency_key)
+    if len(matches) > 1:
+        conflicting_ids = tuple(m["Commercial Offer ID"] for m in matches)
+        return _offer_result(
+            ok=False, code="MULTIPLE_COMMERCIAL_OFFER_MATCHES",
+            error=f"Найдено несколько Commercial Offer с этим ключом: {conflicting_ids}",
+            business_id=business_id, offer_series_id=series_id, conflicting_ids=conflicting_ids, retry_safe=True,
+        )
+    if len(matches) == 1:
+        existing = matches[0]
+        return _offer_result(
+            ok=True, code="COMMERCIAL_OFFER_REUSED", error=None,
+            commercial_offer_id=existing["Commercial Offer ID"], offer_series_id=existing.get("Offer Series ID", ""),
+            previous_commercial_offer_id=existing.get("Previous Commercial Offer ID", ""),
+            version_number=int(existing.get("Version Number") or 0),
+            business_id=business_id, final_status=existing.get("Status", ""), reused=True, retry_safe=True,
+        )
+
+    final_title = title_snapshot if title_snapshot else source.get("Title Snapshot", "")
+    final_scope = scope_snapshot if scope_snapshot else source.get("Scope Snapshot", "")
+    final_amount_raw = quoted_amount if quoted_amount is not None else source.get("Quoted Amount", "")
+    final_currency_raw = currency if currency else source.get("Currency", "")
+    final_valid_until_raw = valid_until if valid_until else source.get("Valid Until", "")
+    final_object_id = object_id if object_id else source.get("Object ID", "")
+    final_service_id = service_id if service_id else source.get("Service ID", "")
+    final_roadmap_id = roadmap_id if roadmap_id else source.get("Roadmap ID", "")
+    final_document_id = offer_document_id if offer_document_id else source.get("Offer Document ID", "")
+
+    amount_result = normalize_commercial_offer_amount(final_amount_raw)
+    if not amount_result["ok"]:
+        return _offer_result(ok=False, code=amount_result["code"], error=amount_result["error"], business_id=business_id, offer_series_id=series_id)
+    normalized_amount = amount_result["normalized"]
+
+    currency_result = normalize_commercial_offer_currency(final_currency_raw)
+    if not currency_result["ok"]:
+        return _offer_result(ok=False, code=currency_result["code"], error=currency_result["error"], business_id=business_id, offer_series_id=series_id)
+    normalized_currency = currency_result["currency"]
+
+    valid_until_result = normalize_commercial_offer_valid_until(final_valid_until_raw)
+    if not valid_until_result["ok"]:
+        return _offer_result(ok=False, code=valid_until_result["code"], error=valid_until_result["error"], business_id=business_id, offer_series_id=series_id)
+    normalized_valid_until = valid_until_result["valid_until"]
+
+    snapshot_result = _validate_commercial_offer_snapshots(final_title, final_scope)
+    if not snapshot_result["ok"]:
+        return _offer_result(ok=False, code=snapshot_result["code"], error=snapshot_result["error"], business_id=business_id, offer_series_id=series_id)
+
+    relation_result = _validate_commercial_offer_relations(
+        business_id, source.get("Client ID", ""), object_id=final_object_id, service_id=final_service_id,
+        roadmap_id=final_roadmap_id, offer_document_id=final_document_id,
+    )
+    if not relation_result["ok"]:
+        return _offer_result(ok=False, code=relation_result["code"], error=relation_result["error"], business_id=business_id, offer_series_id=series_id)
+    resolved = relation_result["resolved"]
+
+    new_version = int(source.get("Version Number") or 0) + 1
+
+    create_result = om_create_offer(
+        series_id, source_commercial_offer_id, new_version, business_id, source.get("Client ID", ""),
+        snapshot_result["title"], snapshot_result["scope"], normalized_amount, normalized_currency, normalized_valid_until,
+        object_id=resolved["object_id"], service_id=resolved["service_id"], roadmap_id=resolved["roadmap_id"],
+        offer_document_id=resolved["offer_document_id"], caller_idempotency_key=caller_idempotency_key,
+        created_by=created_by, notes=notes,
+    )
+    if not create_result["ok"]:
+        return _offer_result(ok=False, code="COMMERCIAL_OFFER_PERSISTENCE_FAILED", error=create_result.get("error"), business_id=business_id, offer_series_id=series_id, retry_safe=True)
+    new_offer_id = create_result["commercial_offer_id"]
+
+    from business_core.offer_manager import find_commercial_offer_by_id as _find
+    saved = _find(new_offer_id)
+    if saved is None:
+        return _offer_result(
+            ok=False, code="COMMERCIAL_OFFER_POST_WRITE_VERIFICATION_FAILED",
+            error="Revision записана, но проверка после записи не прошла",
+            commercial_offer_id=new_offer_id, offer_series_id=series_id,
+            previous_commercial_offer_id=source_commercial_offer_id, business_id=business_id, retry_safe=False,
+        )
+
+    return _offer_result(
+        ok=True, code="COMMERCIAL_OFFER_REVISED", error=None,
+        commercial_offer_id=new_offer_id, offer_series_id=series_id,
+        previous_commercial_offer_id=source_commercial_offer_id, version_number=new_version,
+        business_id=business_id, client_id=source.get("Client ID", ""),
+        object_id=resolved["object_id"], service_id=resolved["service_id"], roadmap_id=resolved["roadmap_id"],
+        document_id=resolved["offer_document_id"],
+        amount=normalized_amount, currency=normalized_currency, valid_until=normalized_valid_until,
+        final_status="draft", created=True, revised=True, retry_safe=True,
+    )
+
+
+def _offer_latest_version_check(offer: dict) -> dict:
+    """Shared latest-version guard used by every lifecycle transition
+    that requires it (ADR-023 §20/§21/§22/§24)."""
+    from business_core.offer_manager import find_latest_commercial_offer_in_series
+
+    series_id = offer.get("Offer Series ID", "")
+    offer_id = offer.get("Commercial Offer ID", "")
+    latest_result = find_latest_commercial_offer_in_series(series_id)
+    if not latest_result["ok"]:
+        return latest_result
+    if latest_result["offer"]["Commercial Offer ID"] != offer_id:
+        return {"ok": False, "code": "COMMERCIAL_OFFER_NOT_LATEST_VERSION", "error": f"Commercial Offer {offer_id} не является последней версией серии {series_id}", "offer": None}
+    return {"ok": True, "code": "", "error": None, "offer": offer}
+
+
+def _transition_commercial_offer(
+    offer_id: str, target_status: str, *, require_latest: bool, actor_field: str = "", actor: str = "",
+    reason_field: str = "", reason: str = "", extra_status_kwargs: dict | None = None,
+) -> dict:
+    """Internal shared transition engine for send/accept/reject/expire/
+    cancel/archive — validates the transition matrix, actor/reason
+    requirements, and latest-version gating uniformly, then delegates
+    the actual write to offer_manager.update_commercial_offer_status()."""
+    from business_core.offer_manager import find_commercial_offer_by_id, update_commercial_offer_status
+
+    if not offer_id:
+        return _offer_result(ok=False, code="COMMERCIAL_OFFER_NOT_FOUND", error="offer_id обязателен")
+
+    offer = find_commercial_offer_by_id(offer_id)
+    if offer is None:
+        return _offer_result(ok=False, code="COMMERCIAL_OFFER_NOT_FOUND", error=f"Commercial Offer {offer_id} не найден", commercial_offer_id=offer_id)
+
+    business_id = offer.get("Business ID", "")
+    previous_status = offer.get("Status", "")
+
+    if target_status == previous_status:
+        return _offer_result(
+            ok=True, code="COMMERCIAL_OFFER_STATUS_UNCHANGED", error=None,
+            commercial_offer_id=offer_id, business_id=business_id,
+            previous_status=previous_status, requested_status=target_status, final_status=previous_status, changed=False,
+        )
+
+    allowed_targets = _COMMERCIAL_OFFER_ORDINARY_TRANSITIONS.get(previous_status, (previous_status,))
+    if target_status not in allowed_targets:
+        return _offer_result(
+            ok=False, code="INVALID_COMMERCIAL_OFFER_TRANSITION",
+            error=f"Переход '{previous_status}' → '{target_status}' не разрешён",
+            commercial_offer_id=offer_id, business_id=business_id,
+            previous_status=previous_status, requested_status=target_status, final_status=previous_status,
+        )
+
+    if actor_field and not actor:
+        return _offer_result(
+            ok=False, code="COMMERCIAL_OFFER_ACTOR_REQUIRED", error=f"{actor_field} обязателен",
+            commercial_offer_id=offer_id, business_id=business_id,
+            previous_status=previous_status, requested_status=target_status, final_status=previous_status,
+        )
+    if reason_field == "Rejection Reason" and not reason:
+        return _offer_result(
+            ok=False, code="COMMERCIAL_OFFER_REJECTION_REASON_REQUIRED", error="rejection_reason обязателен",
+            commercial_offer_id=offer_id, business_id=business_id,
+            previous_status=previous_status, requested_status=target_status, final_status=previous_status,
+        )
+    if reason_field == "Cancellation Reason" and not reason:
+        return _offer_result(
+            ok=False, code="COMMERCIAL_OFFER_CANCELLATION_REASON_REQUIRED", error="cancellation_reason обязателен",
+            commercial_offer_id=offer_id, business_id=business_id,
+            previous_status=previous_status, requested_status=target_status, final_status=previous_status,
+        )
+
+    if require_latest:
+        latest_check = _offer_latest_version_check(offer)
+        if not latest_check["ok"]:
+            return _offer_result(
+                ok=False, code=latest_check["code"], error=latest_check["error"],
+                commercial_offer_id=offer_id, business_id=business_id,
+                previous_status=previous_status, requested_status=target_status, final_status=previous_status,
+            )
+
+    now = _now_utc_str()
+    status_kwargs = dict(extra_status_kwargs or {})
+    write_result = update_commercial_offer_status(offer_id, target_status, **status_kwargs)
+    if not write_result["ok"]:
+        return _offer_result(
+            ok=False, code=write_result.get("code") or "COMMERCIAL_OFFER_PERSISTENCE_FAILED", error=write_result.get("error"),
+            commercial_offer_id=offer_id, business_id=business_id,
+            previous_status=previous_status, requested_status=target_status, final_status=previous_status,
+        )
+
+    changed = write_result["changed"]
+    return _offer_result(
+        ok=True, code="COMMERCIAL_OFFER_STATUS_UPDATED" if changed else "COMMERCIAL_OFFER_STATUS_UNCHANGED", error=None,
+        commercial_offer_id=offer_id, business_id=business_id,
+        previous_status=previous_status, requested_status=target_status, final_status=target_status, changed=changed,
+    )
+
+
+def send_commercial_offer(offer_id: str, sent_by: str) -> dict:
+    """Phase 40C (ADR-023 §20): the sole canonical draft→sent orchestration
+    boundary. Only draft may become sent; latest-version required."""
+    now = _now_utc_str()
+    result = _transition_commercial_offer(
+        offer_id, "sent", require_latest=True,
+        actor_field="sent_by", actor=sent_by,
+        extra_status_kwargs={"sent_at": now, "sent_by": sent_by},
+    )
+    if result["ok"] and result["changed"] and result["final_status"] == "sent":
+        result["code"] = "COMMERCIAL_OFFER_SENT"
+        result["sent"] = True
+    return result
+
+
+def accept_commercial_offer(offer_id: str, accepted_by: str) -> dict:
+    """Phase 40C (ADR-023 §21): the sole canonical sent→accepted
+    orchestration boundary. Never creates a Payment Obligation, never
+    mutates Roadmap/Stage/Service/Document/Payment — acceptance is
+    purely a Commercial Offer lifecycle fact."""
+    now = _now_utc_str()
+    result = _transition_commercial_offer(
+        offer_id, "accepted", require_latest=True,
+        actor_field="accepted_by", actor=accepted_by,
+        extra_status_kwargs={"accepted_at": now, "accepted_by": accepted_by},
+    )
+    if result["ok"] and result["changed"] and result["final_status"] == "accepted":
+        result["code"] = "COMMERCIAL_OFFER_ACCEPTED"
+        result["accepted"] = True
+    return result
+
+
+def reject_commercial_offer(offer_id: str, rejected_by: str, rejection_reason: str) -> dict:
+    """Phase 40C (ADR-023 §22): the sole canonical sent→rejected
+    orchestration boundary. rejection_reason is never logged by this
+    function — only passed through to persistence."""
+    now = _now_utc_str()
+    result = _transition_commercial_offer(
+        offer_id, "rejected", require_latest=True,
+        actor_field="rejected_by", actor=rejected_by,
+        reason_field="Rejection Reason", reason=rejection_reason,
+        extra_status_kwargs={"rejected_at": now, "rejected_by": rejected_by, "rejection_reason": rejection_reason},
+    )
+    if result["ok"] and result["changed"] and result["final_status"] == "rejected":
+        result["code"] = "COMMERCIAL_OFFER_REJECTED"
+        result["rejected"] = True
+    return result
+
+
+def expire_commercial_offer(offer_id: str) -> dict:
+    """Phase 40C (ADR-023 §23): the sole canonical sent→expired
+    orchestration boundary — explicit transition only, never a
+    background/scheduled mutation."""
+    now = _now_utc_str()
+    result = _transition_commercial_offer(
+        offer_id, "expired", require_latest=True,
+        extra_status_kwargs={"expired_at": now},
+    )
+    if result["ok"] and result["changed"] and result["final_status"] == "expired":
+        result["code"] = "COMMERCIAL_OFFER_EXPIRED"
+        result["expired"] = True
+    return result
+
+
+def cancel_commercial_offer(offer_id: str, cancelled_by: str, cancellation_reason: str) -> dict:
+    """Phase 40C (ADR-023 §24): the sole canonical draft/sent→cancelled
+    orchestration boundary. accepted cannot be cancelled (blocked by
+    the transition matrix itself, since 'cancelled' is absent from
+    the accepted row's allowed targets). Latest-version is checked
+    unconditionally — trivially satisfied for an un-revised draft/sent
+    Offer, and correctly blocks cancellation of a version that has
+    since been superseded by a revision, whether draft or sent."""
+    now = _now_utc_str()
+    result = _transition_commercial_offer(
+        offer_id, "cancelled", require_latest=True,
+        actor_field="cancelled_by", actor=cancelled_by,
+        reason_field="Cancellation Reason", reason=cancellation_reason,
+        extra_status_kwargs={"cancelled_at": now, "cancelled_by": cancelled_by, "cancellation_reason": cancellation_reason},
+    )
+    if result["ok"] and result["changed"] and result["final_status"] == "cancelled":
+        result["code"] = "COMMERCIAL_OFFER_CANCELLED"
+        result["cancelled"] = True
+    return result
+
+
+def archive_commercial_offer(offer_id: str) -> dict:
+    """Phase 40C (ADR-023 §25): the sole canonical →archived
+    orchestration boundary. Terminal; no restore; no cascade."""
+    now = _now_utc_str()
+    result = _transition_commercial_offer(
+        offer_id, "archived", require_latest=False,
+        extra_status_kwargs={"archived_at": now},
+    )
+    if result["ok"] and result["changed"] and result["final_status"] == "archived":
+        result["code"] = "COMMERCIAL_OFFER_ARCHIVED"
+        result["archived"] = True
+    return result
+
+
+def update_commercial_offer_draft(offer_id: str, updates: dict) -> dict:
+    """
+    Phase 40C (ADR-023 §16/§26): the sole canonical draft-only
+    commercial-field update orchestration boundary. Revalidates every
+    supplied override exactly like creation does — amount/currency/
+    date/snapshot/relations — before persisting. Only permitted while
+    the Offer is still `draft`.
+    """
+    from business_core.offer_manager import find_commercial_offer_by_id, update_commercial_offer_draft_fields
+
+    if not offer_id:
+        return _offer_result(ok=False, code="COMMERCIAL_OFFER_NOT_FOUND", error="offer_id обязателен")
+
+    offer = find_commercial_offer_by_id(offer_id)
+    if offer is None:
+        return _offer_result(ok=False, code="COMMERCIAL_OFFER_NOT_FOUND", error=f"Commercial Offer {offer_id} не найден", commercial_offer_id=offer_id)
+
+    business_id = offer.get("Business ID", "")
+    current_status = offer.get("Status", "")
+    if current_status != "draft":
+        return _offer_result(
+            ok=False, code="COMMERCIAL_OFFER_IMMUTABLE",
+            error=f"Commercial Offer {offer_id} имеет статус '{current_status}' — коммерческие поля изменяемы только в draft",
+            commercial_offer_id=offer_id, business_id=business_id,
+        )
+
+    persisted_updates: dict = {}
+
+    if "Title Snapshot" in updates or "Scope Snapshot" in updates:
+        title = updates.get("Title Snapshot", offer.get("Title Snapshot", ""))
+        scope = updates.get("Scope Snapshot", offer.get("Scope Snapshot", ""))
+        snap_result = _validate_commercial_offer_snapshots(title, scope)
+        if not snap_result["ok"]:
+            return _offer_result(ok=False, code=snap_result["code"], error=snap_result["error"], commercial_offer_id=offer_id, business_id=business_id)
+        if "Title Snapshot" in updates:
+            persisted_updates["Title Snapshot"] = snap_result["title"]
+        if "Scope Snapshot" in updates:
+            persisted_updates["Scope Snapshot"] = snap_result["scope"]
+
+    if "Quoted Amount" in updates:
+        amount_result = normalize_commercial_offer_amount(updates["Quoted Amount"])
+        if not amount_result["ok"]:
+            return _offer_result(ok=False, code=amount_result["code"], error=amount_result["error"], commercial_offer_id=offer_id, business_id=business_id)
+        persisted_updates["Quoted Amount"] = amount_result["normalized"]
+
+    if "Currency" in updates:
+        currency_result = normalize_commercial_offer_currency(updates["Currency"])
+        if not currency_result["ok"]:
+            return _offer_result(ok=False, code=currency_result["code"], error=currency_result["error"], commercial_offer_id=offer_id, business_id=business_id)
+        persisted_updates["Currency"] = currency_result["currency"]
+
+    if "Valid Until" in updates:
+        valid_until_result = normalize_commercial_offer_valid_until(updates["Valid Until"])
+        if not valid_until_result["ok"]:
+            return _offer_result(ok=False, code=valid_until_result["code"], error=valid_until_result["error"], commercial_offer_id=offer_id, business_id=business_id)
+        persisted_updates["Valid Until"] = valid_until_result["valid_until"]
+
+    if any(k in updates for k in ("Object ID", "Service ID", "Roadmap ID", "Offer Document ID")):
+        relation_result = _validate_commercial_offer_relations(
+            business_id, offer.get("Client ID", ""),
+            object_id=updates.get("Object ID", offer.get("Object ID", "")),
+            service_id=updates.get("Service ID", offer.get("Service ID", "")),
+            roadmap_id=updates.get("Roadmap ID", offer.get("Roadmap ID", "")),
+            offer_document_id=updates.get("Offer Document ID", offer.get("Offer Document ID", "")),
+        )
+        if not relation_result["ok"]:
+            return _offer_result(ok=False, code=relation_result["code"], error=relation_result["error"], commercial_offer_id=offer_id, business_id=business_id)
+        for field in ("Object ID", "Service ID", "Roadmap ID", "Offer Document ID"):
+            if field in updates:
+                persisted_updates[field] = relation_result["resolved"][
+                    {"Object ID": "object_id", "Service ID": "service_id", "Roadmap ID": "roadmap_id", "Offer Document ID": "offer_document_id"}[field]
+                ]
+
+    if "Notes" in updates:
+        persisted_updates["Notes"] = updates["Notes"]
+
+    result = update_commercial_offer_draft_fields(offer_id, persisted_updates)
+    return _offer_result(
+        ok=result["ok"], code=result.get("code") or ("COMMERCIAL_OFFER_UPDATED" if result.get("changed") else "COMMERCIAL_OFFER_UPDATE_UNCHANGED"),
+        error=result.get("error"), commercial_offer_id=offer_id, business_id=business_id, changed=result.get("changed", False), retry_safe=True,
+    )
+
+
+def update_commercial_offer_admin_fields(offer_id: str, updates: dict) -> dict:
+    """Phase 40C (ADR-023 §27): thin resolve-then-delegate wrapper.
+    Only Notes is ordinarily mutable, in every status."""
+    from business_core.offer_manager import find_commercial_offer_by_id, update_commercial_offer_admin_fields as om_update_admin
+
+    if not offer_id:
+        return _offer_result(ok=False, code="COMMERCIAL_OFFER_NOT_FOUND", error="offer_id обязателен")
+
+    offer = find_commercial_offer_by_id(offer_id)
+    if offer is None:
+        return _offer_result(ok=False, code="COMMERCIAL_OFFER_NOT_FOUND", error=f"Commercial Offer {offer_id} не найден", commercial_offer_id=offer_id)
+
+    result = om_update_admin(offer_id, updates)
+    return _offer_result(
+        ok=result["ok"], code=result.get("code") or ("COMMERCIAL_OFFER_UPDATED" if result.get("changed") else "COMMERCIAL_OFFER_UPDATE_UNCHANGED"),
+        error=result.get("error"), commercial_offer_id=offer_id, business_id=offer.get("Business ID", ""),
+        changed=result.get("changed", False), retry_safe=True,
+    )
+
+
+def is_commercial_offer_effectively_expired(offer: dict, *, reference_date: _date | None = None) -> bool:
+    """
+    Phase 40C (ADR-023 §17/§29): stateless read-only helper — only
+    `sent` Offers with a past Valid Until are effectively expired.
+    Never writes, never mutates Status. accepted/rejected/cancelled/
+    archived never qualify, regardless of Valid Until.
+    """
+    if offer.get("Status", "") != "sent":
+        return False
+    valid_until_raw = offer.get("Valid Until", "")
+    if not valid_until_raw:
+        return False
+    try:
+        valid_until = datetime.strptime(valid_until_raw, "%Y-%m-%d").date()
+    except ValueError:
+        return False
+    from datetime import timezone as _timezone
+    today = reference_date or datetime.now(_timezone.utc).date()
+    return valid_until < today

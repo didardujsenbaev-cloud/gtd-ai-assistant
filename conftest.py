@@ -201,11 +201,21 @@ _PAYMENT_DOMAIN_TEST_FILES = frozenset({
     "test_payment_caller_ux.py",
 })
 
+# Phase 40C (ADR-023): Commercial Offer Domain Foundation — registered
+# BEFORE any test logic was written, per the PRS-003 precedent.
+_OFFER_DOMAIN_TEST_FILES = frozenset({
+    "test_offer_manager.py",
+    "test_business_offer_foundation.py",
+    "test_offer_architecture_guards.py",
+    "test_offer_mock_completeness.py",
+})
+
 _HARD_SOCKET_BLOCK_TEST_FILES = (
     _CLIENT_DOMAIN_TEST_FILES | _ROADMAP_DOMAIN_TEST_FILES
     | _ORGANIZATION_DOMAIN_TEST_FILES | _OTHER_HARDENED_TEST_FILES
     | _TASK_DOMAIN_TEST_FILES | _DOCUMENT_DOMAIN_TEST_FILES
     | _CHECKLIST_KNOWLEDGE_TEST_FILES | _PAYMENT_DOMAIN_TEST_FILES
+    | _OFFER_DOMAIN_TEST_FILES
 )
 
 
