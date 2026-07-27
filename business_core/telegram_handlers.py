@@ -3755,7 +3755,9 @@ def _document_relink_message(result: dict, document_id: str) -> str:
             f"Document ID: {document_id}",
             f"Roadmap ID: {result.get('roadmap_id', '') or '—'}",
             f"Stage ID: {result.get('stage_id', '') or '—'}",
-            "Drive File ID и Drive URL не изменились.",
+            f"Document Template ID: {result.get('document_template_id', '') or '—'}",
+            "Drive File ID, Drive URL, Document ID, Business/Client/Object ID, "
+            "Family ID и Version не изменились.",
         ])
 
     if code == "DOCUMENT_RELATION_UNCHANGED":
@@ -3774,12 +3776,16 @@ def _document_relink_message(result: dict, document_id: str) -> str:
     return f"❌ Ошибка ({code or 'unknown'}): {result.get('error') or 'см. логи'}"
 
 
-def _document_relink_preview_message(result: dict, document_id: str, old_roadmap_id: str, old_stage_id: str) -> str:
+def _document_relink_preview_message(
+    result: dict, document_id: str, old_roadmap_id: str, old_stage_id: str, old_document_template_id: str = "",
+) -> str:
     """Render the dry_run preview step of /updatedoc's relink mode —
-    shows old->new Roadmap/Stage and explicitly confirms Drive File ID/
-    URL will not change. Any validation failure (incompatible/missing
-    Stage, etc.) falls through to the same mapping the applied outcome
-    uses, so a bad request never silently looks like a valid preview."""
+    shows old->new Roadmap/Stage/Document Template ID and explicitly
+    confirms Drive File ID/URL/Document ID/Business/Client/Object ID/
+    Family ID/Version will not change. Any validation failure
+    (incompatible/missing Stage, unknown Document Template, etc.) falls
+    through to the same mapping the applied outcome uses, so a bad
+    request never silently looks like a valid preview."""
     if result.get("code") == "DOCUMENT_RELINK_PREVIEW":
         return "\n".join([
             "📋 Подтверди перепривязку Document:",
@@ -3787,8 +3793,11 @@ def _document_relink_preview_message(result: dict, document_id: str, old_roadmap
             f"Document ID: {document_id}",
             f"Roadmap ID — было: {old_roadmap_id or '—'} → станет: {result.get('roadmap_id', '') or '—'}",
             f"Stage ID — было: {old_stage_id or '—'} → станет: {result.get('stage_id', '') or '—'}",
+            f"Document Template ID — было: {old_document_template_id or '—'} → станет: "
+            f"{result.get('document_template_id', '') or '—'}",
             "",
-            "Drive File ID и Drive URL не изменятся.",
+            "Drive File ID, Drive URL, Document ID, Business/Client/Object ID, "
+            "Family ID и Version не изменятся.",
             "",
             "Чтобы применить, повтори команду с confirm=yes.",
         ])
@@ -4083,6 +4092,7 @@ async def updatedoc_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     /updatedoc document_id=DREG-001 status=under_review
     /updatedoc document_id=DREG-001 stage_id=STAGE-014
     /updatedoc document_id=DREG-001 roadmap_id=RM-... stage_id=STAGE-... confirm=yes
+    /updatedoc document_id=DREG-001 document_template_id=DOC-012 confirm=yes
 
     Phase 37E (ADR-020 §14/§15/§20): status and admin fields are never
     mixed in one call — mirrors /updatetask's Phase 36D foundation UX
@@ -4090,14 +4100,16 @@ async def updatedoc_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     single ambiguous write. No review fields, no Drive-field repair, no
     restore.
 
-    Relink mode (roadmap_id/stage_id only — narrow, audit-approved
-    scope): the first call (no confirm=yes) only validates and shows a
-    before/after preview via business_builder.relink_document(...,
-    dry_run=True) — nothing is written. Repeating the exact same call
-    with confirm=yes re-validates (staleness guard) and applies it.
-    Business ID/Client ID/Object ID/Document Template ID can never be
+    Relink mode (roadmap_id/stage_id/document_template_id only —
+    narrow, audit-approved scope): the first call (no confirm=yes) only
+    validates and shows a before/after preview via business_builder.
+    relink_document(..., dry_run=True) — nothing is written. Repeating
+    the exact same call with confirm=yes re-validates (staleness guard)
+    and applies it. Business ID/Client ID/Object ID can never be
     changed this way — passing any of them is an explicit, visible
-    rejection, never a silent no-op.
+    rejection, never a silent no-op. Document Template ID is a pure
+    classification field (no Drive-path implication like Object ID
+    has), so — unlike those three — it IS relinkable.
     """
     if not _is_bc_enabled():
         await _reply(update, _bc_disabled_msg())
@@ -4117,19 +4129,19 @@ async def updatedoc_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         )
         return
 
-    forbidden_relink_keys = ("business_id", "client_id", "object_id", "document_template_id")
+    forbidden_relink_keys = ("business_id", "client_id", "object_id")
     forbidden_present = [k for k in forbidden_relink_keys if k in args]
     if forbidden_present:
         forbidden_list = ", ".join(f"`{k}`" for k in forbidden_present)
         await _reply(
             update,
             f"❌ Изменение полей {forbidden_list} через /updatedoc не поддерживается.\n"
-            "Через relink можно менять только `roadmap_id` и `stage_id`.",
+            "Через relink можно менять только `roadmap_id`, `stage_id` и `document_template_id`.",
         )
         return
 
     admin_keys = {"name", "notes"}
-    relink_keys = {"roadmap_id", "stage_id"}
+    relink_keys = {"roadmap_id", "stage_id", "document_template_id"}
     has_status = "status" in args
     has_admin = any(k in args for k in admin_keys)
     has_relink = any(k in args for k in relink_keys)
@@ -4138,7 +4150,8 @@ async def updatedoc_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if modes_selected > 1:
         await _reply(
             update,
-            "❌ Нельзя одновременно менять статус, admin-поля и связи (`roadmap_id`/`stage_id`).\n"
+            "❌ Нельзя одновременно менять статус, admin-поля и связи "
+            "(`roadmap_id`/`stage_id`/`document_template_id`).\n"
             "Отправь отдельные команды:\n"
             "`/updatedoc document_id=... status=...`\n"
             '`/updatedoc document_id=... name="..." notes="..."`\n'
@@ -4147,7 +4160,11 @@ async def updatedoc_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     if modes_selected == 0:
-        await _reply(update, "❌ Укажи либо status=..., либо admin-поля (name/notes), либо `roadmap_id`/`stage_id` для перепривязки.")
+        await _reply(
+            update,
+            "❌ Укажи либо status=..., либо admin-поля (name/notes), либо "
+            "`roadmap_id`/`stage_id`/`document_template_id` для перепривязки.",
+        )
         return
 
     try:
@@ -4168,10 +4185,12 @@ async def updatedoc_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
             new_roadmap_id = args.get("roadmap_id")
             new_stage_id = args.get("stage_id")
+            new_document_template_id = args.get("document_template_id")
             confirmed = args.get("confirm", "").strip().lower() == "yes"
 
             result = relink_document(
-                document_id, roadmap_id=new_roadmap_id, stage_id=new_stage_id, dry_run=not confirmed,
+                document_id, roadmap_id=new_roadmap_id, stage_id=new_stage_id,
+                document_template_id=new_document_template_id, dry_run=not confirmed,
             )
             if confirmed:
                 await _reply(update, _document_relink_message(result, document_id))
@@ -4180,6 +4199,7 @@ async def updatedoc_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                     update,
                     _document_relink_preview_message(
                         result, document_id, document.get("roadmap_id", ""), document.get("stage_id", ""),
+                        document.get("document_template_id", ""),
                     ),
                 )
             return
@@ -4193,6 +4213,142 @@ async def updatedoc_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     except Exception as e:
         log.error(f"updatedoc_cmd error: {e}")
         await _reply(update, "❌ Не удалось обновить документ.")
+
+
+def _stage_knowledge_sync_message(result: dict) -> str:
+    """Render any business_builder.sync_stage_document_requirements()
+    result (both the dry_run preview and the applied outcome share this
+    mapping, except for the dedicated preview case handled by
+    _stage_knowledge_sync_preview_message() before falling back here)."""
+    code = result.get("code", "")
+    stage_id = result.get("stage_id", "")
+    template_stage_id = result.get("template_stage_id", "")
+
+    if code == "STAGE_KNOWLEDGE_SYNCED":
+        created = result.get("created", ())
+        already_present = result.get("already_present", ())
+        lines = [
+            "✅ Синхронизация выполнена",
+            f"Stage ID: {stage_id}",
+            f"Template Stage ID: {template_stage_id}",
+        ]
+        if created:
+            lines.append(f"Добавлено: {', '.join(created)}")
+        else:
+            lines.append("Добавлено: ничего (уже было синхронизировано).")
+        if already_present:
+            lines.append(f"Уже было: {', '.join(already_present)}")
+        lines.append(
+            "Статус, ответственный, сроки, приоритет и прогресс этапа не изменились. "
+            "Legacy-поле \"Document Template IDs\" не менялось."
+        )
+        return "\n".join(lines)
+
+    if code == "STAGE_NOT_FOUND":
+        return f"❌ Stage {stage_id} не найден."
+
+    if code == "ROADMAP_NOT_FOUND":
+        return f"❌ {result.get('error') or 'Roadmap не найден.'}"
+
+    if code == "ROADMAP_HAS_NO_TEMPLATE":
+        return f"❌ {result.get('error') or 'У Roadmap не определён Template ID.'}"
+
+    if code == "TEMPLATE_STAGE_NOT_FOUND":
+        return f"❌ {result.get('error') or 'Template Stage не найден.'}"
+
+    if code == "NO_DOCUMENT_TEMPLATE_RELATIONS":
+        return f"❌ {result.get('error') or 'У Template Stage нет document_template relations.'}"
+
+    if code == "UNSUPPORTED_RELATION_TYPE_ON_TEMPLATE_STAGE":
+        return f"❌ {result.get('error') or 'Template Stage содержит relations вне поддерживаемого типа.'}"
+
+    if code == "STAGE_KNOWLEDGE_SYNC_FAILED":
+        return f"❌ {result.get('error') or 'Не удалось синхронизировать.'}"
+
+    log.warning(f"_stage_knowledge_sync_message: unmapped code={code!r} stage_id={stage_id}")
+    return f"❌ Ошибка ({code or 'unknown'}): {result.get('error') or 'см. логи'}"
+
+
+def _stage_knowledge_sync_preview_message(result: dict) -> str:
+    """Render the dry_run preview step of /syncstageknowledge — shows
+    Stage ID, Template Stage ID, which Document Template IDs would be
+    added vs. are already present, and explicitly confirms Status/
+    Responsible/Due Date/Priority/Progress will not change. Any
+    resolution/validation failure falls through to the same mapping the
+    applied outcome uses, so a bad request never silently looks like a
+    valid preview."""
+    if result.get("code") == "STAGE_KNOWLEDGE_SYNC_PREVIEW":
+        to_add = result.get("to_add", ())
+        already_present = result.get("already_present", ())
+        lines = [
+            "📋 Подтверди синхронизацию document-template knowledge:",
+            "",
+            f"Stage ID: {result.get('stage_id', '')}",
+            f"Template Stage ID: {result.get('template_stage_id', '')}",
+            "",
+        ]
+        if to_add:
+            lines.append(f"Будет добавлено: {', '.join(to_add)}")
+        else:
+            lines.append("Будет добавлено: ничего — уже полностью синхронизировано.")
+        if already_present:
+            lines.append(f"Уже привязано: {', '.join(already_present)}")
+        lines.append("")
+        lines.append(
+            "Статус, ответственный, сроки, приоритет и прогресс этапа не изменятся. "
+            "Legacy-поле \"Document Template IDs\" меняться не будет."
+        )
+        lines.append("")
+        lines.append("Чтобы применить, повтори команду с confirm=yes.")
+        return "\n".join(lines)
+    return _stage_knowledge_sync_message(result)
+
+
+async def syncstageknowledge_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /syncstageknowledge stage_id=STAGE-014
+    /syncstageknowledge stage_id=STAGE-014 confirm=yes
+
+    Retroactively syncs document_template requirements from the
+    Template Stage a Stage was created from, into that already-existing
+    Stage — for the case where /linkknowledge added a document_template
+    relation to the Template Stage AFTER the real Stage had already
+    been instantiated, so the one-time creation-time copy never saw it.
+
+    Narrow, audit-approved scope: only Entity Type "document_template"
+    via business_builder.sync_stage_document_requirements(); SOP/
+    Checklist/Materials/FAQ IDs and the legacy ROADMAP_STAGES."Document
+    Template IDs" column are never touched. Same preview/confirm shape
+    as /updatedoc's relink mode: the first call (no confirm=yes) only
+    resolves and previews via dry_run=True — nothing is written.
+    Repeating the exact same call with confirm=yes re-validates
+    (staleness guard) and applies it.
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg())
+        return
+
+    raw = " ".join(context.args or [])
+    args = _parse_kv_args(raw)
+    stage_id = args.get("stage_id") or args.get("_pos0", "")
+
+    if not stage_id:
+        await _reply(update, "❌ Укажи stage_id.\n\nПример: `/syncstageknowledge stage_id=STAGE-014`")
+        return
+
+    confirmed = args.get("confirm", "").strip().lower() == "yes"
+
+    try:
+        from business_core.business_builder import sync_stage_document_requirements
+
+        result = sync_stage_document_requirements(stage_id, dry_run=not confirmed)
+        if confirmed:
+            await _reply(update, _stage_knowledge_sync_message(result))
+        else:
+            await _reply(update, _stage_knowledge_sync_preview_message(result))
+    except Exception as e:
+        log.error(f"syncstageknowledge_cmd error: {e}")
+        await _reply(update, "❌ Не удалось синхронизировать knowledge этапа.")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -11500,6 +11656,7 @@ def register_business_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("doc", doc_cmd))
     app.add_handler(CommandHandler("docs4stage", docs4stage_cmd))
     app.add_handler(CommandHandler("updatedoc", updatedoc_cmd))
+    app.add_handler(CommandHandler("syncstageknowledge", syncstageknowledge_cmd))
 
     # Phase 15B: Telegram Document Upload Foundation
     app.add_handler(ConversationHandler(

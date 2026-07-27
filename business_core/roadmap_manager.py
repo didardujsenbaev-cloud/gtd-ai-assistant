@@ -1235,6 +1235,90 @@ def find_stage_by_id(stage_id: str) -> Optional[dict]:
         return None
 
 
+def resolve_template_stage_for_stage(stage_id: str) -> dict:
+    """
+    Read-only: derive which ROADMAP_TEMPLATE_STAGES row an already-
+    created ROADMAP_STAGES row was (or would have been) created from,
+    by joining Stage -> Roadmap -> Template ID -> Order.
+
+    This is the exact same join business_builder.create_roadmap_for_object()
+    already performs at Stage-creation time (its local
+    order_to_template_stage_id map, built from find_template_stages()'s
+    "order" field) — extracted here as a reusable read-only primitive so
+    a later retroactive sync can ask "what template stage does this
+    already-existing stage correspond to" without re-deriving the join
+    inline a second time.
+
+    Never writes anything. Order is the join key (same key
+    ensure_roadmap_stages() itself uses for stage-creation idempotency)
+    — a Stage ID is never stored on ROADMAP_TEMPLATE_STAGES rows and a
+    Template Stage ID is never stored on ROADMAP_STAGES rows, so Order
+    is the only correspondence available.
+
+    Returns:
+        {"ok": bool, "code": str, "error": str | None,
+         "stage": dict | None, "roadmap": dict | None,
+         "template_id": str, "template_stage_id": str}
+
+        code is one of "" (ok=True), "STAGE_NOT_FOUND",
+        "ROADMAP_NOT_FOUND", "ROADMAP_HAS_NO_TEMPLATE",
+        "TEMPLATE_STAGE_NOT_FOUND".
+    """
+    empty = {"stage": None, "roadmap": None, "template_id": "", "template_stage_id": ""}
+
+    if not stage_id:
+        return {"ok": False, "code": "STAGE_NOT_FOUND", "error": "stage_id обязателен", **empty}
+
+    stage = find_stage_by_id(stage_id)
+    if stage is None:
+        return {"ok": False, "code": "STAGE_NOT_FOUND", "error": f"Stage {stage_id} не найден", **empty}
+
+    roadmap = find_roadmap_by_id(stage["roadmap_id"])
+    if roadmap is None:
+        return {
+            "ok": False, "code": "ROADMAP_NOT_FOUND",
+            "error": f"Roadmap {stage['roadmap_id']} не найден",
+            "stage": stage, "roadmap": None, "template_id": "", "template_stage_id": "",
+        }
+
+    template_id = _resolve_template_id(roadmap)
+    if not template_id:
+        return {
+            "ok": False, "code": "ROADMAP_HAS_NO_TEMPLATE",
+            "error": f"У Roadmap {roadmap['roadmap_id']} не определён Template ID",
+            "stage": stage, "roadmap": roadmap, "template_id": "", "template_stage_id": "",
+        }
+
+    order_raw = str(stage.get("order", "")).strip()
+    if not order_raw.isdigit():
+        return {
+            "ok": False, "code": "TEMPLATE_STAGE_NOT_FOUND",
+            "error": f"У Stage {stage_id} некорректный Order ({stage.get('order', '')!r})",
+            "stage": stage, "roadmap": roadmap, "template_id": template_id, "template_stage_id": "",
+        }
+    order = int(order_raw)
+
+    from business_core.roadmap_template_manager import find_template_stages
+    template_stage_rows = find_template_stages(template_id)
+    match = next(
+        (r for r in template_stage_rows
+         if str(r.get("order", "")).strip().isdigit() and int(r["order"]) == order),
+        None,
+    )
+    if match is None:
+        return {
+            "ok": False, "code": "TEMPLATE_STAGE_NOT_FOUND",
+            "error": f"Template Stage с Order={order} не найден в шаблоне {template_id}",
+            "stage": stage, "roadmap": roadmap, "template_id": template_id, "template_stage_id": "",
+        }
+
+    return {
+        "ok": True, "code": "", "error": None,
+        "stage": stage, "roadmap": roadmap, "template_id": template_id,
+        "template_stage_id": match["stage_id"],
+    }
+
+
 def _stage_update_result(
     *, ok: bool, partial_success: bool, stage_id: str, roadmap_id: str,
     previous_status: str, requested_status: str, final_status: str, changed: bool,

@@ -3786,46 +3786,60 @@ def update_document_admin_fields(document_id: str, updates: dict) -> dict:
     )
 
 
-def relink_document(document_id: str, *, roadmap_id: str | None = None, stage_id: str | None = None, dry_run: bool = False) -> dict:
+def relink_document(
+    document_id: str, *,
+    roadmap_id: str | None = None, stage_id: str | None = None,
+    document_template_id: str | None = None, dry_run: bool = False,
+) -> dict:
     """
     The sole canonical Document relation-relink orchestration boundary
-    — deliberately narrow: only Roadmap ID and Stage ID may ever be
-    changed through this function (audit finding: Object ID relink
-    carries an unresolved physical-Drive-folder-move risk; Business ID
-    is Document identity, never relinkable; Client ID/Document Template
-    ID are left untouched alongside Object ID for this same reason).
-    Business ID/Client ID/Object ID/Document Template ID are always
-    read from the document's own existing row and passed to relation
-    validation as fixed anchors — never accepted as parameters here —
-    so a new Roadmap/Stage that would imply a different Object or
-    Client is caught as a contradiction by resolve_and_validate_links()
-    exactly like any other cross-entity mismatch, not silently allowed.
+    — deliberately narrow: only Roadmap ID, Stage ID and Document
+    Template ID may ever be changed through this function (audit
+    finding: Object ID relink carries an unresolved physical-Drive-
+    folder-move risk; Business ID is Document identity, never
+    relinkable; Client ID is left untouched alongside Object ID for
+    this same reason. Document Template ID carries no such risk — it
+    is a pure classification field with no Drive-path implication —
+    which is why it, unlike Object ID/Client ID, is a caller-suppliable
+    parameter here rather than a fixed anchor).
 
-    A value of None for roadmap_id/stage_id means "keep the document's
-    current value" — passing "" explicitly would mean "clear it", which
-    this narrow feature does not need and does not attempt.
+    Business ID/Client ID/Object ID are always read from the document's
+    own existing row and passed to relation validation as fixed anchors
+    — never accepted as parameters here — so a new Roadmap/Stage that
+    would imply a different Object or Client is caught as a
+    contradiction by resolve_and_validate_links() exactly like any
+    other cross-entity mismatch, not silently allowed.
+
+    A value of None for roadmap_id/stage_id/document_template_id means
+    "keep the document's current value" — passing "" explicitly would
+    mean "clear it"; this is mechanically possible (identical to how
+    roadmap_id/stage_id already behave) but is not a dedicated,
+    supported, or tested feature of this function in this iteration.
 
     dry_run=True validates the requested relink fully (existence +
-    Stage->Roadmap->Object->Client->Business consistency) and returns
-    what WOULD change, without writing anything — used for the /updatedoc
-    preview step, so the preview and the actual apply share exactly one
+    Stage->Roadmap->Object->Client->Business consistency, plus Document
+    Template existence/Business-ownership) and returns what WOULD
+    change, without writing anything — used for the /updatedoc preview
+    step, so the preview and the actual apply share exactly one
     validation path, never two.
 
     Validation order, all before any write:
       A. required document_id
       B. Document exists (DOCUMENT_NOT_FOUND)
       C. relation validation via the existing resolve_and_validate_links()
-         (reused via _validate_document_relations()), anchored to the
-         document's own Business/Client/Object/Template — never caller-supplied
+         (reused via _validate_document_relations()) — Business/Client/
+         Object anchored from the document's own row, Document Template
+         ID taken from the caller (or the document's current value if
+         not supplied)
       D. (dry_run only) return preview, no write
-      E. low-level persistence (Roadmap ID/Stage ID only)
+      E. low-level persistence (Roadmap ID/Stage ID/Document Template ID)
       F. structured result
 
     Returns:
         See _document_result() for the full field list. roadmap_id/
-        stage_id in the result are always the NEW (resolved) values;
-        the caller already has the OLD values from find_document_by_id()
-        for rendering a before/after preview.
+        stage_id/document_template_id in the result are always the NEW
+        (resolved) values; the caller already has the OLD values from
+        find_document_by_id() for rendering a before/after preview.
     """
     from business_core.document_manager import find_document_by_id, update_document_relations
 
@@ -3839,23 +3853,27 @@ def relink_document(document_id: str, *, roadmap_id: str | None = None, stage_id
     business_id = document.get("business_id", "")
     client_id = document.get("client_id", "")
     object_id = document.get("object_id", "")
-    document_template_id = document.get("document_template_id", "")
+    current_document_template_id = document.get("document_template_id", "")
     current_roadmap_id = document.get("roadmap_id", "")
     current_stage_id = document.get("stage_id", "")
 
     target_roadmap_id = current_roadmap_id if roadmap_id is None else roadmap_id
     target_stage_id = current_stage_id if stage_id is None else stage_id
+    target_document_template_id = (
+        current_document_template_id if document_template_id is None else document_template_id
+    )
 
     relation_result = _validate_document_relations(
         business_id, client_id=client_id, object_id=object_id,
         roadmap_id=target_roadmap_id, stage_id=target_stage_id,
-        document_template_id=document_template_id,
+        document_template_id=target_document_template_id,
     )
     if not relation_result["ok"]:
         return _document_result(
             ok=False, code=relation_result["code"], error=relation_result["error"],
             document_id=document_id, business_id=business_id,
             roadmap_id=current_roadmap_id, stage_id=current_stage_id,
+            document_template_id=current_document_template_id,
         )
     resolved = relation_result["resolved"]
 
@@ -3864,24 +3882,162 @@ def relink_document(document_id: str, *, roadmap_id: str | None = None, stage_id
             ok=True, code="DOCUMENT_RELINK_PREVIEW", error=None,
             document_id=document_id, business_id=business_id,
             roadmap_id=resolved["roadmap_id"], stage_id=resolved["stage_id"],
+            document_template_id=resolved["document_template_id"],
         )
 
     write_result = update_document_relations(document_id, {
         "Roadmap ID": resolved["roadmap_id"], "Stage ID": resolved["stage_id"],
+        "Document Template ID": resolved["document_template_id"],
     })
     if not write_result["ok"]:
         return _document_result(
             ok=False, code=write_result.get("code") or "", error=write_result.get("error"),
             document_id=document_id, business_id=business_id,
             roadmap_id=current_roadmap_id, stage_id=current_stage_id,
+            document_template_id=current_document_template_id,
         )
 
     changed = write_result["changed"]
     return _document_result(
         ok=True, code="DOCUMENT_RELATION_UPDATED" if changed else "DOCUMENT_RELATION_UNCHANGED", error=None,
         document_id=document_id, business_id=business_id,
-        roadmap_id=resolved["roadmap_id"], stage_id=resolved["stage_id"], changed=changed,
+        roadmap_id=resolved["roadmap_id"], stage_id=resolved["stage_id"],
+        document_template_id=resolved["document_template_id"], changed=changed,
     )
+
+
+def sync_stage_document_requirements(stage_id: str, dry_run: bool = True) -> dict:
+    """
+    The sole canonical orchestration boundary for retroactively syncing
+    document_template requirements from a Template Stage into an
+    already-created Roadmap Stage — /syncstageknowledge's backing
+    function. Built for the case where a document_template relation
+    (via /linkknowledge) was added to a Template Stage AFTER the real
+    Stage had already been instantiated from it, so
+    business_builder.create_roadmap_for_object()'s one-time,
+    creation-time copy never saw it.
+
+    Deliberately narrow to Entity Type "document_template" — SOP/
+    Checklist/Materials/FAQ IDs are a structurally different storage
+    layer (comma-list columns written once on ROADMAP_STAGES at
+    creation time, not STAGE_ENTITY_RELATIONS rows) and are out of
+    scope for this function; it never reads or writes them. If the
+    resolved Template Stage also carries an active relation of any
+    OTHER Entity Type (e.g. "role"), this function refuses rather than
+    silently letting copy_template_relations_to_stage() (which is
+    itself deliberately generic over Entity Type) copy something wider
+    than requested.
+
+    Never writes ROADMAP_STAGES."Document Template IDs" (the legacy
+    comma-list column) — Phase 18C-4 precedence means an active
+    instance-scoped STAGE_ENTITY_RELATIONS row already fully replaces
+    that legacy source for a stage that has one; touching the legacy
+    column here would be redundant and is deliberately not done. Never
+    writes Status/Responsible/Due Date/Priority/Progress — this
+    function only ever calls stage_entity_relations functions, which
+    read/write STAGE_ENTITY_RELATIONS exclusively and never touch
+    ROADMAP_STAGES at all.
+
+    dry_run=True (the default, used for /syncstageknowledge's preview
+    step) performs every read/resolution/validation step and returns
+    what WOULD be added, without writing anything.
+
+    Idempotent: relies entirely on copy_template_relations_to_stage()'s
+    own existing duplicate-detection (find_active_duplicate_relation())
+    — calling this twice never creates a second active relation row for
+    the same (Stage ID, Entity Type, Entity ID).
+
+    Validation/resolution order, all before any write:
+      A. required stage_id
+      B. Stage exists (STAGE_NOT_FOUND)
+      C. Stage's Roadmap exists (ROADMAP_NOT_FOUND)
+      D. Roadmap has a resolvable Template ID (ROADMAP_HAS_NO_TEMPLATE)
+      E. a Template Stage with matching Order exists (TEMPLATE_STAGE_NOT_FOUND)
+      F. the Template Stage has at least one active document_template
+         relation (NO_DOCUMENT_TEMPLATE_RELATIONS)
+      G. the Template Stage has no active relation of any other Entity
+         Type (UNSUPPORTED_RELATION_TYPE_ON_TEMPLATE_STAGE)
+      H. (dry_run only) return preview, no write
+      I. copy_template_relations_to_stage() (existing, idempotent)
+      J. structured result
+
+    Returns:
+        {
+            "ok": bool, "code": str, "error": str | None,
+            "stage_id": str, "template_stage_id": str,
+            "to_add": tuple[str, ...],          # Document Template IDs not yet linked to this Stage
+            "already_present": tuple[str, ...], # Document Template IDs already linked to this Stage
+            "created": tuple[str, ...],         # actually created (dry_run=False only; always () on preview)
+        }
+    """
+    from business_core.roadmap_manager import resolve_template_stage_for_stage
+    from business_core.stage_entity_relations import (
+        get_relations_for_template_stage, get_relations_for_stage, copy_template_relations_to_stage,
+    )
+
+    empty = {"stage_id": stage_id, "template_stage_id": "", "to_add": (), "already_present": (), "created": ()}
+
+    resolved = resolve_template_stage_for_stage(stage_id)
+    if not resolved["ok"]:
+        return {"ok": False, "code": resolved["code"], "error": resolved["error"], **empty}
+
+    template_stage_id = resolved["template_stage_id"]
+
+    all_template_relations = get_relations_for_template_stage(template_stage_id)
+    non_document_types = sorted({
+        r.get("Entity Type", "") for r in all_template_relations
+    } - {"document_template"})
+    if non_document_types:
+        return {
+            "ok": False, "code": "UNSUPPORTED_RELATION_TYPE_ON_TEMPLATE_STAGE",
+            "error": (
+                f"Template Stage {template_stage_id} содержит relations типа "
+                f"{', '.join(non_document_types)} — эта команда синхронизирует только document_template."
+            ),
+            "stage_id": stage_id, "template_stage_id": template_stage_id,
+            "to_add": (), "already_present": (), "created": (),
+        }
+
+    template_relations = [r for r in all_template_relations if r.get("Entity Type", "") == "document_template"]
+    if not template_relations:
+        return {
+            "ok": False, "code": "NO_DOCUMENT_TEMPLATE_RELATIONS",
+            "error": f"У Template Stage {template_stage_id} нет активных document_template relations",
+            "stage_id": stage_id, "template_stage_id": template_stage_id,
+            "to_add": (), "already_present": (), "created": (),
+        }
+
+    existing_relations = get_relations_for_stage(stage_id, entity_type="document_template")
+    existing_entity_ids = {r.get("Entity ID", "") for r in existing_relations}
+    template_entity_ids = [r.get("Entity ID", "") for r in template_relations]
+
+    to_add = tuple(eid for eid in template_entity_ids if eid not in existing_entity_ids)
+    already_present = tuple(eid for eid in template_entity_ids if eid in existing_entity_ids)
+
+    if dry_run:
+        return {
+            "ok": True, "code": "STAGE_KNOWLEDGE_SYNC_PREVIEW", "error": None,
+            "stage_id": stage_id, "template_stage_id": template_stage_id,
+            "to_add": to_add, "already_present": already_present, "created": (),
+        }
+
+    copy_result = copy_template_relations_to_stage(template_stage_id, stage_id)
+    if not copy_result.ok:
+        return {
+            "ok": False, "code": "STAGE_KNOWLEDGE_SYNC_FAILED",
+            "error": "; ".join(str(errs) for _, errs in copy_result.errors) or "Не удалось синхронизировать",
+            "stage_id": stage_id, "template_stage_id": template_stage_id,
+            "to_add": to_add, "already_present": already_present, "created": (),
+        }
+
+    created_entity_ids = tuple(
+        rec.get("Entity ID", "") for rec in copy_result.created if rec.get("Entity Type", "") == "document_template"
+    )
+    return {
+        "ok": True, "code": "STAGE_KNOWLEDGE_SYNCED", "error": None,
+        "stage_id": stage_id, "template_stage_id": template_stage_id,
+        "to_add": to_add, "already_present": already_present, "created": created_entity_ids,
+    }
 
 
 def transition_document_status(document_id: str, target_status: str) -> dict:

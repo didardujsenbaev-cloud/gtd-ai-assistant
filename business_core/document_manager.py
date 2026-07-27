@@ -429,28 +429,31 @@ def update_document_admin_fields(document_id: str, updates: dict) -> dict:
 # Relation relink (Roadmap ID / Stage ID only)
 # ─────────────────────────────────────────────────────────────
 
-# Deliberately narrow: only the two relation fields business_builder.
-# relink_document() is approved to change. Client ID/Object ID/Document
-# Template ID remain unreachable through ANY generic write path — a
-# future explicit action for those (if ever approved) must be its own
-# separate function, never an expansion of this allowlist, since
-# Object ID relink carries the unresolved physical-Drive-folder-move
-# risk flagged during the audit for this feature.
-_DOCUMENT_RELINK_EDITABLE_FIELDS = ("Roadmap ID", "Stage ID")
+# Deliberately narrow: only the three relation fields business_builder.
+# relink_document() is approved to change. Client ID/Object ID remain
+# unreachable through ANY generic write path — a future explicit action
+# for those (if ever approved) must be its own separate function, never
+# an expansion of this allowlist, since Object ID relink carries the
+# unresolved physical-Drive-folder-move risk flagged during the audit
+# for this feature. Document Template ID was added here in a later
+# audit pass — unlike Object ID, it is a pure classification field with
+# no Drive-path implication, so it carries none of that risk.
+_DOCUMENT_RELINK_EDITABLE_FIELDS = ("Roadmap ID", "Stage ID", "Document Template ID")
 
 
 def update_document_relations(document_id: str, updates: dict) -> dict:
     """
-    Update Roadmap ID and/or Stage ID only. Does not itself validate
-    that the new values form a consistent Stage->Roadmap->Object->
-    Client->Business chain — business_builder.relink_document() already
-    did that (via the existing resolve_and_validate_links()) before
-    calling this function. Business ID/Client ID/Object ID/Document
-    Template ID/Drive fields/identity/version fields are all rejected
-    outright, regardless of value — this function's allowlist makes
-    changing them structurally impossible, exactly like
-    update_document_admin_fields() already does for Status/Drive/
-    review fields.
+    Update Roadmap ID and/or Stage ID and/or Document Template ID only.
+    Does not itself validate that the new values form a consistent
+    Stage->Roadmap->Object->Client->Business chain (or that Document
+    Template ID exists/belongs to the right Business) —
+    business_builder.relink_document() already did that (via the
+    existing resolve_and_validate_links()) before calling this
+    function. Business ID/Client ID/Object ID/Drive fields/identity/
+    version fields are all rejected outright, regardless of value —
+    this function's allowlist makes changing them structurally
+    impossible, exactly like update_document_admin_fields() already
+    does for Status/Drive/review fields.
 
     Returns:
         {"ok": bool, "changed": bool, "updated_fields": tuple, "code": str, "error": str | None}
