@@ -5194,3 +5194,784 @@ milestone_templates`/`payment_obligations`/`payment_transactions` не
 Google Sheets не менялась; GTD Core не затронут. Ни один закрытый домен
 (Object/Client/Service/Roadmap/Stage/Organization/Task/Document/
 Checklist) не переоткрыт.
+
+
+## ADR-023 — Commercial Offer Domain Architecture Decision (Phase 40B)
+
+### 0. Контекст
+
+Phase 40A (Next Domain Selection Audit) установила: ни один оставшийся
+домен не имеет production-данных, но Commercial Offer — единственный
+кандидат, чья необходимость уже прямо задокументирована предыдущим
+закрытым доменом. ADR-022 (Payment/Milestone) явно отказался от
+автоматического расчёта суммы для `percentage`-режима Commercial
+Milestone Template именно потому, что в репозитории нет канонического
+источника согласованной (agreed) цены — `service_catalog`'s "Цена
+мин"/"Цена макс" являются диапазоном для reference, а не операционной
+ценой конкретному Клиенту. Commercial Offer Domain закрывает именно
+этот пробел: канонический quoted/agreed amount, привязанный к
+конкретному Client/Object/Service/Roadmap, с собственным жизненным
+циклом (draft/sent/accepted/...), но без Contract-уровня (подпись,
+юридические условия) и без Invoice-уровня (номер счёта, налоги).
+
+Repository evidence (Phase 40A): нет ни одной строки production-данных,
+нет реестра, нет manager-модуля, нет команд — полностью чистый лист,
+аналогично состоянию Payment Domain перед Phase 39C, но даже без
+hardcoded-конфигурации вроде `COMMERCIAL_MILESTONES_MAP`.
+
+Это ADR утверждает архитектуру Commercial Offer Domain Foundation
+(Phase 40C) — один операционный реестр `commercial_offers`,
+immutable-row-based versioning, явный closed lifecycle, без Contract,
+без Invoice, без line items, без автоматического создания Payment
+Obligation.
+
+### 1. Канонический entity
+
+**Commercial Offer** — единственная каноническая сущность Foundation.
+Представляет одно конкретное коммерческое предложение, представленное
+одному Client, принадлежащее одному Business. Содержит одну явную
+quoted-сумму и валюту. Снапшотит предложенный объём (scope) и
+коммерческие условия версии. Может ссылаться на Object/Service/
+Roadmap/Document. Имеет собственный lifecycle. НЕ является Contract
+(нет подписи/юридических условий), НЕ является Invoice (нет номера
+счёта/налогов/due-date-статуса оплаты), НЕ является Payment Obligation
+(не доказывает получение денег — Payment Obligation остаётся
+единственной canonical expected-money сущностью, ADR-022).
+
+```
+COMMERCIAL_OFFER_IS_CANONICAL_QUOTED_TERMS_ENTITY = YES
+COMMERCIAL_OFFER_IS_NOT_PAYMENT_OBLIGATION = YES
+COMMERCIAL_OFFER_IS_NOT_CONTRACT = YES
+COMMERCIAL_OFFER_IS_NOT_INVOICE = YES
+COMMERCIAL_OFFER_ACCEPTANCE_DOES_NOT_MEAN_PAYMENT_RECEIVED = YES
+```
+
+### 2. Модель версионирования
+
+Выбрана: **immutable version rows с самого начала** (не единственная
+mutable draft-строка с иммутабельными снапшотами после отправки).
+
+- каждая строка `commercial_offers` — immutable коммерческая версия;
+- пересмотр предложения создаёт НОВУЮ строку, никогда не переписывает
+  существующую;
+- `Previous Commercial Offer ID` связывает новую версию с
+  непосредственным предшественником;
+- `Offer Series ID` группирует все версии одного и того же
+  коммерческого предложения;
+- `Version Number` — положительное целое число, монотонно
+  увеличивается внутри серии;
+- только одна текущая non-terminal версия может быть "активной"
+  (derived, не хранится отдельным полем — см. решение 12);
+- предыдущие версии никогда не перезаписываются;
+- никакой line-level amendment-машинерии.
+
+Обоснование: отправленные/принятые коммерческие условия должны
+оставаться auditable — позднее изменение суммы или объёма не должно
+переписывать то, что Клиент реально получил изначально. Реализация
+остаётся ограниченной, поскольку версионирование — на уровне строки, а
+не на уровне отдельных пунктов предложения (тот же принцип, что и
+Document Domain использует для версий документа).
+
+```
+COMMERCIAL_OFFER_VERSIONING_IS_IMMUTABLE_ROW_BASED = YES
+```
+
+### 3. Дизайн реестра
+
+Утверждён ровно один Foundation registry: **`commercial_offers`**.
+
+```
+Commercial Offer ID
+Offer Series ID
+Previous Commercial Offer ID
+Version Number
+Business ID
+Client ID
+Object ID
+Service ID
+Roadmap ID
+Offer Document ID
+Title Snapshot
+Scope Snapshot
+Quoted Amount
+Currency
+Valid Until
+Status
+Caller Idempotency Key
+Created At
+Created By
+Updated At
+Sent At
+Sent By
+Accepted At
+Accepted By
+Rejected At
+Rejected By
+Rejection Reason
+Expired At
+Cancelled At
+Cancelled By
+Cancellation Reason
+Archived At
+Notes
+```
+
+Все предложенные поля сохранены как необходимые — каждое соответствует
+ровно одному lifecycle-переходу или одному identity/relation/snapshot
+факту, без избыточности (то же соответствие "одно поле = один
+задокументированный факт", что используют payment_obligations/
+payment_transactions).
+
+Явно НЕ добавлено:
+
+```
+- line-item JSON;
+- comma-separated Service IDs;
+- comma-separated Object IDs;
+- generic relation JSON;
+- payment status;
+- paid amount;
+- remaining amount;
+- contract-поля;
+- invoice-поля;
+- signature payload;
+- tax ledger-поля.
+```
+
+```
+COMMERCIAL_OFFER_REGISTRY_APPROVED = YES
+```
+
+### 4. Решение по line items
+
+```
+COMMERCIAL_OFFER_LINE_ITEM_ENTITY_REQUIRED_IN_FOUNDATION = NO
+```
+
+Foundation хранит: одну quoted-сумму итого; один ограниченный Scope
+Snapshot (текстовое описание объёма); опциональную единственную Service
+-связь; опциональные Object/Roadmap-связи.
+
+Обоснование: нет текущих доказательств необходимости multi-line
+pricing (ни одного production-примера, ни одного запроса); line items
+добавили бы identity/ordering/quantity/unit-price/discount/tax
+сложность несоразмерную демонстрированной потребности. Путь будущего
+расширения явно оставлен открытым: `Offer Series ID` + `Commercial
+Offer ID` уже дают стабильный parent-identity, к которому в будущем
+можно добавить отдельный `commercial_offer_line_items` реестр (тот же
+паттерн parent+child, что checklist_instances/checklist_instance_items
+и payment_obligations/payment_transactions), не переписывая уже
+созданные Offer-строки.
+
+### 5. Identity policy
+
+```
+Commercial Offer ID: OFR-NNN
+Offer Series ID:     OFS-NNN
+```
+
+Проверка коллизий: среди всех существующих `_ID_PREFIXES` (BIZ, SVC,
+PRS, CH, INT, RM, STAGE, MAT, OBJ, RTMPL, TSTG, SOP, CHK, DOC, FAQ,
+DREG, REL, DEPT, ROLE, FUNC, PRA, TSK, TAS, CLIN, CLII, PMT, POB, PTXN)
+— `OFR`/`OFS` не пересекаются ни с одним.
+
+Ровно один генератор на identity, оба живут в `offer_manager.py` через
+`sheets.generate_next_id`/`generate_next_ids`. Никакой caller-side
+генерации. Malformed ID безопасно игнорируются. ID генерируются только
+после полной валидации и idempotency-проверки. Никакой title-based или
+amount/date-based identity. Никакого повторного использования Client/
+Object/Service/Payment ID как Offer identity.
+
+```
+OFR_IDENTITY_APPROVED = YES
+OFS_IDENTITY_APPROVED = YES
+```
+
+### 6. Persistence ownership
+
+`business_core/offer_manager.py` — единственный persistence owner для
+`commercial_offers`. Владеет: точечные reads, ограниченные list/filter
+reads, генерацию OFR/OFS, низкоуровневое создание строки,
+низкоуровневую персистентность lifecycle-переходов, ограниченное
+draft-only admin-обновление, idempotency-lookup примитивы, version-
+series lookup (поиск максимального Version Number в серии), проверку
+текущей строки после записи, immutable-field enforcement.
+
+НЕ владеет: cross-domain relation-валидацией, коммерческой policy-
+оркестрацией (acceptance policy, revision-оркестрация), Telegram UX,
+созданием Payment Obligation, созданием/мутацией Document, raw
+exception rendering.
+
+```
+OFFER_MANAGER_IS_APPROVED_PERSISTENCE_OWNER = YES
+```
+
+### 7. Orchestration ownership
+
+`business_builder.py` — единственный cross-domain owner Commercial
+Offer-оркестрации. Владеет: relation-валидацию, amount/currency
+normalization, создание Offer, revision Offer, lifecycle-переходы,
+version/series-валидацию, idempotency zero/one/multiple handling,
+неизменность принятого Offer, structured result assembly.
+
+Направление зависимостей:
+
+```
+telegram_handlers
+  → business_builder
+    → offer_manager
+      → sheets
+```
+
+Без обратной зависимости и без циклов.
+
+```
+BUSINESS_BUILDER_IS_APPROVED_OFFER_ORCHESTRATION_OWNER = YES
+```
+
+### 8. Amount policy
+
+Переиспользуется Payment-дисциплина Decimal без изменений в закрытом
+Payment Domain. `Decimal` исключительно, никогда `float`; каноническая
+decimal-строка; scale ровно 2; сумма обязательна и строго `> 0`; более
+2 дробных знаков блокирует; никакой scientific notation; никаких
+locale-разделителей в хранимом значении; никакого silent rounding.
+
+Решение по реализации: Phase 40C должен предпочесть переиспользование
+существующего примитива `business_builder.normalize_payment_amount()`
+как есть (без изменения его кода, интерфейса или поведения — чтение
+только), если это не требует модификации файла `payment_manager.py`
+или Payment-специфичных кодов результата. Если переиспользование
+создаёт двусмысленность именования (например, код ошибки
+`INVALID_PAYMENT_AMOUNT` появляется в Offer-контексте), Phase 40C
+обязан реализовать эквивалентный Offer-локальный wrapper
+(`normalize_commercial_offer_amount()`), производящий Offer-specific
+коды (`INVALID_COMMERCIAL_OFFER_AMOUNT` и т.д.), не трогая Payment-код.
+Payment Domain остаётся полностью нетронутым в любом случае.
+
+```
+COMMERCIAL_OFFER_USES_DECIMAL_NOT_FLOAT = YES
+COMMERCIAL_OFFER_AMOUNT_SCALE_IS_EXPLICIT = YES
+```
+
+### 9. Currency policy
+
+Явная валюта обязательна; uppercase 3-буквенный ASCII-код; никакого
+implicit default на уровне персистентности; никакой FX-конвертации;
+никакой кросс-валютной агрегации Offer. Пересмотренные версии обычно
+сохраняют валюту исходной версии; смена валюты в revision должна быть
+явной (передана заново, не унаследована молча) и никогда не
+переписывает предыдущие версии.
+
+```
+COMMERCIAL_OFFER_CURRENCY_IS_EXPLICIT = YES
+```
+
+### 10. Snapshot policy
+
+`Title Snapshot` и `Scope Snapshot` обязательны. Снапшоты — коммерческие
+факты именно этой версии. После выхода из `draft` amount/currency/
+title/scope/relations становятся неизменяемыми. Изменения Service/
+Object/Roadmap после создания никогда не переписывают снапшоты.
+Никакой live-реконструкции принятого объёма из Service catalog. Никакой
+логирование полного текста snapshot (см. §решение о privacy).
+Ограничение длины: `Title Snapshot` — разумный короткий заголовок (as
+with Document/Checklist Title fields, без жёсткого числового лимита в
+Foundation, но не блок текста); `Scope Snapshot` — свободный текст без
+искусственного лимита в Foundation (аналогично `Description Snapshot`
+Payment Obligation), поскольку коммерческий объём может быть
+многострочным описанием условий.
+
+```
+COMMERCIAL_OFFER_TITLE_SNAPSHOT_IS_REQUIRED = YES
+COMMERCIAL_OFFER_SCOPE_SNAPSHOT_IS_REQUIRED = YES
+```
+
+### 11. Relation policy
+
+Обязательны: `Business ID`, `Client ID`. Опциональны: `Object ID`,
+`Service ID`, `Roadmap ID`, `Offer Document ID`. Правила: все
+переданные сущности должны существовать; все связи должны принадлежать
+той же Business (там, где текущая canonical модель это поддерживает —
+Roadmap может служить источником Client/Object/Service context, тем же
+паттерном, что и Payment Obligation §18 ADR-022); Client должен быть
+валидным Client; противоречия блокируются; никакого auto-repair;
+никакого движения между Business; Offer Document — только ссылка;
+никакой мутации Document/Service/Client/Object/Roadmap/Payment.
+
+Решение: хотя бы одна коммерческая context-связь обязательна — Service
+ID, Object ID или Roadmap ID (нельзя создать Offer без привязки к
+конкретному коммерческому контексту, только Business+Client
+недостаточно).
+
+```
+COMMERCIAL_OFFER_CONTEXT_RELATION_IS_REQUIRED = YES
+```
+
+### 12. Document boundary
+
+`Offer Document ID` — опциональная ссылка на существующий Document
+только. Commercial Offer Domain не генерирует файлы в Foundation:
+никакой upload-логики, никакого template rendering, никакого PDF-
+генерации, никакой мутации Document lifecycle. Same-Business
+валидация обязательна при передаче. Принятый Offer остаётся валидным,
+даже если связанный Document позже архивирован — коммерческие снапшоты
+хранятся в самой строке Offer, не зависят от текущего состояния
+Document.
+
+```
+COMMERCIAL_OFFER_DOCUMENT_IS_REFERENCE_ONLY = YES
+```
+
+### 13. Lifecycle vocabulary
+
+```
+draft
+sent
+accepted
+rejected
+expired
+cancelled
+archived
+```
+
+Не добавлены: `paid`, `partially_paid`, `invoiced`, `contracted`,
+`signed` — все они относятся к другим доменам (Payment/Contract/
+Invoice), не Commercial Offer.
+
+```
+COMMERCIAL_OFFER_STATUS_VOCABULARY_IS_APPROVED = YES
+```
+
+### 14. Lifecycle matrix
+
+```
+draft:      draft, sent, cancelled, archived
+sent:       sent, accepted, rejected, expired, cancelled, archived
+accepted:   accepted, archived
+rejected:   rejected, archived
+expired:    expired, archived
+cancelled:  cancelled, archived
+archived:   archived (только)
+```
+
+`accepted` — коммерчески терминален: никакого accepted → rejected/
+cancelled/draft. `rejected`/`expired`/`cancelled` не могут быть
+reopened обычным переходом. Никакого ordinary restore. Никакого hard
+delete. Тот же статус — безопасный no-op.
+
+```
+COMMERCIAL_OFFER_TRANSITION_MATRIX_IS_APPROVED = YES
+```
+
+### 15. Expiration policy
+
+Выбрана модель: `expired` остаётся в closed vocabulary как реальный
+хранимый статус, доступный через явный `sent → expired` переход
+(callable), НЕ через фоновую автоматическую мутацию. Read-слои
+(будущая caller UX) могут дополнительно отображать "sent, но Valid
+Until уже прошёл" как effectively-expired без перезаписи строки — это
+derived-отображение, не изменение канонического Status. Никакого
+background job в Foundation. `accepted`/`rejected`/`cancelled`/
+`archived` никогда не auto-expire.
+
+```
+COMMERCIAL_OFFER_EXPIRATION_POLICY_IS_APPROVED = YES
+```
+
+### 16. Draft mutability и sent/accepted immutability
+
+Draft может обновлять: `Title Snapshot`, `Scope Snapshot`, `Quoted
+Amount`, `Currency`, `Valid Until`, `Object ID`, `Service ID`,
+`Roadmap ID`, `Offer Document ID`, `Notes`. После `sent` коммерческие
+поля становятся неизменяемыми — изменяются только lifecycle-переходы и
+их метаданные. `Notes` остаётся административно изменяемым всегда
+(включая после `sent`/`accepted`) — единственное исключение из
+коммерческой неизменности, поскольку Notes — не коммерческий факт, а
+внутренняя административная заметка (тот же принцип, что payment_
+obligations допускает Notes-редактирование независимо от финансовой
+неизменности Transaction).
+
+```
+SENT_COMMERCIAL_OFFER_TERMS_ARE_IMMUTABLE = YES
+ACCEPTED_COMMERCIAL_OFFER_TERMS_ARE_IMMUTABLE = YES
+```
+
+### 17. Revision policy
+
+Revision реализуется как новая строка, никогда не как обновление
+sent/accepted условий. Требуется существующий source Offer; source
+должен принадлежать той же Business; новая строка получает новый OFR
+ID; тот же Offer Series ID; Version Number увеличивается
+детерминированно (`max(existing) + 1`); `Previous Commercial Offer ID`
+ссылается на непосредственного предшественника; caller обязан передать
+новый idempotency key; source-строка остаётся неизменной; новая версия
+по умолчанию `draft`; коммерческие поля могут наследоваться от source и
+быть явно переопределены. `accepted`/`rejected`/`expired`/`cancelled`
+Offer МОГУТ быть revised в новую draft-версию без reopening старой
+версии — сама операция revision не является reopen исходной строки
+(исходная строка остаётся в своём терминальном статусе, просто
+появляется новая независимая строка-потомок).
+
+Branching запрещён в Foundation: ровно одна следующая версия на каждую
+текущую последнюю версию. Revision НЕ-последней версии блокируется
+(`COMMERCIAL_OFFER_NOT_LATEST_VERSION`). Множественные совпадения с
+максимальным Version Number — integrity error, блокируется
+(`COMMERCIAL_OFFER_SERIES_INTEGRITY_ERROR`), без first-pick.
+
+```
+COMMERCIAL_OFFER_REVISION_CREATES_NEW_ROW = YES
+COMMERCIAL_OFFER_BRANCHING_IS_ALLOWED_IN_FOUNDATION = NO
+```
+
+### 18. Latest/current-version policy
+
+Единственный источник истины: latest version определяется как
+максимальный `Version Number` внутри `Offer Series ID` — derived
+чтением, никакого мутируемого поля `Is Current` в Foundation.
+Множественные строки с одинаковым максимальным Version Number —
+integrity error (не должно происходить при корректной работе
+Foundation, но защищено явной проверкой), без first-pick.
+
+```
+LATEST_COMMERCIAL_OFFER_VERSION_IS_DERIVED = YES
+```
+
+### 19. Создание Offer
+
+Обязательны: `Business ID`, `Client ID`, `Title Snapshot`, `Scope
+Snapshot`, `Quoted Amount`, `Currency`, `Valid Until`, `Created By`,
+`Caller Idempotency Key`, хотя бы одна коммерческая context-связь.
+
+`Valid Until` обязателен (не "explicit no-expiry policy" — Foundation
+не поддерживает бессрочные предложения, что соответствует нормальной
+коммерческой практике и упрощает §15's expiration-модель); ISO-дата;
+не может быть раньше даты создания.
+
+Defaults: новый `Offer Series ID`; `Version Number = 1`; `Previous
+Commercial Offer ID` пуст; `Status = draft`; lifecycle-таймстампы
+пусты; `Created At`/`Updated At` установлены.
+
+### 20. Idempotency policy
+
+Primary key создания: `Business ID` + `Caller Idempotency Key`. Тот же
+ключ используется и для revision (каждая revision требует свой новый
+caller key — не переиспользует ключ source-версии). Caller key
+обязателен (нет template-derived fallback, в отличие от Payment
+Obligation — у Commercial Offer нет эквивалента Commercial Milestone
+Template как источника инстанциации). Zero creates; один совместимый
+match — reuse; несколько matches — блок с полным списком конфликтующих
+ID; несовместимый payload с тем же ключом — блок; никакого first-pick;
+никакого title-based или amount/date-based dedup; ID генерируются
+только после проверки идемпотентности.
+
+```
+COMMERCIAL_OFFER_IDEMPOTENCY_IS_APPROVED = YES
+COMMERCIAL_OFFER_TITLE_BASED_DEDUP_IS_ALLOWED = NO
+COMMERCIAL_OFFER_AMOUNT_DATE_BASED_DEDUP_IS_ALLOWED = NO
+MULTIPLE_COMMERCIAL_OFFER_MATCHES_MUST_BLOCK = YES
+```
+
+### 21. Acceptance policy
+
+Только `sent` Offer может быть принят. `Accepted By` обязателен.
+`Accepted At` устанавливается один раз. Принятый Offer — коммерчески
+неизменен. Acceptance НЕ создаёт Payment Obligation, НЕ мутирует
+Roadmap/Stage, НЕ создаёт Contract, НЕ создаёт Invoice, НЕ означает
+получение оплаты, НЕ обновляет автоматически цену в Service.
+
+Только последняя (latest) версия в Offer Series может быть принята —
+принятие устаревшей (superseded) версии блокируется
+(`COMMERCIAL_OFFER_NOT_LATEST_VERSION`).
+
+```
+ONLY_LATEST_OFFER_VERSION_MAY_BE_ACCEPTED = YES
+COMMERCIAL_OFFER_ACCEPTANCE_CREATES_PAYMENT_OBLIGATION = NO
+```
+
+### 22. Rejection policy
+
+Только `sent` Offer может быть отклонён. `Rejected By` обязателен.
+`Rejection Reason` обязателен, но является чувствительным свободным
+текстом — не логируется (см. §privacy). Никакого reopen. Revision
+может создать новую draft-версию из отклонённой.
+
+### 23. Cancellation policy
+
+`draft` или `sent` могут быть отменены. `Cancelled By` обязателен.
+`Cancellation Reason` обязателен. `accepted` не может быть отменён.
+Cancellation не удаляет строку. Никакого reopen. Revision из
+отменённой версии допускается только как новая версия.
+
+### 24. Archive policy
+
+Archive терминален. Никакого hard delete. Никакого ordinary restore.
+Архивированные строки остаются читаемыми по точному ID. Архивированные
+строки исключены из обычных активных списков по умолчанию. Никакого
+автоматического каскада на связанные сущности.
+
+### 25. Payment boundary
+
+Принятый Commercial Offer МОЖЕТ стать будущей pricing basis (то есть
+будущая интеграция Offer→Payment концептуально допустима), но:
+
+```
+COMMERCIAL_OFFER_ACCEPTANCE_CREATES_PAYMENT_OBLIGATION = NO
+```
+
+Phase 40C не создаёт Payment Obligation автоматически; никакой
+интеграции с percentage-расчётом Payment Template в Phase 40C; никакой
+записи в payment_manager из Offer Domain; никакой мутации Payment
+lifecycle; никаких paid/remaining-полей в Commercial Offer. Будущая
+интеграция Offer→Payment требует отдельного ADR или отдельно
+утверждённой интеграционной фазы.
+
+```
+COMMERCIAL_OFFER_CAN_MUTATE_PAYMENT = NO
+```
+
+### 26. Service boundary
+
+Service-связь — только для чтения. Диапазон цены Service остаётся
+reference-данными. Commercial Offer не переписывает цены Service.
+Offer amount — операционная quoted-сумма, независимая от диапазона
+Service. Несовпадение с диапазоном цены Service НЕ блокирует создание
+Offer в Foundation (никакой скрытой pricing-policy); опциональное
+предупреждение может быть рассмотрено позже, но не реализуется в
+Foundation.
+
+```
+COMMERCIAL_OFFER_CAN_MUTATE_SERVICE = NO
+COMMERCIAL_OFFER_CAN_MUTATE_CLIENT = NO
+COMMERCIAL_OFFER_CAN_MUTATE_OBJECT = NO
+COMMERCIAL_OFFER_CAN_MUTATE_ROADMAP = NO
+COMMERCIAL_OFFER_CAN_MUTATE_DOCUMENT = NO
+```
+
+### 27. Contract и Invoice boundaries
+
+Никакого Contract registry. Никакого signature workflow. Никакой
+legal amendment/termination модели. Никакого Invoice registry. Никакой
+нумерации счетов. Никаких налоговых полей. Никакого due-payment-
+статуса. Никакого revenue recognition. Принятый Offer — не Contract и
+не Invoice.
+
+```
+CONTRACT_IS_FOUNDATION_SCOPE = NO
+INVOICE_IS_FOUNDATION_SCOPE = NO
+```
+
+### 28. Структурированный result contract
+
+```
+ok, code, error,
+commercial_offer_id, offer_series_id, previous_commercial_offer_id, version_number,
+business_id, client_id, object_id, service_id, roadmap_id, document_id,
+amount, currency, valid_until,
+previous_status, requested_status, final_status,
+created, reused, changed, revised,
+sent, accepted, rejected, expired, cancelled, archived,
+conflicting_ids, warnings, retry_safe
+```
+
+Каждое поле присутствует всегда. Никакого raw exception. Никакого raw
+row. Никакого Telegram-специфичного текста в manager/orchestration.
+
+```
+COMMERCIAL_OFFER_RESULT_CONTRACT_APPROVED = YES
+```
+
+### 29. Result-code vocabulary
+
+Утверждены как канонические (без синонимов), реализуются в Phase 40C
+только там, где есть реальный runtime-вызов:
+
+```
+Создание/revision:
+  COMMERCIAL_OFFER_CREATED
+  COMMERCIAL_OFFER_REUSED
+  COMMERCIAL_OFFER_REVISED
+  COMMERCIAL_OFFER_NOT_FOUND
+  MULTIPLE_COMMERCIAL_OFFER_MATCHES
+  COMMERCIAL_OFFER_IDEMPOTENCY_REQUIRED
+  COMMERCIAL_OFFER_IDEMPOTENCY_CONFLICT
+  COMMERCIAL_OFFER_SERIES_INTEGRITY_ERROR
+  COMMERCIAL_OFFER_NOT_LATEST_VERSION
+  COMMERCIAL_OFFER_PERSISTENCE_FAILED
+  COMMERCIAL_OFFER_POST_WRITE_VERIFICATION_FAILED
+
+Amount/currency:
+  INVALID_COMMERCIAL_OFFER_AMOUNT
+  INVALID_COMMERCIAL_OFFER_AMOUNT_SCALE
+  COMMERCIAL_OFFER_AMOUNT_MUST_BE_POSITIVE
+  INVALID_COMMERCIAL_OFFER_CURRENCY
+
+Relations:
+  BUSINESS_NOT_FOUND
+  CLIENT_NOT_FOUND
+  OBJECT_NOT_FOUND
+  SERVICE_NOT_FOUND
+  ROADMAP_NOT_FOUND
+  DOCUMENT_NOT_FOUND
+  COMMERCIAL_OFFER_RELATION_MISMATCH
+  COMMERCIAL_OFFER_CONTEXT_REQUIRED
+
+Validation:
+  COMMERCIAL_OFFER_TITLE_REQUIRED
+  COMMERCIAL_OFFER_SCOPE_REQUIRED
+  INVALID_COMMERCIAL_OFFER_VALID_UNTIL
+  COMMERCIAL_OFFER_VALID_UNTIL_IN_PAST
+  INVALID_COMMERCIAL_OFFER_VERSION
+
+Lifecycle:
+  INVALID_COMMERCIAL_OFFER_STATUS
+  INVALID_COMMERCIAL_OFFER_TRANSITION
+  COMMERCIAL_OFFER_STATUS_UPDATED
+  COMMERCIAL_OFFER_STATUS_UNCHANGED
+  COMMERCIAL_OFFER_SENT
+  COMMERCIAL_OFFER_ACCEPTED
+  COMMERCIAL_OFFER_REJECTED
+  COMMERCIAL_OFFER_EXPIRED
+  COMMERCIAL_OFFER_CANCELLED
+  COMMERCIAL_OFFER_ARCHIVED
+  COMMERCIAL_OFFER_ACCEPTED_IMMUTABLE
+  COMMERCIAL_OFFER_REJECTION_REASON_REQUIRED
+  COMMERCIAL_OFFER_CANCELLATION_REASON_REQUIRED
+  COMMERCIAL_OFFER_ACTOR_REQUIRED
+  COMMERCIAL_OFFER_RESTORE_REQUIRES_EXPLICIT_ACTION
+
+Admin update:
+  COMMERCIAL_OFFER_UPDATED
+  COMMERCIAL_OFFER_UPDATE_UNCHANGED
+  COMMERCIAL_OFFER_IMMUTABLE
+```
+
+Phase 40C не обязан реализовывать коды, для которых в Foundation нет
+реального callable (тот же принцип "no comment-only vocabulary",
+закрывший находку Phase 37F Document Domain).
+
+### 30. Privacy и логирование
+
+Разрешено в логах: внутренние ID, result code, lifecycle-статусы,
+валюта, ограниченные amount-поля только при необходимости, номер
+версии, флаги created/reused/revised, ID и count конфликтов,
+`retry_safe`.
+
+Запрещено в логах: полный текст `Scope Snapshot`, `Notes`, `Rejection
+Reason`, `Cancellation Reason`, полное тело Telegram-сообщения,
+персональные данные Client, содержимое Document, raw row, raw
+exception, credentials/токены.
+
+```
+COMMERCIAL_OFFER_PRIVACY_LOGGING_POLICY_APPROVED = YES
+```
+
+### 31. Тестовые требования для Phase 40C
+
+Обязательные изолированные категории тестов: schema (точные заголовки
+`commercial_offers`, отсутствие мутации существующей схемы); IDs
+(генерация OFR/OFS, malformed игнорируются, отсутствие caller-side
+генерации, генерация после validation/idempotency); amounts (Decimal
+only, positivity, scale, отклонение float/scientific/comma, точная
+персистентность); currency (обязательность, uppercase, недопустимые
+коды, отсутствие implicit default); relations (обязательность
+Business/Client/context, same-Business, Roadmap-derived context,
+блокировка противоречий, опциональная валидация Document, отсутствие
+мутации закрытых доменов); creation (дефолты, снапшоты, валидация
+expiry, идемпотентность zero/one/multiple/conflict, ошибки
+persistence/verification); versioning (новая серия, revision,
+Previous ID, инкремент версии, derivation latest-version, блокировка
+revision не-последней версии, предотвращение branching, неизменность
+source); lifecycle (все разрешённые переходы, все запрещённые
+переходы, no-op, обязательность actor/reason, latest-version-only
+acceptance, неизменность после acceptance, отсутствие restore,
+отсутствие hard delete); admin update (draft-only коммерческие
+обновления, неизменность после sent/terminal, политика Notes, no-op
+таймстампы); boundaries (отсутствие мутации Payment/Service/Client/
+Object/Roadmap/Document, отсутствие Contract/Invoice); isolation (все
+тесты Commercial Offer — hard socket-block, mock-completeness guard,
+отсутствие live Sheets/Drive/Telegram/Railway/socket).
+
+### 32. Production migration policy
+
+Никакой production-миграции в Phase 40C. Никаких существующих строк
+для миграции. Никаких legacy Offer-данных. Схема может быть определена
+только в коде. Физическая production-вкладка может отсутствовать.
+Никаких живых строк Commercial Offer, созданных во время Foundation-
+тестов. Никаких изменений Payment. Никакой перезаписи цен Service.
+
+```
+COMMERCIAL_OFFER_PRODUCTION_MIGRATION_REQUIRED = NO
+```
+
+### 33. Bounded scope Phase 40C
+
+Phase 40C реализует ТОЛЬКО: одну схему registry `commercial_offers` (в
+коде); ID OFR/OFS; `offer_manager.py`; нормализацию amount/currency/
+date; точные reads и ограниченные фильтры; создание Commercial Offer;
+revision Commercial Offer; draft admin-обновление; lifecycle-переходы;
+derivation latest-version; idempotency; relation-валидацию;
+immutability; структурированный result contract; architecture/
+isolation guards; тесты.
+
+Явно запрещено в Phase 40C: Telegram caller UX; деплой; Contract;
+Invoice; Offer line items; PDF/document generation; автоматическое
+создание Payment Obligation; интеграция percentage Payment; автоматическая
+мутация Roadmap/Stage; signature flow; налоговая логика; полный pricing
+engine; discounts/commissions; записи в production-данные; hard
+delete; restore/reopen.
+
+### 34. Отклонённые альтернативы
+
+**A. Переиспользование Payment Obligation как Commercial Offer.**
+Отклонено: ожидаемая дебиторская задолженность (receivable) и
+коммерческое предложение (quote) — разные факты жизненного цикла;
+Obligation подразумевает согласованный долг, Offer — ещё не принятое
+предложение.
+
+**B. Хранение согласованной цены прямо в Service.**
+Отклонено: диапазон цены Service — общие reference-данные, не
+Client-специфичные согласованные условия.
+
+**C. Mutable единственная Offer-строка после отправки.**
+Отклонено: переписывает исторические коммерческие условия, которые
+Клиент реально получил.
+
+**D. Полный Contract domain сейчас.**
+Отклонено: объём signature/legal/amendment слишком широк для
+следующего bounded-цикла.
+
+**E. Invoice domain сейчас.**
+Отклонено: дублирует Payment Obligation без демонстрированной внешней
+необходимости.
+
+**F. Line items в Foundation.**
+Отклонено: нет текущих доказательств необходимости разбивки по
+количеству/цене за единицу/налогу.
+
+**G. Автоматическое создание Payment Obligation при acceptance.**
+Отклонено: cross-domain интеграция такого рода пока не утверждена.
+
+**H. Автоматический percentage-расчёт Payment в Phase 40C.**
+Отклонено: интеграция Offer→Payment требует отдельного явного решения
+в будущем.
+
+### 35. Cross-ADR consistency
+
+Проверено на отсутствие противоречий с решениями по Service/Client/
+Object/Roadmap/Stage Domain, Document ADR-020, Payment ADR-022,
+Organization ADR-018, Task ADR-019, Checklist ADR-021: ни один закрытый
+домен не мутируется Commercial Offer Foundation — Offer ссылается на их
+ID только для чтения/валидации существования, тем же паттерном, что уже
+используют Document/Checklist/Payment Domains для своих cross-domain
+связей.
+
+### 36. Статус
+
+Утверждено для реализации (Phase 40C) с bounded scope, определённым в
+решении 33. Ничего не реализовано в рамках этого ADR — только
+архитектурное решение. `offer_manager.py` не создан; `commercial_
+offers` не существует; ни один production-caller не мигрирован; ни
+один код не изменён; схема Google Sheets не менялась; GTD Core не
+затронут. Ни один закрытый домен (Object/Client/Service/Roadmap/Stage/
+Organization/Task/Document/Checklist/Payment) не переоткрыт.
