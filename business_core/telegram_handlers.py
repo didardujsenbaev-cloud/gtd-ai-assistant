@@ -9423,6 +9423,445 @@ async def archivelead_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await _reply(update, "❌ Не удалось архивировать Lead.", parse_mode=None)
 
 
+# ─────────────────────────────────────────────────────────────
+# Phase 42D (ADR-025): Interaction / Communication History Domain
+# caller (Telegram) UX.
+#
+# Every command below is a thin resolve-args -> call-canonical-
+# orchestration -> render-message wrapper — no business logic beyond
+# what business_builder/interaction_manager already returns.
+# Centralized result-code -> Russian message mapping below mirrors the
+# Phase 41D Lead UX pattern exactly. Summary/Outcome are only ever
+# rendered in bounded/truncated form; Notes and External Reference are
+# never shown or logged in any command.
+# ─────────────────────────────────────────────────────────────
+
+_INTERACTION_STATUS_RU: dict[str, str] = {
+    "active": "Активно", "archived": "В архиве",
+}
+
+_INTERACTION_TYPE_RU: dict[str, str] = {
+    "call": "Звонок", "message": "Сообщение", "email": "Email",
+    "meeting": "Встреча", "note": "Заметка", "other": "Другое",
+}
+
+_INTERACTION_DIRECTION_RU: dict[str, str] = {
+    "inbound": "Входящее", "outbound": "Исходящее", "internal": "Внутреннее",
+}
+
+_INTERACTION_SUMMARY_LIST_PREVIEW_LENGTH = 80
+_INTERACTION_SUMMARY_DETAIL_MAX_LENGTH = 500
+_INTERACTION_OUTCOME_DETAIL_MAX_LENGTH = 300
+
+
+def _interaction_status_ru(status: str) -> str:
+    return f"{_INTERACTION_STATUS_RU.get(status, status)} ({status})"
+
+
+def _interaction_type_ru(interaction_type: str) -> str:
+    return _INTERACTION_TYPE_RU.get(interaction_type, interaction_type or "—")
+
+
+def _interaction_direction_ru(direction: str) -> str:
+    if not direction:
+        return "не указано"
+    return _INTERACTION_DIRECTION_RU.get(direction, direction)
+
+
+def _interaction_subject_summary(interaction: dict) -> str:
+    """Centralized subject renderer — exactly one of Lead ID/Client ID
+    is expected. Malformed historical data (both or neither present)
+    is disclosed as an integrity warning, never silently repaired or
+    arbitrarily chosen. Never exposes Client personal data — only the
+    internal ID."""
+    lead_id = interaction.get("Lead ID", "")
+    client_id = interaction.get("Client ID", "")
+    if lead_id and client_id:
+        return f"⚠️ Некорректные данные: указаны и Lead ({lead_id}), и Client ({client_id})"
+    if lead_id:
+        return f"Lead: {lead_id}"
+    if client_id:
+        return f"Client: {client_id}"
+    return "⚠️ Некорректные данные: не указан ни Lead, ни Client"
+
+
+def _truncate_interaction_text(text: str, max_length: int) -> str:
+    """Caller-only bounded rendering — discloses truncation, never
+    shows unbounded content merely because it exists in the row."""
+    text = text or ""
+    if len(text) <= max_length:
+        return text
+    return text[:max_length] + "…"
+
+
+def _interaction_creation_message(result: dict) -> str:
+    """Render any business_builder.create_interaction() result."""
+    code = result.get("code", "")
+
+    if code == "INTERACTION_CREATED":
+        lines = [
+            "✅ Interaction создан",
+            f"Interaction ID: {result.get('interaction_id', '')}",
+            f"Тип: {_interaction_type_ru(result.get('interaction_type', ''))}",
+        ]
+        if result.get("direction"):
+            lines.append(f"Направление: {_interaction_direction_ru(result.get('direction', ''))}")
+        lines.append(f"Дата: {result.get('occurred_at', '')}")
+        if result.get("lead_id"):
+            lines.append(f"Lead: {result['lead_id']}")
+        if result.get("client_id"):
+            lines.append(f"Client: {result['client_id']}")
+        return "\n".join(lines)
+
+    if code == "INTERACTION_REUSED":
+        return "\n".join([
+            "♻️ Interaction с этим ключом уже существует — использована существующая запись",
+            f"Interaction ID: {result.get('interaction_id', '')}",
+        ])
+
+    if code == "BUSINESS_NOT_FOUND":
+        return f"❌ Business не найден: {result.get('error') or ''}"
+
+    if code in ("LEAD_NOT_FOUND", "CLIENT_NOT_FOUND", "COMMERCIAL_OFFER_NOT_FOUND", "CHANNEL_NOT_FOUND", "PERSON_NOT_FOUND"):
+        return f"❌ {result.get('error') or 'Указанная связанная запись не найдена.'}"
+
+    if code == "INTERACTION_SUBJECT_REQUIRED":
+        return "❌ Укажи ровно один субъект: lead_id либо client_id."
+
+    if code == "INTERACTION_SUBJECT_CONFLICT":
+        return "❌ Нельзя одновременно указать lead_id и client_id."
+
+    if code == "INTERACTION_RELATION_MISMATCH":
+        return f"❌ Несогласованные ссылки на сущности: {result.get('error') or 'см. логи'}"
+
+    if code == "INTERACTION_TYPE_REQUIRED":
+        return "❌ Укажи interaction_type."
+
+    if code == "INVALID_INTERACTION_TYPE":
+        return f"❌ {result.get('error') or 'Недопустимый interaction_type.'}"
+
+    if code == "INTERACTION_DIRECTION_REQUIRED":
+        return "❌ Укажи direction для этого interaction_type."
+
+    if code == "INVALID_INTERACTION_DIRECTION":
+        return f"❌ {result.get('error') or 'Недопустимый direction.'}"
+
+    if code == "INTERACTION_OCCURRED_AT_REQUIRED":
+        return "❌ Укажи occurred_at."
+
+    if code in ("INVALID_INTERACTION_OCCURRED_AT", "INTERACTION_OCCURRED_AT_IN_FUTURE"):
+        return f"❌ {result.get('error') or 'Недопустимая дата occurred_at.'}"
+
+    if code == "INTERACTION_SUMMARY_REQUIRED":
+        return "❌ Укажи summary."
+
+    if code in ("INTERACTION_SUMMARY_TOO_LONG", "INTERACTION_OUTCOME_TOO_LONG", "INTERACTION_NOTES_TOO_LONG", "INTERACTION_EXTERNAL_REFERENCE_TOO_LONG"):
+        return f"❌ {result.get('error') or 'Превышена допустимая длина поля.'}"
+
+    if code == "INTERACTION_IDEMPOTENCY_REQUIRED":
+        return "❌ Укажи caller_idempotency_key."
+
+    if code == "MULTIPLE_INTERACTION_MATCHES":
+        ids = ", ".join(result.get("conflicting_ids", ())) or "—"
+        return "\n".join([
+            "⚠️ Обнаружен конфликт целостности данных",
+            f"Найдено несколько Interaction с одним ключом: {ids}",
+            "Новый Interaction не создан — автоматический выбор одного из них не выполняется.",
+        ])
+
+    if code == "INTERACTION_PERSISTENCE_FAILED":
+        return f"❌ {result.get('error') or 'Не удалось создать Interaction.'}"
+
+    if code == "INTERACTION_POST_WRITE_VERIFICATION_FAILED":
+        return "\n".join(["⚠️ Interaction записан, но пост-проверка записи не прошла.", "Требуется ручная проверка."])
+
+    if not code and result.get("error"):
+        return f"❌ {result['error']}"
+
+    log.warning(f"_interaction_creation_message: unmapped code={code!r}")
+    return "❌ Не удалось создать Interaction."
+
+
+def _interaction_archive_message(result: dict, interaction_id: str) -> str:
+    """Render any business_builder.archive_interaction() result."""
+    code = result.get("code", "")
+    previous_status = result.get("previous_status", "")
+
+    if code == "INTERACTION_ARCHIVED":
+        return "\n".join([
+            "✅ Interaction архивирован",
+            f"Interaction ID: {interaction_id}",
+            f"Был: {_interaction_status_ru(previous_status)}",
+        ])
+
+    if code == "INTERACTION_STATUS_UNCHANGED":
+        return f"ℹ️ Interaction {interaction_id} уже архивирован — изменений нет."
+
+    if code == "INTERACTION_NOT_FOUND":
+        return f"❌ Interaction {interaction_id} не найден."
+
+    if code == "INVALID_INTERACTION_TRANSITION":
+        return f"❌ Переход '{previous_status}' → 'archived' не разрешён."
+
+    if code == "INTERACTION_PERSISTENCE_FAILED":
+        return f"❌ Не удалось архивировать Interaction {interaction_id}."
+
+    log.warning(f"_interaction_archive_message: unmapped code={code!r} interaction_id={interaction_id}")
+    return f"❌ Ошибка ({code or 'unknown'}): {result.get('error') or 'см. логи'}"
+
+
+def _interaction_notes_message(result: dict, interaction_id: str) -> str:
+    """Render any business_builder.update_interaction_notes() result.
+    Notes content is never echoed back, regardless of outcome."""
+    code = result.get("code", "")
+
+    if code == "INTERACTION_NOTES_UPDATED":
+        return f"✅ Notes для Interaction {interaction_id} обновлены."
+
+    if code == "INTERACTION_NOTES_UNCHANGED":
+        return f"ℹ️ Interaction {interaction_id} — изменений нет (значения совпадают)."
+
+    if code == "INTERACTION_NOT_FOUND":
+        return f"❌ Interaction {interaction_id} не найден."
+
+    if code == "INTERACTION_IMMUTABLE":
+        return f"❌ {result.get('error') or 'Изменение недоступно — только Notes могут быть изменены.'}"
+
+    if code == "INTERACTION_NOTES_TOO_LONG":
+        return f"❌ {result.get('error') or 'Notes превышают допустимую длину.'}"
+
+    log.warning(f"_interaction_notes_message: unmapped code={code!r} interaction_id={interaction_id}")
+    return f"❌ Ошибка ({code or 'unknown'}): {result.get('error') or 'см. логи'}"
+
+
+async def newinteraction_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /newinteraction business_id=BIZ-001 interaction_type=call
+                     occurred_at=2026-08-01T10:00:00+05:00 summary=...
+                     caller_idempotency_key=...
+                     (lead_id=LED-001 | client_id=PRS-001)
+                     [direction=outbound] [channel_id=CH-001]
+                     [commercial_offer_id=OFR-001] [assigned_person_id=PRS-002]
+                     [outcome=...] [external_reference=...]
+                     [created_by=...] [notes=...]
+
+    Creates one immutable Interaction event. Idempotent via
+    caller_idempotency_key (ADR-025 §17) — repeated calls with the same
+    key reuse the existing Interaction rather than creating a
+    duplicate. Exactly one of lead_id/client_id is required.
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg(), parse_mode=None)
+        return
+
+    raw = " ".join(context.args or [])
+    args = _parse_kv_args(raw)
+    business_id = args.get("business_id", "")
+    interaction_type = args.get("interaction_type", "")
+    occurred_at = args.get("occurred_at", "")
+    summary = args.get("summary", "")
+    caller_idempotency_key = args.get("caller_idempotency_key", "")
+
+    if not business_id or not interaction_type or not occurred_at or not summary or not caller_idempotency_key:
+        await _reply(
+            update,
+            "❌ Укажи business_id, interaction_type, occurred_at, summary и caller_idempotency_key.\n\nПример:\n"
+            "`/newinteraction business_id=BIZ-001 interaction_type=call direction=outbound "
+            "occurred_at=2026-08-01T10:00:00+05:00 summary=\"Обсудили цену\" lead_id=LED-001 "
+            "caller_idempotency_key=...`", parse_mode=None)
+        return
+
+    try:
+        from business_core.business_builder import create_interaction
+
+        result = create_interaction(
+            business_id, interaction_type, occurred_at, summary,
+            created_by=args.get("created_by", "") or _telegram_username(update),
+            caller_idempotency_key=caller_idempotency_key,
+            direction=args.get("direction", ""), channel_id=args.get("channel_id", ""),
+            outcome=args.get("outcome", ""), lead_id=args.get("lead_id", ""), client_id=args.get("client_id", ""),
+            commercial_offer_id=args.get("commercial_offer_id", ""), assigned_person_id=args.get("assigned_person_id", ""),
+            external_reference=args.get("external_reference", ""), notes=args.get("notes", ""),
+        )
+        await _reply(update, _interaction_creation_message(result), parse_mode=None)
+    except Exception as e:
+        log.error(f"newinteraction_cmd error: {e}")
+        await _reply(update, "❌ Не удалось создать Interaction.", parse_mode=None)
+
+
+_INTERACTIONS_LIST_MAX_SHOWN = 20
+
+
+async def interactions_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /interactions [business_id=...] [lead_id=...] [client_id=...]
+                  [commercial_offer_id=...] [channel_id=...] [assigned_person_id=...]
+                  [interaction_type=...] [direction=...] [status=...]
+
+    Read-only, bounded, filtered list of Interactions. Archived
+    Interactions are excluded by default unless status=archived is
+    explicit. Never shows full Summary/Outcome, Notes, External
+    Reference, or Caller Idempotency Key.
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg(), parse_mode=None)
+        return
+
+    raw = " ".join(context.args or [])
+    args = _parse_kv_args(raw)
+    status_filter = args.get("status", "")
+
+    try:
+        from business_core.interaction_manager import list_interactions
+
+        interactions = list_interactions(
+            business_id=args.get("business_id", ""), lead_id=args.get("lead_id", ""),
+            client_id=args.get("client_id", ""), commercial_offer_id=args.get("commercial_offer_id", ""),
+            channel_id=args.get("channel_id", ""), assigned_person_id=args.get("assigned_person_id", ""),
+            interaction_type=args.get("interaction_type", ""), direction=args.get("direction", ""),
+            status=status_filter, include_archived=(status_filter == "archived"),
+        )
+
+        if not interactions:
+            await _reply(update, "ℹ️ Interactions не найдены.", parse_mode=None)
+            return
+
+        lines = [f"📞 Interactions ({len(interactions)})", ""]
+        for i in interactions[:_INTERACTIONS_LIST_MAX_SHOWN]:
+            preview = _truncate_interaction_text(i.get("Summary", ""), _INTERACTION_SUMMARY_LIST_PREVIEW_LENGTH)
+            entry = (
+                f"{i.get('Interaction ID', '')} [{_interaction_status_ru(i.get('Status', ''))}] "
+                f"{_interaction_type_ru(i.get('Interaction Type', ''))} — {_interaction_subject_summary(i)} — {preview}"
+            )
+            lines.append(entry)
+        if len(interactions) > _INTERACTIONS_LIST_MAX_SHOWN:
+            lines.append(f"\n… показаны первые {_INTERACTIONS_LIST_MAX_SHOWN} из {len(interactions)}.")
+
+        await _reply(update, "\n".join(lines), parse_mode=None)
+    except Exception as e:
+        log.error(f"interactions_cmd error: {e}")
+        await _reply(update, "❌ Не удалось получить список Interactions.", parse_mode=None)
+
+
+async def interaction_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /interaction interaction_id=ACT-001
+
+    Read-only, exact-ID detail. Hides Notes, External Reference, and
+    Caller Idempotency Key. Summary/Outcome are shown only in bounded
+    form.
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg(), parse_mode=None)
+        return
+
+    raw = " ".join(context.args or [])
+    args = _parse_kv_args(raw)
+    interaction_id = args.get("interaction_id") or args.get("_pos0", "")
+
+    if not interaction_id:
+        await _reply(update, "❌ Укажи interaction_id.\n\nПример: /interaction interaction_id=ACT-001", parse_mode=None)
+        return
+
+    try:
+        from business_core.interaction_manager import find_interaction_by_id
+
+        interaction = find_interaction_by_id(interaction_id)
+        if interaction is None:
+            await _reply(update, f"❌ Interaction {interaction_id} не найден.", parse_mode=None)
+            return
+
+        lines = [
+            f"📞 Interaction {interaction.get('Interaction ID', '')}",
+            "",
+            f"Business: {interaction.get('Business ID', '')}",
+            _interaction_subject_summary(interaction),
+            f"Тип: {_interaction_type_ru(interaction.get('Interaction Type', ''))}",
+        ]
+        if interaction.get("Direction"):
+            lines.append(f"Направление: {_interaction_direction_ru(interaction.get('Direction', ''))}")
+        for key, label in (("Commercial Offer ID", "Offer"), ("Channel ID", "Channel"), ("Assigned Person ID", "Ответственный")):
+            if interaction.get(key):
+                lines.append(f"{label}: {interaction[key]}")
+        lines.append(f"Дата: {interaction.get('Occurred At', '')}")
+        lines.append(f"Summary: {_truncate_interaction_text(interaction.get('Summary', ''), _INTERACTION_SUMMARY_DETAIL_MAX_LENGTH)}")
+        if interaction.get("Outcome"):
+            lines.append(f"Outcome: {_truncate_interaction_text(interaction.get('Outcome', ''), _INTERACTION_OUTCOME_DETAIL_MAX_LENGTH)}")
+        lines.append(f"Статус: {_interaction_status_ru(interaction.get('Status', ''))}")
+        lines.append(f"Создан: {interaction.get('Created At', '')}")
+        if interaction.get("Updated At"):
+            lines.append(f"Обновлён: {interaction['Updated At']}")
+        if interaction.get("Archived At"):
+            lines.append(f"Архивирован: {interaction['Archived At']}")
+
+        await _reply(update, "\n".join(lines), parse_mode=None)
+    except Exception as e:
+        log.error(f"interaction_cmd error: {e}")
+        await _reply(update, "❌ Не удалось получить Interaction.", parse_mode=None)
+
+
+async def archiveinteraction_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /archiveinteraction interaction_id=ACT-001
+
+    active → archived. Terminal — no restore, no hard delete.
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg(), parse_mode=None)
+        return
+
+    raw = " ".join(context.args or [])
+    args = _parse_kv_args(raw)
+    interaction_id = args.get("interaction_id") or args.get("_pos0", "")
+
+    if not interaction_id:
+        await _reply(update, "❌ Укажи interaction_id.\n\nПример: /archiveinteraction interaction_id=ACT-001", parse_mode=None)
+        return
+
+    try:
+        from business_core.business_builder import archive_interaction
+
+        result = archive_interaction(interaction_id)
+        await _reply(update, _interaction_archive_message(result, interaction_id), parse_mode=None)
+    except Exception as e:
+        log.error(f"archiveinteraction_cmd error: {e}")
+        await _reply(update, "❌ Не удалось архивировать Interaction.", parse_mode=None)
+
+
+async def updateinteractionnotes_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /updateinteractionnotes interaction_id=ACT-001 notes=...
+
+    Notes-only admin update, allowed in both active and archived
+    states. No Interaction fact may be changed through this command.
+    Notes content is never echoed back in the reply.
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg(), parse_mode=None)
+        return
+
+    raw = " ".join(context.args or [])
+    args = _parse_kv_args(raw)
+    interaction_id = args.get("interaction_id", "")
+    notes = args.get("notes", "")
+
+    if not interaction_id or not notes:
+        await _reply(
+            update,
+            "❌ Укажи interaction_id и notes.\n\nПример:\n"
+            "`/updateinteractionnotes interaction_id=ACT-001 notes=...`", parse_mode=None)
+        return
+
+    try:
+        from business_core.business_builder import update_interaction_notes
+
+        result = update_interaction_notes(interaction_id, notes)
+        await _reply(update, _interaction_notes_message(result, interaction_id), parse_mode=None)
+    except Exception as e:
+        log.error(f"updateinteractionnotes_cmd error: {e}")
+        await _reply(update, "❌ Не удалось обновить Notes для Interaction.", parse_mode=None)
+
+
 async def milestones_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     /milestones roadmap_id=RM-022
@@ -11036,6 +11475,12 @@ def register_business_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("loselead",         loselead_cmd))
     app.add_handler(CommandHandler("convertlead",      convertlead_cmd))
     app.add_handler(CommandHandler("archivelead",      archivelead_cmd))
+    # Phase 42D (ADR-025): Interaction / Communication History Domain — operational commands.
+    app.add_handler(CommandHandler("newinteraction",        newinteraction_cmd))
+    app.add_handler(CommandHandler("interactions",           interactions_cmd))
+    app.add_handler(CommandHandler("interaction",            interaction_cmd))
+    app.add_handler(CommandHandler("archiveinteraction",     archiveinteraction_cmd))
+    app.add_handler(CommandHandler("updateinteractionnotes", updateinteractionnotes_cmd))
     # Phase 8D
     app.add_handler(CommandHandler("milestones",       milestones_cmd))
     # Phase 11B

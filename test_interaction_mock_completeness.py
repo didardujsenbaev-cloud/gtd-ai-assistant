@@ -23,6 +23,8 @@ _INTERACTION_TEST_FILES = frozenset({
     "test_business_interaction_foundation.py",
     "test_interaction_architecture_guards.py",
     "test_interaction_mock_completeness.py",
+    # Phase 42D (ADR-025): Interaction caller (Telegram) UX test file.
+    "test_interaction_caller_ux.py",
 })
 
 

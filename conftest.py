@@ -236,6 +236,10 @@ _INTERACTION_DOMAIN_TEST_FILES = frozenset({
     "test_business_interaction_foundation.py",
     "test_interaction_architecture_guards.py",
     "test_interaction_mock_completeness.py",
+    # Phase 42D (ADR-025): Interaction caller (Telegram) UX test file —
+    # registered BEFORE any test logic was written, per the PRS-003
+    # precedent.
+    "test_interaction_caller_ux.py",
 })
 
 _HARD_SOCKET_BLOCK_TEST_FILES = (

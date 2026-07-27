@@ -379,15 +379,203 @@ class TestInteractionTestsHaveHardSocketBlock(unittest.TestCase):
             self.assertIn(filename, conftest_src, f"{filename} must be registered in conftest.py's hard socket-block set")
 
 
-class TestNoTelegramCallerYet(unittest.TestCase):
-    """Phase 42C is explicitly Foundation-only — no Telegram command
-    for Interaction may exist yet (that is Phase 42D's scope)."""
+# ─────────────────────────────────────────────────────────────
+# Phase 42D (ADR-025): Interaction caller (Telegram) architecture
+# guards. Mirrors the Phase 41D Lead caller guard pattern exactly.
+# ─────────────────────────────────────────────────────────────
 
-    def test_no_interaction_commands_registered(self):
-        path = WORKSPACE / "business_core" / "telegram_handlers.py"
+_INTERACTION_COMMANDS = (
+    "newinteraction_cmd", "interactions_cmd", "interaction_cmd",
+    "archiveinteraction_cmd", "updateinteractionnotes_cmd",
+)
+
+
+def _th_function_body(fn_name: str) -> str:
+    return _function_body(BUSINESS_CORE / "telegram_handlers.py", fn_name)
+
+
+class TestInteractionCommandsCallOnlyCanonicalOrchestration(unittest.TestCase):
+
+    def test_no_low_level_interaction_manager_write_calls_in_mutating_commands(self):
+        forbidden = (
+            "interaction_manager.create_interaction(", "interaction_manager.update_interaction_status(",
+            "interaction_manager.update_interaction_admin_fields(",
+        )
+        for fn_name in ("newinteraction_cmd", "archiveinteraction_cmd", "updateinteractionnotes_cmd"):
+            body = _th_function_body(fn_name)
+            for call in forbidden:
+                self.assertNotIn(call, body, f"{fn_name} must not call low-level {call.rstrip('(')} directly")
+
+    def test_mutating_commands_call_business_builder_only(self):
+        expectations = {
+            "newinteraction_cmd": "create_interaction(",
+            "archiveinteraction_cmd": "archive_interaction(",
+            "updateinteractionnotes_cmd": "update_interaction_notes(",
+        }
+        for fn_name, call in expectations.items():
+            body = _th_function_body(fn_name)
+            self.assertIn(call, body, f"{fn_name} must call business_builder.{call.rstrip('(')}")
+
+    def test_read_commands_call_exact_interaction_manager_helpers_only(self):
+        expectations = {
+            "interactions_cmd": "list_interactions(",
+            "interaction_cmd": "find_interaction_by_id(",
+        }
+        for fn_name, call in expectations.items():
+            body = _th_function_body(fn_name)
+            self.assertIn(call, body)
+            for forbidden in ("create_interaction(", "archive_interaction(", "update_interaction_notes("):
+                self.assertNotIn(forbidden, body, f"{fn_name} is read-only and must not call {forbidden.rstrip('(')}")
+
+
+class TestNoCallerSideInteractionPolicy(unittest.TestCase):
+
+    def test_no_caller_side_id_generation(self):
+        for fn_name in _INTERACTION_COMMANDS:
+            body = _th_function_body(fn_name)
+            self.assertNotIn('"ACT-"', body)
+            self.assertNotIn("generate_next_id(", body)
+            self.assertNotIn("generate_next_interaction_id(", body)
+
+    def test_no_caller_side_type_direction_datetime_normalization(self):
+        for fn_name in _INTERACTION_COMMANDS:
+            body = _th_function_body(fn_name)
+            self.assertNotIn("normalize_interaction_type(", body)
+            self.assertNotIn("normalize_interaction_direction(", body)
+            self.assertNotIn("normalize_interaction_occurred_at(", body)
+
+    def test_no_caller_side_subject_or_relation_policy(self):
+        for fn_name in _INTERACTION_COMMANDS:
+            body = _th_function_body(fn_name)
+            self.assertNotIn("_validate_interaction_subject(", body)
+            self.assertNotIn("_validate_interaction_relations(", body)
+            self.assertNotIn("read_business_sheet(", body)
+
+    def test_no_caller_side_idempotency_policy(self):
+        for fn_name in _INTERACTION_COMMANDS:
+            body = _th_function_body(fn_name)
+            self.assertNotIn("find_interactions_by_idempotency_key(", body)
+
+    def test_no_relationship_capital_reuse(self):
+        for fn_name in _INTERACTION_COMMANDS:
+            body = _th_function_body(fn_name)
+            self.assertNotIn("relationship_capital", body)
+            self.assertNotIn("RelationshipTouch", body)
+
+    def test_no_lead_client_offer_task_payment_mutation_calls(self):
+        for fn_name in _INTERACTION_COMMANDS:
+            body = _th_function_body(fn_name)
+            for forbidden in (
+                "update_lead(", "convert_lead(", "update_person(", "create_person(",
+                "accept_commercial_offer(", "create_commercial_offer(",
+                "create_payment_obligation(", "create_business_task(", "transition_task_status(",
+                "register_document(", "transition_document_status(",
+                "instantiate_checklist(", "transition_checklist_status(",
+                "update_stage_status_in_sheet(", "recalculate_roadmap_progress(",
+            ):
+                self.assertNotIn(forbidden, body, f"{fn_name} must not mutate Lead/Person/Offer/Task/Document/Checklist/Stage/Roadmap ({forbidden!r} found)")
+
+
+class TestInteractionCommandRegistration(unittest.TestCase):
+
+    def test_all_5_commands_registered_exactly_once(self):
+        path = BUSINESS_CORE / "telegram_handlers.py"
         src = path.read_text(encoding="utf-8")
-        for forbidden in ("newinteraction_cmd", "interactions_cmd", "archiveinteraction_cmd"):
-            self.assertNotIn(forbidden, src)
+        for name in ("newinteraction", "interactions", "interaction", "archiveinteraction", "updateinteractionnotes"):
+            self.assertEqual(src.count(f'CommandHandler("{name}"'), 1, f"/{name} must be registered exactly once")
+
+    def test_milestones_still_registered_exactly_once(self):
+        path = BUSINESS_CORE / "telegram_handlers.py"
+        src = path.read_text(encoding="utf-8")
+        self.assertEqual(src.count('CommandHandler("milestones"'), 1)
+
+
+class TestInteractionUxHelpersDefinedOnce(unittest.TestCase):
+
+    def test_helpers_defined_exactly_once(self):
+        path = BUSINESS_CORE / "telegram_handlers.py"
+        src = path.read_text(encoding="utf-8")
+        for fn in (
+            "_interaction_creation_message", "_interaction_archive_message", "_interaction_notes_message",
+            "_interaction_status_ru", "_interaction_type_ru", "_interaction_direction_ru",
+            "_interaction_subject_summary", "_truncate_interaction_text",
+        ):
+            self.assertEqual(src.count(f"def {fn}("), 1, f"{fn} must be defined exactly once")
+
+    def test_helpers_are_callable(self):
+        import business_core.telegram_handlers as th
+        for fn in ("_interaction_creation_message", "_interaction_archive_message", "_interaction_notes_message"):
+            self.assertTrue(callable(getattr(th, fn, None)))
+
+
+class TestExternalReferenceNeverExposedGuard(unittest.TestCase):
+
+    def test_external_reference_field_never_rendered(self):
+        for fn_name in ("interaction_cmd", "interactions_cmd"):
+            body = _th_function_body(fn_name)
+            self.assertNotIn('"External Reference"', body)
+
+
+class TestNoSensitiveInteractionFieldsLoggedGuard(unittest.TestCase):
+
+    _DISALLOWED_LOG_TOKENS = ("Summary", "Outcome", "Notes", "External Reference", "Caller Idempotency Key", "update.message.text")
+
+    def test_interaction_handlers_do_not_log_disallowed_fields(self):
+        for fn_name in _INTERACTION_COMMANDS:
+            body = _th_function_body(fn_name)
+            log_lines = [line for line in body.splitlines() if "log.error(" in line or "log.warning(" in line or "log.info(" in line]
+            for line in log_lines:
+                for token in self._DISALLOWED_LOG_TOKENS:
+                    self.assertNotIn(token, line, f"{fn_name} logs disallowed token {token!r}: {line}")
+
+
+class TestNoRawExceptionInInteractionCommands(unittest.TestCase):
+
+    def test_no_raw_exception_interpolation(self):
+        for fn_name in _INTERACTION_COMMANDS:
+            body = _th_function_body(fn_name)
+            self.assertNotIn("Ошибка: {e}", body)
+            self.assertNotIn("str(e)", body)
+
+
+class TestInteractionParserValidationOrdering(unittest.TestCase):
+
+    def test_newinteraction_validates_before_orchestration(self):
+        body = _th_function_body("newinteraction_cmd")
+        validation_idx = body.index("if not business_id or not interaction_type or not occurred_at or not summary or not caller_idempotency_key")
+        orchestration_idx = body.index("create_interaction(")
+        self.assertLess(validation_idx, orchestration_idx)
+
+    def test_archiveinteraction_validates_before_orchestration(self):
+        body = _th_function_body("archiveinteraction_cmd")
+        validation_idx = body.index("if not interaction_id")
+        orchestration_idx = body.index("archive_interaction(")
+        self.assertLess(validation_idx, orchestration_idx)
+
+    def test_updateinteractionnotes_validates_before_orchestration(self):
+        body = _th_function_body("updateinteractionnotes_cmd")
+        validation_idx = body.index("if not interaction_id or not notes")
+        orchestration_idx = body.index("update_interaction_notes(")
+        self.assertLess(validation_idx, orchestration_idx)
+
+
+class TestInteractionParseModeIsNone(unittest.TestCase):
+
+    def test_all_interaction_commands_pass_parse_mode_none(self):
+        for fn_name in _INTERACTION_COMMANDS:
+            body = _th_function_body(fn_name)
+            reply_calls = body.count("_reply(update,")
+            parse_none_calls = body.count("parse_mode=None")
+            self.assertGreaterEqual(parse_none_calls, reply_calls, f"{fn_name}: not every _reply call passes parse_mode=None")
+
+
+class TestMilestonesCommandUntouchedByInteractionCallerPhase(unittest.TestCase):
+
+    def test_milestones_body_unchanged_shape(self):
+        body = _th_function_body("milestones_cmd")
+        self.assertIn("get_commercial_milestones_for_roadmap", body)
+        self.assertNotIn("interaction_manager", body)
+        self.assertNotIn("create_interaction", body)
 
 
 if __name__ == "__main__":
