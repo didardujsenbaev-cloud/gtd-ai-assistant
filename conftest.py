@@ -208,6 +208,10 @@ _OFFER_DOMAIN_TEST_FILES = frozenset({
     "test_business_offer_foundation.py",
     "test_offer_architecture_guards.py",
     "test_offer_mock_completeness.py",
+    # Phase 40D (ADR-023): Commercial Offer caller (Telegram) UX test
+    # file — registered BEFORE any test logic was written, per the
+    # PRS-003 precedent.
+    "test_offer_caller_ux.py",
 })
 
 _HARD_SOCKET_BLOCK_TEST_FILES = (

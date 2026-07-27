@@ -7920,6 +7920,752 @@ async def failpayment_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await _reply(update, "❌ Не удалось обновить статус Payment.", parse_mode=None)
 
 
+# ─────────────────────────────────────────────────────────────
+# Phase 40D (ADR-023): Commercial Offer Domain caller (Telegram) UX.
+#
+# Every command below is a thin resolve-args -> call-canonical-
+# orchestration -> render-message wrapper — no business logic beyond
+# what business_builder/offer_manager already returns. Centralized
+# result-code -> Russian message mapping below mirrors the Phase 39D
+# Payment / Phase 38D Checklist UX pattern exactly.
+# ─────────────────────────────────────────────────────────────
+
+_OFFER_STATUS_RU: dict[str, str] = {
+    "draft": "Черновик", "sent": "Отправлен", "accepted": "Принят",
+    "rejected": "Отклонён", "expired": "Истёк", "cancelled": "Отменён", "archived": "В архиве",
+}
+
+
+def _offer_status_ru(status: str) -> str:
+    return f"{_OFFER_STATUS_RU.get(status, status)} ({status})"
+
+
+def _format_offer_amount(amount: str, currency: str) -> str:
+    """Caller-only display formatting. Never recomputes — renders
+    exactly the canonical Decimal string Foundation already produced,
+    alongside its currency."""
+    amount = amount or "—"
+    currency = currency or ""
+    return f"{amount} {currency}".strip()
+
+
+def _offer_creation_message(result: dict) -> str:
+    """Render any business_builder.create_commercial_offer() result."""
+    code = result.get("code", "")
+
+    if code == "COMMERCIAL_OFFER_CREATED":
+        lines = [
+            "✅ Commercial Offer создан",
+            f"OFR ID: {result.get('commercial_offer_id', '')}",
+            f"Series ID: {result.get('offer_series_id', '')}",
+            f"Версия: {result.get('version_number', '')}",
+            f"Сумма: {_format_offer_amount(result.get('amount', ''), result.get('currency', ''))}",
+            f"Действителен до: {result.get('valid_until', '')}",
+            f"Статус: {_offer_status_ru(result.get('final_status', ''))}",
+        ]
+        return "\n".join(lines)
+
+    if code == "COMMERCIAL_OFFER_REUSED":
+        return "\n".join([
+            "♻️ Commercial Offer с этим ключом уже существует — использована существующая запись",
+            f"OFR ID: {result.get('commercial_offer_id', '')}",
+            f"Статус: {_offer_status_ru(result.get('final_status', ''))}",
+        ])
+
+    if code == "BUSINESS_NOT_FOUND":
+        return f"❌ Business не найден: {result.get('error') or ''}"
+
+    if code == "CLIENT_NOT_FOUND":
+        return f"❌ Client не найден: {result.get('error') or ''}"
+
+    if code == "OBJECT_NOT_FOUND":
+        return "❌ Указанный Object не найден."
+
+    if code == "SERVICE_NOT_FOUND":
+        return "❌ Указанный Service не найден."
+
+    if code == "ROADMAP_NOT_FOUND":
+        return "❌ Указанный Roadmap не найден."
+
+    if code == "DOCUMENT_NOT_FOUND":
+        return "❌ Указанный Document не найден."
+
+    if code == "COMMERCIAL_OFFER_CONTEXT_REQUIRED":
+        return "❌ Требуется хотя бы одно: object_id, service_id или roadmap_id."
+
+    if code == "COMMERCIAL_OFFER_RELATION_MISMATCH":
+        return f"❌ Несогласованные ссылки на сущности: {result.get('error') or 'см. логи'}"
+
+    if code == "COMMERCIAL_OFFER_TITLE_REQUIRED":
+        return "❌ Укажи title (не более 300 символов)."
+
+    if code == "COMMERCIAL_OFFER_SCOPE_REQUIRED":
+        return "❌ Укажи scope (не более 10000 символов)."
+
+    if code in ("INVALID_COMMERCIAL_OFFER_AMOUNT", "INVALID_COMMERCIAL_OFFER_AMOUNT_SCALE", "COMMERCIAL_OFFER_AMOUNT_MUST_BE_POSITIVE"):
+        return f"❌ {result.get('error') or 'Недопустимая сумма.'}"
+
+    if code == "INVALID_COMMERCIAL_OFFER_CURRENCY":
+        return f"❌ {result.get('error') or 'Недопустимая валюта.'}"
+
+    if code == "INVALID_COMMERCIAL_OFFER_VALID_UNTIL":
+        return f"❌ {result.get('error') or 'Недопустимая дата valid_until.'}"
+
+    if code == "COMMERCIAL_OFFER_VALID_UNTIL_IN_PAST":
+        return f"❌ {result.get('error') or 'valid_until не может быть в прошлом.'}"
+
+    if code == "COMMERCIAL_OFFER_IDEMPOTENCY_REQUIRED":
+        return "❌ Укажи caller_idempotency_key."
+
+    if code == "MULTIPLE_COMMERCIAL_OFFER_MATCHES":
+        ids = ", ".join(result.get("conflicting_ids", ())) or "—"
+        return "\n".join([
+            "⚠️ Обнаружен конфликт целостности данных",
+            f"Найдено несколько Commercial Offer с одним ключом: {ids}",
+            "Новый Offer не создан — автоматический выбор одного из них не выполняется.",
+        ])
+
+    if code == "COMMERCIAL_OFFER_PERSISTENCE_FAILED":
+        return "❌ Не удалось создать Commercial Offer."
+
+    if code == "COMMERCIAL_OFFER_POST_WRITE_VERIFICATION_FAILED":
+        return "\n".join(["⚠️ Commercial Offer записан, но пост-проверка записи не прошла.", "Требуется ручная проверка."])
+
+    if not code and result.get("error"):
+        return f"❌ {result['error']}"
+
+    log.warning(f"_offer_creation_message: unmapped code={code!r}")
+    return "❌ Не удалось создать Commercial Offer."
+
+
+def _offer_revision_message(result: dict) -> str:
+    """Render any business_builder.revise_commercial_offer() result."""
+    code = result.get("code", "")
+
+    if code == "COMMERCIAL_OFFER_REVISED":
+        return "\n".join([
+            "✅ Создана новая версия Commercial Offer",
+            f"Новый OFR ID: {result.get('commercial_offer_id', '')}",
+            f"Series ID: {result.get('offer_series_id', '')}",
+            f"Версия: {result.get('version_number', '')}",
+            f"Предыдущая версия: {result.get('previous_commercial_offer_id', '')}",
+            f"Статус: {_offer_status_ru(result.get('final_status', ''))}",
+        ])
+
+    if code == "COMMERCIAL_OFFER_REUSED":
+        return "\n".join([
+            "♻️ Revision с этим ключом уже существует — использована существующая запись",
+            f"OFR ID: {result.get('commercial_offer_id', '')}",
+        ])
+
+    if code == "COMMERCIAL_OFFER_NOT_FOUND":
+        return "❌ Указанный source_commercial_offer_id не найден."
+
+    if code == "COMMERCIAL_OFFER_NOT_LATEST_VERSION":
+        return "\n".join([
+            "🔒 Указанная версия не является последней в серии",
+            "Revision возможен только от последней версии.",
+        ])
+
+    if code == "COMMERCIAL_OFFER_SERIES_INTEGRITY_ERROR":
+        ids = ", ".join(result.get("conflicting_ids", ())) or "—"
+        return "\n".join([
+            "⚠️ Обнаружен конфликт целостности серии",
+            f"Уже существует ревизия(и): {ids}",
+        ])
+
+    if code == "COMMERCIAL_OFFER_IDEMPOTENCY_REQUIRED":
+        return "❌ Укажи caller_idempotency_key."
+
+    if code == "MULTIPLE_COMMERCIAL_OFFER_MATCHES":
+        ids = ", ".join(result.get("conflicting_ids", ())) or "—"
+        return f"⚠️ Найдено несколько Commercial Offer с одним ключом: {ids}"
+
+    if code in (
+        "INVALID_COMMERCIAL_OFFER_AMOUNT", "INVALID_COMMERCIAL_OFFER_AMOUNT_SCALE", "COMMERCIAL_OFFER_AMOUNT_MUST_BE_POSITIVE",
+        "INVALID_COMMERCIAL_OFFER_CURRENCY", "INVALID_COMMERCIAL_OFFER_VALID_UNTIL", "COMMERCIAL_OFFER_VALID_UNTIL_IN_PAST",
+        "COMMERCIAL_OFFER_TITLE_REQUIRED", "COMMERCIAL_OFFER_SCOPE_REQUIRED",
+        "BUSINESS_NOT_FOUND", "CLIENT_NOT_FOUND", "OBJECT_NOT_FOUND", "SERVICE_NOT_FOUND", "ROADMAP_NOT_FOUND",
+        "DOCUMENT_NOT_FOUND", "COMMERCIAL_OFFER_CONTEXT_REQUIRED", "COMMERCIAL_OFFER_RELATION_MISMATCH",
+    ):
+        return f"❌ {result.get('error') or 'Проверьте параметры revision.'}"
+
+    if code == "COMMERCIAL_OFFER_PERSISTENCE_FAILED":
+        return "❌ Не удалось создать новую версию Commercial Offer."
+
+    if code == "COMMERCIAL_OFFER_POST_WRITE_VERIFICATION_FAILED":
+        return "\n".join(["⚠️ Revision записана, но пост-проверка записи не прошла.", "Требуется ручная проверка."])
+
+    log.warning(f"_offer_revision_message: unmapped code={code!r}")
+    return "❌ Не удалось создать revision Commercial Offer."
+
+
+def _offer_update_message(result: dict, offer_id: str) -> str:
+    """Render any business_builder.update_commercial_offer_draft()/
+    update_commercial_offer_admin_fields() result."""
+    code = result.get("code", "")
+
+    if code == "COMMERCIAL_OFFER_UPDATED":
+        return f"✅ Commercial Offer {offer_id} обновлён."
+
+    if code == "COMMERCIAL_OFFER_UPDATE_UNCHANGED":
+        return f"ℹ️ Commercial Offer {offer_id} — изменений нет (значения совпадают)."
+
+    if code == "COMMERCIAL_OFFER_NOT_FOUND":
+        return f"❌ Commercial Offer {offer_id} не найден."
+
+    if code == "COMMERCIAL_OFFER_IMMUTABLE":
+        return f"❌ {result.get('error') or 'Изменение недоступно — поле неизменяемо или Offer не в статусе draft.'}"
+
+    if code in (
+        "INVALID_COMMERCIAL_OFFER_AMOUNT", "INVALID_COMMERCIAL_OFFER_AMOUNT_SCALE", "COMMERCIAL_OFFER_AMOUNT_MUST_BE_POSITIVE",
+        "INVALID_COMMERCIAL_OFFER_CURRENCY", "INVALID_COMMERCIAL_OFFER_VALID_UNTIL", "COMMERCIAL_OFFER_VALID_UNTIL_IN_PAST",
+        "COMMERCIAL_OFFER_TITLE_REQUIRED", "COMMERCIAL_OFFER_SCOPE_REQUIRED",
+        "OBJECT_NOT_FOUND", "SERVICE_NOT_FOUND", "ROADMAP_NOT_FOUND", "DOCUMENT_NOT_FOUND", "COMMERCIAL_OFFER_RELATION_MISMATCH",
+    ):
+        return f"❌ {result.get('error') or 'Проверьте параметры обновления.'}"
+
+    log.warning(f"_offer_update_message: unmapped code={code!r} offer_id={offer_id}")
+    return f"❌ Ошибка ({code or 'unknown'}): {result.get('error') or 'см. логи'}"
+
+
+def _offer_lifecycle_message(result: dict, offer_id: str, action_label: str) -> str:
+    """
+    Shared renderer for send/accept/reject/expire/cancel/archive
+    results — all share the same underlying _transition_commercial_
+    offer() code family plus one action-specific success code.
+    `action_label` is the past-tense Russian verb for the success line
+    (e.g. "отправлен", "принят") — acceptance intentionally never
+    implies payment received, invoice issued, or contract signed
+    (ADR-023 §21/Phase 40D §9): only "коммерческие условия приняты".
+    """
+    code = result.get("code", "")
+    previous_status = result.get("previous_status", "")
+    requested_status = result.get("requested_status", "")
+
+    success_codes = {
+        "COMMERCIAL_OFFER_SENT": "✅ Commercial Offer отправлен",
+        "COMMERCIAL_OFFER_ACCEPTED": "✅ Коммерческие условия приняты",
+        "COMMERCIAL_OFFER_REJECTED": "✅ Commercial Offer отклонён",
+        "COMMERCIAL_OFFER_EXPIRED": "✅ Commercial Offer помечен как истёкший",
+        "COMMERCIAL_OFFER_CANCELLED": "✅ Commercial Offer отменён",
+        "COMMERCIAL_OFFER_ARCHIVED": "✅ Commercial Offer архивирован",
+    }
+    if code in success_codes:
+        return "\n".join([
+            success_codes[code],
+            f"OFR ID: {offer_id}",
+            f"Был: {_offer_status_ru(previous_status)}",
+            f"Стал: {_offer_status_ru(result.get('final_status', ''))}",
+        ])
+
+    if code == "COMMERCIAL_OFFER_STATUS_UNCHANGED":
+        return f"ℹ️ Commercial Offer {offer_id} уже имеет статус {_offer_status_ru(previous_status)} — изменений нет."
+
+    if code == "COMMERCIAL_OFFER_NOT_FOUND":
+        return f"❌ Commercial Offer {offer_id} не найден."
+
+    if code == "INVALID_COMMERCIAL_OFFER_TRANSITION":
+        return f"❌ Переход '{previous_status}' → '{requested_status}' не разрешён."
+
+    if code == "COMMERCIAL_OFFER_NOT_LATEST_VERSION":
+        return "\n".join([
+            "🔒 Commercial Offer не является последней версией серии",
+            f"OFR ID: {offer_id}",
+            f"Действие {action_label} возможно только для последней версии.",
+        ])
+
+    if code == "COMMERCIAL_OFFER_ACTOR_REQUIRED":
+        return f"❌ {result.get('error') or 'Укажи ответственного (actor).'}"
+
+    if code == "COMMERCIAL_OFFER_REJECTION_REASON_REQUIRED":
+        return "❌ Укажи rejection_reason."
+
+    if code == "COMMERCIAL_OFFER_CANCELLATION_REASON_REQUIRED":
+        return "❌ Укажи cancellation_reason."
+
+    if code == "COMMERCIAL_OFFER_PERSISTENCE_FAILED":
+        return f"❌ Не удалось изменить статус Commercial Offer {offer_id}."
+
+    log.warning(f"_offer_lifecycle_message: unmapped code={code!r} offer_id={offer_id}")
+    return f"❌ Ошибка ({code or 'unknown'}): {result.get('error') or 'см. логи'}"
+
+
+async def newoffer_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /newoffer business_id=BIZ-001 client_id=PRS-001 title=... scope=...
+              quoted_amount=500000 currency=KZT valid_until=YYYY-MM-DD
+              caller_idempotency_key=...
+              [object_id=...] [service_id=...] [roadmap_id=...]
+              [offer_document_id=...] [created_by=...] [notes=...]
+
+    Creates one version-1 Commercial Offer. Idempotent via
+    caller_idempotency_key (ADR-023 §22) — repeated calls with the same
+    key reuse the existing Offer rather than creating a duplicate.
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg(), parse_mode=None)
+        return
+
+    raw = " ".join(context.args or [])
+    args = _parse_kv_args(raw)
+    business_id = args.get("business_id", "")
+    client_id = args.get("client_id", "")
+    title = args.get("title", "")
+    scope = args.get("scope", "")
+    quoted_amount = args.get("quoted_amount", "")
+    currency = args.get("currency", "")
+    valid_until = args.get("valid_until", "")
+    caller_idempotency_key = args.get("caller_idempotency_key", "")
+
+    if not business_id or not client_id or not title or not scope or not quoted_amount or not currency or not valid_until:
+        await _reply(
+            update,
+            "❌ Укажи business_id, client_id, title, scope, quoted_amount, currency и valid_until.\n\nПример:\n"
+            "`/newoffer business_id=BIZ-001 client_id=PRS-001 title=... scope=... quoted_amount=500000 "
+            "currency=KZT valid_until=2026-12-31 caller_idempotency_key=... service_id=SVC-001`", parse_mode=None)
+        return
+
+    if not caller_idempotency_key:
+        await _reply(update, "❌ Укажи caller_idempotency_key.", parse_mode=None)
+        return
+
+    try:
+        from business_core.business_builder import create_commercial_offer
+
+        result = create_commercial_offer(
+            business_id, client_id, title, scope, quoted_amount, currency, valid_until,
+            object_id=args.get("object_id", ""), service_id=args.get("service_id", ""),
+            roadmap_id=args.get("roadmap_id", ""), offer_document_id=args.get("offer_document_id", ""),
+            caller_idempotency_key=caller_idempotency_key,
+            created_by=args.get("created_by", "") or _telegram_username(update),
+            notes=args.get("notes", ""),
+        )
+        await _reply(update, _offer_creation_message(result), parse_mode=None)
+    except Exception as e:
+        log.error(f"newoffer_cmd error: {e}")
+        await _reply(update, "❌ Не удалось создать Commercial Offer.", parse_mode=None)
+
+
+_OFFERS_LIST_MAX_SHOWN = 20
+
+
+async def offers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /offers [business_id=...] [client_id=...] [object_id=...] [service_id=...]
+            [roadmap_id=...] [offer_series_id=...] [status=...] [currency=...]
+            [document_id=...]
+
+    Read-only, bounded, filtered list of Commercial Offers. Archived
+    Offers are excluded by default unless status=archived is explicit.
+    Never shows Scope Snapshot, Notes, Rejection Reason, or Cancellation
+    Reason.
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg(), parse_mode=None)
+        return
+
+    raw = " ".join(context.args or [])
+    args = _parse_kv_args(raw)
+    status_filter = args.get("status", "")
+
+    try:
+        from business_core.offer_manager import list_commercial_offers
+
+        offers = list_commercial_offers(
+            business_id=args.get("business_id", ""), client_id=args.get("client_id", ""),
+            object_id=args.get("object_id", ""), service_id=args.get("service_id", ""),
+            roadmap_id=args.get("roadmap_id", ""), offer_series_id=args.get("offer_series_id", ""),
+            status=status_filter, currency=args.get("currency", ""), document_id=args.get("document_id", ""),
+        )
+        if not status_filter:
+            offers = [o for o in offers if o.get("Status", "") != "archived"]
+
+        if not offers:
+            await _reply(update, "ℹ️ Commercial Offers не найдены.", parse_mode=None)
+            return
+
+        lines = [f"📄 Commercial Offers ({len(offers)})", ""]
+        for o in offers[:_OFFERS_LIST_MAX_SHOWN]:
+            lines.append(
+                f"{o.get('Commercial Offer ID', '')} (v{o.get('Version Number', '')}) — {o.get('Title Snapshot', '')} "
+                f"[{_offer_status_ru(o.get('Status', ''))}] "
+                f"{_format_offer_amount(o.get('Quoted Amount', ''), o.get('Currency', ''))} "
+                f"Client: {o.get('Client ID', '')}"
+            )
+        if len(offers) > _OFFERS_LIST_MAX_SHOWN:
+            lines.append(f"\n… показаны первые {_OFFERS_LIST_MAX_SHOWN} из {len(offers)}.")
+
+        await _reply(update, "\n".join(lines), parse_mode=None)
+    except Exception as e:
+        log.error(f"offers_cmd error: {e}")
+        await _reply(update, "❌ Не удалось получить список Commercial Offers.", parse_mode=None)
+
+
+_OFFER_SCOPE_DISPLAY_MAX_LENGTH = 500
+_OFFER_SERIES_HISTORY_MAX_SHOWN = 10
+
+
+async def offer_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /offer commercial_offer_id=OFR-001
+
+    Read-only, exact-ID detail + bounded version-history summary. Hides
+    Notes, Caller Idempotency Key, Rejection Reason, Cancellation
+    Reason. Scope Snapshot is bounded to a safe display length.
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg(), parse_mode=None)
+        return
+
+    raw = " ".join(context.args or [])
+    args = _parse_kv_args(raw)
+    offer_id = args.get("commercial_offer_id") or args.get("_pos0", "")
+
+    if not offer_id:
+        await _reply(update, "❌ Укажи commercial_offer_id.\n\nПример: /offer commercial_offer_id=OFR-001", parse_mode=None)
+        return
+
+    try:
+        from business_core.offer_manager import find_commercial_offer_by_id, list_commercial_offers_by_series
+        from business_core.business_builder import is_commercial_offer_effectively_expired
+
+        offer = find_commercial_offer_by_id(offer_id)
+        if offer is None:
+            await _reply(update, f"❌ Commercial Offer {offer_id} не найден.", parse_mode=None)
+            return
+
+        scope = offer.get("Scope Snapshot", "")
+        scope_display = scope if len(scope) <= _OFFER_SCOPE_DISPLAY_MAX_LENGTH else scope[:_OFFER_SCOPE_DISPLAY_MAX_LENGTH] + "…"
+
+        lines = [
+            f"📄 Commercial Offer {offer.get('Commercial Offer ID', '')}",
+            "",
+            f"Series: {offer.get('Offer Series ID', '')} (версия {offer.get('Version Number', '')})",
+            f"Предыдущая версия: {offer.get('Previous Commercial Offer ID', '') or '—'}",
+            f"Business: {offer.get('Business ID', '')}",
+            f"Client: {offer.get('Client ID', '')}",
+        ]
+        for key, label in (("Object ID", "Object"), ("Service ID", "Service"), ("Roadmap ID", "Roadmap"), ("Offer Document ID", "Document")):
+            if offer.get(key):
+                lines.append(f"{label}: {offer[key]}")
+        lines.extend([
+            f"Название: {offer.get('Title Snapshot', '')}",
+            f"Объём: {scope_display}",
+            f"Сумма: {_format_offer_amount(offer.get('Quoted Amount', ''), offer.get('Currency', ''))}",
+            f"Действителен до: {offer.get('Valid Until', '')}",
+            f"Статус: {_offer_status_ru(offer.get('Status', ''))}",
+        ])
+        if is_commercial_offer_effectively_expired(offer):
+            lines.append("⚠️ Внимание: срок действия истёк (Valid Until в прошлом), но статус ещё не переведён в 'expired'.")
+        for key, label in (("Sent At", "Отправлен"), ("Accepted At", "Принят"), ("Rejected At", "Отклонён"), ("Cancelled At", "Отменён"), ("Archived At", "Архивирован")):
+            if offer.get(key):
+                lines.append(f"{label}: {offer[key]}")
+
+        series = list_commercial_offers_by_series(offer.get("Offer Series ID", ""))
+        series_sorted = sorted(series, key=lambda o: int(o.get("Version Number") or 0))
+        lines.append("")
+        lines.append(f"История версий: {len(series_sorted)}")
+        for v in series_sorted[:_OFFER_SERIES_HISTORY_MAX_SHOWN]:
+            lines.append(f"  v{v.get('Version Number', '')} — {v.get('Commercial Offer ID', '')} [{_offer_status_ru(v.get('Status', ''))}]")
+        if len(series_sorted) > _OFFER_SERIES_HISTORY_MAX_SHOWN:
+            lines.append(f"  … показаны первые {_OFFER_SERIES_HISTORY_MAX_SHOWN} из {len(series_sorted)}.")
+
+        await _reply(update, "\n".join(lines), parse_mode=None)
+    except Exception as e:
+        log.error(f"offer_cmd error: {e}")
+        await _reply(update, "❌ Не удалось получить Commercial Offer.", parse_mode=None)
+
+
+async def reviseoffer_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /reviseoffer source_commercial_offer_id=OFR-001 caller_idempotency_key=...
+                 [title=...] [scope=...] [quoted_amount=...] [currency=...]
+                 [valid_until=...] [object_id=...] [service_id=...]
+                 [roadmap_id=...] [offer_document_id=...] [created_by=...] [notes=...]
+
+    Creates a new immutable draft version in the same Offer Series.
+    Unspecified commercial fields default from the source version.
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg(), parse_mode=None)
+        return
+
+    raw = " ".join(context.args or [])
+    args = _parse_kv_args(raw)
+    source_id = args.get("source_commercial_offer_id", "")
+    caller_idempotency_key = args.get("caller_idempotency_key", "")
+
+    if not source_id or not caller_idempotency_key:
+        await _reply(
+            update,
+            "❌ Укажи source_commercial_offer_id и caller_idempotency_key.\n\nПример:\n"
+            "`/reviseoffer source_commercial_offer_id=OFR-001 caller_idempotency_key=... quoted_amount=550000`", parse_mode=None)
+        return
+
+    try:
+        from business_core.business_builder import revise_commercial_offer
+
+        result = revise_commercial_offer(
+            source_id, caller_idempotency_key, args.get("created_by", "") or _telegram_username(update),
+            title_snapshot=args.get("title", ""), scope_snapshot=args.get("scope", ""),
+            quoted_amount=args.get("quoted_amount"), currency=args.get("currency", ""),
+            valid_until=args.get("valid_until", ""),
+            object_id=args.get("object_id", ""), service_id=args.get("service_id", ""),
+            roadmap_id=args.get("roadmap_id", ""), offer_document_id=args.get("offer_document_id", ""),
+            notes=args.get("notes", ""),
+        )
+        await _reply(update, _offer_revision_message(result), parse_mode=None)
+    except Exception as e:
+        log.error(f"reviseoffer_cmd error: {e}")
+        await _reply(update, "❌ Не удалось создать revision Commercial Offer.", parse_mode=None)
+
+
+async def updateoffer_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /updateoffer commercial_offer_id=OFR-001 quoted_amount=... (draft only)
+    /updateoffer commercial_offer_id=OFR-001 notes=... (any status)
+
+    Draft-commercial-field mode and Notes-only mode are mutually
+    exclusive — mirrors /updatepaymenttemplate's foundation UX exactly.
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg(), parse_mode=None)
+        return
+
+    raw = " ".join(context.args or [])
+    args = _parse_kv_args(raw)
+    offer_id = args.get("commercial_offer_id", "")
+
+    if not offer_id:
+        await _reply(
+            update,
+            "❌ Укажи commercial_offer_id.\n\nПример:\n"
+            "`/updateoffer commercial_offer_id=OFR-001 quoted_amount=550000`\n"
+            "`/updateoffer commercial_offer_id=OFR-001 notes=...`", parse_mode=None)
+        return
+
+    draft_field_map = {
+        "title": "Title Snapshot", "scope": "Scope Snapshot", "quoted_amount": "Quoted Amount",
+        "currency": "Currency", "valid_until": "Valid Until",
+        "object_id": "Object ID", "service_id": "Service ID", "roadmap_id": "Roadmap ID",
+        "offer_document_id": "Offer Document ID",
+    }
+    draft_updates = {header: args[key] for key, header in draft_field_map.items() if key in args}
+    has_notes = "notes" in args
+
+    if draft_updates and has_notes:
+        await _reply(
+            update,
+            "❌ Нельзя одновременно менять коммерческие поля и Notes.\n"
+            "Отправь две отдельные команды:\n"
+            "`/updateoffer commercial_offer_id=... quoted_amount=...`\n"
+            "`/updateoffer commercial_offer_id=... notes=...`", parse_mode=None)
+        return
+
+    if not draft_updates and not has_notes:
+        await _reply(update, "❌ Укажи хотя бы одно поле для обновления (например quoted_amount=... или notes=...).", parse_mode=None)
+        return
+
+    try:
+        if draft_updates:
+            from business_core.business_builder import update_commercial_offer_draft
+            result = update_commercial_offer_draft(offer_id, draft_updates)
+            await _reply(update, _offer_update_message(result, offer_id), parse_mode=None)
+            return
+
+        from business_core.business_builder import update_commercial_offer_admin_fields
+        result = update_commercial_offer_admin_fields(offer_id, {"Notes": args["notes"]})
+        await _reply(update, _offer_update_message(result, offer_id), parse_mode=None)
+    except Exception as e:
+        log.error(f"updateoffer_cmd error: {e}")
+        await _reply(update, "❌ Не удалось обновить Commercial Offer.", parse_mode=None)
+
+
+async def sendoffer_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /sendoffer commercial_offer_id=OFR-001 sent_by=...
+
+    draft → sent. Only the latest version in its series may be sent.
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg(), parse_mode=None)
+        return
+
+    raw = " ".join(context.args or [])
+    args = _parse_kv_args(raw)
+    offer_id = args.get("commercial_offer_id", "")
+    sent_by = args.get("sent_by", "") or _telegram_username(update)
+
+    if not offer_id or not sent_by:
+        await _reply(update, "❌ Укажи commercial_offer_id и sent_by.\n\nПример:\n`/sendoffer commercial_offer_id=OFR-001 sent_by=...`", parse_mode=None)
+        return
+
+    try:
+        from business_core.business_builder import send_commercial_offer
+
+        result = send_commercial_offer(offer_id, sent_by)
+        await _reply(update, _offer_lifecycle_message(result, offer_id, "отправка"), parse_mode=None)
+    except Exception as e:
+        log.error(f"sendoffer_cmd error: {e}")
+        await _reply(update, "❌ Не удалось отправить Commercial Offer.", parse_mode=None)
+
+
+async def acceptoffer_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /acceptoffer commercial_offer_id=OFR-001 accepted_by=...
+
+    sent → accepted. Means only that the commercial terms were
+    accepted — never that payment was received, an invoice was issued,
+    or a contract was signed (ADR-023 §21). Never creates a Payment
+    Obligation.
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg(), parse_mode=None)
+        return
+
+    raw = " ".join(context.args or [])
+    args = _parse_kv_args(raw)
+    offer_id = args.get("commercial_offer_id", "")
+    accepted_by = args.get("accepted_by", "") or _telegram_username(update)
+
+    if not offer_id or not accepted_by:
+        await _reply(update, "❌ Укажи commercial_offer_id и accepted_by.\n\nПример:\n`/acceptoffer commercial_offer_id=OFR-001 accepted_by=...`", parse_mode=None)
+        return
+
+    try:
+        from business_core.business_builder import accept_commercial_offer
+
+        result = accept_commercial_offer(offer_id, accepted_by)
+        await _reply(update, _offer_lifecycle_message(result, offer_id, "принятие"), parse_mode=None)
+    except Exception as e:
+        log.error(f"acceptoffer_cmd error: {e}")
+        await _reply(update, "❌ Не удалось принять Commercial Offer.", parse_mode=None)
+
+
+async def rejectoffer_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /rejectoffer commercial_offer_id=OFR-001 rejected_by=... rejection_reason=...
+
+    sent → rejected. rejection_reason is never logged.
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg(), parse_mode=None)
+        return
+
+    raw = " ".join(context.args or [])
+    args = _parse_kv_args(raw)
+    offer_id = args.get("commercial_offer_id", "")
+    rejected_by = args.get("rejected_by", "") or _telegram_username(update)
+    rejection_reason = args.get("rejection_reason", "")
+
+    if not offer_id or not rejected_by or not rejection_reason:
+        await _reply(
+            update,
+            "❌ Укажи commercial_offer_id, rejected_by и rejection_reason.\n\nПример:\n"
+            "`/rejectoffer commercial_offer_id=OFR-001 rejected_by=... rejection_reason=...`", parse_mode=None)
+        return
+
+    try:
+        from business_core.business_builder import reject_commercial_offer
+
+        result = reject_commercial_offer(offer_id, rejected_by, rejection_reason)
+        await _reply(update, _offer_lifecycle_message(result, offer_id, "отклонение"), parse_mode=None)
+    except Exception as e:
+        log.error(f"rejectoffer_cmd error: {e}")
+        await _reply(update, "❌ Не удалось отклонить Commercial Offer.", parse_mode=None)
+
+
+async def expireoffer_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /expireoffer commercial_offer_id=OFR-001
+
+    Explicit sent → expired. Never a background/scheduled mutation.
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg(), parse_mode=None)
+        return
+
+    raw = " ".join(context.args or [])
+    args = _parse_kv_args(raw)
+    offer_id = args.get("commercial_offer_id") or args.get("_pos0", "")
+
+    if not offer_id:
+        await _reply(update, "❌ Укажи commercial_offer_id.\n\nПример: /expireoffer commercial_offer_id=OFR-001", parse_mode=None)
+        return
+
+    try:
+        from business_core.business_builder import expire_commercial_offer
+
+        result = expire_commercial_offer(offer_id)
+        await _reply(update, _offer_lifecycle_message(result, offer_id, "истечение срока"), parse_mode=None)
+    except Exception as e:
+        log.error(f"expireoffer_cmd error: {e}")
+        await _reply(update, "❌ Не удалось обновить статус Commercial Offer.", parse_mode=None)
+
+
+async def canceloffer_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /canceloffer commercial_offer_id=OFR-001 cancelled_by=... cancellation_reason=...
+
+    draft/sent → cancelled. accepted cannot be cancelled.
+    cancellation_reason is never logged.
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg(), parse_mode=None)
+        return
+
+    raw = " ".join(context.args or [])
+    args = _parse_kv_args(raw)
+    offer_id = args.get("commercial_offer_id", "")
+    cancelled_by = args.get("cancelled_by", "") or _telegram_username(update)
+    cancellation_reason = args.get("cancellation_reason", "")
+
+    if not offer_id or not cancelled_by or not cancellation_reason:
+        await _reply(
+            update,
+            "❌ Укажи commercial_offer_id, cancelled_by и cancellation_reason.\n\nПример:\n"
+            "`/canceloffer commercial_offer_id=OFR-001 cancelled_by=... cancellation_reason=...`", parse_mode=None)
+        return
+
+    try:
+        from business_core.business_builder import cancel_commercial_offer
+
+        result = cancel_commercial_offer(offer_id, cancelled_by, cancellation_reason)
+        await _reply(update, _offer_lifecycle_message(result, offer_id, "отмена"), parse_mode=None)
+    except Exception as e:
+        log.error(f"canceloffer_cmd error: {e}")
+        await _reply(update, "❌ Не удалось отменить Commercial Offer.", parse_mode=None)
+
+
+async def archiveoffer_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /archiveoffer commercial_offer_id=OFR-001
+
+    Any allowed status → archived. Terminal — no restore.
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg(), parse_mode=None)
+        return
+
+    raw = " ".join(context.args or [])
+    args = _parse_kv_args(raw)
+    offer_id = args.get("commercial_offer_id") or args.get("_pos0", "")
+
+    if not offer_id:
+        await _reply(update, "❌ Укажи commercial_offer_id.\n\nПример: /archiveoffer commercial_offer_id=OFR-001", parse_mode=None)
+        return
+
+    try:
+        from business_core.business_builder import archive_commercial_offer
+
+        result = archive_commercial_offer(offer_id)
+        await _reply(update, _offer_lifecycle_message(result, offer_id, "архивирование"), parse_mode=None)
+    except Exception as e:
+        log.error(f"archiveoffer_cmd error: {e}")
+        await _reply(update, "❌ Не удалось архивировать Commercial Offer.", parse_mode=None)
+
+
 async def milestones_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     /milestones roadmap_id=RM-022
@@ -9510,6 +10256,18 @@ def register_business_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("confirmpayment",         confirmpayment_cmd))
     app.add_handler(CommandHandler("reversepayment",         reversepayment_cmd))
     app.add_handler(CommandHandler("failpayment",            failpayment_cmd))
+    # Phase 40D (ADR-023): Commercial Offer Domain — operational commands.
+    app.add_handler(CommandHandler("newoffer",         newoffer_cmd))
+    app.add_handler(CommandHandler("offers",           offers_cmd))
+    app.add_handler(CommandHandler("offer",            offer_cmd))
+    app.add_handler(CommandHandler("reviseoffer",      reviseoffer_cmd))
+    app.add_handler(CommandHandler("updateoffer",      updateoffer_cmd))
+    app.add_handler(CommandHandler("sendoffer",        sendoffer_cmd))
+    app.add_handler(CommandHandler("acceptoffer",      acceptoffer_cmd))
+    app.add_handler(CommandHandler("rejectoffer",      rejectoffer_cmd))
+    app.add_handler(CommandHandler("expireoffer",      expireoffer_cmd))
+    app.add_handler(CommandHandler("canceloffer",      canceloffer_cmd))
+    app.add_handler(CommandHandler("archiveoffer",     archiveoffer_cmd))
     # Phase 8D
     app.add_handler(CommandHandler("milestones",       milestones_cmd))
     # Phase 11B

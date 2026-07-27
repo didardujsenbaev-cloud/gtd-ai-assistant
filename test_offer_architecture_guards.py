@@ -409,20 +409,232 @@ class TestOfferTestsHaveHardSocketBlock(unittest.TestCase):
             self.assertIn(filename, conftest_src, f"{filename} must be registered in conftest.py's hard socket-block set")
 
 
-class TestNoTelegramCallerYet(unittest.TestCase):
-    """Phase 40C is Foundation-only — no Telegram command may exist for
-    Commercial Offer yet (that's a future caller-UX phase's scope)."""
+# ─────────────────────────────────────────────────────────────
+# Phase 40D (ADR-023): Commercial Offer caller (Telegram) architecture
+# guards. Mirrors the Phase 39D Payment caller guard pattern exactly.
+# ─────────────────────────────────────────────────────────────
 
-    def test_no_offer_commands_registered(self):
+_OFFER_COMMANDS = (
+    "newoffer_cmd", "offers_cmd", "offer_cmd", "reviseoffer_cmd", "updateoffer_cmd",
+    "sendoffer_cmd", "acceptoffer_cmd", "rejectoffer_cmd", "expireoffer_cmd",
+    "canceloffer_cmd", "archiveoffer_cmd",
+)
+
+
+def _th_function_body(fn_name: str) -> str:
+    return _function_body(BUSINESS_CORE / "telegram_handlers.py", fn_name)
+
+
+class TestOfferCommandsCallOnlyCanonicalOrchestration(unittest.TestCase):
+
+    def test_no_low_level_offer_manager_write_calls_in_mutating_commands(self):
+        forbidden = (
+            "offer_manager.create_commercial_offer(", "offer_manager.update_commercial_offer_status(",
+            "offer_manager.update_commercial_offer_draft_fields(", "offer_manager.update_commercial_offer_admin_fields(",
+        )
+        for fn_name in (
+            "newoffer_cmd", "reviseoffer_cmd", "updateoffer_cmd", "sendoffer_cmd", "acceptoffer_cmd",
+            "rejectoffer_cmd", "expireoffer_cmd", "canceloffer_cmd", "archiveoffer_cmd",
+        ):
+            body = _th_function_body(fn_name)
+            for call in forbidden:
+                self.assertNotIn(call, body, f"{fn_name} must not call low-level {call.rstrip('(')} directly")
+
+    def test_mutating_commands_call_business_builder_only(self):
+        expectations = {
+            "newoffer_cmd": "create_commercial_offer(",
+            "reviseoffer_cmd": "revise_commercial_offer(",
+            "sendoffer_cmd": "send_commercial_offer(",
+            "acceptoffer_cmd": "accept_commercial_offer(",
+            "rejectoffer_cmd": "reject_commercial_offer(",
+            "expireoffer_cmd": "expire_commercial_offer(",
+            "canceloffer_cmd": "cancel_commercial_offer(",
+            "archiveoffer_cmd": "archive_commercial_offer(",
+        }
+        for fn_name, call in expectations.items():
+            body = _th_function_body(fn_name)
+            self.assertIn(call, body, f"{fn_name} must call business_builder.{call.rstrip('(')}")
+
+    def test_read_commands_call_exact_offer_manager_helpers_only(self):
+        expectations = {
+            "offers_cmd": "list_commercial_offers(",
+            "offer_cmd": "find_commercial_offer_by_id(",
+        }
+        for fn_name, call in expectations.items():
+            body = _th_function_body(fn_name)
+            self.assertIn(call, body)
+            for forbidden in (
+                "create_commercial_offer(", "revise_commercial_offer(",
+                "send_commercial_offer(", "accept_commercial_offer(", "reject_commercial_offer(",
+                "expire_commercial_offer(", "cancel_commercial_offer(", "archive_commercial_offer(",
+            ):
+                self.assertNotIn(forbidden, body, f"{fn_name} is read-only and must not call {forbidden.rstrip('(')}")
+
+
+class TestNoCallerSideOfferPolicy(unittest.TestCase):
+
+    def test_no_caller_side_id_generation(self):
+        for fn_name in _OFFER_COMMANDS:
+            body = _th_function_body(fn_name)
+            self.assertNotIn('"OFR-"', body)
+            self.assertNotIn('"OFS-"', body)
+            self.assertNotIn("generate_next_id(", body)
+            self.assertNotIn("generate_next_ids(", body)
+
+    def test_no_caller_side_amount_currency_date_normalization(self):
+        for fn_name in _OFFER_COMMANDS:
+            body = _th_function_body(fn_name)
+            self.assertNotIn("Decimal(", body)
+            self.assertNotIn("normalize_commercial_offer_amount(", body)
+            self.assertNotIn("normalize_commercial_offer_currency(", body)
+            self.assertNotIn("normalize_commercial_offer_valid_until(", body)
+
+    def test_no_caller_side_relation_or_idempotency_policy(self):
+        for fn_name in _OFFER_COMMANDS:
+            body = _th_function_body(fn_name)
+            self.assertNotIn("_validate_commercial_offer_relations(", body)
+            self.assertNotIn("find_commercial_offers_by_idempotency_key(", body)
+            self.assertNotIn("read_business_sheet(", body)
+
+    def test_no_caller_side_version_or_branching_policy(self):
+        for fn_name in _OFFER_COMMANDS:
+            body = _th_function_body(fn_name)
+            self.assertNotIn("find_latest_commercial_offer_in_series(", body)
+            self.assertNotIn("generate_next_series_id(", body)
+
+    def test_no_caller_side_transition_matrix(self):
+        for fn_name in _OFFER_COMMANDS:
+            body = _th_function_body(fn_name)
+            self.assertNotIn("_COMMERCIAL_OFFER_ORDINARY_TRANSITIONS", body)
+
+    def test_no_payment_or_closed_domain_mutation_calls(self):
+        for fn_name in _OFFER_COMMANDS:
+            body = _th_function_body(fn_name)
+            for forbidden in (
+                "create_payment_obligation(", "create_payment_transaction(",
+                "create_business_task(", "transition_task_status(",
+                "register_document(", "transition_document_status(",
+                "instantiate_checklist(", "transition_checklist_status(",
+                "update_stage_status_in_sheet(", "recalculate_roadmap_progress(",
+            ):
+                self.assertNotIn(forbidden, body, f"{fn_name} must not mutate Payment/Task/Document/Checklist/Stage/Roadmap ({forbidden!r} found)")
+
+
+class TestOfferCommandRegistration(unittest.TestCase):
+
+    def test_all_11_commands_registered_exactly_once(self):
         path = BUSINESS_CORE / "telegram_handlers.py"
         src = path.read_text(encoding="utf-8")
-        for forbidden in ("newoffer", "sendoffer", "acceptoffer", "rejectoffer"):
-            self.assertNotIn(f'CommandHandler("{forbidden}"', src)
+        for name in ("newoffer", "offers", "offer", "reviseoffer", "updateoffer", "sendoffer", "acceptoffer", "rejectoffer", "expireoffer", "canceloffer", "archiveoffer"):
+            self.assertEqual(src.count(f'CommandHandler("{name}"'), 1, f"/{name} must be registered exactly once")
 
-    def test_telegram_handlers_does_not_import_offer_manager(self):
+    def test_milestones_still_registered_exactly_once(self):
         path = BUSINESS_CORE / "telegram_handlers.py"
-        found = _imported_module_names(path) & {"offer_manager"}
-        self.assertEqual(found, set())
+        src = path.read_text(encoding="utf-8")
+        self.assertEqual(src.count('CommandHandler("milestones"'), 1)
+
+
+class TestOfferUxHelpersDefinedOnce(unittest.TestCase):
+
+    def test_helpers_defined_exactly_once(self):
+        path = BUSINESS_CORE / "telegram_handlers.py"
+        src = path.read_text(encoding="utf-8")
+        for fn in (
+            "_offer_creation_message", "_offer_revision_message", "_offer_update_message",
+            "_offer_lifecycle_message", "_offer_status_ru", "_format_offer_amount",
+        ):
+            self.assertEqual(src.count(f"def {fn}("), 1, f"{fn} must be defined exactly once")
+
+    def test_helpers_are_callable(self):
+        import business_core.telegram_handlers as th
+        for fn in ("_offer_creation_message", "_offer_revision_message", "_offer_update_message", "_offer_lifecycle_message"):
+            self.assertTrue(callable(getattr(th, fn, None)))
+
+
+class TestNoSensitiveOfferFieldsLoggedGuard(unittest.TestCase):
+
+    _DISALLOWED_LOG_TOKENS = ("Scope Snapshot", "Notes", "Caller Idempotency Key", "Rejection Reason", "Cancellation Reason", "update.message.text")
+
+    def test_offer_handlers_do_not_log_disallowed_fields(self):
+        for fn_name in _OFFER_COMMANDS:
+            body = _th_function_body(fn_name)
+            log_lines = [line for line in body.splitlines() if "log.error(" in line or "log.warning(" in line or "log.info(" in line]
+            for line in log_lines:
+                for token in self._DISALLOWED_LOG_TOKENS:
+                    self.assertNotIn(token, line, f"{fn_name} logs disallowed token {token!r}: {line}")
+
+
+class TestNoRawExceptionInOfferCommands(unittest.TestCase):
+
+    def test_no_raw_exception_interpolation(self):
+        for fn_name in _OFFER_COMMANDS:
+            body = _th_function_body(fn_name)
+            self.assertNotIn("Ошибка: {e}", body)
+            self.assertNotIn("str(e)", body)
+
+
+class TestOfferParserValidationOrdering(unittest.TestCase):
+
+    def test_newoffer_validates_before_orchestration(self):
+        body = _th_function_body("newoffer_cmd")
+        validation_idx = body.index("if not business_id or not client_id or not title or not scope")
+        orchestration_idx = body.index("create_commercial_offer(")
+        self.assertLess(validation_idx, orchestration_idx)
+
+    def test_reviseoffer_validates_before_orchestration(self):
+        body = _th_function_body("reviseoffer_cmd")
+        validation_idx = body.index("if not source_id or not caller_idempotency_key")
+        orchestration_idx = body.index("revise_commercial_offer(")
+        self.assertLess(validation_idx, orchestration_idx)
+
+    def test_sendoffer_validates_before_orchestration(self):
+        body = _th_function_body("sendoffer_cmd")
+        validation_idx = body.index("if not offer_id or not sent_by")
+        orchestration_idx = body.index("send_commercial_offer(")
+        self.assertLess(validation_idx, orchestration_idx)
+
+    def test_acceptoffer_validates_before_orchestration(self):
+        body = _th_function_body("acceptoffer_cmd")
+        validation_idx = body.index("if not offer_id or not accepted_by")
+        orchestration_idx = body.index("accept_commercial_offer(")
+        self.assertLess(validation_idx, orchestration_idx)
+
+    def test_rejectoffer_validates_before_orchestration(self):
+        body = _th_function_body("rejectoffer_cmd")
+        validation_idx = body.index("if not offer_id or not rejected_by or not rejection_reason")
+        orchestration_idx = body.index("reject_commercial_offer(")
+        self.assertLess(validation_idx, orchestration_idx)
+
+    def test_canceloffer_validates_before_orchestration(self):
+        body = _th_function_body("canceloffer_cmd")
+        validation_idx = body.index("if not offer_id or not cancelled_by or not cancellation_reason")
+        orchestration_idx = body.index("cancel_commercial_offer(")
+        self.assertLess(validation_idx, orchestration_idx)
+
+    def test_archiveoffer_validates_before_orchestration(self):
+        body = _th_function_body("archiveoffer_cmd")
+        validation_idx = body.index("if not offer_id")
+        orchestration_idx = body.index("archive_commercial_offer(")
+        self.assertLess(validation_idx, orchestration_idx)
+
+
+class TestOfferParseModeIsNone(unittest.TestCase):
+
+    def test_all_offer_commands_pass_parse_mode_none(self):
+        for fn_name in _OFFER_COMMANDS:
+            body = _th_function_body(fn_name)
+            reply_calls = body.count("_reply(update,")
+            parse_none_calls = body.count("parse_mode=None")
+            self.assertGreaterEqual(parse_none_calls, reply_calls, f"{fn_name}: not every _reply call passes parse_mode=None")
+
+
+class TestMilestonesCommandUntouchedByCallerPhase(unittest.TestCase):
+
+    def test_milestones_body_unchanged_shape(self):
+        body = _th_function_body("milestones_cmd")
+        self.assertIn("get_commercial_milestones_for_roadmap", body)
+        self.assertNotIn("offer_manager", body)
+        self.assertNotIn("create_commercial_offer", body)
 
 
 if __name__ == "__main__":
