@@ -421,6 +421,27 @@ class TestDocumentCompletionGateCallerUX(_AsyncTestCase):
         self.assertIn("✅", reply)
         self.assertIn("SCO-001", reply)
 
+    def test_override_type_underscores_preserved_via_code_span(self):
+        """Live-production bug: override_type rendered outside a
+        backtick code-span under parse_mode="Markdown" had its
+        underscores silently eaten by legacy Telegram Markdown
+        (missing_blocking_documents -> missingblockingdocuments in the
+        actual message, even though the Sheets row itself was correct).
+        Fixed by wrapping override_type in backticks, same as
+        override_id already was."""
+        th = _fresh_th()
+        result = _transition_result(
+            previous_status="in_progress", requested_status="done", final_status="done",
+            override_applied=True, override_type="missing_blocking_documents", override_id="SCO-001",
+        )
+        reply, _ = self._invoke(
+            th, result,
+            '/updatestage stage_id=STAGE-001 status=done force=yes reason="approved"',
+        )
+        self.assertIn("`missing_blocking_documents`", reply)
+        self.assertIn("`SCO-001`", reply)
+        self.assertNotIn("missingblockingdocuments", reply)
+
     def test_force_omitted_defaults_to_false(self):
         th = _fresh_th()
         result = _transition_result(previous_status="in_progress", requested_status="done", final_status="done")

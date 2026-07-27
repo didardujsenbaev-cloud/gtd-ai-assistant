@@ -2941,7 +2941,7 @@ def _stage_transition_success_lines(result: dict, stage_id: str, notes: Optional
     if result.get("override_applied"):
         lines.append(
             f"🔓 Применён override документного гейта (force=yes). "
-            f"Override ID: `{result.get('override_id') or '—'}`, тип: {result.get('override_type') or '—'}."
+            f"Override ID: `{result.get('override_id') or '—'}`, тип: `{result.get('override_type') or '—'}`."
         )
 
     if notes is not None:
