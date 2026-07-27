@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
 
@@ -2179,6 +2180,8 @@ def _stage_transition_result(
     retry_safe: bool = True,
     missing_blocking_doc_ids: tuple = (), configuration_error_details: str = "",
     override_applied: bool = False, override_type: str = "", override_id: str = "",
+    missing_checklist_instance_ids: tuple = (), missing_checklist_item_ids: tuple = (),
+    missing_checklist_item_titles: tuple = (),
 ) -> dict:
     """
     Shared result-builder for transition_stage_status() and
@@ -2191,6 +2194,10 @@ def _stage_transition_result(
     override_type/override_id all default to their empty/False state, so
     any result built without the gate (which is every result for every
     transition other than in_progress->done) is unaffected.
+
+    Phase 44 (Checklist Completion Gate) additive fields:
+    missing_checklist_instance_ids/missing_checklist_item_ids/
+    missing_checklist_item_titles — same empty-default contract.
     """
     return {
         "ok": ok,
@@ -2216,7 +2223,192 @@ def _stage_transition_result(
         "override_applied": override_applied,
         "override_type": override_type,
         "override_id": override_id,
+        "missing_checklist_instance_ids": tuple(missing_checklist_instance_ids),
+        "missing_checklist_item_ids": tuple(missing_checklist_item_ids),
+        "missing_checklist_item_titles": tuple(missing_checklist_item_titles),
     }
+
+
+@dataclass(frozen=True)
+class _StageCompletionGateResult:
+    """
+    Phase 44: shared, minimal contract every individual Stage completion
+    gate function returns (_evaluate_document_completion_gate(),
+    _evaluate_checklist_completion_gate(), and any future one) — so
+    transition_stage_status() can evaluate all of them uniformly, combine
+    their results into a single failure message / single override audit
+    row, and never grow a gate-specific branch inline for each new gate
+    type.
+
+    blocked=False + configuration_error=False + warning="" is the
+    "nothing to report" default every gate returns when there's simply
+    nothing configured for that Stage (not an error — ADR audit finding).
+    """
+    blocked: bool = False
+    warning: str = ""
+    error_code: str = ""
+    error: str = ""
+    override_type: str = ""
+    configuration_error: bool = False
+    configuration_error_details: str = ""
+    missing_blocking_doc_ids: tuple = ()
+    missing_checklist_instance_ids: tuple = ()
+    missing_checklist_item_ids: tuple = ()
+    missing_checklist_item_titles: tuple = ()
+
+
+def _evaluate_document_completion_gate(stage_id: str) -> _StageCompletionGateResult:
+    """
+    Phase 43: Document Completion Gate, extracted as its own function
+    (previously inline in transition_stage_status()) so Phase 44 can
+    evaluate it side-by-side with _evaluate_checklist_completion_gate()
+    uniformly, without transition_stage_status() growing a second
+    gate-specific inline block. Behavior is byte-for-byte unchanged from
+    Phase 43: uses document_requirements_query.evaluate_scope("stage", ...).
+
+      - no structured requirements configured, or all satisfied ->
+        not blocked, not an error
+      - only optional missing -> not blocked, warning returned
+      - blocking_missing > 0 -> blocked, override_type=
+        "missing_blocking_documents", missing_blocking_doc_ids populated
+      - has_configuration_errors -> blocked, configuration_error=True,
+        override_type="configuration_error", configuration_error_details
+        populated (checked BEFORE blocking_missing, exactly as Phase 43
+        did — a broken relation is reported as a configuration error,
+        never merged with a plain missing-document message)
+    """
+    from business_core.document_requirements_query import evaluate_scope
+
+    scope_result = evaluate_scope("stage", stage_id)
+    summary = scope_result.summary if scope_result.exists else None
+
+    if summary is not None and summary.has_configuration_errors:
+        details = "; ".join(
+            f"{err_stage_id or '—'}/{relation_id or '—'}: {reason}"
+            for err_stage_id, relation_id, reason in summary.configuration_errors
+        )
+        return _StageCompletionGateResult(
+            blocked=True, error_code="STAGE_DOCUMENT_REQUIREMENTS_CONFIGURATION_ERROR",
+            error=f"Настройка требований к документам этапа {stage_id} повреждена: {details}",
+            override_type="configuration_error",
+            configuration_error=True, configuration_error_details=details,
+        )
+
+    if summary is not None and summary.blocking_missing > 0:
+        missing_doc_ids = tuple(item.requirement.document_template_id for item in summary.items if item.is_blocking)
+        return _StageCompletionGateResult(
+            blocked=True, error_code="STAGE_DOCUMENT_GATE_BLOCKED",
+            error=(
+                f"У этапа {stage_id} есть незакрытые обязательные (blocking) "
+                f"требования к документам: {', '.join(missing_doc_ids)}"
+            ),
+            override_type="missing_blocking_documents",
+            missing_blocking_doc_ids=missing_doc_ids,
+        )
+
+    if summary is not None and summary.optional_missing > 0:
+        return _StageCompletionGateResult(
+            warning=(
+                f"У этапа {stage_id} не хватает {summary.optional_missing} "
+                f"необязательных (optional) документов — завершение разрешено."
+            ),
+        )
+
+    return _StageCompletionGateResult()
+
+
+def _evaluate_checklist_completion_gate(stage_id: str) -> _StageCompletionGateResult:
+    """
+    Phase 44: Checklist Completion Gate. Mirrors
+    _evaluate_document_completion_gate()'s exact "nothing configured is
+    not an error" / "only optional missing is a warning, not a block"
+    shape, applied to CHECKLIST_INSTANCES/CHECKLIST_INSTANCE_ITEMS
+    (ADR-021) instead of Document Requirements.
+
+    Reuses the existing canonical progress calculator
+    _compute_checklist_progress() unchanged — no new progress-counting
+    logic is introduced here, only the gate policy around its result.
+
+    Every "cancelled"/"archived" Checklist Instance for this Stage is
+    excluded from consideration entirely (an abandoned/retired checklist
+    must never block completion) — every other status (draft/
+    in_progress/blocked/completed) has its items recomputed fresh from
+    CHECKLIST_INSTANCE_ITEMS, never from the Instance's own cached
+    Total/Required/Completed/Required Remaining columns (those are a
+    display cache written by business_builder.instantiate_checklist()/
+    transition_checklist_item_status(), never treated as the source of
+    truth here — same "recompute from item Status, never trust a prior
+    cache" principle _compute_checklist_progress()'s own docstring
+    states).
+
+    If a Stage has zero live Checklist Instances at all, this is
+    identical in meaning to "no structured Document requirements
+    configured" — allowed, not an error, so old Roadmaps predating this
+    gate (which never ran /startchecklist for any of their Stages) are
+    never retroactively blocked.
+    """
+    from business_core.checklist_manager import list_checklist_instances, list_checklist_instance_items
+
+    all_instances = list_checklist_instances()
+    live_instances = [
+        inst for inst in all_instances
+        if inst.get("Stage ID", "") == stage_id and inst.get("Status", "") not in ("cancelled", "archived")
+    ]
+
+    if not live_instances:
+        return _StageCompletionGateResult()
+
+    missing_instance_ids: list[str] = []
+    missing_item_ids: list[str] = []
+    missing_item_titles: list[str] = []
+    total_optional_missing = 0
+
+    for inst in live_instances:
+        instance_id = inst.get("Checklist Instance ID", "")
+        raw_items = list_checklist_instance_items(instance_id=instance_id)
+        items_for_progress = [
+            {"required": (it.get("Required", "").strip().lower() == "true"), "status": it.get("Status", "")}
+            for it in raw_items
+        ]
+        progress = _compute_checklist_progress(items_for_progress)
+
+        if progress["required_remaining"] > 0:
+            missing_instance_ids.append(instance_id)
+            for it in raw_items:
+                required = it.get("Required", "").strip().lower() == "true"
+                status = it.get("Status", "")
+                if required and status not in _CHECKLIST_SATISFYING_ITEM_STATUSES:
+                    missing_item_ids.append(it.get("Checklist Instance Item ID", ""))
+                    missing_item_titles.append(it.get("Item Title Snapshot", ""))
+        else:
+            total_optional_missing += sum(
+                1 for it in raw_items
+                if it.get("Required", "").strip().lower() != "true"
+                and it.get("Status", "") not in _CHECKLIST_SATISFYING_ITEM_STATUSES
+            )
+
+    if missing_instance_ids:
+        return _StageCompletionGateResult(
+            blocked=True, error_code="STAGE_CHECKLIST_GATE_BLOCKED",
+            error=(
+                f"У этапа {stage_id} есть незавершённые обязательные пункты чек-листа: "
+                f"{', '.join(missing_item_titles)}"
+            ),
+            override_type="missing_checklist_items",
+            missing_checklist_instance_ids=tuple(missing_instance_ids),
+            missing_checklist_item_ids=tuple(missing_item_ids),
+            missing_checklist_item_titles=tuple(missing_item_titles),
+        )
+
+    if total_optional_missing > 0:
+        return _StageCompletionGateResult(
+            warning=(
+                f"У этапа {stage_id} не хватает {total_optional_missing} "
+                f"необязательных (optional) пунктов чек-листа — завершение разрешено."
+            ),
+        )
+
+    return _StageCompletionGateResult()
 
 
 def _roadmap_eligibility_code_for_stage_update(roadmap_status: str) -> str | None:
@@ -2272,24 +2464,35 @@ def transition_stage_status(
          (STAGE_REOPEN_REQUIRES_EXPLICIT_ACTION for an ordinary attempt
          to leave done/skipped; INVALID_STAGE_TRANSITION for any other
          disallowed pair)
-      F.5. Document completion gate (Phase 43) — ONLY when
-         previous_status=="in_progress" and target_status=="done";
-         every other transition (including anything to/from "skipped")
-         skips this step entirely and never calls evaluate_scope().
-         Uses document_requirements_query.evaluate_scope("stage", stage_id):
-           - no structured requirements configured, or all satisfied ->
-             allowed, not an error
-           - only optional missing -> allowed, warning appended
-           - blocking_missing > 0 -> blocked (STAGE_DOCUMENT_GATE_BLOCKED)
-             unless force=True (+ non-blank reason)
-           - has_configuration_errors -> blocked
-             (STAGE_DOCUMENT_REQUIREMENTS_CONFIGURATION_ERROR), a
-             DIFFERENT code from the missing-documents case, unless
+      F.5. Stage Completion Gates (Phase 43 Document / Phase 44
+         Checklist) — ONLY when previous_status=="in_progress" and
+         target_status=="done"; every other transition (including
+         anything to/from "skipped") skips this step entirely and never
+         evaluates either gate. Both _evaluate_document_completion_gate()
+         and _evaluate_checklist_completion_gate() are ALWAYS evaluated
+         together (never short-circuited after the first one blocks) so
+         a Stage missing both documents and checklist items gets told
+         about both reasons in one response, never just the first one
+         found:
+           - neither gate blocked -> allowed; any optional-missing
+             warning from either gate is appended, never silently
+             dropped
+           - exactly one gate blocked -> that gate's own code
+             (STAGE_DOCUMENT_GATE_BLOCKED /
+             STAGE_DOCUMENT_REQUIREMENTS_CONFIGURATION_ERROR /
+             STAGE_CHECKLIST_GATE_BLOCKED) unless force=True (+ non-blank
+             reason)
+           - both gates blocked -> combined STAGE_COMPLETION_GATE_BLOCKED,
+             error message concatenates both gates' messages, result
+             carries both gates' missing_* fields at once, unless
              force=True (+ non-blank reason)
            - force=True with an empty/blank reason is rejected up front
-             (STAGE_DOCUMENT_GATE_OVERRIDE_REASON_REQUIRED), before
-             evaluate_scope() is even called
-         On block, Status/Completed At/Roadmap Progress are all
+             (STAGE_COMPLETION_GATE_OVERRIDE_REASON_REQUIRED — the
+             legacy STAGE_DOCUMENT_GATE_OVERRIDE_REASON_REQUIRED name is
+             still recognized by telegram_handlers' renderer for
+             backward compatibility, but this function only ever emits
+             the new neutral name now), before either gate is evaluated
+         On any block, Status/Completed At/Roadmap Progress are all
          untouched — the function returns before step G, exactly like
          every other pre-write validation failure.
       G. persist Stage status (roadmap_manager.update_stage_status_in_sheet),
@@ -2297,15 +2500,21 @@ def transition_stage_status(
          /unblockstage's coupled write) via roadmap_manager.
          update_stage_fields — gated behind the SAME eligibility check
          above, never a second, independent one
-      G.5. Document completion gate override audit (Phase 43) — a row is
-         appended to STAGE_COMPLETION_OVERRIDES via roadmap_manager.
+      G.5. Completion gate override audit (Phase 43/44) — a SINGLE row
+         is appended to STAGE_COMPLETION_OVERRIDES via roadmap_manager.
          record_stage_completion_override() ONLY when force=True
-         actually bypassed a real block above (never for a force=yes
-         call where the gate wouldn't have blocked anyway — that would
-         make the audit trail meaningless). Written only after the
-         Status write in G already succeeded. A failure recording this
-         row does NOT roll back the Status write — surfaced via
-         partial_success/downstream_failures.
+         actually bypassed at least one real block above (never for a
+         force=yes call where neither gate would have blocked anyway —
+         that would make the audit trail meaningless). When BOTH gates
+         were genuinely bypassed by the same force=yes call, this is
+         still exactly ONE audit row, with Override Type set to the
+         "+"-joined composite of every gate actually bypassed (e.g.
+         "missing_blocking_documents+missing_checklist_items") and every
+         gate's own missing_* fields populated in that same row — never
+         two separate rows for one completion operation. Written only
+         after the Status write in G already succeeded. A failure
+         recording this row does NOT roll back the Status write —
+         surfaced via partial_success/downstream_failures.
       H. recalculate Roadmap progress, only if Status actually changed
       I. maybe auto-complete Roadmap, only after a successful recalculation
       J. return the structured result (ADR-017 §12)
@@ -2453,19 +2662,22 @@ def transition_stage_status(
             retry_safe=True,
         )
 
-    # F.5. Document completion gate (Phase 43) — only for the specific
-    # in_progress -> done edge; every other transition (including any
-    # path to/from "skipped") is completely unaffected and never calls
-    # evaluate_scope() at all.
+    # F.5. Stage Completion Gates (Phase 43 Document / Phase 44
+    # Checklist) — only for the specific in_progress -> done edge; every
+    # other transition (including any path to/from "skipped") is
+    # completely unaffected and never evaluates either gate.
     gate_missing_blocking_doc_ids: tuple = ()
     gate_configuration_error_details = ""
-    gate_override_type = ""
-    gate_optional_missing_warning: str | None = None
+    gate_missing_checklist_instance_ids: tuple = ()
+    gate_missing_checklist_item_ids: tuple = ()
+    gate_missing_checklist_item_titles: tuple = ()
+    gate_override_types: list[str] = []
+    gate_optional_missing_warnings: list[str] = []
 
     if previous_status == "in_progress" and target_status == "done":
         if force and not (reason or "").strip():
             return _stage_transition_result(
-                ok=False, code="STAGE_DOCUMENT_GATE_OVERRIDE_REASON_REQUIRED",
+                ok=False, code="STAGE_COMPLETION_GATE_OVERRIDE_REASON_REQUIRED",
                 error="force=yes требует непустой reason.",
                 stage_id=stage_id, roadmap_id=roadmap_id,
                 previous_status=previous_status, requested_status=target_status,
@@ -2475,49 +2687,46 @@ def transition_stage_status(
                 retry_safe=True,
             )
 
-        from business_core.document_requirements_query import evaluate_scope
-        scope_result = evaluate_scope("stage", stage_id)
-        summary = scope_result.summary if scope_result.exists else None
+        # Both gates are always evaluated together — never short-circuited
+        # after the first one blocks — so a Stage missing both documents
+        # and checklist items is reported in full, in one response.
+        document_gate = _evaluate_document_completion_gate(stage_id)
+        checklist_gate = _evaluate_checklist_completion_gate(stage_id)
+        blocked_gates = [g for g in (document_gate, checklist_gate) if g.blocked]
 
-        # No structured requirements configured at all (summary is None,
-        # or a real summary with zero items and no configuration errors)
-        # — completion is allowed, this is not an error (ADR — audit п.10).
-        gate_blocking = bool(summary is not None and summary.blocking_missing > 0)
-        gate_configuration_error = bool(summary is not None and summary.has_configuration_errors)
+        if document_gate.warning:
+            gate_optional_missing_warnings.append(document_gate.warning)
+        if checklist_gate.warning:
+            gate_optional_missing_warnings.append(checklist_gate.warning)
 
-        if gate_configuration_error:
-            gate_configuration_error_details = "; ".join(
-                f"{err_stage_id or '—'}/{relation_id or '—'}: {reason}"
-                for err_stage_id, relation_id, reason in summary.configuration_errors
-            )
+        if blocked_gates:
+            gate_missing_blocking_doc_ids = document_gate.missing_blocking_doc_ids
+            gate_configuration_error_details = document_gate.configuration_error_details
+            gate_missing_checklist_instance_ids = checklist_gate.missing_checklist_instance_ids
+            gate_missing_checklist_item_ids = checklist_gate.missing_checklist_item_ids
+            gate_missing_checklist_item_titles = checklist_gate.missing_checklist_item_titles
+            gate_override_types = [g.override_type for g in blocked_gates]
+
             if not force:
+                if len(blocked_gates) > 1:
+                    combined_error = " | ".join(g.error for g in blocked_gates)
+                    return _stage_transition_result(
+                        ok=False, code="STAGE_COMPLETION_GATE_BLOCKED", error=combined_error,
+                        stage_id=stage_id, roadmap_id=roadmap_id,
+                        previous_status=previous_status, requested_status=target_status,
+                        final_status=previous_status,
+                        roadmap_status_before=roadmap_status_before,
+                        roadmap_status_after=roadmap_status_before,
+                        retry_safe=True,
+                        missing_blocking_doc_ids=gate_missing_blocking_doc_ids,
+                        configuration_error_details=gate_configuration_error_details,
+                        missing_checklist_instance_ids=gate_missing_checklist_instance_ids,
+                        missing_checklist_item_ids=gate_missing_checklist_item_ids,
+                        missing_checklist_item_titles=gate_missing_checklist_item_titles,
+                    )
+                single = blocked_gates[0]
                 return _stage_transition_result(
-                    ok=False, code="STAGE_DOCUMENT_REQUIREMENTS_CONFIGURATION_ERROR",
-                    error=(
-                        f"Настройка требований к документам этапа {stage_id} повреждена: "
-                        f"{gate_configuration_error_details}"
-                    ),
-                    stage_id=stage_id, roadmap_id=roadmap_id,
-                    previous_status=previous_status, requested_status=target_status,
-                    final_status=previous_status,
-                    roadmap_status_before=roadmap_status_before,
-                    roadmap_status_after=roadmap_status_before,
-                    retry_safe=True,
-                    configuration_error_details=gate_configuration_error_details,
-                )
-            gate_override_type = "configuration_error"
-
-        elif gate_blocking:
-            gate_missing_blocking_doc_ids = tuple(
-                item.requirement.document_template_id for item in summary.items if item.is_blocking
-            )
-            if not force:
-                return _stage_transition_result(
-                    ok=False, code="STAGE_DOCUMENT_GATE_BLOCKED",
-                    error=(
-                        f"У этапа {stage_id} есть незакрытые обязательные (blocking) "
-                        f"требования к документам: {', '.join(gate_missing_blocking_doc_ids)}"
-                    ),
+                    ok=False, code=single.error_code, error=single.error,
                     stage_id=stage_id, roadmap_id=roadmap_id,
                     previous_status=previous_status, requested_status=target_status,
                     final_status=previous_status,
@@ -2525,16 +2734,13 @@ def transition_stage_status(
                     roadmap_status_after=roadmap_status_before,
                     retry_safe=True,
                     missing_blocking_doc_ids=gate_missing_blocking_doc_ids,
+                    configuration_error_details=gate_configuration_error_details,
+                    missing_checklist_instance_ids=gate_missing_checklist_instance_ids,
+                    missing_checklist_item_ids=gate_missing_checklist_item_ids,
+                    missing_checklist_item_titles=gate_missing_checklist_item_titles,
                 )
-            gate_override_type = "missing_blocking_documents"
 
-        elif summary is not None and summary.optional_missing > 0:
-            # Only optional documents missing — allowed, surfaced as a
-            # warning rather than silently ignored (ADR audit п.4).
-            gate_optional_missing_warning = (
-                f"У этапа {stage_id} не хватает {summary.optional_missing} "
-                f"необязательных (optional) документов — завершение разрешено."
-            )
+    gate_override_type = "+".join(gate_override_types)
 
     # G. Persist Stage status (+ any coupled admin_fields).
     write_result = update_stage_status_in_sheet(stage_id, target_status, notes=notes)
@@ -2565,23 +2771,27 @@ def transition_stage_status(
             partial_success = True
             downstream_failures.append(f"Не удалось обновить дополнительные поля: {admin_result.get('error')}")
 
-    if gate_optional_missing_warning:
-        warnings.append(gate_optional_missing_warning)
+    for w in gate_optional_missing_warnings:
+        warnings.append(w)
 
-    # Audit trail (Phase 43): only written when the gate actually had
-    # something to override (gate_override_type is non-empty only when
-    # force=True genuinely bypassed a real block, per the gate logic
-    # above — never for a force=yes call where nothing was blocking, so
-    # a repeat "done" call or an unnecessary force=yes never creates a
-    # second/duplicate row). Written only now, AFTER the Status write
-    # above already succeeded (changed is guaranteed True here, since
-    # previous_status="in_progress" != target_status="done" by
-    # construction) — never before, and never if that write had failed
-    # (this code path is unreachable in that case, see the early return
-    # a few lines above). A failure recording the audit row does NOT
-    # roll back the already-confirmed Status write — surfaced via
-    # partial_success/downstream_failures, the same principle already
-    # used for progress-recalculation/auto-completion failures below.
+    # Audit trail (Phase 43/44): only written when at least one gate
+    # actually had something to override (gate_override_type is non-empty
+    # only when force=True genuinely bypassed a real block above — never
+    # for a force=yes call where nothing was blocking, so a repeat "done"
+    # call or an unnecessary force=yes never creates a second/duplicate
+    # row). When BOTH gates were bypassed by this same call, this is
+    # still exactly ONE row — gate_override_type is already the
+    # "+"-joined composite of every gate that blocked, and every gate's
+    # own missing_* fields are included in this single call. Written only
+    # now, AFTER the Status write above already succeeded (changed is
+    # guaranteed True here, since previous_status="in_progress" !=
+    # target_status="done" by construction) — never before, and never if
+    # that write had failed (this code path is unreachable in that case,
+    # see the early return a few lines above). A failure recording the
+    # audit row does NOT roll back the already-confirmed Status write —
+    # surfaced via partial_success/downstream_failures, the same
+    # principle already used for progress-recalculation/auto-completion
+    # failures below.
     override_applied = False
     override_id = ""
     if gate_override_type:
@@ -2592,6 +2802,9 @@ def transition_stage_status(
             previous_status=previous_status, target_status=target_status,
             override_type=gate_override_type,
             configuration_error_details=gate_configuration_error_details,
+            missing_checklist_instance_ids=gate_missing_checklist_instance_ids,
+            missing_checklist_item_ids=gate_missing_checklist_item_ids,
+            missing_checklist_item_titles=gate_missing_checklist_item_titles,
         )
         if override_result["ok"]:
             override_id = override_result["override_id"]
@@ -2644,6 +2857,9 @@ def transition_stage_status(
         missing_blocking_doc_ids=gate_missing_blocking_doc_ids,
         configuration_error_details=gate_configuration_error_details,
         override_applied=override_applied, override_type=gate_override_type, override_id=override_id,
+        missing_checklist_instance_ids=gate_missing_checklist_instance_ids,
+        missing_checklist_item_ids=gate_missing_checklist_item_ids,
+        missing_checklist_item_titles=gate_missing_checklist_item_titles,
     )
 
 

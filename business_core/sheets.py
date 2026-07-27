@@ -495,6 +495,15 @@ BUSINESS_HEADERS: dict[str, list[str]] = {
         "Override ID", "Stage ID", "Roadmap ID", "User", "Overridden At",
         "Reason", "Missing Blocking Doc IDs", "Previous Status", "Target Status",
         "Override Type", "Configuration Error Details",
+        # Phase 44 (Checklist Completion Gate): additive — appended at the
+        # end so the existing SCO-001 row (written before this phase)
+        # reads back as "" for all three, never breaking. Override Type
+        # may now be a "+"-joined composite (e.g.
+        # "missing_blocking_documents+missing_checklist_items") when one
+        # force=yes call bypassed more than one gate at once — see
+        # business_builder.transition_stage_status().
+        "Missing Checklist Instance IDs", "Missing Checklist Item IDs",
+        "Missing Checklist Item Titles",
     ],
 }
 

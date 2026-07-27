@@ -376,5 +376,13 @@ def _default_stage_document_gate_mocks(request):
         yield
         return
 
-    with patch("business_core.document_requirements_query.evaluate_scope", side_effect=_default_evaluate_scope):
+    # Phase 44 (Checklist Completion Gate): same reasoning as above,
+    # applied to business_builder._evaluate_checklist_completion_gate()'s
+    # own call to checklist_manager.list_checklist_instances() — an
+    # empty list is exactly "no Checklist Instances for this Stage",
+    # which is the correct, non-blocking default for every pre-existing
+    # test (none of them instantiate a Checklist for their fixture
+    # stages).
+    with patch("business_core.document_requirements_query.evaluate_scope", side_effect=_default_evaluate_scope), \
+         patch("business_core.checklist_manager.list_checklist_instances", return_value=[]):
         yield

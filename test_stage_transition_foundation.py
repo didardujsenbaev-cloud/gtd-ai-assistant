@@ -145,7 +145,8 @@ class _BaseTransitionTestCase(unittest.TestCase):
               stage=_UNSET, roadmap=_UNSET, write_result=None, progress_result=None,
               completion_result=None, stage_id="STAGE-001",
               force=False, reason=None, actor="",
-              evaluate_scope_result=_UNSET, record_override_result=None):
+              evaluate_scope_result=_UNSET, record_override_result=None,
+              checklist_instances=None, checklist_items=None):
         bb = _fresh_bb()
         with patch("business_core.roadmap_manager.find_stage_by_id",
                    return_value=_stage() if stage is _UNSET else stage), \
@@ -160,6 +161,10 @@ class _BaseTransitionTestCase(unittest.TestCase):
              patch("business_core.document_requirements_query.evaluate_scope",
                    return_value=(_satisfied_scope_result(stage_id) if evaluate_scope_result is _UNSET
                                  else evaluate_scope_result)) as mock_evaluate_scope, \
+             patch("business_core.checklist_manager.list_checklist_instances",
+                   return_value=(checklist_instances if checklist_instances is not None else [])) as mock_checklist_instances, \
+             patch("business_core.checklist_manager.list_checklist_instance_items",
+                   return_value=(checklist_items if checklist_items is not None else [])) as mock_checklist_items, \
              patch("business_core.roadmap_manager.record_stage_completion_override",
                    return_value=(record_override_result if record_override_result is not None
                                  else _override_write_result())) as mock_record_override:
@@ -171,6 +176,8 @@ class _BaseTransitionTestCase(unittest.TestCase):
             self._last_mock_evaluate_scope = mock_evaluate_scope
             self._last_mock_write = mock_write
             self._last_mock_progress = mock_progress
+            self._last_mock_checklist_instances = mock_checklist_instances
+            self._last_mock_checklist_items = mock_checklist_items
             return result
 
 
@@ -603,7 +610,7 @@ class TestDocumentCompletionGate(_BaseTransitionTestCase):
             evaluate_scope_result=_blocking_missing_scope_result(), force=True, reason=None,
         )
         self.assertFalse(result["ok"])
-        self.assertEqual(result["code"], "STAGE_DOCUMENT_GATE_OVERRIDE_REASON_REQUIRED")
+        self.assertEqual(result["code"], "STAGE_COMPLETION_GATE_OVERRIDE_REASON_REQUIRED")
 
     def test_force_with_blank_reason_rejected(self):
         result = self._call(
@@ -611,7 +618,7 @@ class TestDocumentCompletionGate(_BaseTransitionTestCase):
             evaluate_scope_result=_blocking_missing_scope_result(), force=True, reason="   ",
         )
         self.assertFalse(result["ok"])
-        self.assertEqual(result["code"], "STAGE_DOCUMENT_GATE_OVERRIDE_REASON_REQUIRED")
+        self.assertEqual(result["code"], "STAGE_COMPLETION_GATE_OVERRIDE_REASON_REQUIRED")
 
     def test_force_with_reason_and_blocking_missing_completes_and_audits(self):
         result = self._call(
@@ -630,6 +637,7 @@ class TestDocumentCompletionGate(_BaseTransitionTestCase):
             missing_blocking_doc_ids=("DOC-008", "DOC-009"),
             previous_status="in_progress", target_status="done",
             override_type="missing_blocking_documents", configuration_error_details="",
+            missing_checklist_instance_ids=(), missing_checklist_item_ids=(), missing_checklist_item_titles=(),
         )
 
     def test_force_with_reason_and_blocking_zero_completes_without_audit(self):
@@ -731,6 +739,212 @@ class TestDocumentCompletionGate(_BaseTransitionTestCase):
         self._last_mock_evaluate_scope.assert_called_once_with("stage", "STAGE-001")
 
 
+# ─────────────────────────────────────────────────────────────
+# Phase 44: Checklist Completion Gate — fixture builders
+# ─────────────────────────────────────────────────────────────
+
+def _checklist_instance(instance_id="CLIN-001", stage_id="STAGE-001", status="in_progress"):
+    return {"Checklist Instance ID": instance_id, "Stage ID": stage_id, "Status": status}
+
+
+def _checklist_item(item_id="CLII-001", instance_id="CLIN-001", required=True, status="pending", title="Пункт"):
+    return {
+        "Checklist Instance Item ID": item_id, "Checklist Instance ID": instance_id,
+        "Required": "true" if required else "false", "Status": status,
+        "Item Title Snapshot": title,
+    }
+
+
+class TestChecklistCompletionGate(_BaseTransitionTestCase):
+    def test_no_checklist_instances_allows_done(self):
+        result = self._call(target_status="done", stage=_stage(status="in_progress"), checklist_instances=[])
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["code"], "STAGE_STATUS_UPDATED")
+
+    def test_fully_completed_checklist_allows_done(self):
+        result = self._call(
+            target_status="done", stage=_stage(status="in_progress"),
+            checklist_instances=[_checklist_instance()],
+            checklist_items=[_checklist_item(required=True, status="done")],
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["code"], "STAGE_STATUS_UPDATED")
+
+    def test_only_optional_missing_allows_done_with_warning(self):
+        result = self._call(
+            target_status="done", stage=_stage(status="in_progress"),
+            checklist_instances=[_checklist_instance()],
+            checklist_items=[
+                _checklist_item(item_id="CLII-001", required=True, status="done", title="Req"),
+                _checklist_item(item_id="CLII-002", required=False, status="pending", title="Opt"),
+            ],
+        )
+        self.assertTrue(result["ok"])
+        self.assertTrue(any("необязательных" in w.lower() for w in result["warnings"]))
+
+    def test_required_item_missing_rejects_without_force(self):
+        result = self._call(
+            target_status="done", stage=_stage(status="in_progress"),
+            checklist_instances=[_checklist_instance()],
+            checklist_items=[_checklist_item(item_id="CLII-001", required=True, status="pending", title="Проверить документы")],
+        )
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "STAGE_CHECKLIST_GATE_BLOCKED")
+        self.assertEqual(result["final_status"], "in_progress")
+
+    def test_required_item_missing_does_not_write_status_or_progress(self):
+        self._call(
+            target_status="done", stage=_stage(status="in_progress"),
+            checklist_instances=[_checklist_instance()],
+            checklist_items=[_checklist_item(required=True, status="pending")],
+        )
+        self._last_mock_write.assert_not_called()
+        self._last_mock_progress.assert_not_called()
+
+    def test_multiple_required_items_missing_all_returned(self):
+        result = self._call(
+            target_status="done", stage=_stage(status="in_progress"),
+            checklist_instances=[_checklist_instance()],
+            checklist_items=[
+                _checklist_item(item_id="CLII-001", required=True, status="pending", title="Первый"),
+                _checklist_item(item_id="CLII-002", required=True, status="blocked", title="Второй"),
+            ],
+        )
+        self.assertFalse(result["ok"])
+        self.assertEqual(set(result["missing_checklist_item_ids"]), {"CLII-001", "CLII-002"})
+        self.assertEqual(set(result["missing_checklist_item_titles"]), {"Первый", "Второй"})
+
+    def test_cancelled_instance_never_blocks(self):
+        result = self._call(
+            target_status="done", stage=_stage(status="in_progress"),
+            checklist_instances=[_checklist_instance(status="cancelled")],
+            checklist_items=[_checklist_item(required=True, status="pending")],
+        )
+        self.assertTrue(result["ok"])
+
+    def test_force_without_reason_rejected(self):
+        result = self._call(
+            target_status="done", stage=_stage(status="in_progress"),
+            checklist_instances=[_checklist_instance()],
+            checklist_items=[_checklist_item(required=True, status="pending")],
+            force=True, reason=None,
+        )
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "STAGE_COMPLETION_GATE_OVERRIDE_REASON_REQUIRED")
+
+    def test_force_with_reason_completes_and_audits_missing_checklist_items(self):
+        result = self._call(
+            target_status="done", stage=_stage(status="in_progress"),
+            checklist_instances=[_checklist_instance()],
+            checklist_items=[_checklist_item(item_id="CLII-001", required=True, status="pending", title="Проверить")],
+            force=True, reason="manager approved", actor="dida",
+        )
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["override_applied"])
+        self.assertEqual(result["override_type"], "missing_checklist_items")
+
+        self._last_mock_record_override.assert_called_once_with(
+            stage_id="STAGE-001", roadmap_id="RM-001", user="dida", reason="manager approved",
+            missing_blocking_doc_ids=(), previous_status="in_progress", target_status="done",
+            override_type="missing_checklist_items", configuration_error_details="",
+            missing_checklist_instance_ids=("CLIN-001",), missing_checklist_item_ids=("CLII-001",),
+            missing_checklist_item_titles=("Проверить",),
+        )
+
+    def test_force_with_reason_and_checklist_complete_completes_without_audit(self):
+        result = self._call(
+            target_status="done", stage=_stage(status="in_progress"),
+            checklist_instances=[_checklist_instance()],
+            checklist_items=[_checklist_item(required=True, status="done")],
+            force=True, reason="just in case",
+        )
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["override_applied"])
+        self._last_mock_record_override.assert_not_called()
+
+    def test_audit_write_failure_after_successful_done_returns_warning_but_status_stays_done(self):
+        result = self._call(
+            target_status="done", stage=_stage(status="in_progress"),
+            checklist_instances=[_checklist_instance()],
+            checklist_items=[_checklist_item(required=True, status="pending")],
+            force=True, reason="approved",
+            record_override_result=_override_write_result(ok=False, error="append failed"),
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["final_status"], "done")
+        self.assertTrue(result["partial_success"])
+        self.assertTrue(any("append failed" in f for f in result["downstream_failures"]))
+
+    def test_checklist_gate_not_evaluated_for_pending_to_in_progress(self):
+        result = self._call(target_status="in_progress", stage=_stage(status="pending"))
+        self._last_mock_checklist_instances.assert_not_called()
+        self.assertTrue(result["ok"])
+
+    def test_checklist_gate_not_evaluated_for_skipped(self):
+        result = self._call(target_status="skipped", stage=_stage(status="in_progress"))
+        self._last_mock_checklist_instances.assert_not_called()
+        self.assertTrue(result["ok"])
+
+
+class TestCombinedDocumentAndChecklistGate(_BaseTransitionTestCase):
+    def test_both_gates_blocked_without_force_returns_combined_code(self):
+        result = self._call(
+            target_status="done", stage=_stage(status="in_progress"),
+            evaluate_scope_result=_blocking_missing_scope_result(doc_ids=("DOC-008",)),
+            checklist_instances=[_checklist_instance()],
+            checklist_items=[_checklist_item(item_id="CLII-001", required=True, status="pending", title="Проверить")],
+        )
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "STAGE_COMPLETION_GATE_BLOCKED")
+        self.assertEqual(result["missing_blocking_doc_ids"], ("DOC-008",))
+        self.assertEqual(result["missing_checklist_item_ids"], ("CLII-001",))
+
+    def test_both_gates_blocked_does_not_write(self):
+        self._call(
+            target_status="done", stage=_stage(status="in_progress"),
+            evaluate_scope_result=_blocking_missing_scope_result(doc_ids=("DOC-008",)),
+            checklist_instances=[_checklist_instance()],
+            checklist_items=[_checklist_item(required=True, status="pending")],
+        )
+        self._last_mock_write.assert_not_called()
+
+    def test_both_gates_blocked_with_force_creates_single_combined_audit_row(self):
+        result = self._call(
+            target_status="done", stage=_stage(status="in_progress"),
+            evaluate_scope_result=_blocking_missing_scope_result(doc_ids=("DOC-008",)),
+            checklist_instances=[_checklist_instance()],
+            checklist_items=[_checklist_item(item_id="CLII-001", required=True, status="pending", title="Проверить")],
+            force=True, reason="both approved", actor="dida",
+        )
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["override_applied"])
+        self.assertEqual(result["override_type"], "missing_blocking_documents+missing_checklist_items")
+        self._last_mock_record_override.assert_called_once()
+        self.assertEqual(self._last_mock_record_override.call_count, 1)
+        _, kwargs = self._last_mock_record_override.call_args
+        self.assertEqual(kwargs["missing_blocking_doc_ids"], ("DOC-008",))
+        self.assertEqual(kwargs["missing_checklist_item_ids"], ("CLII-001",))
+        self.assertEqual(kwargs["override_type"], "missing_blocking_documents+missing_checklist_items")
+
+    def test_only_document_blocked_checklist_clean_uses_document_only_code(self):
+        result = self._call(
+            target_status="done", stage=_stage(status="in_progress"),
+            evaluate_scope_result=_blocking_missing_scope_result(doc_ids=("DOC-008",)),
+            checklist_instances=[],
+        )
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "STAGE_DOCUMENT_GATE_BLOCKED")
+
+    def test_only_checklist_blocked_document_clean_uses_checklist_only_code(self):
+        result = self._call(
+            target_status="done", stage=_stage(status="in_progress"),
+            checklist_instances=[_checklist_instance()],
+            checklist_items=[_checklist_item(required=True, status="pending")],
+        )
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "STAGE_CHECKLIST_GATE_BLOCKED")
+
+
 class TestUpdateStageStatusInSheetStillDocumentAgnostic(unittest.TestCase):
     """Phase 43 architectural guard: the gate lives ONLY in
     business_builder.transition_stage_status() — roadmap_manager.
@@ -748,6 +962,7 @@ class TestUpdateStageStatusInSheetStillDocumentAgnostic(unittest.TestCase):
         self.assertNotIn("document_requirements", src)
         self.assertNotIn("evaluate_scope", src)
         self.assertNotIn("stage_entity_relations", src)
+        self.assertNotIn("checklist", src.lower())
 
 
 if __name__ == "__main__":

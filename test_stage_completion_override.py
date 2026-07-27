@@ -34,7 +34,15 @@ EXPECTED_HEADERS = [
     "Override ID", "Stage ID", "Roadmap ID", "User", "Overridden At",
     "Reason", "Missing Blocking Doc IDs", "Previous Status", "Target Status",
     "Override Type", "Configuration Error Details",
+    "Missing Checklist Instance IDs", "Missing Checklist Item IDs",
+    "Missing Checklist Item Titles",
 ]
+
+# Pre-Phase-44 header shape — the exact row shape SCO-001 was written
+# with, before the 3 checklist columns existed. Used to prove backward
+# compatibility: a sheet still on this older header list must still be
+# readable/writable, and the 3 new fields simply default to "".
+LEGACY_HEADERS = EXPECTED_HEADERS[:11]
 
 
 class TestStageCompletionOverridesSchema(unittest.TestCase):
@@ -121,6 +129,87 @@ class TestRecordStageCompletionOverride(unittest.TestCase):
         self.assertEqual(row_dict["Override Type"], "configuration_error")
         self.assertEqual(row_dict["Configuration Error Details"], "STAGE-011/REL-999: dangling entity")
         self.assertEqual(row_dict["Missing Blocking Doc IDs"], "")
+
+    def test_checklist_fields_recorded(self):
+        _, appended = self._run(
+            override_type="missing_checklist_items", missing_blocking_doc_ids=(),
+            missing_checklist_instance_ids=("CLIN-001",), missing_checklist_item_ids=("CLII-001", "CLII-002"),
+            missing_checklist_item_titles=("Первый пункт", "Второй пункт"),
+        )
+        row_dict = dict(zip(EXPECTED_HEADERS, appended[0][1]))
+        self.assertEqual(row_dict["Override Type"], "missing_checklist_items")
+        self.assertEqual(row_dict["Missing Checklist Instance IDs"], "CLIN-001")
+        self.assertEqual(row_dict["Missing Checklist Item IDs"], "CLII-001, CLII-002")
+        self.assertEqual(row_dict["Missing Checklist Item Titles"], "Первый пункт, Второй пункт")
+
+    def test_composite_override_type_recorded_verbatim(self):
+        _, appended = self._run(
+            override_type="missing_blocking_documents+missing_checklist_items",
+            missing_checklist_instance_ids=("CLIN-001",), missing_checklist_item_ids=("CLII-001",),
+            missing_checklist_item_titles=("Пункт",),
+        )
+        row_dict = dict(zip(EXPECTED_HEADERS, appended[0][1]))
+        self.assertEqual(row_dict["Override Type"], "missing_blocking_documents+missing_checklist_items")
+
+    def test_checklist_fields_default_empty_for_document_only_override(self):
+        """A pure document-gate override (Phase 43 behavior, unchanged)
+        must leave the 3 new checklist columns blank, never populated
+        with stray data from a prior call."""
+        _, appended = self._run()
+        row_dict = dict(zip(EXPECTED_HEADERS, appended[0][1]))
+        self.assertEqual(row_dict["Missing Checklist Instance IDs"], "")
+        self.assertEqual(row_dict["Missing Checklist Item IDs"], "")
+        self.assertEqual(row_dict["Missing Checklist Item Titles"], "")
+
+    def test_sco_001_shaped_row_still_reads_back_with_blank_new_columns(self):
+        """Backward compatibility: SCO-001 (written before Phase 44) has
+        only the 11 legacy columns. Reading it back via the CURRENT
+        (14-column) header map must yield "" for the 3 new fields, never
+        an error or a missing key — proves the existing production row
+        remains fully readable after this additive schema change."""
+        legacy_row = {
+            "Override ID": "SCO-001", "Stage ID": "STAGE-011", "Roadmap ID": "RM-003",
+            "User": "570004109", "Overridden At": "2026-07-27 12:59:15",
+            "Reason": "Топосъёмка будет зарегистрирована после получения оригинала",
+            "Missing Blocking Doc IDs": "DOC-008", "Previous Status": "in_progress",
+            "Target Status": "done", "Override Type": "missing_blocking_documents",
+            "Configuration Error Details": "",
+        }
+        # Simulate reading this legacy row through the CURRENT header map —
+        # any header absent from the raw row's own keys must read back "".
+        full_row_dict = {h: legacy_row.get(h, "") for h in EXPECTED_HEADERS}
+        self.assertEqual(full_row_dict["Override ID"], "SCO-001")
+        self.assertEqual(full_row_dict["Missing Checklist Instance IDs"], "")
+        self.assertEqual(full_row_dict["Missing Checklist Item IDs"], "")
+        self.assertEqual(full_row_dict["Missing Checklist Item Titles"], "")
+
+    def test_write_against_unmigrated_legacy_header_sheet_fails_safely(self):
+        """Documents a real operational consequence of this additive
+        schema change: until the LIVE Google Sheet's header row is
+        actually extended with the 3 new columns (e.g. via
+        init_business_core_sheets()/ensure_headers()), a write attempt
+        against a sheet still on the old 11-column header will fail —
+        row_from_header_map() deliberately raises rather than writing a
+        value into the wrong/nonexistent column. The failure is caught
+        and surfaced as {"ok": False, "error": ...}, never an unhandled
+        exception — see record_stage_completion_override()'s own
+        try/except. transition_stage_status() already treats this as a
+        non-fatal partial_success (the Stage itself still completes),
+        exactly like any other audit-write failure."""
+        rm = _fresh_rm()
+        mock_sheet = MagicMock()
+        mock_sheet.row_values.return_value = list(LEGACY_HEADERS)
+        with patch("business_core.sheets.get_business_sheet", return_value=mock_sheet), \
+             patch("business_core.sheets.generate_next_id", return_value="SCO-002"), \
+             patch("business_core.sheets.append_business_row") as mock_append:
+            result = rm.record_stage_completion_override(
+                stage_id="STAGE-011", roadmap_id="RM-003", user="dida", reason="x",
+                override_type="missing_checklist_items",
+                missing_checklist_instance_ids=("CLIN-001",),
+            )
+        self.assertFalse(result["ok"])
+        self.assertIsNotNone(result["error"])
+        mock_append.assert_not_called()
 
     def test_missing_required_args_rejected(self):
         rm = _fresh_rm()

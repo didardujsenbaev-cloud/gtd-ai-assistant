@@ -482,7 +482,10 @@ class TestDocumentCompletionGateCallerUX(_AsyncTestCase):
         self.assertIn("REL-999", reply)
         self.assertNotIn("DOC-", reply)
 
-    def test_override_reason_required_message(self):
+    def test_override_reason_required_message_legacy_code_still_renders(self):
+        """Backward compatibility: the pre-Phase-44 code name must still
+        render correctly, even though transition_stage_status() itself
+        now only ever emits the new neutral name."""
         th = _fresh_th()
         result = {
             "ok": False, "code": "STAGE_DOCUMENT_GATE_OVERRIDE_REASON_REQUIRED",
@@ -492,6 +495,62 @@ class TestDocumentCompletionGateCallerUX(_AsyncTestCase):
         reply, _ = self._invoke(th, result, "/updatestage stage_id=STAGE-001 status=done force=yes")
         self.assertIn("❌", reply)
         self.assertIn("force=yes", reply)
+
+    def test_override_reason_required_message_new_code(self):
+        th = _fresh_th()
+        result = {
+            "ok": False, "code": "STAGE_COMPLETION_GATE_OVERRIDE_REASON_REQUIRED",
+            "error": "force=yes требует reason", "stage_id": "STAGE-001", "roadmap_id": "RM-001",
+            "previous_status": "in_progress", "requested_status": "done", "final_status": "in_progress",
+        }
+        reply, _ = self._invoke(th, result, "/updatestage stage_id=STAGE-001 status=done force=yes")
+        self.assertIn("❌", reply)
+        self.assertIn("force=yes", reply)
+
+    def test_checklist_gate_blocked_message_shows_instance_and_item_info(self):
+        th = _fresh_th()
+        result = {
+            "ok": False, "code": "STAGE_CHECKLIST_GATE_BLOCKED",
+            "error": "missing checklist items", "stage_id": "STAGE-001", "roadmap_id": "RM-001",
+            "previous_status": "in_progress", "requested_status": "done", "final_status": "in_progress",
+            "missing_checklist_instance_ids": ("CLIN-001",),
+            "missing_checklist_item_ids": ("CLII-001",),
+            "missing_checklist_item_titles": ("Проверить документы",),
+        }
+        reply, _ = self._invoke(th, result, "/updatestage stage_id=STAGE-001 status=done")
+        self.assertIn("CLIN-001", reply)
+        self.assertIn("CLII-001", reply)
+        self.assertIn("Проверить документы", reply)
+        self.assertIn("force=yes", reply)
+
+    def test_combined_gate_blocked_message_shows_both_reasons(self):
+        th = _fresh_th()
+        result = {
+            "ok": False, "code": "STAGE_COMPLETION_GATE_BLOCKED",
+            "error": "both blocked", "stage_id": "STAGE-001", "roadmap_id": "RM-001",
+            "previous_status": "in_progress", "requested_status": "done", "final_status": "in_progress",
+            "missing_blocking_doc_ids": ("DOC-008",),
+            "missing_checklist_instance_ids": ("CLIN-001",),
+            "missing_checklist_item_ids": ("CLII-001",),
+            "missing_checklist_item_titles": ("Проверить документы",),
+        }
+        reply, _ = self._invoke(th, result, "/updatestage stage_id=STAGE-001 status=done")
+        self.assertIn("DOC-008", reply)
+        self.assertIn("CLIN-001", reply)
+        self.assertIn("Проверить документы", reply)
+
+    def test_override_success_shows_checklist_item_titles_when_present(self):
+        th = _fresh_th()
+        result = _transition_result(
+            previous_status="in_progress", requested_status="done", final_status="done",
+            override_applied=True, override_type="missing_blocking_documents+missing_checklist_items",
+            override_id="SCO-003", missing_checklist_item_titles=("Проверить документы",),
+        )
+        reply, _ = self._invoke(
+            th, result, '/updatestage stage_id=STAGE-001 status=done force=yes reason="both"',
+        )
+        self.assertIn("`missing_blocking_documents+missing_checklist_items`", reply)
+        self.assertIn("Проверить документы", reply)
 
     def test_no_free_text_confirm_word_used_anywhere_in_command_source(self):
         """Phase 43 audit п.22: the override must never rely on a free-

@@ -144,7 +144,11 @@ def _make_sheet_dispatcher(stage_row, roadmaps_row, stage_row_num=2, roadmaps_ro
         if key == "roadmaps":
             return roadmaps_sheet
         if key in ("stage_entity_relations", "document_registry",
-                   "roadmap_template_stages", "document_template_registry"):
+                   "roadmap_template_stages", "document_template_registry",
+                   # Phase 44 (Checklist Completion Gate): same reasoning —
+                   # empty means "no Checklist Instances for this Stage",
+                   # the gate's own non-blocking default.
+                   "checklist_instances", "checklist_instance_items"):
             return empty_sheet
         raise AssertionError(f"неожиданный лист '{key}'")
 

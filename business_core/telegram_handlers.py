@@ -2840,7 +2840,48 @@ def _stage_transition_failure_message(result: dict, stage_id: str, status: str) 
             f"`/updatestage stage_id={stage_id} status=done force=yes reason=\"...\"`",
         ])
 
-    if code == "STAGE_DOCUMENT_GATE_OVERRIDE_REASON_REQUIRED":
+    if code == "STAGE_CHECKLIST_GATE_BLOCKED":
+        instance_ids = result.get("missing_checklist_instance_ids", ())
+        item_ids = result.get("missing_checklist_item_ids", ())
+        titles = result.get("missing_checklist_item_titles", ())
+        return "\n".join([
+            "🔒 Завершение заблокировано — не хватает обязательных пунктов чек-листа",
+            f"Этап: `{stage_id}`",
+            f"Roadmap: `{roadmap_id}`",
+            f"Checklist Instance IDs: {', '.join(instance_ids) if instance_ids else '—'}",
+            f"Missing Checklist Item IDs: {', '.join(item_ids) if item_ids else '—'}",
+            f"Невыполненные пункты: {', '.join(titles) if titles else '—'}",
+            "",
+            "Чтобы всё же завершить этап, используй явный override:",
+            f"`/updatestage stage_id={stage_id} status=done force=yes reason=\"...\"`",
+        ])
+
+    if code == "STAGE_COMPLETION_GATE_BLOCKED":
+        missing_docs = result.get("missing_blocking_doc_ids", ())
+        instance_ids = result.get("missing_checklist_instance_ids", ())
+        item_ids = result.get("missing_checklist_item_ids", ())
+        titles = result.get("missing_checklist_item_titles", ())
+        lines = [
+            "🔒 Завершение заблокировано сразу по нескольким причинам",
+            f"Этап: `{stage_id}`",
+            f"Roadmap: `{roadmap_id}`",
+        ]
+        if missing_docs:
+            lines.append(f"Missing Blocking Document Template IDs: {', '.join(missing_docs)}")
+        if result.get("configuration_error_details"):
+            lines.append(f"Ошибка настройки требований к документам: {result.get('configuration_error_details')}")
+        if instance_ids:
+            lines.append(f"Checklist Instance IDs: {', '.join(instance_ids)}")
+        if item_ids:
+            lines.append(f"Missing Checklist Item IDs: {', '.join(item_ids)}")
+        if titles:
+            lines.append(f"Невыполненные пункты чек-листа: {', '.join(titles)}")
+        lines.append("")
+        lines.append("Чтобы всё же завершить этап, используй явный override:")
+        lines.append(f"`/updatestage stage_id={stage_id} status=done force=yes reason=\"...\"`")
+        return "\n".join(lines)
+
+    if code in ("STAGE_DOCUMENT_GATE_OVERRIDE_REASON_REQUIRED", "STAGE_COMPLETION_GATE_OVERRIDE_REASON_REQUIRED"):
         return "\n".join([
             "❌ force=yes требует явную причину",
             f"Этап: `{stage_id}`",
@@ -2940,9 +2981,12 @@ def _stage_transition_success_lines(result: dict, stage_id: str, notes: Optional
 
     if result.get("override_applied"):
         lines.append(
-            f"🔓 Применён override документного гейта (force=yes). "
+            f"🔓 Применён override completion gate (force=yes). "
             f"Override ID: `{result.get('override_id') or '—'}`, тип: `{result.get('override_type') or '—'}`."
         )
+        titles = result.get("missing_checklist_item_titles", ())
+        if titles:
+            lines.append(f"Обойдённые пункты чек-листа: {', '.join(titles)}")
 
     if notes is not None:
         lines.append(f"Notes обновлены: {notes}")

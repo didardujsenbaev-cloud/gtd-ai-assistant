@@ -2366,25 +2366,30 @@ def record_stage_completion_override(
     *, stage_id: str, roadmap_id: str, user: str, reason: str,
     missing_blocking_doc_ids: tuple = (), previous_status: str = "", target_status: str = "done",
     override_type: str = "missing_blocking_documents", configuration_error_details: str = "",
+    missing_checklist_instance_ids: tuple = (), missing_checklist_item_ids: tuple = (),
+    missing_checklist_item_titles: tuple = (),
     timestamp: str | None = None,
 ) -> dict:
     """
-    Phase 43 (Document Completion Gate): sole write primitive for the
-    STAGE_COMPLETION_OVERRIDES audit trail — append-only, one row per
-    successful force=yes bypass of business_builder.
-    transition_stage_status()'s document completion gate. Never called
-    for a Stage transition the gate would have allowed anyway (the
-    caller decides that; this function only ever appends what it's
-    given).
+    Phase 43/44 (Document + Checklist Completion Gates): sole write
+    primitive for the STAGE_COMPLETION_OVERRIDES audit trail —
+    append-only, one row per successful force=yes bypass of
+    business_builder.transition_stage_status()'s completion gates.
+    Never called for a Stage transition the gate(s) would have allowed
+    anyway (the caller decides that; this function only ever appends
+    what it's given).
 
     No update/delete path exists anywhere for this registry — it is a
     pure historical record. Never touches ROADMAP_STAGES or ROADMAPS.
 
     Args:
-        override_type: "missing_blocking_documents" or
-            "configuration_error" — which failure mode was overridden;
-            never both in one row (the gate itself decides which one
-            applied for a given call).
+        override_type: one of "missing_blocking_documents",
+            "configuration_error", "missing_checklist_items", or a
+            "+"-joined composite of more than one (e.g.
+            "missing_blocking_documents+missing_checklist_items") when
+            a single force=yes call bypassed more than one gate at
+            once — the caller (transition_stage_status()) decides this
+            string; this function never inspects or validates it.
 
     Returns:
         {"ok": bool, "override_id": str, "error": str | None}
@@ -2417,6 +2422,9 @@ def record_stage_completion_override(
             "Target Status": target_status,
             "Override Type": override_type,
             "Configuration Error Details": configuration_error_details,
+            "Missing Checklist Instance IDs": ", ".join(missing_checklist_instance_ids),
+            "Missing Checklist Item IDs": ", ".join(missing_checklist_item_ids),
+            "Missing Checklist Item Titles": ", ".join(missing_checklist_item_titles),
         }
         row = row_from_header_map(headers, values)
         append_business_row("stage_completion_overrides", row)
