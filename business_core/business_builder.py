@@ -4506,6 +4506,154 @@ def sync_stage_document_requirements(stage_id: str, dry_run: bool = True) -> dic
     }
 
 
+def sync_stage_sop_knowledge(stage_id: str, dry_run: bool = True) -> dict:
+    """
+    Phase 45 (SOP Foundation UX): the SOP twin of
+    sync_stage_document_requirements() — same dual-source (active
+    STAGE_ENTITY_RELATIONS "sop" relations on the Template Stage, else
+    legacy ROADMAP_TEMPLATE_STAGES."SOP IDs" fallback), same
+    preview/confirm contract, same idempotency guarantee, kept as a
+    SEPARATE function (not merged into sync_stage_document_requirements())
+    so neither function grows into a multi-entity-type monolith — the
+    same principle already applied to keeping
+    _evaluate_document_completion_gate()/_evaluate_checklist_completion_gate()
+    as two small functions instead of one. /syncstageknowledge's handler
+    calls both this and sync_stage_document_requirements() and combines
+    their previews/results into one response.
+
+    SOP relations carry no Required/Blocking semantics (see
+    stage_entity_relations._SOP_RELATION_DEFAULTS) and are never read by
+    transition_stage_status() or either Stage Completion Gate — this
+    function exists purely to make "what SOP applies to this Stage"
+    discoverable via /sop stage_id=..., nothing more.
+
+    Never writes ROADMAP_STAGES (SOP IDs legacy column lives on
+    ROADMAP_TEMPLATE_STAGES, not ROADMAP_STAGES, and isn't written here
+    either way) and never touches Status/Responsible/Due Date/Priority/
+    Progress — only ever calls stage_entity_relations functions.
+
+    dry_run=True (the default, used for /syncstageknowledge's preview
+    step) performs every read/resolution/validation step and returns
+    what WOULD be added, without writing anything.
+
+    Returns:
+        {
+            "ok": bool, "code": str, "error": str | None,
+            "stage_id": str, "template_stage_id": str, "source": str,
+            "to_add": tuple[str, ...],          # SOP IDs not yet linked to this Stage
+            "already_present": tuple[str, ...], # SOP IDs already linked to this Stage
+            "created": tuple[str, ...],         # actually created (dry_run=False only)
+        }
+        source is "" until a source is chosen, else "relations" or "legacy".
+    """
+    from business_core.roadmap_manager import resolve_template_stage_for_stage
+    from business_core.stage_entity_relations import (
+        get_relations_for_template_stage, get_relations_for_stage,
+        copy_template_relations_to_stage, create_sop_relations_for_stage,
+        validate_relation_references,
+    )
+
+    empty = {
+        "stage_id": stage_id, "template_stage_id": "", "source": "",
+        "to_add": (), "already_present": (), "created": (),
+    }
+
+    resolved = resolve_template_stage_for_stage(stage_id)
+    if not resolved["ok"]:
+        return {"ok": False, "code": resolved["code"], "error": resolved["error"], **empty}
+
+    template_stage_id = resolved["template_stage_id"]
+
+    all_template_relations = get_relations_for_template_stage(template_stage_id)
+    sop_type_relations = [r for r in all_template_relations if r.get("Entity Type", "") == "sop"]
+    other_type_relations = [r for r in all_template_relations if r.get("Entity Type", "") != "sop"]
+
+    source = ""
+    template_entity_ids: list[str] = []
+
+    if sop_type_relations:
+        source = "relations"
+        if other_type_relations:
+            non_sop_types = sorted({r.get("Entity Type", "") for r in other_type_relations})
+            return {
+                "ok": False, "code": "UNSUPPORTED_RELATION_TYPE_ON_TEMPLATE_STAGE",
+                "error": (
+                    f"Template Stage {template_stage_id} содержит relations типа "
+                    f"{', '.join(non_sop_types)} — эта операция синхронизирует только sop."
+                ),
+                "stage_id": stage_id, "template_stage_id": template_stage_id, "source": source,
+                "to_add": (), "already_present": (), "created": (),
+            }
+        template_entity_ids = [r.get("Entity ID", "") for r in sop_type_relations]
+    else:
+        legacy_ids = list((resolved.get("template_stage_row") or {}).get("sop_ids", []))
+        if legacy_ids:
+            source = "legacy"
+            invalid = []
+            for sop_id in legacy_ids:
+                errs = validate_relation_references({
+                    "Template Stage ID": "", "Stage ID": stage_id,
+                    "Entity Type": "sop", "Entity ID": sop_id,
+                })
+                if errs:
+                    invalid.append((sop_id, errs))
+            if invalid:
+                detail = "; ".join(f"{sop_id}: {', '.join(errs)}" for sop_id, errs in invalid)
+                return {
+                    "ok": False, "code": "INVALID_LEGACY_SOP_ID",
+                    "error": f"Некорректные SOP ID в legacy-поле Template Stage {template_stage_id}: {detail}",
+                    "stage_id": stage_id, "template_stage_id": template_stage_id, "source": source,
+                    "to_add": (), "already_present": (), "created": (),
+                }
+            template_entity_ids = legacy_ids
+
+    if not template_entity_ids:
+        return {
+            "ok": False, "code": "NO_SOP_KNOWLEDGE",
+            "error": (
+                f"У Template Stage {template_stage_id} нет ни активных sop relations, "
+                f"ни значений в legacy-поле \"SOP IDs\""
+            ),
+            "stage_id": stage_id, "template_stage_id": template_stage_id, "source": "",
+            "to_add": (), "already_present": (), "created": (),
+        }
+
+    existing_relations = get_relations_for_stage(stage_id, entity_type="sop")
+    existing_entity_ids = {r.get("Entity ID", "") for r in existing_relations}
+
+    to_add = tuple(eid for eid in template_entity_ids if eid not in existing_entity_ids)
+    already_present = tuple(eid for eid in template_entity_ids if eid in existing_entity_ids)
+
+    if dry_run:
+        return {
+            "ok": True, "code": "STAGE_SOP_SYNC_PREVIEW", "error": None,
+            "stage_id": stage_id, "template_stage_id": template_stage_id, "source": source,
+            "to_add": to_add, "already_present": already_present, "created": (),
+        }
+
+    if source == "relations":
+        write_result = copy_template_relations_to_stage(template_stage_id, stage_id)
+    else:
+        write_result = create_sop_relations_for_stage(stage_id, template_entity_ids)
+
+    if not write_result.ok:
+        return {
+            "ok": False, "code": "STAGE_SOP_SYNC_FAILED",
+            "error": "; ".join(str(errs) for _, errs in write_result.errors) or "Не удалось синхронизировать",
+            "stage_id": stage_id, "template_stage_id": template_stage_id, "source": source,
+            "to_add": to_add, "already_present": already_present, "created": (),
+        }
+
+    created_entity_ids = tuple(
+        rec.get("Entity ID", "") for rec in write_result.created if rec.get("Entity Type", "") == "sop"
+    )
+    return {
+        "ok": True, "code": "STAGE_SOP_SYNCED", "error": None,
+        "stage_id": stage_id, "template_stage_id": template_stage_id, "source": source,
+        "to_add": to_add, "already_present": already_present, "created": created_entity_ids,
+    }
+
+
 def transition_document_status(document_id: str, target_status: str) -> dict:
     """
     Phase 37D (ADR-020 §15/§11/§12): the sole canonical Document-

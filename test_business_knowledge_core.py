@@ -323,6 +323,175 @@ class TestKnowledgeCommands(unittest.TestCase):
             self.assertIn("❌", msg)
         asyncio.run(run())
 
+    def test_newsop_expected_result_forwarded(self):
+        """п.22: expected_result= передаётся в create_sop_record."""
+        import asyncio
+        self._setup()
+        from business_core.telegram_handlers import newsop_cmd
+        update, context = self._update('title=Проверка expected_result="Документы проверены"')
+
+        async def run():
+            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
+                 patch("business_core.knowledge_manager.create_sop_record",
+                       return_value={"ok": True, "sop_id": "SOP-001", "error": None}) as mock_create:
+                await newsop_cmd(update, context)
+            _, kwargs = mock_create.call_args
+            self.assertEqual(kwargs.get("expected_result"), "Документы проверены")
+        asyncio.run(run())
+
+    def test_newsop_result_short_form_backward_compatible(self):
+        """п.23: result= продолжает работать как алиас."""
+        import asyncio
+        self._setup()
+        from business_core.telegram_handlers import newsop_cmd
+        update, context = self._update('title=Проверка result="Старый синтаксис"')
+
+        async def run():
+            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
+                 patch("business_core.knowledge_manager.create_sop_record",
+                       return_value={"ok": True, "sop_id": "SOP-001", "error": None}) as mock_create:
+                await newsop_cmd(update, context)
+            _, kwargs = mock_create.call_args
+            self.assertEqual(kwargs.get("expected_result"), "Старый синтаксис")
+        asyncio.run(run())
+
+    def test_newsop_expected_result_takes_priority_over_result(self):
+        """п.24: expected_result= побеждает result=, если переданы оба."""
+        import asyncio
+        self._setup()
+        from business_core.telegram_handlers import newsop_cmd
+        update, context = self._update(
+            'title=Проверка expected_result="Новый" result="Старый"'
+        )
+
+        async def run():
+            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
+                 patch("business_core.knowledge_manager.create_sop_record",
+                       return_value={"ok": True, "sop_id": "SOP-001", "error": None}) as mock_create:
+                await newsop_cmd(update, context)
+            _, kwargs = mock_create.call_args
+            self.assertEqual(kwargs.get("expected_result"), "Новый")
+        asyncio.run(run())
+
+    def test_sop_sop_id_shows_full_steps_no_truncation(self):
+        """п.25: /sop sop_id=... показывает Steps полностью, без обрезки [:100]."""
+        import asyncio
+        self._setup()
+        from business_core.telegram_handlers import sop_cmd
+        long_steps = "1. Шаг один. " * 20  # заведомо длиннее 100 символов
+        fake_sop = {
+            "SOP ID": "SOP-001", "Title": "Проверка документов",
+            "Purpose": "Убедиться в комплектности", "Steps": long_steps,
+            "Expected Result": "Документы проверены", "Owner Role": "Юрист",
+            "Version": "1.0", "Status": "active", "Notes": "",
+            "Google Drive": "", "Drive File ID": "",
+        }
+        update, context = self._update("sop_id=SOP-001")
+
+        async def run():
+            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
+                 patch("business_core.knowledge_manager.find_sop_by_id", return_value=fake_sop):
+                await sop_cmd(update, context)
+            sent_texts = [c.args[0] for c in update.message.reply_text.call_args_list]
+            self.assertTrue(any(long_steps in t for t in sent_texts))
+        asyncio.run(run())
+
+    def test_sop_long_message_splits_without_losing_text(self):
+        """п.26: длинный SOP разбивается на несколько сообщений без потери текста."""
+        import asyncio
+        self._setup()
+        from business_core.telegram_handlers import sop_cmd
+        very_long_steps = "Шаг номер {}. ".format("X") * 2000
+        fake_sop = {
+            "SOP ID": "SOP-001", "Title": "Длинный SOP",
+            "Purpose": "", "Steps": very_long_steps,
+            "Expected Result": "", "Owner Role": "", "Version": "1.0",
+            "Status": "active", "Notes": "", "Google Drive": "", "Drive File ID": "",
+        }
+        update, context = self._update("sop_id=SOP-001")
+
+        async def run():
+            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
+                 patch("business_core.knowledge_manager.find_sop_by_id", return_value=fake_sop):
+                await sop_cmd(update, context)
+            sent_texts = [c.args[0] for c in update.message.reply_text.call_args_list]
+            self.assertGreater(len(sent_texts), 1)
+            self.assertIn(very_long_steps, "".join(sent_texts))
+        asyncio.run(run())
+
+    def test_sop_markdown_characters_do_not_corrupt_output(self):
+        """п.27: символы Markdown в Title/Steps не ломают вывод — parse_mode=None."""
+        import asyncio
+        self._setup()
+        from business_core.telegram_handlers import sop_cmd
+        fake_sop = {
+            "SOP ID": "SOP-001", "Title": "Проверка_документов *важно*",
+            "Purpose": "", "Steps": "1. Шаг_один; 2. Шаг_два *срочно*",
+            "Expected Result": "", "Owner Role": "", "Version": "1.0",
+            "Status": "active", "Notes": "", "Google Drive": "", "Drive File ID": "",
+        }
+        update, context = self._update("sop_id=SOP-001")
+
+        async def run():
+            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
+                 patch("business_core.knowledge_manager.find_sop_by_id", return_value=fake_sop):
+                await sop_cmd(update, context)
+            for call in update.message.reply_text.call_args_list:
+                self.assertIsNone(call.kwargs.get("parse_mode"))
+            sent_texts = [c.args[0] for c in update.message.reply_text.call_args_list]
+            self.assertTrue(any("Проверка_документов *важно*" in t for t in sent_texts))
+        asyncio.run(run())
+
+    def test_sop_stage_id_shows_all_linked_sops(self):
+        """п.28: /sop stage_id=... показывает все привязанные SOP по порядку."""
+        import asyncio
+        self._setup()
+        from business_core.telegram_handlers import sop_cmd
+        relations = (
+            {"Relation ID": "REL-1", "Stage ID": "STAGE-013", "Entity Type": "sop",
+             "Entity ID": "SOP-001", "Status": "active"},
+            {"Relation ID": "REL-2", "Stage ID": "STAGE-013", "Entity Type": "sop",
+             "Entity ID": "SOP-002", "Status": "active"},
+        )
+        sop_1 = {"SOP ID": "SOP-001", "Title": "Первый SOP", "Purpose": "", "Steps": "шаги 1",
+                 "Expected Result": "", "Owner Role": "", "Version": "1.0", "Status": "active",
+                 "Notes": "", "Google Drive": "", "Drive File ID": ""}
+        sop_2 = {"SOP ID": "SOP-002", "Title": "Второй SOP", "Purpose": "", "Steps": "шаги 2",
+                 "Expected Result": "", "Owner Role": "", "Version": "1.0", "Status": "active",
+                 "Notes": "", "Google Drive": "", "Drive File ID": ""}
+        update, context = self._update("stage_id=STAGE-013")
+
+        async def run():
+            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
+                 patch("business_core.stage_entity_relations.get_relations_for_stage", return_value=relations), \
+                 patch("business_core.knowledge_manager.find_sop_by_id",
+                       side_effect=lambda sid: {"SOP-001": sop_1, "SOP-002": sop_2}[sid]):
+                await sop_cmd(update, context)
+            sent_texts = [c.args[0] for c in update.message.reply_text.call_args_list]
+            combined = "".join(sent_texts)
+            self.assertIn("Первый SOP", combined)
+            self.assertIn("Второй SOP", combined)
+            self.assertLess(combined.index("Первый SOP"), combined.index("Второй SOP"))
+        asyncio.run(run())
+
+    def test_sop_stage_without_sop_returns_clear_message(self):
+        """п.29: этап без привязанных SOP возвращает понятное сообщение, а не ошибку/пусто."""
+        import asyncio
+        self._setup()
+        from business_core.telegram_handlers import sop_cmd
+        update, context = self._update("stage_id=STAGE-013")
+
+        async def run():
+            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
+                 patch("business_core.stage_entity_relations.get_relations_for_stage", return_value=()), \
+                 patch("business_core.knowledge_manager.get_knowledge_for_stage",
+                       return_value={"sop_ids": []}):
+                await sop_cmd(update, context)
+            msg = update.message.reply_text.call_args[0][0]
+            self.assertIn("STAGE-013", msg)
+            self.assertIn("нет привязанных SOP", msg)
+        asyncio.run(run())
+
     def test_N_newchecklist_creates(self):
         """N: /newchecklist создает чек-лист."""
         import asyncio

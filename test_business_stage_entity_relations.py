@@ -411,19 +411,26 @@ class TestEntityTypeDispatcher(unittest.TestCase):
         self.assertEqual(entry["sheet_key"], "document_template_registry")
         self.assertEqual(entry["id_column"], "Document Template ID")
 
-    def test_only_document_template_and_role_supported_today(self):
-        """Phase 22B added "role" (Work Execution Foundation) — the
-        dispatch table is still exactly two entries, both additive,
-        neither a schema change to STAGE_ENTITY_RELATIONS itself.
-        "contractor_person" remains explicitly deferred (Phase 22A/22B)."""
+    def test_only_document_template_role_and_sop_supported_today(self):
+        """Phase 22B added "role" (Work Execution Foundation), Phase 45
+        added "sop" (SOP Foundation UX) — the dispatch table is exactly
+        three entries, all additive, none a schema change to
+        STAGE_ENTITY_RELATIONS itself. "contractor_person" remains
+        explicitly deferred (Phase 22A/22B)."""
         ser = _fresh_ser()
-        self.assertEqual(set(ser.ENTITY_TYPE_DISPATCH.keys()), {"document_template", "role"})
+        self.assertEqual(set(ser.ENTITY_TYPE_DISPATCH.keys()), {"document_template", "role", "sop"})
 
     def test_role_entity_type_dispatch_target(self):
         ser = _fresh_ser()
         entry = ser.ENTITY_TYPE_DISPATCH["role"]
         self.assertEqual(entry["sheet_key"], "role_registry")
         self.assertEqual(entry["id_column"], "Role ID")
+
+    def test_sop_entity_type_dispatch_target(self):
+        ser = _fresh_ser()
+        entry = ser.ENTITY_TYPE_DISPATCH["sop"]
+        self.assertEqual(entry["sheet_key"], "sop_registry")
+        self.assertEqual(entry["id_column"], "SOP ID")
 
 
 # ────────────────────────────────────────────────────────────
@@ -1033,8 +1040,10 @@ class TestCopyTemplateRelationsToStage(_CopyCase):
         self.assertEqual(appended, [])
 
     def test_unsupported_entity_type_visible(self):
+        """"sop" is now a supported Entity Type (Phase 45) — use
+        "checklist" instead as an example of a still-unsupported type."""
         result, appended = self._run(relations=[_rel_row(**{
-            "Relation ID": "REL-001", "Entity Type": "sop", "Entity ID": "SOP-001",
+            "Relation ID": "REL-001", "Entity Type": "checklist", "Entity ID": "CHK-001",
         })])
         self.assertFalse(result.ok)
         self.assertTrue(any("Unsupported Entity Type" in str(e) for _, errs in result.errors for e in errs))

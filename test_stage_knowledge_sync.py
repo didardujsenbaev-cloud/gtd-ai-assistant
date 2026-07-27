@@ -439,8 +439,128 @@ class TestSyncStageDocumentRequirementsDualSource(unittest.TestCase):
 
 
 # ────────────────────────────────────────────────────────────
+# business_builder.sync_stage_sop_knowledge()
+# ────────────────────────────────────────────────────────────
+
+_TEMPLATE_RELATIONS_SOP_ONLY = (
+    {"Relation ID": "REL-200", "Template Stage ID": "TSTG-030", "Stage ID": "",
+     "Entity Type": "sop", "Entity ID": "SOP-001", "Status": "active"},
+)
+
+
+def _resolved_ok_sop(sop_ids=()):
+    return {
+        "ok": True, "code": "", "error": None,
+        "stage": FAKE_STAGE, "roadmap": FAKE_ROADMAP,
+        "template_id": "RMT-IZH-ALM-STANDARD-002", "template_stage_id": "TSTG-030",
+        "template_stage_row": {
+            "stage_id": "TSTG-030", "template_id": "RMT-IZH-ALM-STANDARD-002", "order": "6",
+            "sop_ids": list(sop_ids),
+        },
+    }
+
+
+_RESOLVED_OK_SOP = _resolved_ok_sop()
+_RESOLVED_OK_SOP_LEGACY = _resolved_ok_sop(["SOP-001"])
+
+
+class TestSyncStageSopKnowledge(unittest.TestCase):
+    """п.30-33: SOP twin of TestSyncStageDocumentRequirements(DualSource) —
+    same dual-source, preview/confirm/idempotency contract, applied to
+    business_builder.sync_stage_sop_knowledge()."""
+
+    def test_no_sop_knowledge_on_template_stage(self):
+        with patch("business_core.roadmap_manager.resolve_template_stage_for_stage", return_value=_RESOLVED_OK_SOP), \
+             patch("business_core.stage_entity_relations.get_relations_for_template_stage", return_value=()):
+            result = bb.sync_stage_sop_knowledge("STAGE-014", dry_run=True)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "NO_SOP_KNOWLEDGE")
+
+    def test_preview_shows_source_and_to_add_relations(self):
+        with patch("business_core.roadmap_manager.resolve_template_stage_for_stage", return_value=_RESOLVED_OK_SOP), \
+             patch("business_core.stage_entity_relations.get_relations_for_template_stage",
+                   return_value=_TEMPLATE_RELATIONS_SOP_ONLY), \
+             patch("business_core.stage_entity_relations.get_relations_for_stage", return_value=()), \
+             patch("business_core.stage_entity_relations.copy_template_relations_to_stage") as mock_copy:
+            result = bb.sync_stage_sop_knowledge("STAGE-014", dry_run=True)
+
+        mock_copy.assert_not_called()
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["code"], "STAGE_SOP_SYNC_PREVIEW")
+        self.assertEqual(result["source"], "relations")
+        self.assertEqual(result["to_add"], ("SOP-001",))
+
+    def test_confirm_yes_creates_relation_via_copy(self):
+        created = ({"Entity Type": "sop", "Entity ID": "SOP-001"},)
+        with patch("business_core.roadmap_manager.resolve_template_stage_for_stage", return_value=_RESOLVED_OK_SOP), \
+             patch("business_core.stage_entity_relations.get_relations_for_template_stage",
+                   return_value=_TEMPLATE_RELATIONS_SOP_ONLY), \
+             patch("business_core.stage_entity_relations.get_relations_for_stage", return_value=()), \
+             patch("business_core.stage_entity_relations.copy_template_relations_to_stage",
+                   return_value=_copy_result(created=created)) as mock_copy:
+            result = bb.sync_stage_sop_knowledge("STAGE-014", dry_run=False)
+
+        mock_copy.assert_called_once_with("TSTG-030", "STAGE-014")
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["code"], "STAGE_SOP_SYNCED")
+        self.assertEqual(result["created"], ("SOP-001",))
+
+    def test_idempotent_second_run_no_new_to_add(self):
+        already_existing = (
+            {"Stage ID": "STAGE-014", "Entity Type": "sop", "Entity ID": "SOP-001", "Status": "active"},
+        )
+        with patch("business_core.roadmap_manager.resolve_template_stage_for_stage", return_value=_RESOLVED_OK_SOP), \
+             patch("business_core.stage_entity_relations.get_relations_for_template_stage",
+                   return_value=_TEMPLATE_RELATIONS_SOP_ONLY), \
+             patch("business_core.stage_entity_relations.get_relations_for_stage",
+                   return_value=already_existing), \
+             patch("business_core.stage_entity_relations.copy_template_relations_to_stage") as mock_copy:
+            result = bb.sync_stage_sop_knowledge("STAGE-014", dry_run=True)
+
+        mock_copy.assert_not_called()
+        self.assertEqual(result["to_add"], ())
+        self.assertEqual(result["already_present"], ("SOP-001",))
+
+    def test_legacy_sop_ids_on_template_stage_supported(self):
+        """п.33: legacy ROADMAP_TEMPLATE_STAGES."SOP IDs" fallback when no
+        STAGE_ENTITY_RELATIONS sop rows exist for the Template Stage."""
+        with patch("business_core.roadmap_manager.resolve_template_stage_for_stage",
+                   return_value=_RESOLVED_OK_SOP_LEGACY), \
+             patch("business_core.stage_entity_relations.get_relations_for_template_stage", return_value=()), \
+             patch("business_core.stage_entity_relations.get_relations_for_stage", return_value=()), \
+             patch("business_core.stage_entity_relations.validate_relation_references", return_value=[]), \
+             patch("business_core.stage_entity_relations.copy_template_relations_to_stage") as mock_copy, \
+             patch("business_core.stage_entity_relations.create_sop_relations_for_stage",
+                   return_value=_copy_result(created=({"Entity Type": "sop", "Entity ID": "SOP-001"},))) as mock_legacy:
+            result = bb.sync_stage_sop_knowledge("STAGE-014", dry_run=False)
+
+        mock_copy.assert_not_called()
+        mock_legacy.assert_called_once_with("STAGE-014", ["SOP-001"])
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["source"], "legacy")
+        self.assertEqual(result["created"], ("SOP-001",))
+
+    def test_never_participates_in_transition_stage_status(self):
+        """п.35: sync_stage_sop_knowledge должен нигде не вызываться из
+        transition_stage_status() — SOP не участвует в Stage Completion Gate."""
+        import inspect
+
+        source = inspect.getsource(bb.transition_stage_status)
+        self.assertNotIn("sync_stage_sop_knowledge", source)
+        self.assertNotIn("sop_registry", source)
+
+
+# ────────────────────────────────────────────────────────────
 # /syncstageknowledge — async command behavior
 # ────────────────────────────────────────────────────────────
+
+_NO_SOP_KNOWLEDGE_DEFAULT = {
+    "ok": False, "code": "NO_SOP_KNOWLEDGE",
+    "error": "У Template Stage нет sop relations, ни legacy-значений",
+    "stage_id": "STAGE-014", "template_stage_id": "TSTG-030",
+    "to_add": (), "already_present": (), "created": (),
+}
+
 
 class TestSyncStageKnowledgeCmd(unittest.TestCase):
     def test_missing_stage_id(self):
@@ -461,7 +581,9 @@ class TestSyncStageKnowledgeCmd(unittest.TestCase):
              patch("business_core.business_builder.sync_stage_document_requirements",
                    return_value={"ok": True, "code": "STAGE_KNOWLEDGE_SYNC_PREVIEW", "error": None,
                                  "stage_id": "STAGE-014", "template_stage_id": "TSTG-030",
-                                 "to_add": ("DOC-012",), "already_present": (), "created": ()}) as mock_fn:
+                                 "to_add": ("DOC-012",), "already_present": (), "created": ()}) as mock_fn, \
+             patch("business_core.business_builder.sync_stage_sop_knowledge",
+                   return_value=_NO_SOP_KNOWLEDGE_DEFAULT):
             asyncio.run(th.syncstageknowledge_cmd(update, context))
 
         _, kwargs = mock_fn.call_args
@@ -479,7 +601,9 @@ class TestSyncStageKnowledgeCmd(unittest.TestCase):
              patch("business_core.business_builder.sync_stage_document_requirements",
                    return_value={"ok": True, "code": "STAGE_KNOWLEDGE_SYNCED", "error": None,
                                  "stage_id": "STAGE-014", "template_stage_id": "TSTG-030",
-                                 "to_add": ("DOC-012",), "already_present": (), "created": ("DOC-012",)}) as mock_fn:
+                                 "to_add": ("DOC-012",), "already_present": (), "created": ("DOC-012",)}) as mock_fn, \
+             patch("business_core.business_builder.sync_stage_sop_knowledge",
+                   return_value=_NO_SOP_KNOWLEDGE_DEFAULT):
             asyncio.run(th.syncstageknowledge_cmd(update, context))
 
         args, kwargs = mock_fn.call_args
@@ -497,7 +621,9 @@ class TestSyncStageKnowledgeCmd(unittest.TestCase):
                    return_value={"ok": False, "code": "NO_DOCUMENT_TEMPLATE_RELATIONS",
                                  "error": "У Template Stage TSTG-030 нет активных document_template relations",
                                  "stage_id": "STAGE-014", "template_stage_id": "TSTG-030",
-                                 "to_add": (), "already_present": (), "created": ()}):
+                                 "to_add": (), "already_present": (), "created": ()}), \
+             patch("business_core.business_builder.sync_stage_sop_knowledge",
+                   return_value=_NO_SOP_KNOWLEDGE_DEFAULT):
             asyncio.run(th.syncstageknowledge_cmd(update, context))
 
         msg = update.message.reply_text.call_args[0][0]
@@ -511,12 +637,86 @@ class TestSyncStageKnowledgeCmd(unittest.TestCase):
              patch("business_core.business_builder.sync_stage_document_requirements",
                    return_value={"ok": True, "code": "STAGE_KNOWLEDGE_SYNC_PREVIEW", "error": None,
                                  "stage_id": "STAGE-014", "template_stage_id": "TSTG-030",
-                                 "to_add": (), "already_present": ("DOC-012",), "created": ()}):
+                                 "to_add": (), "already_present": ("DOC-012",), "created": ()}), \
+             patch("business_core.business_builder.sync_stage_sop_knowledge",
+                   return_value=_NO_SOP_KNOWLEDGE_DEFAULT):
             asyncio.run(th.syncstageknowledge_cmd(update, context))
 
         msg = update.message.reply_text.call_args[0][0]
         self.assertIn("DOC-012", msg)
         self.assertIn("ничего", msg.lower())
+
+    def test_sop_preview_shows_source_and_to_add(self):
+        """п.30: preview показывает источник и список добавления для SOP."""
+        update, context = _cmd("/syncstageknowledge stage_id=STAGE-014")
+
+        doc_ok_nothing = {
+            "ok": False, "code": "NO_DOCUMENT_TEMPLATE_RELATIONS", "error": "нет документов",
+            "stage_id": "STAGE-014", "template_stage_id": "TSTG-030",
+            "to_add": (), "already_present": (), "created": (),
+        }
+        sop_preview = {
+            "ok": True, "code": "STAGE_SOP_SYNC_PREVIEW", "error": None,
+            "stage_id": "STAGE-014", "template_stage_id": "TSTG-030", "source": "legacy",
+            "to_add": ("SOP-001",), "already_present": (), "created": (),
+        }
+        with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
+             patch("business_core.business_builder.sync_stage_document_requirements", return_value=doc_ok_nothing), \
+             patch("business_core.business_builder.sync_stage_sop_knowledge", return_value=sop_preview):
+            asyncio.run(th.syncstageknowledge_cmd(update, context))
+
+        msg = update.message.reply_text.call_args[0][0]
+        self.assertIn("SOP-001", msg)
+        self.assertIn("legacy", msg.lower())
+        self.assertIn("confirm=yes", msg)
+
+    def test_sop_confirm_yes_creates_relation(self):
+        """п.31: confirm=yes создаёт relation для SOP."""
+        update, context = _cmd("/syncstageknowledge stage_id=STAGE-014 confirm=yes")
+
+        doc_ok_nothing = {
+            "ok": False, "code": "NO_DOCUMENT_TEMPLATE_RELATIONS", "error": "нет документов",
+            "stage_id": "STAGE-014", "template_stage_id": "TSTG-030",
+            "to_add": (), "already_present": (), "created": (),
+        }
+        sop_synced = {
+            "ok": True, "code": "STAGE_SOP_SYNCED", "error": None,
+            "stage_id": "STAGE-014", "template_stage_id": "TSTG-030", "source": "legacy",
+            "to_add": ("SOP-001",), "already_present": (), "created": ("SOP-001",),
+        }
+        with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
+             patch("business_core.business_builder.sync_stage_document_requirements", return_value=doc_ok_nothing), \
+             patch("business_core.business_builder.sync_stage_sop_knowledge",
+                   return_value=sop_synced) as mock_sop:
+            asyncio.run(th.syncstageknowledge_cmd(update, context))
+
+        _, kwargs = mock_sop.call_args
+        self.assertEqual(kwargs.get("dry_run"), False)
+        msg = update.message.reply_text.call_args[0][0]
+        self.assertIn("SOP-001", msg)
+        self.assertIn("✅", msg)
+
+    def test_document_sync_unaffected_by_sop_addition(self):
+        """п.34: document sync продолжает работать без изменений — ту
+        же самую функцию продолжает вызывать команда, с теми же кодами
+        и тем же текстом рендеринга, независимо от результата sop sync."""
+        update, context = _cmd("/syncstageknowledge stage_id=STAGE-014 confirm=yes")
+
+        doc_synced = {
+            "ok": True, "code": "STAGE_KNOWLEDGE_SYNCED", "error": None,
+            "stage_id": "STAGE-014", "template_stage_id": "TSTG-030", "source": "legacy",
+            "to_add": ("DOC-012",), "already_present": (), "created": ("DOC-012",),
+        }
+        with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
+             patch("business_core.business_builder.sync_stage_document_requirements",
+                   return_value=doc_synced) as mock_doc, \
+             patch("business_core.business_builder.sync_stage_sop_knowledge",
+                   return_value=_NO_SOP_KNOWLEDGE_DEFAULT):
+            asyncio.run(th.syncstageknowledge_cmd(update, context))
+
+        mock_doc.assert_called_once_with("STAGE-014", dry_run=False)
+        msg = update.message.reply_text.call_args[0][0]
+        self.assertIn("DOC-012", msg)
 
 
 if __name__ == "__main__":

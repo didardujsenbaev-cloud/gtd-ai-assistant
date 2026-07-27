@@ -57,6 +57,14 @@ ENTITY_TYPE_DISPATCH: dict[str, dict[str, str]] = {
         "sheet_key": "role_registry",
         "id_column": "Role ID",
     },
+    # Phase 45 (SOP Foundation UX): links a Stage to a SOP (instruction,
+    # never a completion requirement — see _SOP_RELATION_DEFAULTS above
+    # and business_builder.sync_stage_sop_knowledge()). No Required/
+    # Blocking semantics; never read by any Stage Completion Gate.
+    "sop": {
+        "sheet_key": "sop_registry",
+        "id_column": "SOP ID",
+    },
 }
 
 
@@ -589,28 +597,36 @@ def copy_template_relations_to_stage(
 # carries no Required/Blocking/Minimum Count of its own).
 _DOCUMENT_TEMPLATE_RELATION_DEFAULTS = {"Required": "true", "Blocking": "true", "Minimum Count": "1"}
 
+# Phase 45 (SOP Foundation UX): SOP relations carry no Required/Blocking
+# semantics at all — a SOP is an instruction, never a completion
+# requirement (it never participates in any Stage Completion Gate).
+# Required/Blocking/Minimum Count columns still need a structurally
+# valid value (validate_relation_record() requires it for ANY entity
+# type), so these are set to the most neutral/inert values available —
+# "false"/"false"/"1" — never read or acted on by anything.
+_SOP_RELATION_DEFAULTS = {"Required": "false", "Blocking": "false", "Minimum Count": "1"}
 
-def create_document_template_relations_for_stage(
-    stage_id: str, document_template_ids: list[str], timestamp: str | None = None,
+
+def _create_entity_relations_for_stage(
+    stage_id: str, entity_type: str, entity_ids: list[str], defaults: dict,
+    timestamp: str | None = None,
 ) -> CopyRelationsResult:
     """
-    Create instance-scoped document_template relations for `stage_id`
-    directly from a list of Document Template IDs — the legacy-column
-    fallback counterpart to copy_template_relations_to_stage(), for the
+    Generic legacy-column-fallback counterpart to
+    copy_template_relations_to_stage() — creates instance-scoped
+    relations for `stage_id` directly from a list of Entity IDs, for the
     case where the source Template Stage has no STAGE_ENTITY_RELATIONS
-    rows to copy at all (the IDs instead came from ROADMAP_TEMPLATE_STAGES.
-    "Document Template IDs", the column /linkknowledge and /stageknowledge
-    already read/write). Mirrors copy_template_relations_to_stage()'s
-    contract as closely as possible: same CopyRelationsResult shape,
-    same destination-must-exist precondition, same all-or-nothing
-    validation-before-any-write, same find_active_duplicate_relation()
-    idempotent duplicate-skip.
+    rows of this Entity Type to copy at all (the IDs instead came from a
+    legacy ROADMAP_TEMPLATE_STAGES comma-list column that /linkknowledge/
+    /stageknowledge already read/write). Mirrors
+    copy_template_relations_to_stage()'s contract as closely as possible:
+    same CopyRelationsResult shape, same destination-must-exist
+    precondition, same all-or-nothing validation-before-any-write, same
+    find_active_duplicate_relation() idempotent duplicate-skip.
 
-    Every created row uses _DOCUMENT_TEMPLATE_RELATION_DEFAULTS
-    (Required="true", Blocking="true", Minimum Count="1") — the same
-    values every existing document_template relation row in production
-    already has; the legacy comma-list has no per-item data of its own
-    to carry over.
+    Entity-type-specific public wrappers (create_document_template_relations_for_stage(),
+    create_sop_relations_for_stage()) supply their own `defaults` dict —
+    this function has no entity-type-specific policy of its own.
     """
     from business_core.sheets import (
         find_row_by_id, generate_next_ids, batch_append_business_rows,
@@ -618,10 +634,10 @@ def create_document_template_relations_for_stage(
     )
     from datetime import datetime
 
-    if not stage_id or not document_template_ids:
+    if not stage_id or not entity_ids:
         return CopyRelationsResult(
             template_stage_id="", stage_id=stage_id,
-            errors=(("__precondition__", ("stage_id and document_template_ids are both required.",)),),
+            errors=(("__precondition__", ("stage_id and entity_ids are both required.",)),),
             ok=False,
         )
 
@@ -636,14 +652,14 @@ def create_document_template_relations_for_stage(
             ok=False,
         )
 
-    deduped_ids = list(dict.fromkeys(x.strip() for x in document_template_ids if x.strip()))
+    deduped_ids = list(dict.fromkeys(x.strip() for x in entity_ids if x.strip()))
     candidates = [
         {
             "Template Stage ID": "", "Stage ID": stage_id,
-            "Entity Type": "document_template", "Entity ID": doc_id,
-            **_DOCUMENT_TEMPLATE_RELATION_DEFAULTS, "Status": "active",
+            "Entity Type": entity_type, "Entity ID": entity_id,
+            **defaults, "Status": "active",
         }
-        for doc_id in deduped_ids
+        for entity_id in deduped_ids
     ]
 
     validation_errors = []
@@ -699,6 +715,41 @@ def create_document_template_relations_for_stage(
         template_stage_id="", stage_id=stage_id,
         created=tuple(created_records),
         skipped_duplicates=tuple(skipped_duplicates),
+    )
+
+
+def create_document_template_relations_for_stage(
+    stage_id: str, document_template_ids: list[str], timestamp: str | None = None,
+) -> CopyRelationsResult:
+    """
+    Create instance-scoped document_template relations for `stage_id`
+    directly from a list of Document Template IDs. See
+    _create_entity_relations_for_stage() for the full shared contract.
+    Every created row uses _DOCUMENT_TEMPLATE_RELATION_DEFAULTS
+    (Required="true", Blocking="true", Minimum Count="1") — the same
+    values every existing document_template relation row in production
+    already has; the legacy comma-list has no per-item data of its own
+    to carry over.
+    """
+    return _create_entity_relations_for_stage(
+        stage_id, "document_template", document_template_ids, _DOCUMENT_TEMPLATE_RELATION_DEFAULTS, timestamp,
+    )
+
+
+def create_sop_relations_for_stage(
+    stage_id: str, sop_ids: list[str], timestamp: str | None = None,
+) -> CopyRelationsResult:
+    """
+    Create instance-scoped sop relations for `stage_id` directly from a
+    list of SOP IDs. See _create_entity_relations_for_stage() for the
+    full shared contract. Every created row uses
+    _SOP_RELATION_DEFAULTS (Required="false", Blocking="false",
+    Minimum Count="1") — SOP is an instruction, never a completion
+    requirement, so these values are inert placeholders only, never
+    read by any Stage Completion Gate.
+    """
+    return _create_entity_relations_for_stage(
+        stage_id, "sop", sop_ids, _SOP_RELATION_DEFAULTS, timestamp,
     )
 
 

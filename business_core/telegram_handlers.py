@@ -4423,25 +4423,119 @@ def _stage_knowledge_sync_preview_message(result: dict) -> str:
     return _stage_knowledge_sync_message(result)
 
 
+_STAGE_SOP_SOURCE_RU = {
+    "relations": "STAGE_ENTITY_RELATIONS (активные sop relations на Template Stage)",
+    "legacy": "legacy-поле ROADMAP_TEMPLATE_STAGES.\"SOP IDs\" (то же, что пишет /linkknowledge)",
+    "": "—",
+}
+
+
+def _stage_sop_sync_message(result: dict) -> str:
+    """SOP counterpart of _stage_knowledge_sync_message() — same shape,
+    applied to business_builder.sync_stage_sop_knowledge()'s result.
+    Shared resolution-failure codes (STAGE_NOT_FOUND/ROADMAP_NOT_FOUND/
+    ROADMAP_HAS_NO_TEMPLATE/TEMPLATE_STAGE_NOT_FOUND/
+    UNSUPPORTED_RELATION_TYPE_ON_TEMPLATE_STAGE) are identical messages
+    to the document version since resolve_template_stage_for_stage() is
+    the same shared read for both — delegated to that renderer to avoid
+    duplicating the same five branches twice."""
+    code = result.get("code", "")
+    stage_id = result.get("stage_id", "")
+    template_stage_id = result.get("template_stage_id", "")
+
+    if code == "STAGE_SOP_SYNCED":
+        created = result.get("created", ())
+        already_present = result.get("already_present", ())
+        source = result.get("source", "")
+        lines = [
+            "✅ Синхронизация SOP выполнена",
+            f"Stage ID: {stage_id}",
+            f"Template Stage ID: {template_stage_id}",
+            f"Источник: {_STAGE_SOP_SOURCE_RU.get(source, source)}",
+        ]
+        if created:
+            lines.append(f"Добавлено: {', '.join(created)}")
+        else:
+            lines.append("Добавлено: ничего (уже было синхронизировано).")
+        if already_present:
+            lines.append(f"Уже было: {', '.join(already_present)}")
+        lines.append(
+            "Статус, ответственный, сроки, приоритет и прогресс этапа не изменились. "
+            "ROADMAP_STAGES не изменялся. SOP не участвует в Stage Completion Gate."
+        )
+        return "\n".join(lines)
+
+    if code == "NO_SOP_KNOWLEDGE":
+        return f"❌ {result.get('error') or 'У Template Stage нет sop relations, ни legacy-значений.'}"
+
+    if code == "INVALID_LEGACY_SOP_ID":
+        return f"❌ {result.get('error') or 'В legacy-поле Template Stage есть несуществующий SOP ID.'}"
+
+    if code == "STAGE_SOP_SYNC_FAILED":
+        return f"❌ {result.get('error') or 'Не удалось синхронизировать SOP.'}"
+
+    # Shared resolution-failure codes — same rendering as the document sync.
+    return _stage_knowledge_sync_message(result)
+
+
+def _stage_sop_sync_preview_message(result: dict) -> str:
+    """SOP counterpart of _stage_knowledge_sync_preview_message()."""
+    if result.get("code") == "STAGE_SOP_SYNC_PREVIEW":
+        to_add = result.get("to_add", ())
+        already_present = result.get("already_present", ())
+        source = result.get("source", "")
+        lines = [
+            "📋 Подтверди синхронизацию SOP:",
+            "",
+            f"Stage ID: {result.get('stage_id', '')}",
+            f"Template Stage ID: {result.get('template_stage_id', '')}",
+            f"Источник: {_STAGE_SOP_SOURCE_RU.get(source, source)}",
+            "",
+        ]
+        if to_add:
+            lines.append(f"Будет добавлено: {', '.join(to_add)}")
+        else:
+            lines.append("Будет добавлено: ничего — уже полностью синхронизировано.")
+        if already_present:
+            lines.append(f"Уже привязано: {', '.join(already_present)}")
+        lines.append("")
+        lines.append(
+            "Статус, ответственный, сроки, приоритет и прогресс этапа не изменятся. "
+            "ROADMAP_STAGES меняться не будет. SOP не участвует в Stage Completion Gate."
+        )
+        lines.append("")
+        lines.append("Чтобы применить, повтори команду с confirm=yes.")
+        return "\n".join(lines)
+    return _stage_sop_sync_message(result)
+
+
 async def syncstageknowledge_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     /syncstageknowledge stage_id=STAGE-014
     /syncstageknowledge stage_id=STAGE-014 confirm=yes
 
-    Retroactively syncs document_template requirements from the
-    Template Stage a Stage was created from, into that already-existing
-    Stage — for the case where /linkknowledge added a document_template
-    relation to the Template Stage AFTER the real Stage had already
-    been instantiated, so the one-time creation-time copy never saw it.
+    Retroactively syncs BOTH document_template requirements AND SOP
+    knowledge from the Template Stage a Stage was created from, into
+    that already-existing Stage — for the case where /linkknowledge
+    added a document_template or sop relation to the Template Stage
+    AFTER the real Stage had already been instantiated, so the one-time
+    creation-time copy never saw it.
 
-    Narrow, audit-approved scope: only Entity Type "document_template"
-    via business_builder.sync_stage_document_requirements(); SOP/
-    Checklist/Materials/FAQ IDs and the legacy ROADMAP_STAGES."Document
-    Template IDs" column are never touched. Same preview/confirm shape
-    as /updatedoc's relink mode: the first call (no confirm=yes) only
-    resolves and previews via dry_run=True — nothing is written.
-    Repeating the exact same call with confirm=yes re-validates
-    (staleness guard) and applies it.
+    Calls business_builder.sync_stage_document_requirements() and
+    business_builder.sync_stage_sop_knowledge() independently (two
+    small functions, each scoped to one Entity Type — neither grows
+    into a multi-entity-type monolith, the same principle already
+    applied to the two Stage Completion Gate evaluators) and combines
+    both into one reply. SOP has no Required/Blocking semantics and is
+    never part of any Stage Completion Gate — syncing it here is purely
+    about making /sop stage_id=... able to discover it.
+
+    Checklist/Materials/FAQ IDs and the legacy ROADMAP_STAGES columns
+    are never touched by either function. Same preview/confirm shape as
+    /updatedoc's relink mode: the first call (no confirm=yes) only
+    resolves and previews via dry_run=True for both — nothing is
+    written. Repeating the exact same call with confirm=yes re-validates
+    (staleness guard) and applies both.
     """
     if not _is_bc_enabled():
         await _reply(update, _bc_disabled_msg())
@@ -4458,13 +4552,24 @@ async def syncstageknowledge_cmd(update: Update, context: ContextTypes.DEFAULT_T
     confirmed = args.get("confirm", "").strip().lower() == "yes"
 
     try:
-        from business_core.business_builder import sync_stage_document_requirements
+        from business_core.business_builder import sync_stage_document_requirements, sync_stage_sop_knowledge
 
-        result = sync_stage_document_requirements(stage_id, dry_run=not confirmed)
+        doc_result = sync_stage_document_requirements(stage_id, dry_run=not confirmed)
+        sop_result = sync_stage_sop_knowledge(stage_id, dry_run=not confirmed)
+
         if confirmed:
-            await _reply(update, _stage_knowledge_sync_message(result))
+            doc_text = _stage_knowledge_sync_message(doc_result)
+            sop_text = _stage_sop_sync_message(sop_result)
         else:
-            await _reply(update, _stage_knowledge_sync_preview_message(result))
+            doc_text = _stage_knowledge_sync_preview_message(doc_result)
+            sop_text = _stage_sop_sync_preview_message(sop_result)
+
+        combined = (
+            f"📚 Синхронизация knowledge этапа {stage_id}\n\n"
+            f"── Документы ──\n{doc_text}\n\n"
+            f"── SOP ──\n{sop_text}"
+        )
+        await _reply(update, combined)
     except Exception as e:
         log.error(f"syncstageknowledge_cmd error: {e}")
         await _reply(update, "❌ Не удалось синхронизировать knowledge этапа.")
@@ -6235,7 +6340,21 @@ async def rtemplatestages_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def newsop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     /newsop biz_id=BIZ-001 service_id=SVC-001 template_stage_id=TSTG-001
-            title="Как проверить документы" purpose="..." steps="1. ...; 2. ..." result="..."
+            title="Как проверить документы" purpose="..." steps="1. ...; 2. ..."
+            expected_result="..."
+
+    Полный список поддерживаемых параметров (все опциональны, кроме
+    title): biz_id, service_id, template_id, template_stage_id, title,
+    purpose, steps, expected_result, owner_role, drive_file_id,
+    google_drive, version, status, notes — один в один с колонками
+    sop_registry.
+
+    expected_result= — основной, документированный параметр для
+    ожидаемого результата (совпадает по смыслу с колонкой sop_registry.
+    "Expected Result"). result= — короткий алиас, поддерживается для
+    обратной совместимости. Если передано И длинное, И короткое имя —
+    побеждает expected_result= (тот же приоритет, что уже принят для
+    /newchecklist's required_items=/optional_items= vs required=/optional=).
     """
     if not _is_bc_enabled():
         await _reply(update, _bc_disabled_msg())
@@ -6247,11 +6366,17 @@ async def newsop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await _reply(update,
             "❌ Укажи title.\n\nПример:\n"
             '`/newsop biz_id=BIZ-001 template_stage_id=TSTG-001 title="Проверка документов" '
-            'steps="1. Удостоверение; 2. Правоустанавливающий"`'
+            'steps="1. Удостоверение; 2. Правоустанавливающий" expected_result="Документы проверены"`'
         )
         return
     try:
         from business_core.knowledge_manager import create_sop_record
+
+        # expected_result= — документированное основное имя; result= —
+        # короткий алиас для обратной совместимости. Явно переданное
+        # длинное имя всегда побеждает короткое.
+        expected_result = args.get("expected_result") or args.get("result", "")
+
         result = create_sop_record(
             title=             title,
             biz_id=            args.get("biz_id",            ""),
@@ -6260,8 +6385,12 @@ async def newsop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             template_stage_id= args.get("template_stage_id",  ""),
             purpose=           args.get("purpose",            ""),
             steps=             args.get("steps",              ""),
-            expected_result=   args.get("result",             ""),
+            expected_result=   expected_result,
             owner_role=        args.get("owner_role",         ""),
+            drive_file_id=     args.get("drive_file_id",      ""),
+            google_drive=      args.get("google_drive",       ""),
+            version=           args.get("version",            "1.0"),
+            status=            args.get("status",             "active"),
             notes=             args.get("notes",              ""),
         )
         if not result["ok"]:
@@ -6272,6 +6401,7 @@ async def newsop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         if args.get("template_stage_id"):
             lines.append(f"Stage: `{args['template_stage_id']}`")
         lines.append(f"\nПривязать к этапу: `/linkknowledge template_stage_id=... sop_ids={sop_id}`")
+        lines.append(f"Посмотреть полностью: `/sop sop_id={sop_id}`")
         await _reply(update, "\n".join(lines))
     except Exception as e:
         log.error(f"newsop_cmd error: {e}")
@@ -6608,6 +6738,129 @@ async def stageknowledge_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
     except Exception as e:
         log.error(f"stageknowledge_cmd error: {e}")
         await _reply(update, "❌ Не удалось получить knowledge.")
+
+
+# ─────────────────────────────────────────────────────────────
+# Phase 45: SOP Foundation UX — /sop full-text read-only viewer.
+# /stageknowledge already shows SOPs, but truncates Steps to 100
+# characters and mixes SOP in with Checklist/Document/FAQ/Materials in
+# one combined view. /sop is a dedicated, full-text, SOP-only viewer —
+# never truncates, splits safely across multiple messages if needed,
+# and always sends with parse_mode=None (never the legacy Markdown
+# default) since SOP free text (Purpose/Steps/Expected Result, written
+# by non-technical staff) can contain underscores/asterisks that would
+# otherwise be silently mangled by Telegram's legacy Markdown parser —
+# the same escaping-risk class already found and fixed elsewhere in
+# this codebase (see /updatestage's override_type fix).
+# ─────────────────────────────────────────────────────────────
+
+def _render_sop_full(sop: dict) -> list[str]:
+    """Full, untruncated field-by-field rendering of one sop_registry
+    row — the counterpart to /stageknowledge's truncated inline preview."""
+    lines = [
+        f"📋 SOP: {sop.get('SOP ID', '')}",
+        f"Title: {sop.get('Title', '') or '—'}",
+    ]
+    if sop.get("Purpose"):
+        lines.append(f"Purpose: {sop['Purpose']}")
+    if sop.get("Steps"):
+        lines.append(f"Steps: {sop['Steps']}")
+    if sop.get("Expected Result"):
+        lines.append(f"Expected Result: {sop['Expected Result']}")
+    if sop.get("Owner Role"):
+        lines.append(f"Owner Role: {sop['Owner Role']}")
+    lines.append(f"Version: {sop.get('Version', '') or '—'}")
+    lines.append(f"Status: {sop.get('Status', '') or '—'}")
+    if sop.get("Notes"):
+        lines.append(f"Notes: {sop['Notes']}")
+    drive_url = sop.get("Google Drive", "")
+    drive_id = sop.get("Drive File ID", "")
+    if drive_url or drive_id:
+        lines.append(f"Drive: {drive_url or drive_id}")
+    return lines
+
+
+async def sop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /sop sop_id=SOP-001 — read-only, полная запись без обрезки.
+    /sop stage_id=STAGE-001 — все SOP, привязанные к живому этапу
+    (сначала активные STAGE_ENTITY_RELATIONS Entity Type="sop", если их
+    нет — fallback на legacy ROADMAP_STAGES."SOP IDs"), каждый полностью,
+    без обрезки.
+
+    Read-only — ничего не пишет и не синхронизирует (для этого есть
+    /syncstageknowledge). Всегда отправляется с parse_mode=None —
+    свободный текст SOP (Purpose/Steps/Expected Result) может содержать
+    символы, которые легаси Markdown-парсер Telegram интерпретирует как
+    разметку.
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg(), parse_mode=None)
+        return
+
+    raw = " ".join(context.args or [])
+    args = _parse_kv_args(raw)
+    sop_id = args.get("sop_id") or ""
+    stage_id = args.get("stage_id") or (args.get("_pos0", "") if not sop_id else "")
+
+    if not sop_id and not stage_id:
+        await _reply(
+            update,
+            "❌ Укажи sop_id или stage_id.\n\nПримеры:\n"
+            "/sop sop_id=SOP-001\n"
+            "/sop stage_id=STAGE-001",
+            parse_mode=None,
+        )
+        return
+
+    try:
+        from business_core.knowledge_manager import find_sop_by_id, get_knowledge_for_stage
+
+        if sop_id:
+            sop = find_sop_by_id(sop_id)
+            if sop is None:
+                await _reply(update, f"❌ SOP {sop_id} не найден.", parse_mode=None)
+                return
+            lines = _render_sop_full(sop)
+        else:
+            from business_core.stage_entity_relations import get_relations_for_stage
+
+            relations = get_relations_for_stage(stage_id, entity_type="sop")
+            if relations:
+                sop_ids = [r.get("Entity ID", "") for r in relations if r.get("Entity ID", "")]
+            else:
+                knowledge = get_knowledge_for_stage(stage_id, is_template=False)
+                sop_ids = knowledge.get("sop_ids", [])
+
+            if not sop_ids:
+                await _reply(
+                    update,
+                    f"У этапа {stage_id} нет привязанных SOP.\n\n"
+                    f"Привязать через шаблон: `/linkknowledge template_stage_id=... sop_ids=...`, "
+                    f"затем `/syncstageknowledge stage_id={stage_id}`.",
+                    parse_mode=None,
+                )
+                return
+
+            lines = [f"📚 SOP для этапа {stage_id} ({len(sop_ids)}):", ""]
+            for i, one_sop_id in enumerate(sop_ids):
+                sop = find_sop_by_id(one_sop_id)
+                if sop is None:
+                    lines.append(f"⚠️ SOP {one_sop_id} привязан, но не найден в sop_registry.")
+                else:
+                    lines.extend(_render_sop_full(sop))
+                if i < len(sop_ids) - 1:
+                    lines.append("")
+                    lines.append("──────────")
+                    lines.append("")
+
+        text = "\n".join(lines)
+        for part in _split_message_by_lines(text):
+            await update.message.reply_text(part, parse_mode=None)
+
+    except Exception as e:
+        log.error(f"sop_cmd error: {e}")
+        await _reply(update, "❌ Не удалось получить SOP.", parse_mode=None)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -11851,6 +12104,7 @@ def register_business_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("newfaq",           newfaq_cmd))
     app.add_handler(CommandHandler("linkknowledge",    linkknowledge_cmd))
     app.add_handler(CommandHandler("stageknowledge",   stageknowledge_cmd))
+    app.add_handler(CommandHandler("sop",              sop_cmd))
     # Phase 38D (ADR-021): Checklist Domain — operational commands.
     app.add_handler(CommandHandler("startchecklist",   startchecklist_cmd))
     app.add_handler(CommandHandler("checklists",       checklists_cmd))
