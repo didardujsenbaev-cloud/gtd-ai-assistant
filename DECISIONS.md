@@ -6689,3 +6689,714 @@ Foundation — Lead ссылается на их ID только для чтен
 изменён; схема Google Sheets не менялась; GTD Core не затронут. Ни один
 закрытый домен (Object/Client/Service/Roadmap/Stage/Organization/Task/
 Document/Checklist/Payment/Commercial Offer) не переоткрыт.
+
+
+## ADR-025 — Interaction / Communication History Domain Architecture Decision (Phase 42B)
+
+### 0. Контекст
+
+Phase 42A (Next Domain Selection Audit) переоценила оставшиеся домены
+после закрытия Lead/Sales Funnel и рекомендовала Interaction /
+Communication History с решением **GO WITH PREREQUISITE** — не
+отдельная Phase 42A.1, а два явных решения, зафиксированных прямо в
+этом ADR: (1) ключ реестра не должен быть `interactions` /
+`interaction_registry` / `lead_interactions` — эти строки уже явно
+запрещены существующими Lead architecture guard-тестами
+(`test_lead_manager.py`, `test_lead_architecture_guards.py`); (2)
+основной субъект связи должен быть ровно один — Lead XOR Client, без
+одновременного присутствия обоих.
+
+Аудит подтвердил: `relationship_capital.py`/`RelationshipTouch` —
+полностью нерабочий (orphaned) код, чья схема (`RelationshipTouch.
+to_dict()`: `id/person_id/touch_date/touch_type/channel/summary/
+outcome/warmth_before/warmth_after/created_at`) структурно
+несовместима с фактическими заголовками реестра `relationship_capital`
+(`PRS ID/ФИО/Теплота/Дни без контакта/Тип касания/Дата касания/Общие
+интересы/Чем помог мне/Чем я помог/Кого познакомить/Через кого решить/
+Контент для него`). Реестр не имеет записи в `_ID_PREFIXES`. Ни одного
+живого вызывающего кода нет ни в `business_builder.py`, ни в
+`telegram_handlers.py`. Это ADR явно фиксирует: Interaction Domain НЕ
+переиспользует и не чинит этот orphaned-код — Interaction представляет
+собой полностью новую, чистую сущность.
+
+Это ADR утверждает архитектуру Interaction Foundation (Phase 42C) —
+один канонический immutable-event реестр `interaction_log`, с ровно
+одним обязательным основным субъектом (Lead XOR Client), опциональными
+context-связями, закрытым словарём типов, и immutable-факт моделью с
+архивом как единственным допустимым переходом.
+
+### 1. Канонический entity
+
+**Interaction** — единственная каноническая сущность Foundation.
+Immutable-событие, фиксирующее один содержательный контакт/
+коммуникацию с одним бизнес-субъектом. Channel-neutral (тип канала —
+отдельное поле, не часть идентичности события). Историческое —
+остаётся читаемым после архивации. Принадлежит одному Business. Имеет
+ровно один основной субъект (Lead или Client). Может нести
+опциональные context-связи.
+
+Interaction НЕ является: техническим Audit Event; записью доставки
+сообщения (Message delivery record); Appointment; Task; Reminder;
+обновлением статуса Lead; сводкой отношений Client; RelationshipTouch;
+generic системным Activity Log.
+
+```
+INTERACTION_IS_CANONICAL_BUSINESS_COMMUNICATION_EVENT = YES
+INTERACTION_IS_SEPARATE_FROM_AUDIT_EVENT = YES
+INTERACTION_IS_SEPARATE_FROM_MESSAGE_DELIVERY = YES
+INTERACTION_IS_SEPARATE_FROM_TASK = YES
+INTERACTION_IS_SEPARATE_FROM_REMINDER = YES
+INTERACTION_REUSES_RELATIONSHIP_TOUCH = NO
+```
+
+### 2. Legacy relationship_capital boundary
+
+Явно зафиксировано: `RelationshipTouch` — несовместимый legacy-код;
+схема `relationship_capital` не соответствует модели
+`RelationshipTouch`; канонического persistence-пути не существует; ни
+одна production-миграция не требуется; TCH-идентичность не
+переиспользуется; `relationship_capital` не записывается; файл
+`relationship_capital.py` остаётся нетронутым; в Foundation нет
+compatibility-адаптера; в Phase 42C нет очистки orphaned-кода; будущая
+очистка legacy-кода потребует отдельной фазы.
+
+```
+INTERACTION_REUSES_TCH_IDENTITY = NO
+INTERACTION_WRITES_RELATIONSHIP_CAPITAL = NO
+INTERACTION_MIGRATION_FROM_RELATIONSHIP_CAPITAL_REQUIRED = NO
+```
+
+### 3. Registry naming prerequisite — решение
+
+Ключ реестра НЕ может быть `interactions`, `interaction_registry` или
+`lead_interactions` — эти строки уже явно запрещены существующими Lead
+architecture guard-тестами (`test_lead_manager.py::
+test_no_interaction_registry`, `test_lead_architecture_guards.py::
+test_no_deal_interaction_campaign_registry_exists`). Ослабление или
+удаление этих guard-тестов ради использования запрещённого имени
+недопустимо.
+
+Утверждённый ключ реестра: **`interaction_log`**.
+
+Человеческий смысл: канонический реестр Interaction.
+
+```
+INTERACTION_REGISTRY_KEY_APPROVED = YES
+INTERACTION_REGISTRY_KEY_AVOIDS_LEAD_GUARD_COLLISION = YES
+INTERACTION_REGISTRY_USES_PROHIBITED_NAME = NO
+```
+
+### 4. Точная схема реестра
+
+Утверждён ровно один Foundation registry: **`interaction_log`**.
+
+```
+Interaction ID
+Business ID
+Caller Idempotency Key
+Interaction Type
+Direction
+Channel ID
+Occurred At
+Summary
+Outcome
+Lead ID
+Client ID
+Commercial Offer ID
+Assigned Person ID
+External Reference
+Status
+Created At
+Created By
+Updated At
+Archived At
+Notes
+```
+
+Явно НЕ добавлены: Object ID, Service ID, Roadmap ID, Payment
+Obligation ID, Task ID, Message Body, Email Body, Transcript,
+Attachment Content, Provider Payload, generic relation JSON,
+comma-separated subject IDs, технические audit-event поля, поля
+delivery-статуса, retry count, reminder-поля.
+
+```
+INTERACTION_REGISTRY_SCHEMA_APPROVED = YES
+```
+
+### 5. Identity policy
+
+```
+Interaction ID: ACT-NNN
+```
+
+Обоснование выбора префикса: `INT` коллидирует с
+`integration_registry` (уже занят в `_ID_PREFIXES`); `TCH` семантически
+контаминирован orphaned-кодом `relationship_capital.py`; `ACT` —
+свободен и мнемоничен ("Activity" читается естественно как "одно
+событие взаимодействия").
+
+Ровно один генератор, живёт в `interaction_manager.py`. Никакой
+caller-side генерации. Malformed ID безопасно игнорируются. ID
+генерируется только после полной валидации и idempotency-проверки.
+Никакой Summary/time-based identity. Никакой provider-ID identity.
+Никакого переиспользования Lead/Client ID.
+
+```
+ACT_IDENTITY_APPROVED = YES
+INT_IDENTITY_REJECTED_DUE_TO_COLLISION = YES
+TCH_IDENTITY_REJECTED_DUE_TO_LEGACY_OVERLAP = YES
+```
+
+### 6. Persistence ownership
+
+`business_core/interaction_manager.py` — единственный persistence
+owner для `interaction_log`. Владеет: точечные reads, ограниченные
+list/filter reads, генерацию ACT, низкоуровневое создание строки,
+персистентность архивации, персистентность Notes-only обновления,
+idempotency-lookup примитивы, immutable-field enforcement, проверку
+после записи.
+
+НЕ владеет: cross-domain relation-валидацией, subject-policy
+решениями, lifecycle policy, business-валидацией временных меток,
+Telegram UX, мутацией Person/Lead, созданием Task/Reminder, поведением
+Audit Log, relationship_capital compatibility, raw exception
+rendering.
+
+```
+INTERACTION_MANAGER_IS_APPROVED_PERSISTENCE_OWNER = YES
+```
+
+### 7. Orchestration ownership
+
+`business_builder.py` — единственный cross-domain owner Interaction-
+оркестрации. Владеет: валидацию обязательных полей, валидацию
+Interaction Type, валидацию Direction, валидацию Occurred At,
+валидацию Summary/Outcome, XOR-валидацию основного субъекта,
+relation-валидацию Lead/Client, опциональную валидацию Commercial
+Offer, опциональную валидацию Channel, опциональную валидацию Assigned
+Person, создание, idempotency zero/one/multiple handling, архивацию,
+обновление Notes, сборку структурированного результата.
+
+Направление зависимостей:
+
+```
+telegram_handlers
+  → business_builder
+    → interaction_manager
+      → sheets
+```
+
+Без обратной зависимости.
+
+```
+BUSINESS_BUILDER_IS_APPROVED_INTERACTION_ORCHESTRATION_OWNER = YES
+```
+
+### 8. Primary subject policy
+
+Обязательное решение. Утверждён ровно один основной субъект: **Lead ID
+XOR Client ID**.
+
+Правила: ровно один должен присутствовать; отсутствие обоих блокирует
+(`INTERACTION_SUBJECT_REQUIRED`); присутствие обоих блокирует
+(`INTERACTION_SUBJECT_CONFLICT`); Business ID должен совпадать с
+Business выбранного субъекта; никакого произвольного выбора основного
+субъекта; никакой автоматической конверсии Lead → Client; никакого
+автоматического перепривязывания после конверсии Lead. Interactions,
+записанные до конверсии, могут ссылаться на Lead; записанные после —
+должны ссылаться на Client. Foundation не мутирует и не инспектирует
+историю конверсии Lead сверх точной relation-валидации. Никакого
+multi-subject fan-out.
+
+```
+INTERACTION_ONE_PRIMARY_SUBJECT_POLICY_IS_CLEAR = YES
+INTERACTION_REQUIRES_EXACTLY_ONE_OF_LEAD_OR_CLIENT = YES
+```
+
+### 9. Optional context relations
+
+Утверждены опциональные read-only связи: Commercial Offer ID, Channel
+ID, Assigned Person ID. Правила: точная проверка существования;
+same-Business проверка; никакой мутации связанного домена; Commercial
+Offer остаётся опциональным контекстом (без автоматического
+обновления статуса Offer); никакой автоматической мутации Lead/Client;
+никакой мутации Organization; никакой мутации Channel.
+
+Явно отложены: Object ID, Service ID, Roadmap ID, Payment Obligation
+ID, Task ID — текущие данные репозитория не подтверждают
+необходимость этих связей в Foundation.
+
+```
+INTERACTION_COMMERCIAL_OFFER_IS_REFERENCE_ONLY = YES
+INTERACTION_CHANNEL_IS_REFERENCE_ONLY = YES
+INTERACTION_ASSIGNED_PERSON_IS_REFERENCE_ONLY = YES
+```
+
+### 10. Converted Lead boundary
+
+Interactions, записанные до конверсии Lead, могут ссылаться на Lead;
+записанные после конверсии — должны ссылаться на Client. Никакого
+автоматического перепривязывания. Никакой ретроактивной перезаписи.
+Никакой одновременной связи Lead+Client. Никакой мутации Lead.
+Никакой мутации Client. Исторические Lead-interactions остаются
+привязанными к Lead. Это документационная норма и ответственность
+вызывающей стороны — не автоматическая migration-логика Foundation.
+
+### 11. Interaction Type vocabulary
+
+Утверждено ровно:
+
+```
+call
+message
+email
+meeting
+note
+other
+```
+
+WhatsApp/Telegram — значения Channel, не Interaction Type. Никаких
+системно-сгенерированных audit-событий. Никакого типа "обмен
+документами". Никакого типа "follow_up_due". Никакого типа
+delivery-статуса.
+
+```
+INTERACTION_TYPE_VOCABULARY_IS_APPROVED = YES
+```
+
+### 12. Direction policy
+
+Утверждены закрытые значения: `inbound`, `outbound`, `internal`.
+
+Решение: Direction обязателен для `call`/`message`/`email`/`meeting`;
+для `note` — не обязателен, но при явном указании допустимо только
+`internal`; никакого неявного значения по умолчанию ни для одного
+типа, включая `other` — для `other` Direction обязателен, как и для
+активных коммуникационных типов, поскольку `other` явно не
+идентифицирует форму контакта и требует того же уровня строгости.
+Caller никогда не получает автоматически подставленное значение
+Direction.
+
+```
+INTERACTION_DIRECTION_POLICY_IS_APPROVED = YES
+```
+
+### 13. Occurred At policy
+
+Обязателен. Timezone-aware ISO-8601/RFC3339 (тот же принцип, что уже
+использует `normalize_lead_datetime()` — timezone-naive значения
+блокируются). Created At остаётся отдельной audit-меткой времени.
+Исторические временные метки разрешены. Нереалистично будущие
+временные метки блокируются: значения позже reference-времени плюс
+пять минут блокируются (`INTERACTION_OCCURRED_AT_IN_FUTURE`) —
+пятиминутный допуск покрывает небольшой рассинхрон часов клиента.
+Никакого scheduled-Interaction. Детерминированная инъекция
+reference-времени обязательна для тестов.
+
+```
+INTERACTION_OCCURRED_AT_IS_REQUIRED = YES
+INTERACTION_OCCURRED_AT_REQUIRES_TIMEZONE = YES
+```
+
+### 14. Summary/content policy
+
+Это приватность-чувствительное решение.
+
+**Summary**: обязателен; trimmed; ограничен; пустое после trim
+блокирует. Максимум: 2000 символов.
+
+**Outcome**: опционален; trimmed; ограничен. Максимум: 1000 символов.
+
+**Notes**: опционален; изменяем после создания; ограничен. Максимум:
+5000 символов.
+
+**External Reference**: опционален; ограничен; рассматривается как
+чувствительный операционный идентификатор; не идентичность; никогда не
+логируется; никакого provider-специфичного парсинга.
+
+Не хранится: полное тело сообщения; транскрипт; сырое тело письма;
+транскрипция аудио; содержимое вложений; provider payload;
+credentials/токены.
+
+```
+INTERACTION_SUMMARY_IS_REQUIRED = YES
+INTERACTION_FULL_MESSAGE_CONTENT_IS_FOUNDATION_SCOPE = NO
+```
+
+### 15. Idempotency policy
+
+Primary key: `Business ID` + `Caller Idempotency Key`. Caller key
+обязателен; zero creates; один совместимый match — reuse; несколько
+matches — блок со всеми Interaction ID; несовместимый payload с тем же
+ключом — блок; никакого first-pick; никакого Summary/time dedup;
+никакого External Reference dedup в Foundation; никакого
+channel-provider dedup. ACT генерируется только после проверки
+идемпотентности.
+
+```
+INTERACTION_IDEMPOTENCY_IS_CANONICAL = YES
+```
+
+### 16. External Reference policy
+
+Утверждено: опциональный scalar; некономичен; не идентичность; не
+используется для автоматического dedup; никакой гарантии
+уникальности; никакого provider-адаптера; никакой
+Telegram/WhatsApp/email платформенной логики; никогда не логируется;
+точный фильтр может быть отложен.
+
+Обоснование: внешние provider-идентификаторы требуют отдельных
+интеграционных правил и не могут быть безопасно обобщены в Foundation.
+
+```
+INTERACTION_EXTERNAL_REFERENCE_IS_IDENTITY = NO
+```
+
+### 17. Lifecycle model
+
+Утверждена минимальная immutable-event модель.
+
+```
+active
+archived
+```
+
+Создание: Status = active.
+
+```
+active:   active, archived
+archived: archived только
+```
+
+Правила: тот же статус — no-op; archived терминален; никакого
+restore/reopen; никакого hard delete; никаких
+completed/failed/scheduled/cancelled/pending статусов; никакого
+delivery-статуса; никакого appointment-статуса.
+
+```
+INTERACTION_LIFECYCLE_IS_IMMUTABLE_ARCHIVE_ONLY = YES
+INTERACTION_HARD_DELETE_IS_FOUNDATION_SCOPE = NO
+INTERACTION_RESTORE_REOPEN_IS_FOUNDATION_SCOPE = NO
+```
+
+### 18. Immutable facts
+
+После создания неизменны: Interaction ID, Business ID, Caller
+Idempotency Key, Interaction Type, Direction, Channel ID, Occurred At,
+Summary, Outcome, Lead ID, Client ID, Commercial Offer ID, Assigned
+Person ID, External Reference, Created At, Created By.
+
+Изменяемы: Notes; Status только через архивацию; Updated At; Archived
+At. Никакого generic update bypass.
+
+```
+INTERACTION_FACTS_ARE_IMMUTABLE = YES
+INTERACTION_NOTES_ARE_MUTABLE = YES
+```
+
+### 19. Correction policy
+
+Утверждено: никакого редактирования Interaction-фактов; никакой
+correction-in-place; исправление создаёт новый Interaction; Notes могут
+пояснять исправление; исходная запись остаётся исторической; никакого
+relation relinking; никакой мутации субъекта; никакой мутации Occurred
+At.
+
+### 20. Archive policy
+
+active → archived; Archived At устанавливается один раз; терминален;
+никакого hard delete; никакого restore; точный-ID read по-прежнему
+возвращает архивированную запись; активные списки исключают
+архивированные по умолчанию; никакого каскада; никакой мутации
+Lead/Client/Offer.
+
+### 21. Notes policy
+
+Notes изменяемы в статусах active и archived; Notes никогда не
+логируются; обновление Notes не меняет факты или lifecycle Interaction;
+Updated At меняется только при фактическом изменении; no-op сохраняет
+Updated At.
+
+### 22. Channel policy
+
+Channel ID: опционален; точная read-only связь с `channel_registry`;
+same-Business проверка; никакой мутации канала; никакого вызова
+интеграции; не требуется, чтобы каждый Interaction имел Channel ID —
+`meeting`/`note` могут законно не иметь Channel ID.
+
+### 23. Assigned Person policy
+
+Assigned Person ID: опционален; точная read-only связь с
+Person/Organization; same-Business валидация там, где это допускают
+canonical данные; представляет бизнес-ответственность/владение.
+Created By остаётся фактическим актором создания. Никакой мутации
+Organization/Person.
+
+### 24. Person/Client overlap boundary
+
+Явно зафиксировано: никакой мутации `people_registry`; никаких
+изменений схемы Person; никакого автоматического обновления полей
+"Дата последнего контакта", "Канал последнего контакта", "История",
+"Следующее касание", "Тип касания", "Заметка касания", "Статус
+отношений", "Теплота", "Комментарий"; никакого dual-write; никакой
+миграции/backfill; будущая синхронизация требует отдельного
+интеграционного ADR/фазы.
+
+```
+INTERACTION_MUTATES_PERSON_CONTACT_FIELDS = NO
+```
+
+### 25. Lead overlap boundary
+
+Явно зафиксировано: никакой мутации Lead "Last Contacted At"; никакой
+мутации Lead "Next Follow-up At"; никакого изменения статуса Lead;
+никакой мутации Qualification Notes; никакого создания Task/Reminder;
+никакого автоматического создания Interaction из жизненного цикла
+Lead; никакого автоматического обновления Lead из создания
+Interaction. Будущая синхронизация требует отдельной интеграционной
+фазы.
+
+```
+INTERACTION_MUTATES_LEAD_FOLLOW_UP_FIELDS = NO
+INTERACTION_MUTATES_LEAD_STATUS = NO
+INTERACTION_AUTOMATIC_TASK_CREATION_IS_FOUNDATION_SCOPE = NO
+```
+
+### 26. Audit Log separation
+
+Interaction фиксирует человеческие/бизнес-коммуникационные события.
+Audit Event фиксировал бы: создание сущности, мутацию статуса, вызов
+команды, технические/системные изменения.
+
+Они остаются раздельными, потому что: разная приватность (Summary —
+бизнес-чувствителен; Audit-метаданные — структурны); разные
+потребители (sales/ops персонал vs. compliance/engineering); разный
+объём и паттерн записи; Audit Log потребовал бы hooks во ВСЕХ уже
+закрытых доменах — прямое переоткрытие каждого закрытого orchestration
+пути. Никакого Audit Event registry в Foundation.
+
+```
+INTERACTION_AUDIT_EVENT_REGISTRY_IS_FOUNDATION_SCOPE = NO
+```
+
+### 27. Структурированный result contract
+
+```
+ok, code, error,
+interaction_id, business_id, lead_id, client_id, commercial_offer_id,
+channel_id, assigned_person_id,
+interaction_type, direction, occurred_at,
+previous_status, requested_status, final_status,
+created, reused, changed, archived,
+conflicting_ids, warnings, retry_safe
+```
+
+Каждое поле присутствует всегда. Никакого Summary. Никакого Outcome.
+Никакого Notes. Никакого External Reference. Никакого raw exception.
+Никакого raw row. Никакого Telegram-специфичного текста в Foundation.
+
+```
+INTERACTION_RESULT_CONTRACT_APPROVED = YES
+```
+
+### 28. Result-code vocabulary
+
+```
+Создание/idempotency:
+  INTERACTION_CREATED
+  INTERACTION_REUSED
+  INTERACTION_NOT_FOUND
+  MULTIPLE_INTERACTION_MATCHES
+  INTERACTION_IDEMPOTENCY_REQUIRED
+  INTERACTION_IDEMPOTENCY_CONFLICT
+  INTERACTION_PERSISTENCE_FAILED
+  INTERACTION_POST_WRITE_VERIFICATION_FAILED
+
+Validation:
+  INTERACTION_TYPE_REQUIRED
+  INVALID_INTERACTION_TYPE
+  INTERACTION_DIRECTION_REQUIRED
+  INVALID_INTERACTION_DIRECTION
+  INTERACTION_OCCURRED_AT_REQUIRED
+  INVALID_INTERACTION_OCCURRED_AT
+  INTERACTION_OCCURRED_AT_IN_FUTURE
+  INTERACTION_SUMMARY_REQUIRED
+  INTERACTION_SUMMARY_TOO_LONG
+  INTERACTION_OUTCOME_TOO_LONG
+  INTERACTION_NOTES_TOO_LONG
+  INTERACTION_EXTERNAL_REFERENCE_TOO_LONG
+
+Relations:
+  BUSINESS_NOT_FOUND
+  LEAD_NOT_FOUND
+  CLIENT_NOT_FOUND
+  COMMERCIAL_OFFER_NOT_FOUND
+  CHANNEL_NOT_FOUND
+  PERSON_NOT_FOUND
+  INTERACTION_SUBJECT_REQUIRED
+  INTERACTION_SUBJECT_CONFLICT
+  INTERACTION_RELATION_MISMATCH
+
+Lifecycle/admin:
+  INVALID_INTERACTION_STATUS
+  INVALID_INTERACTION_TRANSITION
+  INTERACTION_STATUS_UNCHANGED
+  INTERACTION_ARCHIVED
+  INTERACTION_NOTES_UPDATED
+  INTERACTION_NOTES_UNCHANGED
+  INTERACTION_IMMUTABLE
+  INTERACTION_RESTORE_REQUIRES_EXPLICIT_ACTION
+```
+
+Phase 42C не обязан реализовывать коды для возможностей вне
+bounded scope.
+
+### 29. Privacy и логирование
+
+Разрешено в логах: Interaction ID, Business ID, Lead/Client/Offer/
+Channel/Assigned Person ID, Interaction Type, Direction, статус,
+result code, флаги created/reused/changed/archived, count и ID
+конфликтов, retry_safe.
+
+Запрещено в логах: Summary, Outcome, Notes, External Reference,
+контактные данные, полное тело Telegram-сообщения, provider payload,
+raw row, raw exception, credentials/токены.
+
+```
+INTERACTION_PRIVACY_LOGGING_POLICY_APPROVED = YES
+```
+
+### 30. Migration policy
+
+Утверждено: никакой production-миграции; никакого backfill из
+`relationship_capital`; никакого backfill из `people_registry`
+"История"; никакого backfill из полей контакта Lead; существующие
+исторические поля остаются нетронутыми; реестр Interaction стартует
+пустым; legacy-импорт потребует отдельного ADR/фазы; никакой
+деструктивной очистки.
+
+### 31. Тестовые требования Phase 42C
+
+Обязательные изолированные категории: schema (точный ключ реестра,
+точные заголовки, отсутствие запрещённых имён, отсутствие мутации
+существующей схемы); identity (генерация ACT, malformed игнорируются,
+отсутствие INT/TCH генератора, отсутствие caller-side генерации,
+генерация после validation/idempotency); subject (только Lead валиден,
+только Client валиден, отсутствие обоих блокирует, оба блокируют,
+same-Business проверки, отсутствие произвольного выбора субъекта);
+relations (опциональные Offer/Channel/Assigned Person, точное
+существование, same-Business, отсутствие мутации связанных доменов);
+type/direction (закрытый словарь, требования Direction,
+WhatsApp/Telegram остаются значениями Channel); Occurred At
+(timezone-aware, исторические разрешены, naive блокируются, future
+tolerance, детерминированное reference-время); content (Summary
+обязателен/ограничен, Outcome ограничен, Notes ограничены, External
+Reference ограничен, отсутствие полей тела сообщения); idempotency
+(zero/one/multiple, совместимый reuse, несовместимый conflict,
+отсутствие Summary/time dedup, отсутствие External Reference dedup,
+отсутствие first-pick); lifecycle (active→archived, no-op, archived
+терминален, restore заблокирован, отсутствие hard delete);
+immutability (факты неизменны, Notes изменяемы, исправления требуют
+нового Interaction, отсутствие relinking, отсутствие мутации Occurred
+At); boundaries (отсутствие мутации Person, отсутствие мутации Client,
+отсутствие мутации Lead, отсутствие мутации Offer, отсутствие
+создания Task/Reminder, отсутствие Audit Event, отсутствие
+использования relationship_capital, отсутствие импорта
+RelationshipTouch, отсутствие TCH identity, отсутствие
+миграции/backfill); isolation (каждый Interaction test file
+hard-socket-blocked до написания логики, mock-completeness guard,
+отсутствие live Sheets/Drive/Telegram/Railway/HTTP/socket).
+
+### 32. Production migration policy (Phase 42C)
+
+Подтверждено: только один новый пустой реестр; никакой миграции
+legacy-строк; никакого создания production Interaction во время Phase
+42C; никакой мутации Person/Lead/Client/Offer; никаких изменений
+`relationship_capital`; никаких изменений Drive; никакого деплоя в
+Phase 42C.
+
+### 33. Точный bounded scope Phase 42C
+
+Phase 42C реализует ТОЛЬКО: один канонический реестр с
+ADR-утверждённым непротиворечивым ключом; точные заголовки; ACT
+identity; `interaction_manager.py`; точные reads и ограниченные
+фильтры; создание Interaction; idempotency; XOR-валидацию субъекта;
+опциональную relation-валидацию; type/direction валидацию;
+валидацию Occurred At; валидацию Summary/Outcome/External Reference;
+архивацию; обновление Notes; immutability; структурированный result
+contract; architecture/isolation guards; тесты.
+
+Явно запрещено в Phase 42C: Telegram caller UX; деплой; использование
+ключей реестра `interactions`/`interaction_registry`/
+`lead_interactions`; переиспользование RelationshipTouch; TCH
+identity; записи в relationship_capital; синхронизация полей Person;
+синхронизация Lead "Last Contacted At"; мутация follow-up/статуса
+Lead; автоматический Task/Reminder; хранение тела сообщения/вложений;
+интеграции с провайдерами; технический Audit Log; связи
+Object/Service/Roadmap/Payment/Task; hard delete; restore/reopen;
+миграция/backfill.
+
+### 34. Отклонённые альтернативы
+
+**A. Переиспользование RelationshipTouch.** Отклонено: несовместимость
+схемы и персистентности; legacy orphan.
+
+**B. Переиспользование реестра relationship_capital.** Отклонено:
+несовместимое назначение и поля.
+
+**C. Использование TCH identity.** Отклонено: legacy семантическая
+контаминация.
+
+**D. Использование INT identity.** Отклонено: коллизия с
+`integration_registry`.
+
+**E. Использование ключа реестра `interactions`.** Отклонено:
+конфликтует с закрытыми Lead architecture guards.
+
+**F. Одновременно Lead и Client как субъекты.** Отклонено: неоднозначный
+fan-out и дублирующее представление жизненного цикла.
+
+**G. Generic Activity entity, объединяющая Interaction и Audit Log.**
+Отклонено: разная приватность, потребители, объём и точки мутации.
+
+**H. Автоматическое обновление сводных полей контакта Person.**
+Отклонено: переоткрывает закрытый Client Domain и создаёт dual-write.
+
+**I. Автоматическое обновление Lead "Last Contacted At".** Отклонено:
+переоткрывает закрытую Lead-оркестрацию и вносит скрытую связанность.
+
+**J. Автоматическое создание Task/Reminder.** Отклонено: кросс-доменная
+автоматизация и scheduler вне объёма.
+
+**K. Хранение полного сообщения/транскрипта.** Отклонено: приватность,
+объём, provider-специфичная сложность.
+
+**L. External Reference как идентичность.** Отклонено: provider-
+специфично и не глобально канонично.
+
+**M. Изменяемые Interaction-факты.** Отклонено: ослабляет историческую
+целостность.
+
+**N. Миграция/backfill из legacy-полей.** Отклонено: отсутствует
+надёжный schema-совместимый источник данных.
+
+### 35. Cross-ADR consistency
+
+Проверено на отсутствие противоречий с решениями по Client, Lead
+ADR-024, Organization ADR-018, Task ADR-019, Document ADR-020,
+Checklist ADR-021, Payment ADR-022, Commercial Offer ADR-023,
+Object/Service/Roadmap/Stage closed-domain решениями. Ни один закрытый
+домен не мутируется Interaction Foundation — Interaction ссылается на
+их ID только для чтения/валидации существования, тем же паттерном, что
+уже используют все предыдущие домены этого engagement.
+
+### 36. Статус
+
+Утверждено для реализации (Phase 42C) с bounded scope, определённым в
+решении 33. Ничего не реализовано в рамках этого ADR — только
+архитектурное решение. `interaction_manager.py` не создан;
+`interaction_log` не существует; ни один production-caller не
+мигрирован; ни один код не изменён; схема Google Sheets не менялась;
+GTD Core не затронут; `relationship_capital.py` не изменён. Ни один
+закрытый домен (Object/Client/Service/Roadmap/Stage/Organization/Task/
+Document/Checklist/Payment/Commercial Offer/Lead) не переоткрыт.
