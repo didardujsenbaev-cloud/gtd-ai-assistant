@@ -4215,6 +4215,13 @@ async def updatedoc_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await _reply(update, "❌ Не удалось обновить документ.")
 
 
+_STAGE_KNOWLEDGE_SOURCE_RU = {
+    "relations": "STAGE_ENTITY_RELATIONS (активные relations на Template Stage)",
+    "legacy": "legacy-поле ROADMAP_TEMPLATE_STAGES.\"Document Template IDs\" (то же, что пишет /linkknowledge)",
+    "": "—",
+}
+
+
 def _stage_knowledge_sync_message(result: dict) -> str:
     """Render any business_builder.sync_stage_document_requirements()
     result (both the dry_run preview and the applied outcome share this
@@ -4227,10 +4234,12 @@ def _stage_knowledge_sync_message(result: dict) -> str:
     if code == "STAGE_KNOWLEDGE_SYNCED":
         created = result.get("created", ())
         already_present = result.get("already_present", ())
+        source = result.get("source", "")
         lines = [
             "✅ Синхронизация выполнена",
             f"Stage ID: {stage_id}",
             f"Template Stage ID: {template_stage_id}",
+            f"Источник: {_STAGE_KNOWLEDGE_SOURCE_RU.get(source, source)}",
         ]
         if created:
             lines.append(f"Добавлено: {', '.join(created)}")
@@ -4240,7 +4249,7 @@ def _stage_knowledge_sync_message(result: dict) -> str:
             lines.append(f"Уже было: {', '.join(already_present)}")
         lines.append(
             "Статус, ответственный, сроки, приоритет и прогресс этапа не изменились. "
-            "Legacy-поле \"Document Template IDs\" не менялось."
+            "ROADMAP_STAGES не изменялся."
         )
         return "\n".join(lines)
 
@@ -4257,10 +4266,15 @@ def _stage_knowledge_sync_message(result: dict) -> str:
         return f"❌ {result.get('error') or 'Template Stage не найден.'}"
 
     if code == "NO_DOCUMENT_TEMPLATE_RELATIONS":
-        return f"❌ {result.get('error') or 'У Template Stage нет document_template relations.'}"
+        return (
+            f"❌ {result.get('error') or 'У Template Stage нет document_template relations, ни legacy-значений.'}"
+        )
 
     if code == "UNSUPPORTED_RELATION_TYPE_ON_TEMPLATE_STAGE":
         return f"❌ {result.get('error') or 'Template Stage содержит relations вне поддерживаемого типа.'}"
+
+    if code == "INVALID_LEGACY_DOCUMENT_TEMPLATE_ID":
+        return f"❌ {result.get('error') or 'В legacy-поле Template Stage есть несуществующий Document Template ID.'}"
 
     if code == "STAGE_KNOWLEDGE_SYNC_FAILED":
         return f"❌ {result.get('error') or 'Не удалось синхронизировать.'}"
@@ -4271,20 +4285,24 @@ def _stage_knowledge_sync_message(result: dict) -> str:
 
 def _stage_knowledge_sync_preview_message(result: dict) -> str:
     """Render the dry_run preview step of /syncstageknowledge — shows
-    Stage ID, Template Stage ID, which Document Template IDs would be
-    added vs. are already present, and explicitly confirms Status/
-    Responsible/Due Date/Priority/Progress will not change. Any
-    resolution/validation failure falls through to the same mapping the
-    applied outcome uses, so a bad request never silently looks like a
-    valid preview."""
+    Stage ID, Template Stage ID, WHICH SOURCE was used (active
+    STAGE_ENTITY_RELATIONS vs. the legacy ROADMAP_TEMPLATE_STAGES.
+    "Document Template IDs" column /linkknowledge writes), which
+    Document Template IDs would be added vs. are already present, and
+    explicitly confirms Status/Responsible/Due Date/Priority/Progress
+    will not change. Any resolution/validation failure falls through to
+    the same mapping the applied outcome uses, so a bad request never
+    silently looks like a valid preview."""
     if result.get("code") == "STAGE_KNOWLEDGE_SYNC_PREVIEW":
         to_add = result.get("to_add", ())
         already_present = result.get("already_present", ())
+        source = result.get("source", "")
         lines = [
             "📋 Подтверди синхронизацию document-template knowledge:",
             "",
             f"Stage ID: {result.get('stage_id', '')}",
             f"Template Stage ID: {result.get('template_stage_id', '')}",
+            f"Источник: {_STAGE_KNOWLEDGE_SOURCE_RU.get(source, source)}",
             "",
         ]
         if to_add:
@@ -4296,7 +4314,7 @@ def _stage_knowledge_sync_preview_message(result: dict) -> str:
         lines.append("")
         lines.append(
             "Статус, ответственный, сроки, приоритет и прогресс этапа не изменятся. "
-            "Legacy-поле \"Document Template IDs\" меняться не будет."
+            "ROADMAP_STAGES меняться не будет."
         )
         lines.append("")
         lines.append("Чтобы применить, повтори команду с confirm=yes.")

@@ -3911,28 +3911,53 @@ def sync_stage_document_requirements(stage_id: str, dry_run: bool = True) -> dic
     The sole canonical orchestration boundary for retroactively syncing
     document_template requirements from a Template Stage into an
     already-created Roadmap Stage — /syncstageknowledge's backing
-    function. Built for the case where a document_template relation
-    (via /linkknowledge) was added to a Template Stage AFTER the real
-    Stage had already been instantiated from it, so
-    business_builder.create_roadmap_for_object()'s one-time,
-    creation-time copy never saw it.
+    function. Built for the case where a document_template requirement
+    was added to a Template Stage AFTER the real Stage had already been
+    instantiated from it, so business_builder.create_roadmap_for_object()'s
+    one-time, creation-time copy never saw it.
+
+    Dual-source (live-audit fix, added after a production mismatch):
+    /linkknowledge and /stageknowledge both read/write the legacy
+    ROADMAP_TEMPLATE_STAGES."Document Template IDs" comma-list column
+    (via roadmap_template_manager.update_template_stage_knowledge_ids()/
+    knowledge_manager.find_knowledge_by_template_stage()) — they never
+    touch STAGE_ENTITY_RELATIONS at all. This function must therefore
+    accept knowledge from EITHER source:
+      1. If the Template Stage has active STAGE_ENTITY_RELATIONS rows
+         (Entity Type "document_template"), those are used — copied via
+         the existing copy_template_relations_to_stage() — exactly as
+         before this fix, unchanged.
+      2. Otherwise, if the Template Stage's legacy "Document Template
+         IDs" column (read via resolve_template_stage_for_stage()'s
+         template_stage_row) has entries, each ID is validated (existence
+         in DOCUMENT_TEMPLATE_REGISTRY, via the existing
+         validate_relation_references()) and instance-scoped relations
+         are created for them via the new
+         create_document_template_relations_for_stage() — the legacy-
+         column counterpart to copy_template_relations_to_stage(), same
+         idempotent/all-or-nothing contract.
+      3. If both sources are empty, NO_DOCUMENT_TEMPLATE_RELATIONS.
+    The result always reports which source was used ("relations" or
+    "legacy") so the preview never hides this from the caller.
+
+    /linkknowledge's own behavior is deliberately UNCHANGED by this fix
+    — it still only writes the legacy column. Migrating it onto
+    STAGE_ENTITY_RELATIONS is a separate, not-yet-approved decision.
 
     Deliberately narrow to Entity Type "document_template" — SOP/
     Checklist/Materials/FAQ IDs are a structurally different storage
     layer (comma-list columns written once on ROADMAP_STAGES at
-    creation time, not STAGE_ENTITY_RELATIONS rows) and are out of
-    scope for this function; it never reads or writes them. If the
-    resolved Template Stage also carries an active relation of any
-    OTHER Entity Type (e.g. "role"), this function refuses rather than
-    silently letting copy_template_relations_to_stage() (which is
-    itself deliberately generic over Entity Type) copy something wider
-    than requested.
+    creation time) and are out of scope for this function; it never
+    reads or writes them. If the resolved Template Stage's
+    STAGE_ENTITY_RELATIONS also carry an active relation of any OTHER
+    Entity Type (e.g. "role") alongside document_template ones, this
+    function refuses rather than silently letting
+    copy_template_relations_to_stage() (which is itself deliberately
+    generic over Entity Type) copy something wider than requested.
 
     Never writes ROADMAP_STAGES."Document Template IDs" (the legacy
-    comma-list column) — Phase 18C-4 precedence means an active
-    instance-scoped STAGE_ENTITY_RELATIONS row already fully replaces
-    that legacy source for a stage that has one; touching the legacy
-    column here would be redundant and is deliberately not done. Never
+    comma-list column lives on ROADMAP_TEMPLATE_STAGES, not
+    ROADMAP_STAGES, and is never written here either way) and never
     writes Status/Responsible/Due Date/Priority/Progress — this
     function only ever calls stage_entity_relations functions, which
     read/write STAGE_ENTITY_RELATIONS exclusively and never touch
@@ -3943,9 +3968,10 @@ def sync_stage_document_requirements(stage_id: str, dry_run: bool = True) -> dic
     what WOULD be added, without writing anything.
 
     Idempotent: relies entirely on copy_template_relations_to_stage()'s
-    own existing duplicate-detection (find_active_duplicate_relation())
-    — calling this twice never creates a second active relation row for
-    the same (Stage ID, Entity Type, Entity ID).
+    / create_document_template_relations_for_stage()'s own existing
+    duplicate-detection (find_active_duplicate_relation()) — calling
+    this twice never creates a second active relation row for the same
+    (Stage ID, Entity Type, Entity ID).
 
     Validation/resolution order, all before any write:
       A. required stage_id
@@ -3953,29 +3979,41 @@ def sync_stage_document_requirements(stage_id: str, dry_run: bool = True) -> dic
       C. Stage's Roadmap exists (ROADMAP_NOT_FOUND)
       D. Roadmap has a resolvable Template ID (ROADMAP_HAS_NO_TEMPLATE)
       E. a Template Stage with matching Order exists (TEMPLATE_STAGE_NOT_FOUND)
-      F. the Template Stage has at least one active document_template
-         relation (NO_DOCUMENT_TEMPLATE_RELATIONS)
-      G. the Template Stage has no active relation of any other Entity
-         Type (UNSUPPORTED_RELATION_TYPE_ON_TEMPLATE_STAGE)
-      H. (dry_run only) return preview, no write
-      I. copy_template_relations_to_stage() (existing, idempotent)
-      J. structured result
+      F. STAGE_ENTITY_RELATIONS source: active document_template
+         relations on the Template Stage, if any (source="relations")
+      G. else legacy source: ROADMAP_TEMPLATE_STAGES."Document Template
+         IDs" on the Template Stage, if any (source="legacy")
+      H. if neither source has anything: NO_DOCUMENT_TEMPLATE_RELATIONS
+      I. (relations source only) no active relation of another Entity
+         Type on the Template Stage (UNSUPPORTED_RELATION_TYPE_ON_TEMPLATE_STAGE)
+      J. (legacy source only) every legacy ID validated
+         (INVALID_LEGACY_DOCUMENT_TEMPLATE_ID)
+      K. (dry_run only) return preview, no write
+      L. copy_template_relations_to_stage() or
+         create_document_template_relations_for_stage(), matching the source
+      M. structured result
 
     Returns:
         {
             "ok": bool, "code": str, "error": str | None,
-            "stage_id": str, "template_stage_id": str,
+            "stage_id": str, "template_stage_id": str, "source": str,
             "to_add": tuple[str, ...],          # Document Template IDs not yet linked to this Stage
             "already_present": tuple[str, ...], # Document Template IDs already linked to this Stage
             "created": tuple[str, ...],         # actually created (dry_run=False only; always () on preview)
         }
+        source is "" until a source is chosen, else "relations" or "legacy".
     """
     from business_core.roadmap_manager import resolve_template_stage_for_stage
     from business_core.stage_entity_relations import (
-        get_relations_for_template_stage, get_relations_for_stage, copy_template_relations_to_stage,
+        get_relations_for_template_stage, get_relations_for_stage,
+        copy_template_relations_to_stage, create_document_template_relations_for_stage,
+        validate_relation_references,
     )
 
-    empty = {"stage_id": stage_id, "template_stage_id": "", "to_add": (), "already_present": (), "created": ()}
+    empty = {
+        "stage_id": stage_id, "template_stage_id": "", "source": "",
+        "to_add": (), "already_present": (), "created": (),
+    }
 
     resolved = resolve_template_stage_for_stage(stage_id)
     if not resolved["ok"]:
@@ -3984,32 +4022,61 @@ def sync_stage_document_requirements(stage_id: str, dry_run: bool = True) -> dic
     template_stage_id = resolved["template_stage_id"]
 
     all_template_relations = get_relations_for_template_stage(template_stage_id)
-    non_document_types = sorted({
-        r.get("Entity Type", "") for r in all_template_relations
-    } - {"document_template"})
-    if non_document_types:
-        return {
-            "ok": False, "code": "UNSUPPORTED_RELATION_TYPE_ON_TEMPLATE_STAGE",
-            "error": (
-                f"Template Stage {template_stage_id} содержит relations типа "
-                f"{', '.join(non_document_types)} — эта команда синхронизирует только document_template."
-            ),
-            "stage_id": stage_id, "template_stage_id": template_stage_id,
-            "to_add": (), "already_present": (), "created": (),
-        }
+    document_type_relations = [r for r in all_template_relations if r.get("Entity Type", "") == "document_template"]
+    other_type_relations = [r for r in all_template_relations if r.get("Entity Type", "") != "document_template"]
 
-    template_relations = [r for r in all_template_relations if r.get("Entity Type", "") == "document_template"]
-    if not template_relations:
+    source = ""
+    template_entity_ids: list[str] = []
+
+    if document_type_relations:
+        source = "relations"
+        if other_type_relations:
+            non_document_types = sorted({r.get("Entity Type", "") for r in other_type_relations})
+            return {
+                "ok": False, "code": "UNSUPPORTED_RELATION_TYPE_ON_TEMPLATE_STAGE",
+                "error": (
+                    f"Template Stage {template_stage_id} содержит relations типа "
+                    f"{', '.join(non_document_types)} — эта команда синхронизирует только document_template."
+                ),
+                "stage_id": stage_id, "template_stage_id": template_stage_id, "source": source,
+                "to_add": (), "already_present": (), "created": (),
+            }
+        template_entity_ids = [r.get("Entity ID", "") for r in document_type_relations]
+    else:
+        legacy_ids = list((resolved.get("template_stage_row") or {}).get("document_template_ids", []))
+        if legacy_ids:
+            source = "legacy"
+            invalid = []
+            for doc_id in legacy_ids:
+                errs = validate_relation_references({
+                    "Template Stage ID": "", "Stage ID": stage_id,
+                    "Entity Type": "document_template", "Entity ID": doc_id,
+                })
+                if errs:
+                    invalid.append((doc_id, errs))
+            if invalid:
+                detail = "; ".join(f"{doc_id}: {', '.join(errs)}" for doc_id, errs in invalid)
+                return {
+                    "ok": False, "code": "INVALID_LEGACY_DOCUMENT_TEMPLATE_ID",
+                    "error": f"Некорректные Document Template ID в legacy-поле Template Stage {template_stage_id}: {detail}",
+                    "stage_id": stage_id, "template_stage_id": template_stage_id, "source": source,
+                    "to_add": (), "already_present": (), "created": (),
+                }
+            template_entity_ids = legacy_ids
+
+    if not template_entity_ids:
         return {
             "ok": False, "code": "NO_DOCUMENT_TEMPLATE_RELATIONS",
-            "error": f"У Template Stage {template_stage_id} нет активных document_template relations",
-            "stage_id": stage_id, "template_stage_id": template_stage_id,
+            "error": (
+                f"У Template Stage {template_stage_id} нет ни активных document_template relations, "
+                f"ни значений в legacy-поле \"Document Template IDs\""
+            ),
+            "stage_id": stage_id, "template_stage_id": template_stage_id, "source": "",
             "to_add": (), "already_present": (), "created": (),
         }
 
     existing_relations = get_relations_for_stage(stage_id, entity_type="document_template")
     existing_entity_ids = {r.get("Entity ID", "") for r in existing_relations}
-    template_entity_ids = [r.get("Entity ID", "") for r in template_relations]
 
     to_add = tuple(eid for eid in template_entity_ids if eid not in existing_entity_ids)
     already_present = tuple(eid for eid in template_entity_ids if eid in existing_entity_ids)
@@ -4017,25 +4084,29 @@ def sync_stage_document_requirements(stage_id: str, dry_run: bool = True) -> dic
     if dry_run:
         return {
             "ok": True, "code": "STAGE_KNOWLEDGE_SYNC_PREVIEW", "error": None,
-            "stage_id": stage_id, "template_stage_id": template_stage_id,
+            "stage_id": stage_id, "template_stage_id": template_stage_id, "source": source,
             "to_add": to_add, "already_present": already_present, "created": (),
         }
 
-    copy_result = copy_template_relations_to_stage(template_stage_id, stage_id)
-    if not copy_result.ok:
+    if source == "relations":
+        write_result = copy_template_relations_to_stage(template_stage_id, stage_id)
+    else:
+        write_result = create_document_template_relations_for_stage(stage_id, template_entity_ids)
+
+    if not write_result.ok:
         return {
             "ok": False, "code": "STAGE_KNOWLEDGE_SYNC_FAILED",
-            "error": "; ".join(str(errs) for _, errs in copy_result.errors) or "Не удалось синхронизировать",
-            "stage_id": stage_id, "template_stage_id": template_stage_id,
+            "error": "; ".join(str(errs) for _, errs in write_result.errors) or "Не удалось синхронизировать",
+            "stage_id": stage_id, "template_stage_id": template_stage_id, "source": source,
             "to_add": to_add, "already_present": already_present, "created": (),
         }
 
     created_entity_ids = tuple(
-        rec.get("Entity ID", "") for rec in copy_result.created if rec.get("Entity Type", "") == "document_template"
+        rec.get("Entity ID", "") for rec in write_result.created if rec.get("Entity Type", "") == "document_template"
     )
     return {
         "ok": True, "code": "STAGE_KNOWLEDGE_SYNCED", "error": None,
-        "stage_id": stage_id, "template_stage_id": template_stage_id,
+        "stage_id": stage_id, "template_stage_id": template_stage_id, "source": source,
         "to_add": to_add, "already_present": already_present, "created": created_entity_ids,
     }
 

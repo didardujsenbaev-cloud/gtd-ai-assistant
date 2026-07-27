@@ -146,11 +146,24 @@ class TestResolveTemplateStageForStage(unittest.TestCase):
 # business_builder.sync_stage_document_requirements()
 # ────────────────────────────────────────────────────────────
 
-_RESOLVED_OK = {
-    "ok": True, "code": "", "error": None,
-    "stage": FAKE_STAGE, "roadmap": FAKE_ROADMAP,
-    "template_id": "RMT-IZH-ALM-STANDARD-002", "template_stage_id": "TSTG-030",
-}
+def _resolved_ok(document_template_ids=()):
+    """Build a resolve_template_stage_for_stage()-shaped result. The
+    legacy `document_template_ids` on template_stage_row defaults to
+    empty — most tests exercise the STAGE_ENTITY_RELATIONS source and
+    don't need it populated; legacy-source tests pass it explicitly."""
+    return {
+        "ok": True, "code": "", "error": None,
+        "stage": FAKE_STAGE, "roadmap": FAKE_ROADMAP,
+        "template_id": "RMT-IZH-ALM-STANDARD-002", "template_stage_id": "TSTG-030",
+        "template_stage_row": {
+            "stage_id": "TSTG-030", "template_id": "RMT-IZH-ALM-STANDARD-002", "order": "6",
+            "document_template_ids": list(document_template_ids),
+        },
+    }
+
+
+_RESOLVED_OK = _resolved_ok()
+_RESOLVED_OK_LEGACY_DOC_012 = _resolved_ok(["DOC-012"])
 
 _TEMPLATE_RELATIONS_DOC_ONLY = (
     {"Relation ID": "REL-100", "Template Stage ID": "TSTG-030", "Stage ID": "",
@@ -296,6 +309,133 @@ class TestSyncStageDocumentRequirements(unittest.TestCase):
         }
         self.assertNotIn("update_stage_fields", called_names)
         self.assertNotIn("update_stage_status_in_sheet", called_names)
+
+
+class TestSyncStageDocumentRequirementsDualSource(unittest.TestCase):
+    """Live-audit fix: /linkknowledge and /stageknowledge both read/write
+    the legacy ROADMAP_TEMPLATE_STAGES."Document Template IDs" column,
+    never STAGE_ENTITY_RELATIONS — sync_stage_document_requirements()
+    must accept knowledge from either source, preferring active
+    STAGE_ENTITY_RELATIONS when present."""
+
+    def test_sync_from_stage_entity_relations_source(self):
+        with patch("business_core.roadmap_manager.resolve_template_stage_for_stage",
+                   return_value=_RESOLVED_OK), \
+             patch("business_core.stage_entity_relations.get_relations_for_template_stage",
+                   return_value=_TEMPLATE_RELATIONS_DOC_ONLY), \
+             patch("business_core.stage_entity_relations.get_relations_for_stage", return_value=()), \
+             patch("business_core.stage_entity_relations.copy_template_relations_to_stage",
+                   return_value=_copy_result(created=({"Entity Type": "document_template",
+                                                        "Entity ID": "DOC-012"},))) as mock_copy, \
+             patch("business_core.stage_entity_relations.create_document_template_relations_for_stage") as mock_legacy_write:
+            result = bb.sync_stage_document_requirements("STAGE-014", dry_run=False)
+
+        mock_copy.assert_called_once_with("TSTG-030", "STAGE-014")
+        mock_legacy_write.assert_not_called()
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["source"], "relations")
+        self.assertEqual(result["created"], ("DOC-012",))
+
+    def test_sync_from_legacy_document_template_ids_source(self):
+        """No STAGE_ENTITY_RELATIONS at all for TSTG-030 (the exact
+        live-production scenario) — falls back to the legacy column and
+        creates an instance-scoped relation via
+        create_document_template_relations_for_stage()."""
+        with patch("business_core.roadmap_manager.resolve_template_stage_for_stage",
+                   return_value=_RESOLVED_OK_LEGACY_DOC_012), \
+             patch("business_core.stage_entity_relations.get_relations_for_template_stage", return_value=()), \
+             patch("business_core.stage_entity_relations.get_relations_for_stage", return_value=()), \
+             patch("business_core.stage_entity_relations.validate_relation_references", return_value=[]), \
+             patch("business_core.stage_entity_relations.copy_template_relations_to_stage") as mock_copy, \
+             patch("business_core.stage_entity_relations.create_document_template_relations_for_stage",
+                   return_value=_copy_result(created=({"Entity Type": "document_template",
+                                                        "Entity ID": "DOC-012"},))) as mock_legacy_write:
+            result = bb.sync_stage_document_requirements("STAGE-014", dry_run=False)
+
+        mock_copy.assert_not_called()
+        mock_legacy_write.assert_called_once_with("STAGE-014", ["DOC-012"])
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["code"], "STAGE_KNOWLEDGE_SYNCED")
+        self.assertEqual(result["source"], "legacy")
+        self.assertEqual(result["created"], ("DOC-012",))
+
+    def test_legacy_preview_shows_source_and_to_add(self):
+        with patch("business_core.roadmap_manager.resolve_template_stage_for_stage",
+                   return_value=_RESOLVED_OK_LEGACY_DOC_012), \
+             patch("business_core.stage_entity_relations.get_relations_for_template_stage", return_value=()), \
+             patch("business_core.stage_entity_relations.get_relations_for_stage", return_value=()), \
+             patch("business_core.stage_entity_relations.validate_relation_references", return_value=[]), \
+             patch("business_core.stage_entity_relations.create_document_template_relations_for_stage") as mock_write:
+            result = bb.sync_stage_document_requirements("STAGE-014", dry_run=True)
+
+        mock_write.assert_not_called()
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["code"], "STAGE_KNOWLEDGE_SYNC_PREVIEW")
+        self.assertEqual(result["source"], "legacy")
+        self.assertEqual(result["to_add"], ("DOC-012",))
+
+    def test_relations_take_priority_over_legacy_when_both_present(self):
+        """Both sources have data — STAGE_ENTITY_RELATIONS must win, the
+        legacy column must be ignored entirely."""
+        resolved_both = _resolved_ok(["DOC-999-LEGACY-ONLY"])
+        with patch("business_core.roadmap_manager.resolve_template_stage_for_stage",
+                   return_value=resolved_both), \
+             patch("business_core.stage_entity_relations.get_relations_for_template_stage",
+                   return_value=_TEMPLATE_RELATIONS_DOC_ONLY), \
+             patch("business_core.stage_entity_relations.get_relations_for_stage", return_value=()), \
+             patch("business_core.stage_entity_relations.copy_template_relations_to_stage",
+                   return_value=_copy_result()) as mock_copy, \
+             patch("business_core.stage_entity_relations.create_document_template_relations_for_stage") as mock_legacy_write:
+            result = bb.sync_stage_document_requirements("STAGE-014", dry_run=True)
+
+        mock_copy.assert_not_called()  # dry_run — nothing written either way
+        mock_legacy_write.assert_not_called()
+        self.assertEqual(result["source"], "relations")
+        self.assertEqual(result["to_add"], ("DOC-012",))
+        self.assertNotIn("DOC-999-LEGACY-ONLY", result["to_add"])
+
+    def test_both_sources_empty_is_no_document_template_relations(self):
+        with patch("business_core.roadmap_manager.resolve_template_stage_for_stage",
+                   return_value=_RESOLVED_OK), \
+             patch("business_core.stage_entity_relations.get_relations_for_template_stage", return_value=()):
+            result = bb.sync_stage_document_requirements("STAGE-014", dry_run=True)
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "NO_DOCUMENT_TEMPLATE_RELATIONS")
+
+    def test_invalid_legacy_document_template_id_blocked_before_write(self):
+        with patch("business_core.roadmap_manager.resolve_template_stage_for_stage",
+                   return_value=_resolved_ok(["DOC-999-NONEXISTENT"])), \
+             patch("business_core.stage_entity_relations.get_relations_for_template_stage", return_value=()), \
+             patch("business_core.stage_entity_relations.validate_relation_references",
+                   return_value=["Entity ID 'DOC-999-NONEXISTENT' not found in document_template_registry."]), \
+             patch("business_core.stage_entity_relations.create_document_template_relations_for_stage") as mock_write:
+            result = bb.sync_stage_document_requirements("STAGE-014", dry_run=False)
+
+        mock_write.assert_not_called()
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "INVALID_LEGACY_DOCUMENT_TEMPLATE_ID")
+        self.assertIn("DOC-999-NONEXISTENT", result["error"])
+
+    def test_legacy_idempotent_second_run_no_new_to_add(self):
+        """Second sync from the legacy source, after the first already
+        created the instance relation — must report nothing left to add
+        and must not call the write primitive with a stale duplicate."""
+        already_existing = (
+            {"Stage ID": "STAGE-014", "Entity Type": "document_template", "Entity ID": "DOC-012",
+             "Status": "active"},
+        )
+        with patch("business_core.roadmap_manager.resolve_template_stage_for_stage",
+                   return_value=_RESOLVED_OK_LEGACY_DOC_012), \
+             patch("business_core.stage_entity_relations.get_relations_for_template_stage", return_value=()), \
+             patch("business_core.stage_entity_relations.get_relations_for_stage",
+                   return_value=already_existing), \
+             patch("business_core.stage_entity_relations.validate_relation_references", return_value=[]):
+            result = bb.sync_stage_document_requirements("STAGE-014", dry_run=True)
+
+        self.assertEqual(result["to_add"], ())
+        self.assertEqual(result["already_present"], ("DOC-012",))
+        self.assertEqual(result["source"], "legacy")
 
 
 # ────────────────────────────────────────────────────────────

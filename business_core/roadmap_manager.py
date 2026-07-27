@@ -1258,13 +1258,20 @@ def resolve_template_stage_for_stage(stage_id: str) -> dict:
     Returns:
         {"ok": bool, "code": str, "error": str | None,
          "stage": dict | None, "roadmap": dict | None,
-         "template_id": str, "template_stage_id": str}
+         "template_id": str, "template_stage_id": str,
+         "template_stage_row": dict | None}
+
+        template_stage_row is the full find_template_stages() row dict
+        (includes "document_template_ids": list[str], the legacy
+        ROADMAP_TEMPLATE_STAGES."Document Template IDs" comma-list
+        already parsed) — additive, so callers that only need
+        template_stage_id are unaffected.
 
         code is one of "" (ok=True), "STAGE_NOT_FOUND",
         "ROADMAP_NOT_FOUND", "ROADMAP_HAS_NO_TEMPLATE",
         "TEMPLATE_STAGE_NOT_FOUND".
     """
-    empty = {"stage": None, "roadmap": None, "template_id": "", "template_stage_id": ""}
+    empty = {"stage": None, "roadmap": None, "template_id": "", "template_stage_id": "", "template_stage_row": None}
 
     if not stage_id:
         return {"ok": False, "code": "STAGE_NOT_FOUND", "error": "stage_id обязателен", **empty}
@@ -1278,7 +1285,7 @@ def resolve_template_stage_for_stage(stage_id: str) -> dict:
         return {
             "ok": False, "code": "ROADMAP_NOT_FOUND",
             "error": f"Roadmap {stage['roadmap_id']} не найден",
-            "stage": stage, "roadmap": None, "template_id": "", "template_stage_id": "",
+            "stage": stage, "roadmap": None, "template_id": "", "template_stage_id": "", "template_stage_row": None,
         }
 
     template_id = _resolve_template_id(roadmap)
@@ -1286,7 +1293,7 @@ def resolve_template_stage_for_stage(stage_id: str) -> dict:
         return {
             "ok": False, "code": "ROADMAP_HAS_NO_TEMPLATE",
             "error": f"У Roadmap {roadmap['roadmap_id']} не определён Template ID",
-            "stage": stage, "roadmap": roadmap, "template_id": "", "template_stage_id": "",
+            "stage": stage, "roadmap": roadmap, "template_id": "", "template_stage_id": "", "template_stage_row": None,
         }
 
     order_raw = str(stage.get("order", "")).strip()
@@ -1295,6 +1302,7 @@ def resolve_template_stage_for_stage(stage_id: str) -> dict:
             "ok": False, "code": "TEMPLATE_STAGE_NOT_FOUND",
             "error": f"У Stage {stage_id} некорректный Order ({stage.get('order', '')!r})",
             "stage": stage, "roadmap": roadmap, "template_id": template_id, "template_stage_id": "",
+            "template_stage_row": None,
         }
     order = int(order_raw)
 
@@ -1310,12 +1318,13 @@ def resolve_template_stage_for_stage(stage_id: str) -> dict:
             "ok": False, "code": "TEMPLATE_STAGE_NOT_FOUND",
             "error": f"Template Stage с Order={order} не найден в шаблоне {template_id}",
             "stage": stage, "roadmap": roadmap, "template_id": template_id, "template_stage_id": "",
+            "template_stage_row": None,
         }
 
     return {
         "ok": True, "code": "", "error": None,
         "stage": stage, "roadmap": roadmap, "template_id": template_id,
-        "template_stage_id": match["stage_id"],
+        "template_stage_id": match["stage_id"], "template_stage_row": match,
     }
 
 

@@ -583,6 +583,125 @@ def copy_template_relations_to_stage(
     )
 
 
+# Defaults for every existing document_template relation row in
+# production (REL-001..REL-009) — a plain document requirement with no
+# per-item override data available (the legacy comma-list column
+# carries no Required/Blocking/Minimum Count of its own).
+_DOCUMENT_TEMPLATE_RELATION_DEFAULTS = {"Required": "true", "Blocking": "true", "Minimum Count": "1"}
+
+
+def create_document_template_relations_for_stage(
+    stage_id: str, document_template_ids: list[str], timestamp: str | None = None,
+) -> CopyRelationsResult:
+    """
+    Create instance-scoped document_template relations for `stage_id`
+    directly from a list of Document Template IDs — the legacy-column
+    fallback counterpart to copy_template_relations_to_stage(), for the
+    case where the source Template Stage has no STAGE_ENTITY_RELATIONS
+    rows to copy at all (the IDs instead came from ROADMAP_TEMPLATE_STAGES.
+    "Document Template IDs", the column /linkknowledge and /stageknowledge
+    already read/write). Mirrors copy_template_relations_to_stage()'s
+    contract as closely as possible: same CopyRelationsResult shape,
+    same destination-must-exist precondition, same all-or-nothing
+    validation-before-any-write, same find_active_duplicate_relation()
+    idempotent duplicate-skip.
+
+    Every created row uses _DOCUMENT_TEMPLATE_RELATION_DEFAULTS
+    (Required="true", Blocking="true", Minimum Count="1") — the same
+    values every existing document_template relation row in production
+    already has; the legacy comma-list has no per-item data of its own
+    to carry over.
+    """
+    from business_core.sheets import (
+        find_row_by_id, generate_next_ids, batch_append_business_rows,
+        get_business_sheet, row_from_header_map,
+    )
+    from datetime import datetime
+
+    if not stage_id or not document_template_ids:
+        return CopyRelationsResult(
+            template_stage_id="", stage_id=stage_id,
+            errors=(("__precondition__", ("stage_id and document_template_ids are both required.",)),),
+            ok=False,
+        )
+
+    if find_row_by_id("roadmap_stages", stage_id) is None:
+        return CopyRelationsResult(
+            template_stage_id="", stage_id=stage_id,
+            errors=((
+                "__precondition__",
+                (f"Destination Stage ID {stage_id!r} does not exist yet in ROADMAP_STAGES — "
+                 f"refusing to create relations before its row exists.",),
+            ),),
+            ok=False,
+        )
+
+    deduped_ids = list(dict.fromkeys(x.strip() for x in document_template_ids if x.strip()))
+    candidates = [
+        {
+            "Template Stage ID": "", "Stage ID": stage_id,
+            "Entity Type": "document_template", "Entity ID": doc_id,
+            **_DOCUMENT_TEMPLATE_RELATION_DEFAULTS, "Status": "active",
+        }
+        for doc_id in deduped_ids
+    ]
+
+    validation_errors = []
+    for candidate in candidates:
+        rel_errors = tuple(validate_relation_record(candidate)) + tuple(validate_relation_references(candidate))
+        if rel_errors:
+            validation_errors.append((candidate["Entity ID"], rel_errors))
+
+    if validation_errors:
+        return CopyRelationsResult(
+            template_stage_id="", stage_id=stage_id,
+            errors=tuple(validation_errors), ok=False,
+        )
+
+    to_create = []
+    skipped_duplicates = []
+    for candidate in candidates:
+        existing = find_active_duplicate_relation(candidate)
+        if existing is not None:
+            skipped_duplicates.append((candidate["Entity ID"], existing.get("Relation ID", "")))
+        else:
+            to_create.append(candidate)
+
+    if not to_create:
+        return CopyRelationsResult(
+            template_stage_id="", stage_id=stage_id,
+            skipped_duplicates=tuple(skipped_duplicates),
+        )
+
+    ts = timestamp or datetime.now().strftime("%Y-%m-%d")
+    sheet = get_business_sheet("stage_entity_relations")
+    headers = sheet.row_values(1)
+    new_relation_ids = generate_next_ids("stage_entity_relations", len(to_create))
+
+    rows = []
+    created_records = []
+    for candidate, new_id in zip(to_create, new_relation_ids):
+        values = {**candidate, "Relation ID": new_id, "Created At": ts, "Updated At": ts}
+        rows.append(row_from_header_map(headers, values))
+        created_records.append(values)
+
+    try:
+        batch_append_business_rows("stage_entity_relations", rows)
+    except Exception as exc:
+        return CopyRelationsResult(
+            template_stage_id="", stage_id=stage_id,
+            skipped_duplicates=tuple(skipped_duplicates),
+            errors=(("__write_failure__", (str(exc),)),),
+            ok=False,
+        )
+
+    return CopyRelationsResult(
+        template_stage_id="", stage_id=stage_id,
+        created=tuple(created_records),
+        skipped_duplicates=tuple(skipped_duplicates),
+    )
+
+
 # ─────────────────────────────────────────────────────────────
 # Phase 18C-4: document-requirements source precedence for an
 # instantiated (real) Stage ID — consumed by

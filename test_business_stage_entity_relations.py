@@ -1072,5 +1072,202 @@ class TestCopyTemplateRelationsToStage(_CopyCase):
         self.assertFalse(result.ok)
 
 
+# ────────────────────────────────────────────────────────────
+# create_document_template_relations_for_stage() — the legacy-column
+# fallback counterpart to copy_template_relations_to_stage(), added
+# after a live-audit finding that /linkknowledge/roadmap_template_manager.
+# update_template_stage_knowledge_ids() only ever writes ROADMAP_TEMPLATE_
+# STAGES."Document Template IDs", never a STAGE_ENTITY_RELATIONS row.
+# ────────────────────────────────────────────────────────────
+
+class _LegacyCreateCase(unittest.TestCase):
+    def _run(self, stage_id="STAGE-100", document_template_ids=("DOC-002",),
+              real_stages=None, templates=None, relations=None,
+              destination_exists=True, next_ids=None, batch_side_effect=None,
+              timestamp="2026-07-22"):
+        ser = _fresh_ser()
+        real_stages = (COPY_REAL_STAGES if destination_exists else []) if real_stages is None else real_stages
+        templates = COPY_TEMPLATES if templates is None else templates
+        relations = relations or []
+
+        appended = []
+
+        def _batch_append(sheet_key, rows):
+            if batch_side_effect is not None:
+                batch_side_effect()
+            appended.extend(rows)
+
+        def _read_business_sheet(sheet_key, *a, **kw):
+            return {
+                "roadmap_stages": real_stages,
+                "document_template_registry": templates,
+                "stage_entity_relations": relations,
+            }.get(sheet_key, [])
+
+        def _find_row_by_id(sheet_key, record_id, *a, **kw):
+            table = {
+                "roadmap_stages": (real_stages, "Stage ID"),
+                "document_template_registry": (templates, "Document Template ID"),
+                "stage_entity_relations": (relations, "Relation ID"),
+            }.get(sheet_key)
+            if table is None:
+                return None
+            rows, key_field = table
+            for i, row in enumerate(rows, start=2):
+                if row.get(key_field, "") == record_id:
+                    return (i, row)
+            return None
+
+        mock_sheet = unittest.mock.MagicMock()
+        mock_sheet.row_values.return_value = [
+            "Relation ID", "Template Stage ID", "Stage ID", "Entity Type", "Entity ID",
+            "Required", "Blocking", "Minimum Count", "Status", "Created At", "Updated At",
+        ]
+
+        with patch("business_core.sheets.read_business_sheet", side_effect=_read_business_sheet), \
+             patch("business_core.sheets.find_row_by_id", side_effect=_find_row_by_id), \
+             patch("business_core.sheets.get_business_sheet", return_value=mock_sheet), \
+             patch("business_core.sheets.generate_next_ids",
+                   return_value=(next_ids if next_ids is not None else ["REL-200", "REL-201", "REL-202"])), \
+             patch("business_core.sheets.batch_append_business_rows", side_effect=_batch_append):
+            result = ser.create_document_template_relations_for_stage(
+                stage_id, list(document_template_ids), timestamp=timestamp,
+            )
+        return result, appended
+
+
+class TestCreateDocumentTemplateRelationsForStage(_LegacyCreateCase):
+    def test_one_id_creates_one_instance_relation(self):
+        result, appended = self._run(document_template_ids=("DOC-002",))
+        self.assertTrue(result.ok)
+        self.assertEqual(len(result.created), 1)
+        self.assertEqual(result.created[0]["Entity ID"], "DOC-002")
+        self.assertEqual(result.created[0]["Entity Type"], "document_template")
+        self.assertEqual(result.created[0]["Stage ID"], "STAGE-100")
+        self.assertEqual(result.created[0]["Template Stage ID"], "")
+        self.assertEqual(len(appended), 1)
+
+    def test_uses_established_document_template_defaults(self):
+        """Required=true, Blocking=true, Minimum Count=1 — the same
+        defaults every existing document_template relation row in
+        production already has."""
+        result, _ = self._run(document_template_ids=("DOC-002",))
+        created = result.created[0]
+        self.assertEqual(created["Required"], "true")
+        self.assertEqual(created["Blocking"], "true")
+        self.assertEqual(created["Minimum Count"], "1")
+        self.assertEqual(created["Status"], "active")
+
+    def test_multiple_ids_create_multiple_relations(self):
+        result, appended = self._run(document_template_ids=("DOC-002", "DOC-003"))
+        self.assertTrue(result.ok)
+        self.assertEqual(len(result.created), 2)
+        self.assertEqual(len(appended), 2)
+
+    def test_dangling_document_template_id_visible_not_written(self):
+        result, appended = self._run(document_template_ids=("DOC-999-MISSING",))
+        self.assertFalse(result.ok)
+        self.assertEqual(appended, [])
+        self.assertTrue(any("DOC-999-MISSING" in str(e) for _, errs in result.errors for e in errs))
+
+    def test_duplicate_active_relation_not_recreated(self):
+        result, appended = self._run(
+            document_template_ids=("DOC-002",),
+            relations=[_rel_row(**{"Relation ID": "REL-050", "Template Stage ID": "",
+                                    "Stage ID": "STAGE-100", "Entity ID": "DOC-002"})],
+        )
+        self.assertTrue(result.ok)
+        self.assertEqual(result.created, ())
+        self.assertEqual(appended, [])
+        self.assertEqual(len(result.skipped_duplicates), 1)
+
+    def test_retry_is_idempotent(self):
+        existing = [_rel_row(**{"Relation ID": "REL-050", "Template Stage ID": "",
+                                 "Stage ID": "STAGE-100", "Entity ID": "DOC-002"})]
+        result1, appended1 = self._run(document_template_ids=("DOC-002", "DOC-003"), relations=existing)
+        self.assertTrue(result1.ok)
+        self.assertEqual(len(result1.created), 1)  # only DOC-003 is new
+        self.assertEqual(result1.created[0]["Entity ID"], "DOC-003")
+
+    def test_deduplicates_repeated_ids_in_input(self):
+        result, appended = self._run(document_template_ids=("DOC-002", "DOC-002"))
+        self.assertTrue(result.ok)
+        self.assertEqual(len(result.created), 1)
+
+    def test_no_writes_before_destination_stage_exists(self):
+        result, appended = self._run(destination_exists=False, document_template_ids=("DOC-002",))
+        self.assertFalse(result.ok)
+        self.assertEqual(appended, [])
+        self.assertTrue(any("does not exist yet" in str(e) for _, errs in result.errors for e in errs))
+
+    def test_blank_args_return_precondition_error(self):
+        ser = _fresh_ser()
+        result = ser.create_document_template_relations_for_stage("STAGE-100", [])
+        self.assertFalse(result.ok)
+
+        result2 = ser.create_document_template_relations_for_stage("", ["DOC-002"])
+        self.assertFalse(result2.ok)
+
+    def test_partial_failure_produces_explicit_structured_error(self):
+        def _boom():
+            raise RuntimeError("simulated write failure")
+
+        result, appended = self._run(document_template_ids=("DOC-002",), batch_side_effect=_boom)
+        self.assertFalse(result.ok)
+        self.assertTrue(any("simulated write failure" in str(e) for _, errs in result.errors for e in errs))
+
+    def test_only_appends_to_stage_entity_relations_sheet(self):
+        """get_business_sheet/batch_append_business_rows must only ever
+        target 'stage_entity_relations' — ROADMAP_STAGES is read once
+        (existence precondition) but never written."""
+        ser = _fresh_ser()
+
+        write_targets = []
+
+        def _batch_append(sheet_key, rows):
+            write_targets.append(sheet_key)
+
+        get_business_sheet_targets = []
+
+        def _get_business_sheet(sheet_key):
+            get_business_sheet_targets.append(sheet_key)
+            mock_sheet = unittest.mock.MagicMock()
+            mock_sheet.row_values.return_value = [
+                "Relation ID", "Template Stage ID", "Stage ID", "Entity Type", "Entity ID",
+                "Required", "Blocking", "Minimum Count", "Status", "Created At", "Updated At",
+            ]
+            return mock_sheet
+
+        def _read_business_sheet(sheet_key, *a, **kw):
+            return {
+                "roadmap_stages": COPY_REAL_STAGES,
+                "document_template_registry": COPY_TEMPLATES,
+                "stage_entity_relations": [],
+            }.get(sheet_key, [])
+
+        def _find_row_by_id(sheet_key, record_id, *a, **kw):
+            table = {
+                "roadmap_stages": (COPY_REAL_STAGES, "Stage ID"),
+                "document_template_registry": (COPY_TEMPLATES, "Document Template ID"),
+            }.get(sheet_key)
+            if table is None:
+                return None
+            rows, key_field = table
+            for i, row in enumerate(rows, start=2):
+                if row.get(key_field, "") == record_id:
+                    return (i, row)
+            return None
+
+        with patch("business_core.sheets.read_business_sheet", side_effect=_read_business_sheet), \
+             patch("business_core.sheets.find_row_by_id", side_effect=_find_row_by_id), \
+             patch("business_core.sheets.get_business_sheet", side_effect=_get_business_sheet), \
+             patch("business_core.sheets.generate_next_ids", return_value=["REL-300"]), \
+             patch("business_core.sheets.batch_append_business_rows", side_effect=_batch_append):
+            ser.create_document_template_relations_for_stage("STAGE-100", ["DOC-002"])
+
+        self.assertEqual(write_targets, ["stage_entity_relations"])
+        self.assertEqual(get_business_sheet_targets, ["stage_entity_relations"])
+
+
 if __name__ == "__main__":
     unittest.main()
