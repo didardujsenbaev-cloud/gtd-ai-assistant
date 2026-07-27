@@ -195,6 +195,10 @@ _PAYMENT_DOMAIN_TEST_FILES = frozenset({
     "test_business_payment_foundation.py",
     "test_payment_architecture_guards.py",
     "test_payment_mock_completeness.py",
+    # Phase 39D (ADR-022): Payment caller (Telegram) UX test file —
+    # registered BEFORE any test logic was written, per the PRS-003
+    # precedent.
+    "test_payment_caller_ux.py",
 })
 
 _HARD_SOCKET_BLOCK_TEST_FILES = (

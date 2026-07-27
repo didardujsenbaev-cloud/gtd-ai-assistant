@@ -6704,6 +6704,1222 @@ async def updatechecklist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
         await _reply(update, "❌ Не удалось обновить Checklist Instance.", parse_mode=None)
 
 
+# ─────────────────────────────────────────────────────────────
+# Phase 39D (ADR-022): Payment/Milestone Domain caller (Telegram) UX.
+#
+# Every command below is a thin resolve-args -> call-canonical-
+# orchestration -> render-message wrapper — no business logic beyond
+# what business_builder/payment_manager already returns. Centralized
+# result-code -> Russian message mapping below mirrors the Phase 36D
+# Task / Phase 37E Document / Phase 38D Checklist UX pattern exactly.
+# `/milestones` (defined above, Phase 9-era) is untouched by this
+# section — it remains its own separate, read-only, Roadmap-owned
+# command with no relation to payment_manager.py.
+# ─────────────────────────────────────────────────────────────
+
+_PAYMENT_TEMPLATE_STATUS_RU: dict[str, str] = {
+    "active": "Активен", "inactive": "Неактивен", "archived": "В архиве",
+}
+
+_PAYMENT_OBLIGATION_STATUS_RU: dict[str, str] = {
+    "draft": "Черновик", "issued": "Выставлен", "partially_paid": "Частично оплачен",
+    "paid": "Оплачен", "cancelled": "Отменён", "archived": "В архиве",
+}
+
+_PAYMENT_TRANSACTION_STATUS_RU: dict[str, str] = {
+    "pending": "Ожидает подтверждения", "confirmed": "Подтверждён",
+    "reversed": "Реверснут", "failed": "Не прошёл",
+}
+
+_PAYMENT_CALCULATION_TYPE_RU: dict[str, str] = {
+    "fixed": "Фиксированная сумма", "percentage": "Процент",
+}
+
+
+def _payment_template_status_ru(status: str) -> str:
+    return f"{_PAYMENT_TEMPLATE_STATUS_RU.get(status, status)} ({status})"
+
+
+def _payment_obligation_status_ru(status: str) -> str:
+    return f"{_PAYMENT_OBLIGATION_STATUS_RU.get(status, status)} ({status})"
+
+
+def _payment_transaction_status_ru(status: str) -> str:
+    return f"{_PAYMENT_TRANSACTION_STATUS_RU.get(status, status)} ({status})"
+
+
+def _payment_calculation_type_ru(calc_type: str) -> str:
+    return _PAYMENT_CALCULATION_TYPE_RU.get(calc_type, calc_type)
+
+
+def _format_payment_amount(amount: str, currency: str) -> str:
+    """Caller-only display formatting. Never recomputes or rounds —
+    renders exactly the canonical Decimal string Foundation already
+    produced, alongside its currency (ADR-022 §20/Phase 39C §12)."""
+    amount = amount or "—"
+    currency = currency or ""
+    return f"{amount} {currency}".strip()
+
+
+def _payment_template_creation_message(result: dict) -> str:
+    """Render any business_builder.create_commercial_milestone_template() result."""
+    code = result.get("code", "")
+
+    if code == "COMMERCIAL_MILESTONE_TEMPLATE_CREATED":
+        lines = [
+            "✅ Commercial Milestone Template создан",
+            f"PMT ID: {result.get('commercial_milestone_template_id', '')}",
+            f"Статус: {_payment_template_status_ru(result.get('final_status', ''))}",
+        ]
+        if result.get("amount"):
+            lines.append(f"Сумма: {_format_payment_amount(result.get('amount', ''), result.get('currency', ''))}")
+        return "\n".join(lines)
+
+    if code == "COMMERCIAL_MILESTONE_TEMPLATE_REUSED":
+        return "\n".join([
+            "♻️ Commercial Milestone Template с этим ключом уже существует — использована существующая запись",
+            f"PMT ID: {result.get('commercial_milestone_template_id', '')}",
+            f"Статус: {_payment_template_status_ru(result.get('final_status', ''))}",
+        ])
+
+    if code == "MULTIPLE_COMMERCIAL_MILESTONE_TEMPLATE_MATCHES":
+        ids = ", ".join(result.get("conflicting_ids", ())) or "—"
+        return "\n".join([
+            "⚠️ Обнаружен конфликт целостности данных",
+            f"Найдено несколько Commercial Milestone Template с одним ключом: {ids}",
+            "Новый Template не создан — автоматический выбор одного из них не выполняется.",
+        ])
+
+    if code == "INVALID_MILESTONE_CALCULATION_TYPE":
+        return f"❌ {result.get('error') or 'Недопустимый calculation_type. Допустимые значения: fixed, percentage.'}"
+
+    if code == "MILESTONE_FIXED_AMOUNT_REQUIRED":
+        return "❌ Для calculation_type=fixed требуется fixed_amount."
+
+    if code == "MILESTONE_PERCENTAGE_REQUIRED":
+        return "❌ Для calculation_type=percentage требуется percentage (0, 100]."
+
+    if code == "MILESTONE_CALCULATION_FIELDS_CONFLICT":
+        return f"❌ {result.get('error') or 'fixed_amount и percentage не могут быть заполнены одновременно.'}"
+
+    if code in ("INVALID_PAYMENT_AMOUNT", "INVALID_PAYMENT_AMOUNT_SCALE", "PAYMENT_AMOUNT_MUST_BE_POSITIVE"):
+        return f"❌ {result.get('error') or 'Недопустимая сумма.'}"
+
+    if code == "INVALID_PAYMENT_CURRENCY":
+        return f"❌ {result.get('error') or 'Недопустимая валюта — требуется 3-буквенный код (например KZT).'}"
+
+    if code == "ROADMAP_NOT_FOUND":
+        return "❌ Указанный Roadmap Template не найден."
+
+    if code == "SERVICE_NOT_FOUND":
+        return "❌ Указанный Service не найден."
+
+    if code == "PAYMENT_ENTITY_RELATION_MISMATCH":
+        return f"❌ {result.get('error') or 'Требуется хотя бы одно: roadmap_template_id или service_id.'}"
+
+    if code == "COMMERCIAL_MILESTONE_TEMPLATE_POST_WRITE_VERIFICATION_FAILED":
+        return "\n".join([
+            "⚠️ Commercial Milestone Template записан, но пост-проверка записи не прошла.",
+            "Требуется ручная проверка.",
+        ])
+
+    if code == "PAYMENT_PERSISTENCE_FAILED":
+        return "❌ Не удалось создать Commercial Milestone Template."
+
+    if not code and result.get("error"):
+        return f"❌ {result['error']}"
+
+    log.warning(f"_payment_template_creation_message: unmapped code={code!r}")
+    return "❌ Не удалось создать Commercial Milestone Template."
+
+
+def _payment_template_status_message(result: dict, template_id: str) -> str:
+    """Render any business_builder.transition_commercial_milestone_template_status() result."""
+    code = result.get("code", "")
+    previous_status = result.get("previous_status", "")
+    requested_status = result.get("requested_status", "")
+
+    if code == "COMMERCIAL_MILESTONE_TEMPLATE_STATUS_UPDATED":
+        return "\n".join([
+            "✅ Статус Commercial Milestone Template изменён",
+            f"PMT ID: {template_id}",
+            f"Был: {_payment_template_status_ru(previous_status)}",
+            f"Стал: {_payment_template_status_ru(result.get('final_status', ''))}",
+        ])
+
+    if code == "COMMERCIAL_MILESTONE_TEMPLATE_STATUS_UNCHANGED":
+        return f"ℹ️ Template {template_id} уже имеет статус {_payment_template_status_ru(previous_status)} — изменений нет."
+
+    if code == "COMMERCIAL_MILESTONE_TEMPLATE_NOT_FOUND":
+        return f"❌ Commercial Milestone Template {template_id} не найден."
+
+    if code == "INVALID_COMMERCIAL_MILESTONE_TEMPLATE_STATUS":
+        from business_core.payment_manager import TEMPLATE_STATUS
+        return f"❌ Недопустимый статус. Допустимые значения: {', '.join(TEMPLATE_STATUS)}"
+
+    if code == "COMMERCIAL_MILESTONE_TEMPLATE_RESTORE_REQUIRES_EXPLICIT_ACTION":
+        return "\n".join([
+            "🔒 Commercial Milestone Template уже деактивирован/архивирован",
+            f"PMT ID: {template_id}",
+            f"Текущий статус: {_payment_template_status_ru(previous_status)}",
+            "Вернуть его в active обычной командой изменения статуса нельзя. "
+            "Отдельное явное действие restore пока не реализовано.",
+        ])
+
+    if code == "PAYMENT_PERSISTENCE_FAILED":
+        return "❌ Не удалось обновить статус Commercial Milestone Template."
+
+    log.warning(f"_payment_template_status_message: unmapped code={code!r} template_id={template_id}")
+    return f"❌ Ошибка ({code or 'unknown'}): {result.get('error') or 'см. логи'}"
+
+
+def _payment_template_admin_message(result: dict, template_id: str) -> str:
+    """Render any business_builder.update_commercial_milestone_template_admin_fields() result."""
+    code = result.get("code", "")
+
+    if result.get("ok"):
+        if result.get("changed"):
+            return f"✅ Commercial Milestone Template {template_id} обновлён."
+        return f"ℹ️ Commercial Milestone Template {template_id} — изменений нет (значения совпадают)."
+
+    if code == "COMMERCIAL_MILESTONE_TEMPLATE_NOT_FOUND":
+        return f"❌ Commercial Milestone Template {template_id} не найден."
+
+    if code == "PAYMENT_TRANSACTION_IMMUTABLE":
+        return f"❌ Указанные поля являются неизменяемой идентичностью Commercial Milestone Template: {result.get('error') or ''}"
+
+    if code == "INVALID_COMMERCIAL_MILESTONE_TEMPLATE_STATUS":
+        return f"❌ {result.get('error') or 'Недопустимое поле для /updatepaymenttemplate.'}"
+
+    log.warning(f"_payment_template_admin_message: unmapped code={code!r} template_id={template_id}")
+    return f"❌ Ошибка ({code or 'unknown'}): {result.get('error') or 'см. логи'}"
+
+
+def _payment_obligation_creation_message(result: dict) -> str:
+    """Render any business_builder.create_payment_obligation() result."""
+    code = result.get("code", "")
+
+    if code == "PAYMENT_OBLIGATION_CREATED":
+        lines = [
+            "✅ Payment Obligation создан",
+            f"POB ID: {result.get('payment_obligation_id', '')}",
+            f"Сумма: {_format_payment_amount(result.get('amount', ''), result.get('currency', ''))}",
+            f"Статус: {_payment_obligation_status_ru(result.get('final_status', ''))}",
+        ]
+        for key, label in (
+            ("object_id", "Object ID"), ("service_id", "Service ID"),
+            ("roadmap_id", "Roadmap ID"), ("stage_id", "Stage ID"),
+            ("commercial_milestone_template_id", "Template ID"),
+        ):
+            if result.get(key):
+                lines.append(f"{label}: {result[key]}")
+        return "\n".join(lines)
+
+    if code == "PAYMENT_OBLIGATION_REUSED":
+        return "\n".join([
+            "♻️ Payment Obligation с этим ключом уже существует — использована существующая запись",
+            f"POB ID: {result.get('payment_obligation_id', '')}",
+            f"Сумма: {_format_payment_amount(result.get('amount', ''), result.get('currency', ''))}",
+            f"Оплачено: {_format_payment_amount(result.get('paid_amount', ''), result.get('currency', ''))}",
+            f"Статус: {_payment_obligation_status_ru(result.get('final_status', ''))}",
+        ])
+
+    if code == "BUSINESS_NOT_FOUND":
+        return f"❌ Business не найден: {result.get('error') or ''}"
+
+    if code == "CLIENT_NOT_FOUND":
+        return f"❌ Client не найден: {result.get('error') or ''}"
+
+    if code == "OBJECT_NOT_FOUND":
+        return "❌ Указанный Object не найден."
+
+    if code == "SERVICE_NOT_FOUND":
+        return "❌ Указанный Service не найден."
+
+    if code == "ROADMAP_NOT_FOUND":
+        return "❌ Указанный Roadmap не найден."
+
+    if code == "STAGE_NOT_FOUND":
+        return "❌ Указанный Stage не найден."
+
+    if code == "COMMERCIAL_MILESTONE_TEMPLATE_NOT_FOUND":
+        return "❌ Указанный Commercial Milestone Template не найден."
+
+    if code in ("PAYMENT_OBLIGATION_RELATION_MISMATCH", "PAYMENT_ENTITY_RELATION_MISMATCH"):
+        return f"❌ Несогласованные ссылки на сущности: {result.get('error') or 'см. логи'}"
+
+    if code == "PAYMENT_OBLIGATION_IDEMPOTENCY_CONFLICT":
+        return f"❌ {result.get('error') or 'Требуется caller_idempotency_key либо полный Template+Roadmap+Stage+Sequence fallback.'}"
+
+    if code == "MULTIPLE_PAYMENT_OBLIGATION_MATCHES":
+        ids = ", ".join(result.get("conflicting_ids", ())) or "—"
+        return "\n".join([
+            "⚠️ Обнаружен конфликт целостности данных",
+            f"Найдено несколько Payment Obligation с одним ключом: {ids}",
+            "Новый Obligation не создан — автоматический выбор одного из них не выполняется.",
+        ])
+
+    if code in ("INVALID_PAYMENT_AMOUNT", "INVALID_PAYMENT_AMOUNT_SCALE", "PAYMENT_AMOUNT_MUST_BE_POSITIVE"):
+        return f"❌ {result.get('error') or 'Недопустимая сумма.'}"
+
+    if code == "INVALID_PAYMENT_CURRENCY":
+        return f"❌ {result.get('error') or 'Недопустимая валюта.'}"
+
+    if code == "PAYMENT_OBLIGATION_PERSISTENCE_FAILED":
+        return "❌ Не удалось создать Payment Obligation."
+
+    if code == "PAYMENT_OBLIGATION_POST_WRITE_VERIFICATION_FAILED":
+        return "\n".join([
+            "⚠️ Payment Obligation записан, но пост-проверка записи не прошла.",
+            "Требуется ручная проверка.",
+        ])
+
+    log.warning(f"_payment_obligation_creation_message: unmapped code={code!r}")
+    return "❌ Не удалось создать Payment Obligation."
+
+
+def _payment_obligation_status_message(result: dict, obligation_id: str) -> str:
+    """Render any business_builder.transition_payment_obligation_status() result."""
+    code = result.get("code", "")
+    previous_status = result.get("previous_status", "")
+
+    if code == "PAYMENT_OBLIGATION_STATUS_UPDATED":
+        return "\n".join([
+            "✅ Статус Payment Obligation изменён",
+            f"POB ID: {obligation_id}",
+            f"Был: {_payment_obligation_status_ru(previous_status)}",
+            f"Стал: {_payment_obligation_status_ru(result.get('final_status', ''))}",
+        ])
+
+    if code == "PAYMENT_OBLIGATION_STATUS_UNCHANGED":
+        return f"ℹ️ Payment Obligation {obligation_id} уже имеет статус {_payment_obligation_status_ru(previous_status)} — изменений нет."
+
+    if code == "PAYMENT_OBLIGATION_NOT_FOUND":
+        return f"❌ Payment Obligation {obligation_id} не найден."
+
+    if code == "INVALID_PAYMENT_OBLIGATION_STATUS":
+        from business_core.payment_manager import OBLIGATION_STATUS
+        return f"❌ Недопустимый статус. Допустимые значения: {', '.join(OBLIGATION_STATUS)}"
+
+    if code == "INVALID_PAYMENT_OBLIGATION_TRANSITION":
+        return f"❌ {result.get('error') or 'Такой переход статуса не разрешён.'}"
+
+    if code == "PAYMENT_OBLIGATION_HAS_CONFIRMED_PAYMENTS":
+        return "\n".join([
+            "🔒 Payment Obligation имеет подтверждённые платежи",
+            f"POB ID: {obligation_id}",
+            f"Оплачено: {_format_payment_amount(result.get('paid_amount', ''), '')}",
+            "Отмена заблокирована — сначала реверсните подтверждённые платежи.",
+        ])
+
+    if code == "PAYMENT_PERSISTENCE_FAILED":
+        return "❌ Не удалось обновить статус Payment Obligation."
+
+    log.warning(f"_payment_obligation_status_message: unmapped code={code!r} obligation_id={obligation_id}")
+    return f"❌ Ошибка ({code or 'unknown'}): {result.get('error') or 'см. логи'}"
+
+
+def _payment_obligation_admin_message(result: dict, obligation_id: str) -> str:
+    """Render any business_builder.update_payment_obligation_admin_fields() result."""
+    code = result.get("code", "")
+
+    if result.get("ok"):
+        if result.get("changed"):
+            return f"✅ Payment Obligation {obligation_id} обновлён."
+        return f"ℹ️ Payment Obligation {obligation_id} — изменений нет (значения совпадают)."
+
+    if code == "PAYMENT_OBLIGATION_NOT_FOUND":
+        return f"❌ Payment Obligation {obligation_id} не найден."
+
+    if code == "PAYMENT_OBLIGATION_RELATION_MISMATCH":
+        return f"❌ Указанные поля являются неизменяемой идентичностью Payment Obligation: {result.get('error') or ''}"
+
+    if code == "INVALID_PAYMENT_OBLIGATION_STATUS":
+        return f"❌ {result.get('error') or 'Недопустимое поле для /updateobligation.'}"
+
+    log.warning(f"_payment_obligation_admin_message: unmapped code={code!r} obligation_id={obligation_id}")
+    return f"❌ Ошибка ({code or 'unknown'}): {result.get('error') or 'см. логи'}"
+
+
+def _payment_transaction_creation_message(result: dict) -> str:
+    """Render any business_builder.create_payment_transaction() result.
+    Never echoes External Transaction ID/Caller Idempotency Key back —
+    only a safe acknowledgement (ADR-022 §27/Phase 39C §12)."""
+    code = result.get("code", "")
+
+    if code == "PAYMENT_TRANSACTION_CREATED":
+        return "\n".join([
+            "✅ Payment записан (pending)",
+            f"PTXN ID: {result.get('payment_transaction_id', '')}",
+            f"Obligation: {result.get('payment_obligation_id', '')}",
+            f"Сумма: {_format_payment_amount(result.get('amount', ''), result.get('currency', ''))}",
+            f"Статус: {_payment_transaction_status_ru(result.get('final_status', ''))}",
+            "Требуется подтверждение через /confirmpayment.",
+        ])
+
+    if code == "PAYMENT_TRANSACTION_REUSED":
+        return "\n".join([
+            "♻️ Payment с этим ключом уже существует — использована существующая запись",
+            f"PTXN ID: {result.get('payment_transaction_id', '')}",
+            f"Статус: {_payment_transaction_status_ru(result.get('final_status', ''))}",
+        ])
+
+    if code == "BUSINESS_NOT_FOUND":
+        return f"❌ Business не найден: {result.get('error') or ''}"
+
+    if code == "PAYMENT_OBLIGATION_NOT_FOUND":
+        return "❌ Указанный Payment Obligation не найден."
+
+    if code == "CLIENT_NOT_FOUND":
+        return f"❌ Client не найден: {result.get('error') or ''}"
+
+    if code == "DOCUMENT_NOT_FOUND":
+        return "❌ Указанный evidence Document не найден."
+
+    if code == "PAYMENT_ENTITY_RELATION_MISMATCH":
+        return f"❌ Несогласованные ссылки на сущности: {result.get('error') or 'см. логи'}"
+
+    if code == "PAYMENT_CURRENCY_MISMATCH":
+        return f"❌ {result.get('error') or 'Валюта Payment не совпадает с валютой Obligation.'}"
+
+    if code == "PAYMENT_TRANSACTION_IDEMPOTENCY_REQUIRED":
+        return "❌ Требуется external_transaction_id или caller_idempotency_key."
+
+    if code == "PAYMENT_TRANSACTION_IDEMPOTENCY_CONFLICT":
+        ids = ", ".join(result.get("conflicting_ids", ())) or "—"
+        return f"⚠️ Ключ идемпотентности уже используется другим Payment ({ids}) с иными параметрами."
+
+    if code == "MULTIPLE_PAYMENT_TRANSACTION_MATCHES":
+        ids = ", ".join(result.get("conflicting_ids", ())) or "—"
+        return "\n".join([
+            "⚠️ Обнаружен конфликт целостности данных",
+            f"Найдено несколько Payment с одним ключом: {ids}",
+            "Новый Payment не создан — автоматический выбор одного из них не выполняется.",
+        ])
+
+    if code in ("INVALID_PAYMENT_AMOUNT", "INVALID_PAYMENT_AMOUNT_SCALE", "PAYMENT_AMOUNT_MUST_BE_POSITIVE"):
+        return f"❌ {result.get('error') or 'Недопустимая сумма.'}"
+
+    if code == "INVALID_PAYMENT_CURRENCY":
+        return f"❌ {result.get('error') or 'Недопустимая валюта.'}"
+
+    if code == "PAYMENT_TRANSACTION_PERSISTENCE_FAILED":
+        return "❌ Не удалось записать Payment."
+
+    if code == "PAYMENT_TRANSACTION_POST_WRITE_VERIFICATION_FAILED":
+        return "\n".join([
+            "⚠️ Payment записан, но пост-проверка записи не прошла.",
+            "Требуется ручная проверка.",
+        ])
+
+    if not code and result.get("error"):
+        return f"❌ {result['error']}"
+
+    log.warning(f"_payment_transaction_creation_message: unmapped code={code!r}")
+    return "❌ Не удалось записать Payment."
+
+
+def _payment_transaction_confirmation_message(result: dict, transaction_id: str) -> str:
+    """Render any business_builder.confirm_payment_transaction() result."""
+    code = result.get("code", "")
+
+    if code == "PAYMENT_TRANSACTION_CONFIRMED":
+        return "\n".join([
+            "✅ Payment подтверждён",
+            f"PTXN ID: {transaction_id}",
+            f"Оплачено (Obligation): {_format_payment_amount(result.get('paid_amount', ''), result.get('currency', ''))}",
+            f"Остаток (Obligation): {_format_payment_amount(result.get('remaining_amount', ''), result.get('currency', ''))}",
+        ])
+
+    if code == "PAYMENT_TRANSACTION_CONFIRMATION_UNCHANGED":
+        return f"ℹ️ Payment {transaction_id} уже подтверждён — изменений нет."
+
+    if code == "PAYMENT_TRANSACTION_NOT_FOUND":
+        return f"❌ Payment {transaction_id} не найден."
+
+    if code == "INVALID_PAYMENT_TRANSACTION_TRANSITION":
+        return f"❌ {result.get('error') or 'Подтверждение возможно только из статуса pending.'}"
+
+    if code == "PAYMENT_TRANSACTION_CONFIRMATION_METADATA_REQUIRED":
+        return "❌ Укажи confirmed_by."
+
+    if code == "PAYMENT_TRANSACTION_OVERPAYMENT_BLOCKED":
+        return "\n".join([
+            "🔒 Подтверждение заблокировано — переплата",
+            f"PTXN ID: {transaction_id}",
+            f"Сумма Payment: {_format_payment_amount(result.get('amount', ''), '')}",
+            f"Остаток Obligation: {_format_payment_amount(result.get('remaining_amount', ''), '')}",
+        ])
+
+    if code == "PAYMENT_OBLIGATION_NOT_FOUND":
+        return "❌ Связанный Payment Obligation не найден."
+
+    if code == "INVALID_PAYMENT_AMOUNT":
+        return "❌ Не удалось разобрать сумму Payment."
+
+    if code == "PAYMENT_PERSISTENCE_FAILED":
+        return "❌ Не удалось подтвердить Payment."
+
+    if code == "PAYMENT_TRANSACTION_POST_WRITE_VERIFICATION_FAILED":
+        return "\n".join(["⚠️ Payment помечен confirmed, но пост-проверка записи не прошла.", "Требуется ручная проверка."])
+
+    if code == "PAYMENT_OBLIGATION_POST_WRITE_VERIFICATION_FAILED":
+        return "\n".join([
+            "⚠️ Payment подтверждён, но синхронизация баланса Obligation не удалась.",
+            "Требуется ручная проверка.",
+        ])
+
+    log.warning(f"_payment_transaction_confirmation_message: unmapped code={code!r} transaction_id={transaction_id}")
+    return f"❌ Ошибка ({code or 'unknown'}): {result.get('error') or 'см. логи'}"
+
+
+def _payment_transaction_reversal_message(result: dict, transaction_id: str) -> str:
+    """Render any business_builder.reverse_payment_transaction() result.
+    Never echoes reversal_reason back verbatim (ADR-022 §22/Phase 39C §22)."""
+    code = result.get("code", "")
+
+    if code == "PAYMENT_TRANSACTION_REVERSED":
+        return "\n".join([
+            "✅ Payment реверснут",
+            f"PTXN ID: {transaction_id}",
+            f"Оплачено (Obligation): {_format_payment_amount(result.get('paid_amount', ''), result.get('currency', ''))}",
+            f"Остаток (Obligation): {_format_payment_amount(result.get('remaining_amount', ''), result.get('currency', ''))}",
+        ])
+
+    if code == "PAYMENT_TRANSACTION_REVERSAL_UNCHANGED":
+        return f"ℹ️ Payment {transaction_id} уже реверснут — изменений нет."
+
+    if code == "PAYMENT_TRANSACTION_NOT_FOUND":
+        return f"❌ Payment {transaction_id} не найден."
+
+    if code == "INVALID_PAYMENT_TRANSACTION_TRANSITION":
+        return f"❌ {result.get('error') or 'Реверс возможен только из статуса confirmed.'}"
+
+    if code == "PAYMENT_TRANSACTION_REVERSAL_REASON_REQUIRED":
+        return "❌ Укажи reversal_reason и reversed_by."
+
+    if code == "PAYMENT_TRANSACTION_IMMUTABLE":
+        return "⚠️ Финансовые поля Payment изменились при реверсе — недопустимо. Требуется ручная проверка."
+
+    if code == "PAYMENT_PERSISTENCE_FAILED":
+        return "❌ Не удалось реверснуть Payment."
+
+    if code == "PAYMENT_TRANSACTION_POST_WRITE_VERIFICATION_FAILED":
+        return "\n".join(["⚠️ Payment помечен reversed, но пост-проверка записи не прошла.", "Требуется ручная проверка."])
+
+    if code == "PAYMENT_OBLIGATION_POST_WRITE_VERIFICATION_FAILED":
+        return "\n".join([
+            "⚠️ Payment реверснут, но синхронизация баланса Obligation не удалась.",
+            "Требуется ручная проверка.",
+        ])
+
+    log.warning(f"_payment_transaction_reversal_message: unmapped code={code!r} transaction_id={transaction_id}")
+    return f"❌ Ошибка ({code or 'unknown'}): {result.get('error') or 'см. логи'}"
+
+
+def _payment_transaction_failure_message(result: dict, transaction_id: str) -> str:
+    """Render any business_builder.fail_payment_transaction() result."""
+    code = result.get("code", "")
+    previous_status = result.get("previous_status", "")
+
+    if code == "PAYMENT_TRANSACTION_FAILED":
+        if previous_status == "failed":
+            return f"ℹ️ Payment {transaction_id} уже помечен failed — изменений нет."
+        return f"✅ Payment {transaction_id} помечен failed."
+
+    if code == "PAYMENT_TRANSACTION_NOT_FOUND":
+        return f"❌ Payment {transaction_id} не найден."
+
+    if code == "INVALID_PAYMENT_TRANSACTION_TRANSITION":
+        return f"❌ {result.get('error') or 'Переход в failed возможен только из статуса pending.'}"
+
+    if code == "PAYMENT_PERSISTENCE_FAILED":
+        return "❌ Не удалось обновить статус Payment."
+
+    log.warning(f"_payment_transaction_failure_message: unmapped code={code!r} transaction_id={transaction_id}")
+    return f"❌ Ошибка ({code or 'unknown'}): {result.get('error') or 'см. логи'}"
+
+
+async def newpaymenttemplate_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /newpaymenttemplate title=... calculation_type=fixed fixed_amount=500000
+                        currency=KZT [roadmap_template_id=RMT-...] [service_id=SVC-...]
+                        [sequence=1] [description=...] [trigger_description=...]
+                        [percentage=...] [created_by=...] [notes=...]
+
+    Creates one Commercial Milestone Template. Idempotent — repeated
+    calls with the same Roadmap Template/Service/Sequence/Title reuse
+    the existing Template rather than creating a duplicate (ADR-022 §10).
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg(), parse_mode=None)
+        return
+
+    raw = " ".join(context.args or [])
+    args = _parse_kv_args(raw)
+    title = args.get("title", "")
+    calculation_type = args.get("calculation_type", "")
+    currency = args.get("currency", "")
+
+    if not title or not calculation_type or not currency:
+        await _reply(
+            update,
+            "❌ Укажи title, calculation_type и currency.\n\nПример:\n"
+            "`/newpaymenttemplate title=... calculation_type=fixed fixed_amount=500000 "
+            "currency=KZT roadmap_template_id=RMT-...`", parse_mode=None)
+        return
+
+    try:
+        from business_core.business_builder import create_commercial_milestone_template
+
+        result = create_commercial_milestone_template(
+            title, calculation_type,
+            roadmap_template_id=args.get("roadmap_template_id", ""), service_id=args.get("service_id", ""),
+            description=args.get("description", ""), sequence=args.get("sequence", "1"),
+            trigger_description=args.get("trigger_description", ""),
+            fixed_amount=args.get("fixed_amount", ""), percentage=args.get("percentage", ""),
+            currency=currency, created_by=args.get("created_by", "") or _telegram_username(update),
+            notes=args.get("notes", ""),
+        )
+        await _reply(update, _payment_template_creation_message(result), parse_mode=None)
+    except Exception as e:
+        log.error(f"newpaymenttemplate_cmd error: {e}")
+        await _reply(update, "❌ Не удалось создать Commercial Milestone Template.", parse_mode=None)
+
+
+_PAYMENT_LIST_MAX_SHOWN = 20
+
+
+async def paymenttemplates_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /paymenttemplates [roadmap_template_id=...] [service_id=...]
+                       [calculation_type=fixed] [currency=KZT] [status=active]
+
+    Read-only, bounded, filtered list of Commercial Milestone Templates.
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg(), parse_mode=None)
+        return
+
+    raw = " ".join(context.args or [])
+    args = _parse_kv_args(raw)
+
+    try:
+        from business_core.payment_manager import list_commercial_milestone_templates
+
+        templates = list_commercial_milestone_templates(
+            roadmap_template_id=args.get("roadmap_template_id", ""), service_id=args.get("service_id", ""),
+            status=args.get("status", ""),
+        )
+        for key, field in (("calculation_type", "Calculation Type"), ("currency", "Currency")):
+            if args.get(key):
+                templates = [t for t in templates if t.get(field, "") == args[key]]
+
+        if not templates:
+            await _reply(update, "ℹ️ Commercial Milestone Templates не найдены.", parse_mode=None)
+            return
+
+        lines = [f"💰 Commercial Milestone Templates ({len(templates)})", ""]
+        for t in templates[:_PAYMENT_LIST_MAX_SHOWN]:
+            amount_display = t.get("Fixed Amount") or (f"{t.get('Percentage', '')}%" if t.get("Percentage") else "—")
+            lines.append(
+                f"{t.get('Commercial Milestone Template ID', '')} — {t.get('Title', '')} "
+                f"[{_payment_template_status_ru(t.get('Status', ''))}] "
+                f"{_payment_calculation_type_ru(t.get('Calculation Type', ''))}: {amount_display} {t.get('Currency', '')}"
+            )
+        if len(templates) > _PAYMENT_LIST_MAX_SHOWN:
+            lines.append(f"\n… показаны первые {_PAYMENT_LIST_MAX_SHOWN} из {len(templates)}.")
+
+        await _reply(update, "\n".join(lines), parse_mode=None)
+    except Exception as e:
+        log.error(f"paymenttemplates_cmd error: {e}")
+        await _reply(update, "❌ Не удалось получить список Commercial Milestone Templates.", parse_mode=None)
+
+
+async def paymenttemplate_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /paymenttemplate commercial_milestone_template_id=PMT-001
+
+    Read-only, exact-ID detail. Hides Notes by default.
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg(), parse_mode=None)
+        return
+
+    raw = " ".join(context.args or [])
+    args = _parse_kv_args(raw)
+    template_id = args.get("commercial_milestone_template_id") or args.get("_pos0", "")
+
+    if not template_id:
+        await _reply(update, "❌ Укажи commercial_milestone_template_id.\n\nПример: /paymenttemplate commercial_milestone_template_id=PMT-001", parse_mode=None)
+        return
+
+    try:
+        from business_core.payment_manager import find_commercial_milestone_template_by_id
+
+        template = find_commercial_milestone_template_by_id(template_id)
+        if template is None:
+            await _reply(update, f"❌ Commercial Milestone Template {template_id} не найден.", parse_mode=None)
+            return
+
+        amount_display = template.get("Fixed Amount") or (f"{template.get('Percentage', '')}%" if template.get("Percentage") else "—")
+        lines = [
+            f"💰 Commercial Milestone Template {template.get('Commercial Milestone Template ID', '')}",
+            "",
+            f"Название: {template.get('Title', '')}",
+            f"Sequence: {template.get('Sequence', '')}",
+            f"Тип расчёта: {_payment_calculation_type_ru(template.get('Calculation Type', ''))}",
+            f"Сумма/процент: {amount_display}",
+            f"Валюта: {template.get('Currency', '')}",
+            f"Статус: {_payment_template_status_ru(template.get('Status', ''))}",
+            f"Roadmap Template: {template.get('Roadmap Template ID', '') or '—'}",
+            f"Service: {template.get('Service ID', '') or '—'}",
+        ]
+        await _reply(update, "\n".join(lines), parse_mode=None)
+    except Exception as e:
+        log.error(f"paymenttemplate_cmd error: {e}")
+        await _reply(update, "❌ Не удалось получить Commercial Milestone Template.", parse_mode=None)
+
+
+async def updatepaymenttemplate_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /updatepaymenttemplate commercial_milestone_template_id=PMT-001 status=inactive
+    /updatepaymenttemplate commercial_milestone_template_id=PMT-001 description=...
+
+    Status and descriptive-admin fields are never mixed in one call —
+    mirrors /updatechecklist's foundation UX exactly.
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg(), parse_mode=None)
+        return
+
+    raw = " ".join(context.args or [])
+    args = _parse_kv_args(raw)
+    template_id = args.get("commercial_milestone_template_id", "")
+
+    if not template_id:
+        await _reply(
+            update,
+            "❌ Укажи commercial_milestone_template_id.\n\nПример:\n"
+            "`/updatepaymenttemplate commercial_milestone_template_id=PMT-001 status=inactive`\n"
+            "`/updatepaymenttemplate commercial_milestone_template_id=PMT-001 description=...`", parse_mode=None)
+        return
+
+    has_status = "status" in args
+    admin_fields = {}
+    for key, header in (("description", "Description"), ("trigger_description", "Trigger Description"), ("notes", "Notes")):
+        if key in args:
+            admin_fields[header] = args[key]
+
+    if has_status and admin_fields:
+        await _reply(
+            update,
+            "❌ Нельзя одновременно менять статус и описательные поля.\n"
+            "Отправь две отдельные команды:\n"
+            "`/updatepaymenttemplate commercial_milestone_template_id=... status=...`\n"
+            "`/updatepaymenttemplate commercial_milestone_template_id=... description=...`", parse_mode=None)
+        return
+
+    if not has_status and not admin_fields:
+        await _reply(update, "❌ Укажи либо status=..., либо description=.../trigger_description=.../notes=....", parse_mode=None)
+        return
+
+    try:
+        if has_status:
+            from business_core.business_builder import transition_commercial_milestone_template_status
+            result = transition_commercial_milestone_template_status(template_id, args["status"])
+            await _reply(update, _payment_template_status_message(result, template_id), parse_mode=None)
+            return
+
+        from business_core.business_builder import update_commercial_milestone_template_admin_fields
+        result = update_commercial_milestone_template_admin_fields(template_id, admin_fields)
+        await _reply(update, _payment_template_admin_message(result, template_id), parse_mode=None)
+    except Exception as e:
+        log.error(f"updatepaymenttemplate_cmd error: {e}")
+        await _reply(update, "❌ Не удалось обновить Commercial Milestone Template.", parse_mode=None)
+
+
+async def newobligation_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /newobligation business_id=BIZ-001 client_id=PRS-001 amount=500000 currency=KZT
+                    caller_idempotency_key=...
+                    [object_id=...] [service_id=...] [roadmap_id=...] [stage_id=...]
+                    [commercial_milestone_template_id=PMT-...] [title=...] [description=...]
+                    [due_date=YYYY-MM-DD] [created_by=...] [notes=...]
+
+    Creates one Payment Obligation. Idempotent via caller_idempotency_key
+    (ADR-022 §16) — repeated calls with the same key reuse the existing
+    Obligation rather than creating a duplicate.
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg(), parse_mode=None)
+        return
+
+    raw = " ".join(context.args or [])
+    args = _parse_kv_args(raw)
+    business_id = args.get("business_id", "")
+    client_id = args.get("client_id", "")
+    amount = args.get("amount", "")
+    currency = args.get("currency", "")
+
+    if not business_id or not client_id or not amount or not currency:
+        await _reply(
+            update,
+            "❌ Укажи business_id, client_id, amount и currency.\n\nПример:\n"
+            "`/newobligation business_id=BIZ-001 client_id=PRS-001 amount=500000 currency=KZT "
+            "caller_idempotency_key=...`", parse_mode=None)
+        return
+
+    if not args.get("caller_idempotency_key") and not (
+        args.get("commercial_milestone_template_id") and args.get("roadmap_id")
+        and args.get("stage_id") and args.get("obligation_sequence")
+    ):
+        await _reply(
+            update,
+            "❌ Укажи caller_idempotency_key, либо полностью commercial_milestone_template_id+"
+            "roadmap_id+stage_id+obligation_sequence.", parse_mode=None)
+        return
+
+    try:
+        from business_core.business_builder import create_payment_obligation
+
+        result = create_payment_obligation(
+            business_id, client_id, amount, currency,
+            object_id=args.get("object_id", ""), service_id=args.get("service_id", ""),
+            roadmap_id=args.get("roadmap_id", ""), stage_id=args.get("stage_id", ""),
+            commercial_milestone_template_id=args.get("commercial_milestone_template_id", ""),
+            caller_idempotency_key=args.get("caller_idempotency_key", ""),
+            title=args.get("title", ""), description=args.get("description", ""),
+            due_date=args.get("due_date", ""),
+            created_by=args.get("created_by", "") or _telegram_username(update),
+            notes=args.get("notes", ""), obligation_sequence=args.get("obligation_sequence", ""),
+        )
+        await _reply(update, _payment_obligation_creation_message(result), parse_mode=None)
+    except Exception as e:
+        log.error(f"newobligation_cmd error: {e}")
+        await _reply(update, "❌ Не удалось создать Payment Obligation.", parse_mode=None)
+
+
+async def obligations_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /obligations [business_id=...] [client_id=...] [object_id=...] [service_id=...]
+                 [roadmap_id=...] [stage_id=...] [commercial_milestone_template_id=...]
+                 [status=...] [currency=...]
+
+    Read-only, bounded, filtered list of Payment Obligations. Never
+    shows Notes.
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg(), parse_mode=None)
+        return
+
+    raw = " ".join(context.args or [])
+    args = _parse_kv_args(raw)
+
+    try:
+        from business_core.payment_manager import list_payment_obligations
+
+        obligations = list_payment_obligations(business_id=args.get("business_id", ""), status=args.get("status", ""))
+        for key, field in (
+            ("client_id", "Client ID"), ("object_id", "Object ID"), ("service_id", "Service ID"),
+            ("roadmap_id", "Roadmap ID"), ("stage_id", "Stage ID"),
+            ("commercial_milestone_template_id", "Commercial Milestone Template ID"),
+            ("currency", "Currency"),
+        ):
+            if args.get(key):
+                obligations = [o for o in obligations if o.get(field, "") == args[key]]
+
+        if not obligations:
+            await _reply(update, "ℹ️ Payment Obligations не найдены.", parse_mode=None)
+            return
+
+        lines = [f"💰 Payment Obligations ({len(obligations)})", ""]
+        for o in obligations[:_PAYMENT_LIST_MAX_SHOWN]:
+            lines.append(
+                f"{o.get('Payment Obligation ID', '')} — {o.get('Title Snapshot', '') or '—'} "
+                f"[{_payment_obligation_status_ru(o.get('Status', ''))}] "
+                f"{_format_payment_amount(o.get('Paid Amount', ''), o.get('Currency', ''))}/"
+                f"{_format_payment_amount(o.get('Obligation Amount', ''), '')} "
+                f"Client: {o.get('Client ID', '')}"
+            )
+        if len(obligations) > _PAYMENT_LIST_MAX_SHOWN:
+            lines.append(f"\n… показаны первые {_PAYMENT_LIST_MAX_SHOWN} из {len(obligations)}.")
+
+        await _reply(update, "\n".join(lines), parse_mode=None)
+    except Exception as e:
+        log.error(f"obligations_cmd error: {e}")
+        await _reply(update, "❌ Не удалось получить список Payment Obligations.", parse_mode=None)
+
+
+_OBLIGATION_TRANSACTIONS_MAX_SHOWN = 20
+
+
+async def obligation_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /obligation payment_obligation_id=POB-001
+
+    Read-only, exact-ID detail + bounded Transaction summary. Hides
+    Notes, Payment Method, External Transaction ID, and Evidence
+    Document content.
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg(), parse_mode=None)
+        return
+
+    raw = " ".join(context.args or [])
+    args = _parse_kv_args(raw)
+    obligation_id = args.get("payment_obligation_id") or args.get("_pos0", "")
+
+    if not obligation_id:
+        await _reply(update, "❌ Укажи payment_obligation_id.\n\nПример: /obligation payment_obligation_id=POB-001", parse_mode=None)
+        return
+
+    try:
+        from business_core.payment_manager import find_payment_obligation_by_id, list_payment_transactions
+
+        obligation = find_payment_obligation_by_id(obligation_id)
+        if obligation is None:
+            await _reply(update, f"❌ Payment Obligation {obligation_id} не найден.", parse_mode=None)
+            return
+
+        transactions = list_payment_transactions(payment_obligation_id=obligation_id)
+        currency = obligation.get("Currency", "")
+
+        lines = [
+            f"💰 Payment Obligation {obligation.get('Payment Obligation ID', '')}",
+            "",
+            f"Название: {obligation.get('Title Snapshot', '') or '—'}",
+            f"Client: {obligation.get('Client ID', '')}",
+            f"Сумма: {_format_payment_amount(obligation.get('Obligation Amount', ''), currency)}",
+            f"Оплачено: {_format_payment_amount(obligation.get('Paid Amount', ''), currency)}",
+            f"Остаток: {_format_payment_amount(obligation.get('Remaining Amount', ''), currency)}",
+            f"Статус: {_payment_obligation_status_ru(obligation.get('Status', ''))}",
+            f"Due Date: {obligation.get('Due Date', '') or '—'}",
+            f"Roadmap: {obligation.get('Roadmap ID', '') or '—'}",
+            f"Stage: {obligation.get('Stage ID', '') or '—'}",
+            f"Template: {obligation.get('Commercial Milestone Template ID', '') or '—'}",
+            "",
+            f"Payments: {len(transactions)}",
+        ]
+        for t in transactions[:_OBLIGATION_TRANSACTIONS_MAX_SHOWN]:
+            lines.append(
+                f"  {t.get('Payment Transaction ID', '')} "
+                f"[{_payment_transaction_status_ru(t.get('Status', ''))}] "
+                f"{_format_payment_amount(t.get('Amount', ''), t.get('Currency', ''))} "
+                f"({t.get('Payment Date', '')})"
+            )
+        if len(transactions) > _OBLIGATION_TRANSACTIONS_MAX_SHOWN:
+            lines.append(f"  … показаны первые {_OBLIGATION_TRANSACTIONS_MAX_SHOWN} из {len(transactions)}.")
+
+        await _reply(update, "\n".join(lines), parse_mode=None)
+    except Exception as e:
+        log.error(f"obligation_cmd error: {e}")
+        await _reply(update, "❌ Не удалось получить Payment Obligation.", parse_mode=None)
+
+
+async def updateobligation_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /updateobligation payment_obligation_id=POB-001 status=issued
+    /updateobligation payment_obligation_id=POB-001 notes=...
+
+    Status and Notes are never mixed in one call.
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg(), parse_mode=None)
+        return
+
+    raw = " ".join(context.args or [])
+    args = _parse_kv_args(raw)
+    obligation_id = args.get("payment_obligation_id", "")
+
+    if not obligation_id:
+        await _reply(
+            update,
+            "❌ Укажи payment_obligation_id.\n\nПример:\n"
+            "`/updateobligation payment_obligation_id=POB-001 status=issued`\n"
+            "`/updateobligation payment_obligation_id=POB-001 notes=...`", parse_mode=None)
+        return
+
+    has_status = "status" in args
+    has_notes = "notes" in args
+
+    if has_status and has_notes:
+        await _reply(
+            update,
+            "❌ Нельзя одновременно менять статус и Notes.\n"
+            "Отправь две отдельные команды:\n"
+            "`/updateobligation payment_obligation_id=... status=...`\n"
+            "`/updateobligation payment_obligation_id=... notes=...`", parse_mode=None)
+        return
+
+    if not has_status and not has_notes:
+        await _reply(update, "❌ Укажи либо status=..., либо notes=....", parse_mode=None)
+        return
+
+    try:
+        if has_status:
+            from business_core.business_builder import transition_payment_obligation_status
+            result = transition_payment_obligation_status(obligation_id, args["status"])
+            await _reply(update, _payment_obligation_status_message(result, obligation_id), parse_mode=None)
+            return
+
+        from business_core.business_builder import update_payment_obligation_admin_fields
+        result = update_payment_obligation_admin_fields(obligation_id, {"Notes": args["notes"]})
+        await _reply(update, _payment_obligation_admin_message(result, obligation_id), parse_mode=None)
+    except Exception as e:
+        log.error(f"updateobligation_cmd error: {e}")
+        await _reply(update, "❌ Не удалось обновить Payment Obligation.", parse_mode=None)
+
+
+async def recordpayment_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /recordpayment business_id=BIZ-001 payment_obligation_id=POB-001 client_id=PRS-001
+                    amount=250000 currency=KZT payment_date=YYYY-MM-DD
+                    [external_transaction_id=...] [caller_idempotency_key=...]
+                    [payment_method=...] [evidence_document_id=DREG-...]
+                    [created_by=...] [notes=...]
+
+    Records one pending Payment Transaction. Never auto-confirms — use
+    /confirmpayment separately (ADR-022 §15/§20).
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg(), parse_mode=None)
+        return
+
+    raw = " ".join(context.args or [])
+    args = _parse_kv_args(raw)
+    business_id = args.get("business_id", "")
+    obligation_id = args.get("payment_obligation_id", "")
+    client_id = args.get("client_id", "")
+    amount = args.get("amount", "")
+    currency = args.get("currency", "")
+    payment_date = args.get("payment_date", "")
+
+    if not business_id or not obligation_id or not client_id or not amount or not currency or not payment_date:
+        await _reply(
+            update,
+            "❌ Укажи business_id, payment_obligation_id, client_id, amount, currency и payment_date.\n\n"
+            "Пример:\n`/recordpayment business_id=BIZ-001 payment_obligation_id=POB-001 client_id=PRS-001 "
+            "amount=250000 currency=KZT payment_date=2026-01-15 external_transaction_id=...`", parse_mode=None)
+        return
+
+    if not args.get("external_transaction_id") and not args.get("caller_idempotency_key"):
+        await _reply(update, "❌ Укажи external_transaction_id или caller_idempotency_key.", parse_mode=None)
+        return
+
+    try:
+        from business_core.business_builder import create_payment_transaction
+
+        result = create_payment_transaction(
+            business_id, obligation_id, client_id, amount, currency, payment_date,
+            payment_method=args.get("payment_method", ""),
+            external_transaction_id=args.get("external_transaction_id", ""),
+            caller_idempotency_key=args.get("caller_idempotency_key", ""),
+            evidence_document_id=args.get("evidence_document_id", ""),
+            created_by=args.get("created_by", "") or _telegram_username(update),
+            notes=args.get("notes", ""),
+        )
+        await _reply(update, _payment_transaction_creation_message(result), parse_mode=None)
+    except Exception as e:
+        log.error(f"recordpayment_cmd error: {e}")
+        await _reply(update, "❌ Не удалось записать Payment.", parse_mode=None)
+
+
+async def payments_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /payments [business_id=...] [payment_obligation_id=...] [client_id=...]
+              [status=...] [currency=...] [evidence_document_id=...]
+
+    Read-only, bounded, filtered list of Payment Transactions. Never
+    shows Notes, Payment Method, External Transaction ID, or Caller
+    Idempotency Key.
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg(), parse_mode=None)
+        return
+
+    raw = " ".join(context.args or [])
+    args = _parse_kv_args(raw)
+
+    try:
+        from business_core.payment_manager import list_payment_transactions
+
+        transactions = list_payment_transactions(
+            payment_obligation_id=args.get("payment_obligation_id", ""), status=args.get("status", ""),
+        )
+        for key, field in (
+            ("business_id", "Business ID"), ("client_id", "Client ID"),
+            ("currency", "Currency"), ("evidence_document_id", "Evidence Document ID"),
+        ):
+            if args.get(key):
+                transactions = [t for t in transactions if t.get(field, "") == args[key]]
+
+        if not transactions:
+            await _reply(update, "ℹ️ Payments не найдены.", parse_mode=None)
+            return
+
+        lines = [f"💰 Payments ({len(transactions)})", ""]
+        for t in transactions[:_PAYMENT_LIST_MAX_SHOWN]:
+            lines.append(
+                f"{t.get('Payment Transaction ID', '')} — Obligation: {t.get('Payment Obligation ID', '')} "
+                f"[{_payment_transaction_status_ru(t.get('Status', ''))}] "
+                f"{_format_payment_amount(t.get('Amount', ''), t.get('Currency', ''))} "
+                f"({t.get('Payment Date', '')})"
+            )
+        if len(transactions) > _PAYMENT_LIST_MAX_SHOWN:
+            lines.append(f"\n… показаны первые {_PAYMENT_LIST_MAX_SHOWN} из {len(transactions)}.")
+
+        await _reply(update, "\n".join(lines), parse_mode=None)
+    except Exception as e:
+        log.error(f"payments_cmd error: {e}")
+        await _reply(update, "❌ Не удалось получить список Payments.", parse_mode=None)
+
+
+async def payment_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /payment payment_transaction_id=PTXN-001
+
+    Read-only, exact-ID detail. Hides External Transaction ID, Caller
+    Idempotency Key, Notes, Payment Method, and Reversal Reason.
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg(), parse_mode=None)
+        return
+
+    raw = " ".join(context.args or [])
+    args = _parse_kv_args(raw)
+    transaction_id = args.get("payment_transaction_id") or args.get("_pos0", "")
+
+    if not transaction_id:
+        await _reply(update, "❌ Укажи payment_transaction_id.\n\nПример: /payment payment_transaction_id=PTXN-001", parse_mode=None)
+        return
+
+    try:
+        from business_core.payment_manager import find_payment_transaction_by_id
+
+        txn = find_payment_transaction_by_id(transaction_id)
+        if txn is None:
+            await _reply(update, f"❌ Payment {transaction_id} не найден.", parse_mode=None)
+            return
+
+        lines = [
+            f"💰 Payment {txn.get('Payment Transaction ID', '')}",
+            "",
+            f"Obligation: {txn.get('Payment Obligation ID', '')}",
+            f"Client: {txn.get('Client ID', '')}",
+            f"Сумма: {_format_payment_amount(txn.get('Amount', ''), txn.get('Currency', ''))}",
+            f"Дата платежа: {txn.get('Payment Date', '')}",
+            f"Статус: {_payment_transaction_status_ru(txn.get('Status', ''))}",
+        ]
+        if txn.get("Evidence Document ID"):
+            lines.append(f"Evidence Document: {txn['Evidence Document ID']}")
+        if txn.get("Confirmed At"):
+            lines.append(f"Подтверждён: {txn['Confirmed At']}")
+        if txn.get("Reversed At"):
+            lines.append(f"Реверснут: {txn['Reversed At']}")
+
+        await _reply(update, "\n".join(lines), parse_mode=None)
+    except Exception as e:
+        log.error(f"payment_cmd error: {e}")
+        await _reply(update, "❌ Не удалось получить Payment.", parse_mode=None)
+
+
+async def confirmpayment_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /confirmpayment payment_transaction_id=PTXN-001 confirmed_by=...
+
+    Confirms one pending Payment Transaction. Synchronizes the parent
+    Obligation's balance/status automatically (ADR-022 §20).
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg(), parse_mode=None)
+        return
+
+    raw = " ".join(context.args or [])
+    args = _parse_kv_args(raw)
+    transaction_id = args.get("payment_transaction_id", "")
+    confirmed_by = args.get("confirmed_by", "") or _telegram_username(update)
+
+    if not transaction_id or not confirmed_by:
+        await _reply(
+            update,
+            "❌ Укажи payment_transaction_id и confirmed_by.\n\nПример:\n"
+            "`/confirmpayment payment_transaction_id=PTXN-001 confirmed_by=...`", parse_mode=None)
+        return
+
+    try:
+        from business_core.business_builder import confirm_payment_transaction
+
+        result = confirm_payment_transaction(transaction_id, confirmed_by)
+        await _reply(update, _payment_transaction_confirmation_message(result, transaction_id), parse_mode=None)
+    except Exception as e:
+        log.error(f"confirmpayment_cmd error: {e}")
+        await _reply(update, "❌ Не удалось подтвердить Payment.", parse_mode=None)
+
+
+async def reversepayment_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /reversepayment payment_transaction_id=PTXN-001 reversal_reason=... reversed_by=...
+
+    Reverses one confirmed Payment Transaction — status-based, on the
+    original row (ADR-022 §13/§19). Never logs reversal_reason verbatim.
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg(), parse_mode=None)
+        return
+
+    raw = " ".join(context.args or [])
+    args = _parse_kv_args(raw)
+    transaction_id = args.get("payment_transaction_id", "")
+    reversal_reason = args.get("reversal_reason", "")
+    reversed_by = args.get("reversed_by", "") or _telegram_username(update)
+
+    if not transaction_id or not reversal_reason or not reversed_by:
+        await _reply(
+            update,
+            "❌ Укажи payment_transaction_id, reversal_reason и reversed_by.\n\nПример:\n"
+            "`/reversepayment payment_transaction_id=PTXN-001 reversal_reason=... reversed_by=...`", parse_mode=None)
+        return
+
+    try:
+        from business_core.business_builder import reverse_payment_transaction
+
+        result = reverse_payment_transaction(transaction_id, reversal_reason, reversed_by)
+        await _reply(update, _payment_transaction_reversal_message(result, transaction_id), parse_mode=None)
+    except Exception as e:
+        log.error(f"reversepayment_cmd error: {e}")
+        await _reply(update, "❌ Не удалось реверснуть Payment.", parse_mode=None)
+
+
+async def failpayment_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /failpayment payment_transaction_id=PTXN-001
+
+    Marks one pending Payment Transaction as failed — never affects
+    Obligation balance.
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg(), parse_mode=None)
+        return
+
+    raw = " ".join(context.args or [])
+    args = _parse_kv_args(raw)
+    transaction_id = args.get("payment_transaction_id") or args.get("_pos0", "")
+
+    if not transaction_id:
+        await _reply(update, "❌ Укажи payment_transaction_id.\n\nПример: /failpayment payment_transaction_id=PTXN-001", parse_mode=None)
+        return
+
+    try:
+        from business_core.business_builder import fail_payment_transaction
+
+        result = fail_payment_transaction(transaction_id)
+        await _reply(update, _payment_transaction_failure_message(result, transaction_id), parse_mode=None)
+    except Exception as e:
+        log.error(f"failpayment_cmd error: {e}")
+        await _reply(update, "❌ Не удалось обновить статус Payment.", parse_mode=None)
+
+
 async def milestones_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     /milestones roadmap_id=RM-022
@@ -8279,6 +9495,21 @@ def register_business_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("checklist",        checklist_cmd))
     app.add_handler(CommandHandler("updatecheckitem",  updatecheckitem_cmd))
     app.add_handler(CommandHandler("updatechecklist",  updatechecklist_cmd))
+    # Phase 39D (ADR-022): Payment/Milestone Domain — operational commands.
+    app.add_handler(CommandHandler("newpaymenttemplate",     newpaymenttemplate_cmd))
+    app.add_handler(CommandHandler("paymenttemplates",       paymenttemplates_cmd))
+    app.add_handler(CommandHandler("paymenttemplate",        paymenttemplate_cmd))
+    app.add_handler(CommandHandler("updatepaymenttemplate",  updatepaymenttemplate_cmd))
+    app.add_handler(CommandHandler("newobligation",          newobligation_cmd))
+    app.add_handler(CommandHandler("obligations",            obligations_cmd))
+    app.add_handler(CommandHandler("obligation",             obligation_cmd))
+    app.add_handler(CommandHandler("updateobligation",       updateobligation_cmd))
+    app.add_handler(CommandHandler("recordpayment",          recordpayment_cmd))
+    app.add_handler(CommandHandler("payments",               payments_cmd))
+    app.add_handler(CommandHandler("payment",                payment_cmd))
+    app.add_handler(CommandHandler("confirmpayment",         confirmpayment_cmd))
+    app.add_handler(CommandHandler("reversepayment",         reversepayment_cmd))
+    app.add_handler(CommandHandler("failpayment",            failpayment_cmd))
     # Phase 8D
     app.add_handler(CommandHandler("milestones",       milestones_cmd))
     # Phase 11B

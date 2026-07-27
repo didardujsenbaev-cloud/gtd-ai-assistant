@@ -407,20 +407,268 @@ class TestPaymentTestsHaveHardSocketBlock(unittest.TestCase):
             self.assertIn(filename, conftest_src, f"{filename} must be registered in conftest.py's hard socket-block set")
 
 
-class TestNoTelegramCallerYet(unittest.TestCase):
-    """Phase 39C is Foundation-only — no Telegram command may exist for
-    Payment yet (that's Phase 39D's scope)."""
+# ─────────────────────────────────────────────────────────────
+# Phase 39D (ADR-022 §18-§26): Payment caller (Telegram) architecture
+# guards. Mirrors the Phase 38D Checklist caller guard pattern exactly.
+# ─────────────────────────────────────────────────────────────
 
-    def test_no_payment_commands_registered(self):
+_PAYMENT_COMMANDS = (
+    "newpaymenttemplate_cmd", "paymenttemplates_cmd", "paymenttemplate_cmd", "updatepaymenttemplate_cmd",
+    "newobligation_cmd", "obligations_cmd", "obligation_cmd", "updateobligation_cmd",
+    "recordpayment_cmd", "payments_cmd", "payment_cmd",
+    "confirmpayment_cmd", "reversepayment_cmd", "failpayment_cmd",
+)
+
+
+def _th_function_body(fn_name: str) -> str:
+    return _function_body(BUSINESS_CORE / "telegram_handlers.py", fn_name)
+
+
+class TestPaymentCommandsCallOnlyCanonicalOrchestration(unittest.TestCase):
+
+    def test_no_low_level_payment_manager_write_calls_in_mutating_commands(self):
+        forbidden = (
+            "payment_manager.create_commercial_milestone_template(", "payment_manager.create_payment_obligation(",
+            "payment_manager.create_payment_transaction(", "payment_manager.update_payment_transaction_status(",
+            "payment_manager.update_payment_obligation_status(", "payment_manager.update_payment_obligation_balance(",
+        )
+        for fn_name in (
+            "newpaymenttemplate_cmd", "updatepaymenttemplate_cmd", "newobligation_cmd", "updateobligation_cmd",
+            "recordpayment_cmd", "confirmpayment_cmd", "reversepayment_cmd", "failpayment_cmd",
+        ):
+            body = _th_function_body(fn_name)
+            for call in forbidden:
+                self.assertNotIn(call, body, f"{fn_name} must not call low-level {call.rstrip('(')} directly")
+
+    def test_mutating_commands_call_business_builder_only(self):
+        expectations = {
+            "newpaymenttemplate_cmd": "create_commercial_milestone_template(",
+            "newobligation_cmd": "create_payment_obligation(",
+            "recordpayment_cmd": "create_payment_transaction(",
+            "confirmpayment_cmd": "confirm_payment_transaction(",
+            "reversepayment_cmd": "reverse_payment_transaction(",
+            "failpayment_cmd": "fail_payment_transaction(",
+        }
+        for fn_name, call in expectations.items():
+            body = _th_function_body(fn_name)
+            self.assertIn(call, body, f"{fn_name} must call business_builder.{call.rstrip('(')}")
+
+    def test_read_commands_call_exact_payment_manager_helpers_only(self):
+        expectations = {
+            "paymenttemplates_cmd": "list_commercial_milestone_templates(",
+            "paymenttemplate_cmd": "find_commercial_milestone_template_by_id(",
+            "obligations_cmd": "list_payment_obligations(",
+            "obligation_cmd": "find_payment_obligation_by_id(",
+            "payments_cmd": "list_payment_transactions(",
+            "payment_cmd": "find_payment_transaction_by_id(",
+        }
+        for fn_name, call in expectations.items():
+            body = _th_function_body(fn_name)
+            self.assertIn(call, body)
+            for forbidden in (
+                "create_commercial_milestone_template(", "create_payment_obligation(", "create_payment_transaction(",
+                "confirm_payment_transaction(", "reverse_payment_transaction(", "fail_payment_transaction(",
+            ):
+                self.assertNotIn(forbidden, body, f"{fn_name} is read-only and must not call {forbidden.rstrip('(')}")
+
+
+class TestNoCallerSidePaymentPolicy(unittest.TestCase):
+
+    def test_no_caller_side_id_generation(self):
+        for fn_name in _PAYMENT_COMMANDS:
+            body = _th_function_body(fn_name)
+            self.assertNotIn('"PMT-"', body)
+            self.assertNotIn('"POB-"', body)
+            self.assertNotIn('"PTXN-"', body)
+            self.assertNotIn("generate_next_id(", body)
+            self.assertNotIn("generate_next_ids(", body)
+
+    def test_no_caller_side_amount_normalization(self):
+        for fn_name in _PAYMENT_COMMANDS:
+            body = _th_function_body(fn_name)
+            self.assertNotIn("Decimal(", body)
+            self.assertNotIn("normalize_payment_amount(", body)
+            self.assertNotIn("normalize_payment_currency(", body)
+
+    def test_no_caller_side_balance_or_overpayment_policy(self):
+        for fn_name in _PAYMENT_COMMANDS:
+            body = _th_function_body(fn_name)
+            self.assertNotIn("_compute_payment_balance(", body)
+            self.assertNotIn("_synchronize_payment_obligation_after_transaction_change(", body)
+
+    def test_no_caller_side_idempotency_lookup(self):
+        for fn_name in _PAYMENT_COMMANDS:
+            body = _th_function_body(fn_name)
+            for forbidden in (
+                "find_obligations_by_caller_key(", "find_obligations_by_template_fallback_key(",
+                "find_transactions_by_external_id(", "find_transactions_by_caller_key(",
+                "find_templates_by_identity(",
+            ):
+                self.assertNotIn(forbidden, body)
+
+    def test_no_caller_side_relation_derivation(self):
+        for fn_name in _PAYMENT_COMMANDS:
+            body = _th_function_body(fn_name)
+            self.assertNotIn("_validate_payment_obligation_relations(", body)
+            self.assertNotIn("read_business_sheet(", body)
+
+    def test_no_caller_side_transition_matrix(self):
+        for fn_name in _PAYMENT_COMMANDS:
+            body = _th_function_body(fn_name)
+            self.assertNotIn("_PAYMENT_OBLIGATION_ORDINARY_TRANSITIONS", body)
+            self.assertNotIn("_PAYMENT_TRANSACTION_ORDINARY_TRANSITIONS", body)
+            self.assertNotIn("_COMMERCIAL_MILESTONE_TEMPLATE_ORDINARY_TRANSITIONS", body)
+
+    def test_no_task_document_stage_roadmap_checklist_mutation_calls(self):
+        for fn_name in _PAYMENT_COMMANDS:
+            body = _th_function_body(fn_name)
+            for forbidden in (
+                "create_business_task(", "transition_task_status(",
+                "register_document(", "transition_document_status(",
+                "instantiate_checklist(", "transition_checklist_status(",
+                "update_stage_status_in_sheet(", "recalculate_roadmap_progress(",
+            ):
+                self.assertNotIn(forbidden, body, f"{fn_name} must not mutate Task/Document/Checklist/Stage/Roadmap ({forbidden!r} found)")
+
+
+class TestPaymentCommandRegistration(unittest.TestCase):
+
+    def test_all_14_commands_registered_exactly_once(self):
         path = BUSINESS_CORE / "telegram_handlers.py"
         src = path.read_text(encoding="utf-8")
-        for forbidden in ("newmilestone", "confirmpayment", "reversepayment", "payobligation"):
-            self.assertNotIn(f'CommandHandler("{forbidden}"', src)
+        for name in (
+            "newpaymenttemplate", "paymenttemplates", "paymenttemplate", "updatepaymenttemplate",
+            "newobligation", "obligations", "obligation", "updateobligation",
+            "recordpayment", "payments", "payment", "confirmpayment", "reversepayment", "failpayment",
+        ):
+            self.assertEqual(src.count(f'CommandHandler("{name}"'), 1, f"/{name} must be registered exactly once")
 
-    def test_telegram_handlers_does_not_import_payment_manager(self):
+    def test_milestones_still_registered_exactly_once(self):
         path = BUSINESS_CORE / "telegram_handlers.py"
-        found = _imported_module_names(path) & {"payment_manager"}
-        self.assertEqual(found, set())
+        src = path.read_text(encoding="utf-8")
+        self.assertEqual(src.count('CommandHandler("milestones"'), 1)
+
+    def test_no_bctasks_collision(self):
+        path = BUSINESS_CORE / "telegram_handlers.py"
+        src = path.read_text(encoding="utf-8")
+        payment_names = {
+            "newpaymenttemplate", "paymenttemplates", "paymenttemplate", "updatepaymenttemplate",
+            "newobligation", "obligations", "obligation", "updateobligation",
+            "recordpayment", "payments", "payment", "confirmpayment", "reversepayment", "failpayment",
+        }
+        task_names = {"newbctask", "bctasks", "bctask", "updatetask", "assigntask", "reassigntask", "unassigntask"}
+        self.assertEqual(payment_names & task_names, set())
+
+
+class TestPaymentUxHelpersDefinedOnce(unittest.TestCase):
+
+    def test_helpers_defined_exactly_once(self):
+        path = BUSINESS_CORE / "telegram_handlers.py"
+        src = path.read_text(encoding="utf-8")
+        for fn in (
+            "_payment_template_creation_message", "_payment_template_status_message", "_payment_template_admin_message",
+            "_payment_obligation_creation_message", "_payment_obligation_status_message", "_payment_obligation_admin_message",
+            "_payment_transaction_creation_message", "_payment_transaction_confirmation_message",
+            "_payment_transaction_reversal_message", "_payment_transaction_failure_message",
+            "_payment_template_status_ru", "_payment_obligation_status_ru", "_payment_transaction_status_ru",
+            "_payment_calculation_type_ru", "_format_payment_amount",
+        ):
+            self.assertEqual(src.count(f"def {fn}("), 1, f"{fn} must be defined exactly once")
+
+    def test_helpers_are_callable(self):
+        import business_core.telegram_handlers as th
+        for fn in (
+            "_payment_template_creation_message", "_payment_obligation_creation_message",
+            "_payment_transaction_creation_message", "_payment_transaction_confirmation_message",
+            "_payment_transaction_reversal_message", "_payment_transaction_failure_message",
+        ):
+            self.assertTrue(callable(getattr(th, fn, None)))
+
+
+class TestNoSensitivePaymentFieldsLogged(unittest.TestCase):
+
+    _DISALLOWED_LOG_TOKENS = (
+        "Notes", "External Transaction ID", "Caller Idempotency Key", "Reversal Reason",
+        "Payment Method", "update.message.text",
+    )
+
+    def test_payment_handlers_do_not_log_disallowed_fields(self):
+        for fn_name in _PAYMENT_COMMANDS:
+            body = _th_function_body(fn_name)
+            log_lines = [line for line in body.splitlines() if "log.error(" in line or "log.warning(" in line or "log.info(" in line]
+            for line in log_lines:
+                for token in self._DISALLOWED_LOG_TOKENS:
+                    self.assertNotIn(token, line, f"{fn_name} logs disallowed token {token!r}: {line}")
+
+
+class TestNoRawExceptionInPaymentCommands(unittest.TestCase):
+
+    def test_no_raw_exception_interpolation(self):
+        for fn_name in _PAYMENT_COMMANDS:
+            body = _th_function_body(fn_name)
+            self.assertNotIn("Ошибка: {e}", body)
+            self.assertNotIn("str(e)", body)
+
+
+class TestPaymentParserValidationOrdering(unittest.TestCase):
+    """Insufficient arguments must return before any orchestration call
+    — verified structurally: the orchestration import/call must appear
+    strictly after the required-argument early-return in source order."""
+
+    def test_newpaymenttemplate_validates_before_orchestration(self):
+        body = _th_function_body("newpaymenttemplate_cmd")
+        validation_idx = body.index("if not title or not calculation_type or not currency")
+        orchestration_idx = body.index("create_commercial_milestone_template(")
+        self.assertLess(validation_idx, orchestration_idx)
+
+    def test_newobligation_validates_before_orchestration(self):
+        body = _th_function_body("newobligation_cmd")
+        validation_idx = body.index("if not business_id or not client_id or not amount or not currency")
+        orchestration_idx = body.index("create_payment_obligation(")
+        self.assertLess(validation_idx, orchestration_idx)
+
+    def test_recordpayment_validates_before_orchestration(self):
+        body = _th_function_body("recordpayment_cmd")
+        validation_idx = body.index("if not business_id or not obligation_id or not client_id")
+        orchestration_idx = body.index("create_payment_transaction(")
+        self.assertLess(validation_idx, orchestration_idx)
+
+    def test_confirmpayment_validates_before_orchestration(self):
+        body = _th_function_body("confirmpayment_cmd")
+        validation_idx = body.index("if not transaction_id or not confirmed_by")
+        orchestration_idx = body.index("confirm_payment_transaction(")
+        self.assertLess(validation_idx, orchestration_idx)
+
+    def test_reversepayment_validates_before_orchestration(self):
+        body = _th_function_body("reversepayment_cmd")
+        validation_idx = body.index("if not transaction_id or not reversal_reason or not reversed_by")
+        orchestration_idx = body.index("reverse_payment_transaction(")
+        self.assertLess(validation_idx, orchestration_idx)
+
+    def test_failpayment_validates_before_orchestration(self):
+        body = _th_function_body("failpayment_cmd")
+        validation_idx = body.index("if not transaction_id")
+        orchestration_idx = body.index("fail_payment_transaction(")
+        self.assertLess(validation_idx, orchestration_idx)
+
+
+class TestPaymentParseModeIsNone(unittest.TestCase):
+
+    def test_all_payment_commands_pass_parse_mode_none(self):
+        for fn_name in _PAYMENT_COMMANDS:
+            body = _th_function_body(fn_name)
+            reply_calls = body.count("_reply(update,")
+            parse_none_calls = body.count("parse_mode=None")
+            self.assertGreaterEqual(parse_none_calls, reply_calls, f"{fn_name}: not every _reply call passes parse_mode=None")
+
+
+class TestMilestonesCommandUntouchedByCallerPhase(unittest.TestCase):
+
+    def test_milestones_body_unchanged_shape(self):
+        body = _th_function_body("milestones_cmd")
+        self.assertIn("get_commercial_milestones_for_roadmap", body)
+        self.assertNotIn("payment_manager", body)
+        self.assertNotIn("create_payment_obligation", body)
 
 
 if __name__ == "__main__":
