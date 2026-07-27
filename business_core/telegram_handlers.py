@@ -6864,6 +6864,644 @@ async def sop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # ─────────────────────────────────────────────────────────────
+# Phase A: Stage Output Foundation — Required Output.
+#
+# Template layer (STAGE_OUTPUT_TEMPLATES, business_core.stage_output_manager)
+# + Instance layer (STAGE_OUTPUT_INSTANCES) — mirrors the Checklist Template/
+# Instance split. /newoutput creates a Template; /linkoutput links it to a
+# Template Stage via STAGE_ENTITY_RELATIONS Entity Type="required_output";
+# /syncoutputs retroactively creates Output Instances for an already-live
+# Stage. Required Output does NOT replace Document/Checklist/SOP/Milestone
+# and does NOT participate in any Stage Completion Gate in this phase — see
+# business_builder.sync_stage_output_requirements()'s docstring.
+# ─────────────────────────────────────────────────────────────
+
+async def newoutput_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /newoutput biz_id=BIZ-001 service_id=SVC-001 template_id=RMT-... template_stage_id=TSTG-029
+               title="Подписанный договор с клиентом" description="..."
+               output_type=document verification_method="Проверить наличие подписанного обеими сторонами договора"
+               related_document_template_id=DOC-001 related_checklist_id=CHK-001
+               required=true blocking=true status=active notes="..."
+
+    biz_id/title/output_type обязательны. output_type ∈ document/approval/
+    decision/communication/system_record/payment/physical_result/
+    external_status/other. required=/blocking= сохраняются как
+    Default Required/Default Blocking шаблона (используются /linkoutput'ом
+    как fallback, если сам /linkoutput их не указал явно).
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg())
+        return
+    raw = " ".join(context.args or [])
+    args = _parse_kv_args(raw)
+    biz_id = args.get("biz_id", "")
+    title = args.get("title") or args.get("_pos0", "")
+    output_type = args.get("output_type", "")
+
+    if not biz_id or not title or not output_type:
+        await _reply(update,
+            "❌ Укажи biz_id, title и output_type.\n\nПример:\n"
+            '`/newoutput biz_id=BIZ-001 template_stage_id=TSTG-029 '
+            'title="Подписанный договор с клиентом" output_type=document '
+            'verification_method="Проверить наличие подписанного обеими сторонами договора" '
+            'required=true blocking=true`'
+        )
+        return
+
+    try:
+        from business_core.stage_output_manager import create_output_template
+
+        result = create_output_template(
+            biz_id=biz_id, title=title, output_type=output_type,
+            service_id=args.get("service_id", ""),
+            template_id=args.get("template_id", ""),
+            template_stage_id=args.get("template_stage_id", ""),
+            description=args.get("description", ""),
+            verification_method=args.get("verification_method", ""),
+            related_document_template_id=args.get("related_document_template_id", ""),
+            related_checklist_id=args.get("related_checklist_id", ""),
+            default_required=args.get("required", "true"),
+            default_blocking=args.get("blocking", "true"),
+            status=args.get("status", "active"),
+            notes=args.get("notes", ""),
+        )
+        if not result["ok"]:
+            await _reply(update, f"❌ Ошибка: {result['error']}")
+            return
+
+        output_template_id = result["output_template_id"]
+        lines = [
+            "✅ *Output Template создан*\n",
+            f"Output Template ID: `{output_template_id}`",
+            f"Название: {title}",
+            f"Тип: {output_type}",
+        ]
+        template_stage_id = args.get("template_stage_id", "")
+        if template_stage_id:
+            lines.append(f"Template Stage: `{template_stage_id}`")
+            lines.append(
+                f"\nПривязать: `/linkoutput template_stage_id={template_stage_id} "
+                f"output_ids={output_template_id}`"
+            )
+        await _reply(update, "\n".join(lines))
+    except Exception as e:
+        log.error(f"newoutput_cmd error: {e}")
+        await _reply(update, "❌ Не удалось создать Output Template.")
+
+
+async def linkoutput_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /linkoutput template_stage_id=TSTG-029 output_ids=SOUT-001,SOUT-002 [required=true] [blocking=true]
+
+    Связывает Output Template(ы) с Template Stage через
+    STAGE_ENTITY_RELATIONS (Entity Type="required_output") — relation
+    остаётся на уровне Template Stage, никогда не копируется на живой
+    Stage (для этого есть /syncoutputs). Отдельная команда, НЕ расширение
+    /linkknowledge — required_output не имеет legacy comma-list колонки,
+    поэтому не вписывается в архитектуру /linkknowledge, которая пишет
+    именно в такие колонки.
+
+    Если required=/blocking= не переданы — для каждого output_id
+    подставляется его собственный Default Required/Default Blocking из
+    Output Template (у разных outputs могут быть разные дефолты). Если
+    переданы явно — применяются одинаково ко ВСЕМ перечисленным outputs.
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg())
+        return
+    raw = " ".join(context.args or [])
+    args = _parse_kv_args(raw)
+    template_stage_id = args.get("template_stage_id") or args.get("_pos0", "")
+    if not template_stage_id:
+        await _reply(update,
+            "❌ Укажи template_stage_id.\n\nПример:\n"
+            "`/linkoutput template_stage_id=TSTG-029 output_ids=SOUT-001`"
+        )
+        return
+
+    output_ids = [x.strip() for x in (args.get("output_ids", "") or "").replace(";", ",").split(",") if x.strip()]
+    if not output_ids:
+        await _reply(update,
+            "❌ Укажи output_ids.\n\nПример:\n"
+            "`/linkoutput template_stage_id=TSTG-029 output_ids=SOUT-001,SOUT-002`"
+        )
+        return
+
+    explicit_required = args.get("required")
+    explicit_blocking = args.get("blocking")
+
+    try:
+        from business_core.stage_output_manager import find_output_template_by_id
+        from business_core.stage_entity_relations import create_required_output_relation_for_template_stage
+
+        not_found = []
+        # Каждый output_id может разрешиться в свою собственную (required,
+        # blocking) пару, если флаги не переданы явно — группируем по
+        # итоговой паре, т.к. примитив записи relation принимает ровно одну
+        # конкретную пару за вызов.
+        by_pair: dict[tuple[str, str], list[str]] = {}
+        for output_template_id in output_ids:
+            template = find_output_template_by_id(output_template_id)
+            if template is None:
+                not_found.append(output_template_id)
+                continue
+            resolved_required = (
+                explicit_required if explicit_required is not None
+                else template.get("Default Required", "true")
+            )
+            resolved_blocking = (
+                explicit_blocking if explicit_blocking is not None
+                else template.get("Default Blocking", "true")
+            )
+            by_pair.setdefault((resolved_required, resolved_blocking), []).append(output_template_id)
+
+        if not_found:
+            await _reply(update, f"❌ Не найдены Output Template: {', '.join(not_found)}")
+            return
+
+        created_ids: list[str] = []
+        error_texts: list[str] = []
+        for (required, blocking), ids in by_pair.items():
+            result = create_required_output_relation_for_template_stage(
+                template_stage_id, ids, required, blocking,
+            )
+            if not result.ok:
+                error_texts.append("; ".join(str(errs) for _, errs in result.errors))
+            else:
+                created_ids.extend(rec.get("Entity ID", "") for rec in result.created)
+
+        if error_texts:
+            await _reply(update, f"❌ Ошибка: {'; '.join(error_texts)}")
+            return
+
+        lines = ["✅ *Output привязан к Template Stage*\n", f"Template Stage: `{template_stage_id}`"]
+        if created_ids:
+            lines.append(f"Добавлено: {', '.join(created_ids)}")
+        else:
+            lines.append("Добавлено: ничего (уже было привязано).")
+        lines.append("\nСинхронизировать в live Stage: `/syncoutputs stage_id=... confirm=yes`")
+        await _reply(update, "\n".join(lines))
+    except Exception as e:
+        log.error(f"linkoutput_cmd error: {e}")
+        await _reply(update, "❌ Не удалось привязать Output.")
+
+
+_STAGE_OUTPUT_SYNC_NOTE = (
+    "Статус, ответственный, сроки, приоритет и прогресс этапа не изменятся. "
+    "ROADMAP_STAGES меняться не будет. Required Output не участвует в Stage "
+    "Completion Gate (Phase A)."
+)
+
+
+def _stage_output_sync_message(result: dict) -> str:
+    """Render any business_builder.sync_stage_output_requirements()
+    result — SOP/Document sync message counterpart, applied to
+    STAGE_OUTPUT_INSTANCES creation instead of a relation copy."""
+    code = result.get("code", "")
+    stage_id = result.get("stage_id", "")
+    template_stage_id = result.get("template_stage_id", "")
+
+    if code == "STAGE_OUTPUT_SYNCED":
+        created = result.get("created", ())
+        already_present = result.get("already_present", ())
+        skipped = result.get("skipped_inactive_templates", ())
+        lines = [
+            "✅ Синхронизация Required Output выполнена",
+            f"Stage ID: {stage_id}",
+            f"Template Stage ID: {template_stage_id}",
+        ]
+        if created:
+            lines.append(f"Добавлено: {', '.join(created)}")
+        else:
+            lines.append("Добавлено: ничего (уже было синхронизировано).")
+        if already_present:
+            lines.append(f"Уже было: {', '.join(already_present)}")
+        if skipped:
+            lines.append(f"Пропущено (неактивный Output Template): {', '.join(skipped)}")
+        lines.append(_STAGE_OUTPUT_SYNC_NOTE)
+        return "\n".join(lines)
+
+    if code == "NO_REQUIRED_OUTPUT_RELATIONS":
+        return f"❌ {result.get('error') or 'У Template Stage нет активных required_output relations.'}"
+
+    if code == "STAGE_OUTPUT_SYNC_FAILED":
+        return f"❌ {result.get('error') or 'Не удалось синхронизировать Required Output.'}"
+
+    # Shared resolution-failure codes (STAGE_NOT_FOUND/ROADMAP_NOT_FOUND/
+    # ROADMAP_HAS_NO_TEMPLATE/TEMPLATE_STAGE_NOT_FOUND) — resolve_template_
+    # stage_for_stage() is the same shared read used by document/SOP sync,
+    # so their rendering already covers these generically.
+    return _stage_knowledge_sync_message(result)
+
+
+def _stage_output_sync_preview_message(result: dict) -> str:
+    """Preview counterpart of _stage_output_sync_message()."""
+    if result.get("code") == "STAGE_OUTPUT_SYNC_PREVIEW":
+        to_add = result.get("to_add", ())
+        already_present = result.get("already_present", ())
+        skipped = result.get("skipped_inactive_templates", ())
+        lines = [
+            "📋 Подтверди синхронизацию Required Output:",
+            "",
+            f"Stage ID: {result.get('stage_id', '')}",
+            f"Template Stage ID: {result.get('template_stage_id', '')}",
+            "",
+        ]
+        if to_add:
+            lines.append(f"Будет добавлено: {', '.join(to_add)}")
+        else:
+            lines.append("Будет добавлено: ничего — уже полностью синхронизировано.")
+        if already_present:
+            lines.append(f"Уже привязано: {', '.join(already_present)}")
+        if skipped:
+            lines.append(f"Пропущено (неактивный Output Template): {', '.join(skipped)}")
+        lines.append("")
+        lines.append(_STAGE_OUTPUT_SYNC_NOTE)
+        lines.append("")
+        lines.append("Чтобы применить, повтори команду с confirm=yes.")
+        return "\n".join(lines)
+    return _stage_output_sync_message(result)
+
+
+async def syncoutputs_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /syncoutputs stage_id=STAGE-013
+    /syncoutputs stage_id=STAGE-013 confirm=yes
+
+    Retroactively creates Output Instances (STAGE_OUTPUT_INSTANCES) for an
+    already-live Stage from its Template Stage's active required_output
+    relations — separate command, NOT folded into /syncstageknowledge
+    (which combines document_template+sop only), so the already-tested
+    combined command stays untouched.
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg())
+        return
+    raw = " ".join(context.args or [])
+    args = _parse_kv_args(raw)
+    stage_id = args.get("stage_id") or args.get("_pos0", "")
+    if not stage_id:
+        await _reply(update, "❌ Укажи stage_id.\n\nПример: `/syncoutputs stage_id=STAGE-013`")
+        return
+
+    confirmed = args.get("confirm", "").strip().lower() == "yes"
+
+    try:
+        from business_core.business_builder import sync_stage_output_requirements
+
+        result = sync_stage_output_requirements(stage_id, confirm=confirmed)
+        text = (
+            _stage_output_sync_message(result) if confirmed
+            else _stage_output_sync_preview_message(result)
+        )
+        await _reply(update, text)
+    except Exception as e:
+        log.error(f"syncoutputs_cmd error: {e}")
+        await _reply(update, "❌ Не удалось синхронизировать Required Output.")
+
+
+_OUTPUT_STATUS_ICON = {
+    "pending": "⏳", "produced": "🔧", "submitted": "📤", "accepted": "✅",
+    "rejected": "❌", "waived": "🚫", "not_applicable": "➖",
+}
+
+
+def _render_output_instance_summary(instance: dict) -> str:
+    icon = _OUTPUT_STATUS_ICON.get(instance.get("Status", ""), "•")
+    has_evidence = "есть" if (instance.get("Evidence Value", "") or "").strip() else "нет"
+    return (
+        f"{icon} {instance.get('Output Instance ID', '')} — {instance.get('Title Snapshot', '')}\n"
+        f"   Тип: {instance.get('Output Type Snapshot', '')} | "
+        f"Required: {instance.get('Required', '')} | Blocking: {instance.get('Blocking', '')} | "
+        f"Статус: {instance.get('Status', '')} | Evidence: {has_evidence}"
+    )
+
+
+def _render_output_instance_full(instance: dict) -> list[str]:
+    """Full, untruncated field-by-field rendering of one
+    STAGE_OUTPUT_INSTANCES row — including every snapshot and every
+    submitted/accepted/rejected/waived audit field."""
+    lines = [
+        f"📦 Output Instance: {instance.get('Output Instance ID', '')}",
+        f"Output Template ID: {instance.get('Output Template ID', '')}",
+        f"Title: {instance.get('Title Snapshot', '') or '—'}",
+    ]
+    if instance.get("Description Snapshot"):
+        lines.append(f"Description: {instance['Description Snapshot']}")
+    lines.append(f"Output Type: {instance.get('Output Type Snapshot', '') or '—'}")
+    if instance.get("Verification Method Snapshot"):
+        lines.append(f"Verification Method: {instance['Verification Method Snapshot']}")
+    if instance.get("Related Document Template ID"):
+        lines.append(f"Related Document Template ID: {instance['Related Document Template ID']}")
+    if instance.get("Related Checklist ID"):
+        lines.append(f"Related Checklist ID: {instance['Related Checklist ID']}")
+    lines.append(f"Required: {instance.get('Required', '')} | Blocking: {instance.get('Blocking', '')}")
+    lines.append(f"Roadmap ID: {instance.get('Roadmap ID', '') or '—'} | Stage ID: {instance.get('Stage ID', '') or '—'}")
+    lines.append(f"Статус: {instance.get('Status', '')}")
+    if instance.get("Evidence Type") or instance.get("Evidence Value"):
+        lines.append(f"Evidence: {instance.get('Evidence Type', '')} = {instance.get('Evidence Value', '')}")
+    if instance.get("Submitted By") or instance.get("Submitted At"):
+        lines.append(f"Submitted By: {instance.get('Submitted By', '') or '—'} / At: {instance.get('Submitted At', '') or '—'}")
+    if instance.get("Accepted By") or instance.get("Accepted At"):
+        lines.append(f"Accepted By: {instance.get('Accepted By', '') or '—'} / At: {instance.get('Accepted At', '') or '—'}")
+    if instance.get("Rejected By") or instance.get("Rejected At"):
+        lines.append(f"Rejected By: {instance.get('Rejected By', '') or '—'} / At: {instance.get('Rejected At', '') or '—'}")
+        if instance.get("Rejection Reason"):
+            lines.append(f"Rejection Reason: {instance['Rejection Reason']}")
+    if instance.get("Waived By") or instance.get("Waived At"):
+        lines.append(f"Waived By: {instance.get('Waived By', '') or '—'} / At: {instance.get('Waived At', '') or '—'}")
+        if instance.get("Waiver Reason"):
+            lines.append(f"Waiver Reason: {instance['Waiver Reason']}")
+    if instance.get("Notes"):
+        lines.append(f"Notes: {instance['Notes']}")
+    return lines
+
+
+async def outputs_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /outputs stage_id=STAGE-013 — read-only список Output Instances этапа:
+    ID, title, type, required, blocking, status, наличие evidence.
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg(), parse_mode=None)
+        return
+    raw = " ".join(context.args or [])
+    args = _parse_kv_args(raw)
+    stage_id = args.get("stage_id") or args.get("_pos0", "")
+    if not stage_id:
+        await _reply(update, "❌ Укажи stage_id.\n\nПример: /outputs stage_id=STAGE-013", parse_mode=None)
+        return
+
+    try:
+        from business_core.stage_output_manager import list_output_instances_for_stage
+
+        instances = list_output_instances_for_stage(stage_id)
+        if not instances:
+            await _reply(
+                update,
+                f"У этапа {stage_id} нет Output Instances.\n\n"
+                f"Синхронизировать: /syncoutputs stage_id={stage_id} confirm=yes",
+                parse_mode=None,
+            )
+            return
+
+        lines = [f"📦 Outputs этапа {stage_id} ({len(instances)}):", ""]
+        for instance in instances:
+            lines.append(_render_output_instance_summary(instance))
+
+        text = "\n".join(lines)
+        for part in _split_message_by_lines(text):
+            await update.message.reply_text(part, parse_mode=None)
+    except Exception as e:
+        log.error(f"outputs_cmd error: {e}")
+        await _reply(update, "❌ Не удалось получить Outputs.", parse_mode=None)
+
+
+async def output_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /output output_instance_id=SOUTI-001 — read-only полная карточка:
+    snapshots, stage/roadmap, статус, evidence, submitted/accepted/
+    rejected/waived audit-поля. Без обрезки, безопасное разбиение длинных
+    сообщений, всегда parse_mode=None.
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg(), parse_mode=None)
+        return
+    raw = " ".join(context.args or [])
+    args = _parse_kv_args(raw)
+    output_instance_id = args.get("output_instance_id") or args.get("_pos0", "")
+    if not output_instance_id:
+        await _reply(update, "❌ Укажи output_instance_id.\n\nПример: /output output_instance_id=SOUTI-001", parse_mode=None)
+        return
+
+    try:
+        from business_core.stage_output_manager import find_output_instance_by_id
+
+        instance = find_output_instance_by_id(output_instance_id)
+        if instance is None:
+            await _reply(update, f"❌ Output Instance {output_instance_id} не найден.", parse_mode=None)
+            return
+
+        text = "\n".join(_render_output_instance_full(instance))
+        for part in _split_message_by_lines(text):
+            await update.message.reply_text(part, parse_mode=None)
+    except Exception as e:
+        log.error(f"output_cmd error: {e}")
+        await _reply(update, "❌ Не удалось получить Output.", parse_mode=None)
+
+
+def _output_lifecycle_message(result: dict, success_text: str) -> str:
+    """Shared result-code -> Russian message mapping for /updateoutput,
+    /submitoutput, /acceptoutput, /rejectoutput, /waiveoutput."""
+    if result.get("ok"):
+        return f"✅ {success_text}"
+    code = result.get("code", "")
+    error = result.get("error", "") or ""
+    if code == "OUTPUT_INSTANCE_NOT_FOUND":
+        return f"❌ {error or 'Output Instance не найден.'}"
+    if code == "INVALID_STATUS_TRANSITION":
+        return f"❌ Недопустимый переход статуса: {error}"
+    if code in ("EVIDENCE_TYPE_REQUIRED", "EVIDENCE_VALUE_REQUIRED",
+                "REJECTION_REASON_REQUIRED", "WAIVER_REASON_REQUIRED"):
+        return f"❌ {error}"
+    return f"❌ {error or 'Не удалось выполнить операцию.'}"
+
+
+async def updateoutput_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /updateoutput output_instance_id=SOUTI-001 status=produced
+    /updateoutput output_instance_id=SOUTI-001 status=not_applicable
+
+    Прямая установка статуса разрешена ТОЛЬКО для produced и
+    not_applicable (даёт доступность переходов pending→produced,
+    rejected→produced, pending→not_applicable). submitted/accepted/
+    rejected/waived требуют своих специализированных команд
+    (/submitoutput, /acceptoutput, /rejectoutput, /waiveoutput) — они
+    несут обязательный evidence/reason, которых /updateoutput не
+    собирает.
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg())
+        return
+    raw = " ".join(context.args or [])
+    args = _parse_kv_args(raw)
+    output_instance_id = args.get("output_instance_id") or args.get("_pos0", "")
+    status = args.get("status", "")
+
+    if not output_instance_id or not status:
+        await _reply(update,
+            "❌ Укажи output_instance_id и status.\n\nПример:\n"
+            "`/updateoutput output_instance_id=SOUTI-001 status=produced`"
+        )
+        return
+
+    if status not in ("produced", "not_applicable"):
+        await _reply(update,
+            "❌ /updateoutput разрешает только status=produced или status=not_applicable.\n\n"
+            "Для submitted/accepted/rejected/waived используй "
+            "/submitoutput, /acceptoutput, /rejectoutput, /waiveoutput."
+        )
+        return
+
+    try:
+        from business_core.stage_output_manager import update_output_instance_status
+
+        result = update_output_instance_status(output_instance_id, status)
+        await _reply(
+            update,
+            _output_lifecycle_message(result, f"Статус Output Instance {output_instance_id} обновлён: {status}"),
+        )
+    except Exception as e:
+        log.error(f"updateoutput_cmd error: {e}")
+        await _reply(update, "❌ Не удалось обновить статус Output.")
+
+
+async def submitoutput_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /submitoutput output_instance_id=SOUTI-001 evidence_type=drive_url evidence_value="https://..."
+
+    evidence_type и evidence_value обязательны и непусты. Сохраняет их,
+    ставит статус submitted, записывает Submitted By (Telegram User ID)
+    / Submitted At.
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg())
+        return
+    raw = " ".join(context.args or [])
+    args = _parse_kv_args(raw)
+    output_instance_id = args.get("output_instance_id") or args.get("_pos0", "")
+    evidence_type = args.get("evidence_type", "")
+    evidence_value = args.get("evidence_value", "")
+
+    if not output_instance_id:
+        await _reply(update,
+            "❌ Укажи output_instance_id.\n\nПример:\n"
+            '`/submitoutput output_instance_id=SOUTI-001 evidence_type=drive_url '
+            'evidence_value="https://drive.google.com/..."`'
+        )
+        return
+
+    try:
+        from business_core.stage_output_manager import submit_output_evidence
+
+        submitted_by = str(update.effective_user.id) if update.effective_user else ""
+        result = submit_output_evidence(output_instance_id, evidence_type, evidence_value, submitted_by)
+        await _reply(
+            update,
+            _output_lifecycle_message(
+                result, f"Evidence сохранено, статус Output Instance {output_instance_id}: submitted",
+            ),
+        )
+    except Exception as e:
+        log.error(f"submitoutput_cmd error: {e}")
+        await _reply(update, "❌ Не удалось сохранить evidence.")
+
+
+async def acceptoutput_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /acceptoutput output_instance_id=SOUTI-001
+
+    Разрешён из produced или submitted. Ставит accepted, записывает
+    Accepted By (Telegram User ID) / Accepted At.
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg())
+        return
+    raw = " ".join(context.args or [])
+    args = _parse_kv_args(raw)
+    output_instance_id = args.get("output_instance_id") or args.get("_pos0", "")
+    if not output_instance_id:
+        await _reply(update, "❌ Укажи output_instance_id.\n\nПример:\n`/acceptoutput output_instance_id=SOUTI-001`")
+        return
+
+    try:
+        from business_core.stage_output_manager import accept_output_instance
+
+        accepted_by = str(update.effective_user.id) if update.effective_user else ""
+        result = accept_output_instance(output_instance_id, accepted_by)
+        await _reply(
+            update,
+            _output_lifecycle_message(result, f"Output Instance {output_instance_id} принят (accepted)"),
+        )
+    except Exception as e:
+        log.error(f"acceptoutput_cmd error: {e}")
+        await _reply(update, "❌ Не удалось принять Output.")
+
+
+async def rejectoutput_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /rejectoutput output_instance_id=SOUTI-001 reason="..."
+
+    reason обязателен. Разрешён только из submitted. Ставит rejected,
+    записывает Rejected By (Telegram User ID) / Rejected At / Rejection Reason.
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg())
+        return
+    raw = " ".join(context.args or [])
+    args = _parse_kv_args(raw)
+    output_instance_id = args.get("output_instance_id") or args.get("_pos0", "")
+    reason = args.get("reason", "")
+
+    if not output_instance_id:
+        await _reply(update,
+            "❌ Укажи output_instance_id.\n\nПример:\n"
+            '`/rejectoutput output_instance_id=SOUTI-001 reason="Договор не подписан второй стороной"`'
+        )
+        return
+
+    try:
+        from business_core.stage_output_manager import reject_output_instance
+
+        rejected_by = str(update.effective_user.id) if update.effective_user else ""
+        result = reject_output_instance(output_instance_id, rejected_by, reason)
+        await _reply(
+            update,
+            _output_lifecycle_message(result, f"Output Instance {output_instance_id} отклонён (rejected)"),
+        )
+    except Exception as e:
+        log.error(f"rejectoutput_cmd error: {e}")
+        await _reply(update, "❌ Не удалось отклонить Output.")
+
+
+async def waiveoutput_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /waiveoutput output_instance_id=SOUTI-001 reason="..."
+
+    reason обязателен. Разрешён из pending/produced/submitted/rejected.
+    Ставит waived, записывает Waived By (Telegram User ID) / Waived At / Waiver Reason.
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg())
+        return
+    raw = " ".join(context.args or [])
+    args = _parse_kv_args(raw)
+    output_instance_id = args.get("output_instance_id") or args.get("_pos0", "")
+    reason = args.get("reason", "")
+
+    if not output_instance_id:
+        await _reply(update,
+            "❌ Укажи output_instance_id.\n\nПример:\n"
+            '`/waiveoutput output_instance_id=SOUTI-001 reason="Требование снято клиентом"`'
+        )
+        return
+
+    try:
+        from business_core.stage_output_manager import waive_output_instance
+
+        waived_by = str(update.effective_user.id) if update.effective_user else ""
+        result = waive_output_instance(output_instance_id, waived_by, reason)
+        await _reply(
+            update,
+            _output_lifecycle_message(result, f"Output Instance {output_instance_id} списан (waived)"),
+        )
+    except Exception as e:
+        log.error(f"waiveoutput_cmd error: {e}")
+        await _reply(update, "❌ Не удалось списать Output.")
+
+
+# ─────────────────────────────────────────────────────────────
 # Phase 38D (ADR-021 §9-§20): Checklist Domain — operational caller UX.
 # /newchecklist /linkknowledge /stageknowledge (above) remain Template/
 # reference commands, unchanged in meaning — knowledge_manager.py
@@ -12105,6 +12743,17 @@ def register_business_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("linkknowledge",    linkknowledge_cmd))
     app.add_handler(CommandHandler("stageknowledge",   stageknowledge_cmd))
     app.add_handler(CommandHandler("sop",              sop_cmd))
+    # Phase A: Stage Output Foundation — Required Output.
+    app.add_handler(CommandHandler("newoutput",        newoutput_cmd))
+    app.add_handler(CommandHandler("linkoutput",       linkoutput_cmd))
+    app.add_handler(CommandHandler("syncoutputs",      syncoutputs_cmd))
+    app.add_handler(CommandHandler("outputs",          outputs_cmd))
+    app.add_handler(CommandHandler("output",           output_cmd))
+    app.add_handler(CommandHandler("updateoutput",     updateoutput_cmd))
+    app.add_handler(CommandHandler("submitoutput",     submitoutput_cmd))
+    app.add_handler(CommandHandler("acceptoutput",     acceptoutput_cmd))
+    app.add_handler(CommandHandler("rejectoutput",     rejectoutput_cmd))
+    app.add_handler(CommandHandler("waiveoutput",      waiveoutput_cmd))
     # Phase 38D (ADR-021): Checklist Domain — operational commands.
     app.add_handler(CommandHandler("startchecklist",   startchecklist_cmd))
     app.add_handler(CommandHandler("checklists",       checklists_cmd))

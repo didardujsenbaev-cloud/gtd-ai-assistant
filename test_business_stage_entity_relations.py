@@ -411,14 +411,18 @@ class TestEntityTypeDispatcher(unittest.TestCase):
         self.assertEqual(entry["sheet_key"], "document_template_registry")
         self.assertEqual(entry["id_column"], "Document Template ID")
 
-    def test_only_document_template_role_and_sop_supported_today(self):
+    def test_only_document_template_role_sop_and_required_output_supported_today(self):
         """Phase 22B added "role" (Work Execution Foundation), Phase 45
-        added "sop" (SOP Foundation UX) — the dispatch table is exactly
-        three entries, all additive, none a schema change to
+        added "sop" (SOP Foundation UX), Phase A added "required_output"
+        (Stage Output Foundation) — the dispatch table is exactly four
+        entries, all additive, none a schema change to
         STAGE_ENTITY_RELATIONS itself. "contractor_person" remains
         explicitly deferred (Phase 22A/22B)."""
         ser = _fresh_ser()
-        self.assertEqual(set(ser.ENTITY_TYPE_DISPATCH.keys()), {"document_template", "role", "sop"})
+        self.assertEqual(
+            set(ser.ENTITY_TYPE_DISPATCH.keys()),
+            {"document_template", "role", "sop", "required_output"},
+        )
 
     def test_role_entity_type_dispatch_target(self):
         ser = _fresh_ser()

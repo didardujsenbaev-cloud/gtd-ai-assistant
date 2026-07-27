@@ -65,6 +65,24 @@ ENTITY_TYPE_DISPATCH: dict[str, dict[str, str]] = {
         "sheet_key": "sop_registry",
         "id_column": "SOP ID",
     },
+    # Phase A (Stage Output Foundation): links a Template Stage to a
+    # Required Output Template (business_core.stage_output_manager). Unlike
+    # sop/document_template, this relation is used ONLY to declare "this
+    # Output Template applies to this Template Stage" — it is never copied
+    # down into a Stage-scoped relation row the way document_template/sop
+    # are; business_builder.sync_stage_output_requirements() reads the
+    # active template-scoped relation directly and creates a
+    # STAGE_OUTPUT_INSTANCES row instead. Required/Blocking on this
+    # relation ARE meaningful (unlike SOP's inert defaults) — they seed
+    # the created Output Instance's own Required/Blocking, falling back to
+    # the Output Template's Default Required/Blocking only at /linkoutput
+    # time, never as a blank value in this table (validate_relation_record()
+    # requires a concrete "true"/"false" for any entity type). Not read by
+    # any Stage Completion Gate in this phase.
+    "required_output": {
+        "sheet_key": "stage_output_templates",
+        "id_column": "Output Template ID",
+    },
 }
 
 
@@ -750,6 +768,126 @@ def create_sop_relations_for_stage(
     """
     return _create_entity_relations_for_stage(
         stage_id, "sop", sop_ids, _SOP_RELATION_DEFAULTS, timestamp,
+    )
+
+
+def create_required_output_relation_for_template_stage(
+    template_stage_id: str, output_template_ids: list[str],
+    required: str, blocking: str, timestamp: str | None = None,
+) -> CopyRelationsResult:
+    """
+    Phase A (Stage Output Foundation): the /linkoutput write path —
+    creates TEMPLATE-scoped required_output relations linking
+    `template_stage_id` to one or more Output Templates. Unlike
+    _create_entity_relations_for_stage() (which creates Stage-scoped
+    instance relations for document_template/sop, the fallback path used
+    when copying FROM a template), this writes to the SAME scope
+    copy_template_relations_to_stage()/get_relations_for_template_stage()
+    read FROM — required_output relations are never copied down to
+    Stage scope; business_builder.sync_stage_output_requirements() reads
+    this template-scoped relation directly and creates a
+    STAGE_OUTPUT_INSTANCES row instead (see that function's docstring).
+
+    `required`/`blocking` must already be resolved to a concrete
+    "true"/"false" by the caller — /linkoutput resolves the Output
+    Template's Default Required/Default Blocking itself BEFORE calling
+    this, if the Telegram user didn't pass required=/blocking=
+    explicitly. This function performs no fallback of its own and never
+    writes a blank value, matching validate_relation_record()'s
+    requirement of a concrete boolean string for any Entity Type.
+
+    Idempotent per (Template Stage ID, Entity Type, Entity ID) via the
+    same find_active_duplicate_relation() check used everywhere else in
+    this module — all-or-nothing validation before any write, same as
+    copy_template_relations_to_stage().
+    """
+    from business_core.sheets import (
+        find_row_by_id, generate_next_ids, batch_append_business_rows,
+        get_business_sheet, row_from_header_map,
+    )
+    from datetime import datetime
+
+    if not template_stage_id or not output_template_ids:
+        return CopyRelationsResult(
+            template_stage_id=template_stage_id, stage_id="",
+            errors=(("__precondition__", ("template_stage_id and output_template_ids are both required.",)),),
+            ok=False,
+        )
+
+    if find_row_by_id("roadmap_template_stages", template_stage_id) is None:
+        return CopyRelationsResult(
+            template_stage_id=template_stage_id, stage_id="",
+            errors=((
+                "__precondition__",
+                (f"Template Stage ID {template_stage_id!r} does not exist in ROADMAP_TEMPLATE_STAGES.",),
+            ),),
+            ok=False,
+        )
+
+    deduped_ids = list(dict.fromkeys(x.strip() for x in output_template_ids if x.strip()))
+    candidates = [
+        {
+            "Template Stage ID": template_stage_id, "Stage ID": "",
+            "Entity Type": "required_output", "Entity ID": output_template_id,
+            "Required": required, "Blocking": blocking, "Minimum Count": "1",
+            "Status": "active",
+        }
+        for output_template_id in deduped_ids
+    ]
+
+    validation_errors = []
+    for candidate in candidates:
+        rel_errors = tuple(validate_relation_record(candidate)) + tuple(validate_relation_references(candidate))
+        if rel_errors:
+            validation_errors.append((candidate["Entity ID"], rel_errors))
+
+    if validation_errors:
+        return CopyRelationsResult(
+            template_stage_id=template_stage_id, stage_id="",
+            errors=tuple(validation_errors), ok=False,
+        )
+
+    to_create = []
+    skipped_duplicates = []
+    for candidate in candidates:
+        existing = find_active_duplicate_relation(candidate)
+        if existing is not None:
+            skipped_duplicates.append((candidate["Entity ID"], existing.get("Relation ID", "")))
+        else:
+            to_create.append(candidate)
+
+    if not to_create:
+        return CopyRelationsResult(
+            template_stage_id=template_stage_id, stage_id="",
+            skipped_duplicates=tuple(skipped_duplicates),
+        )
+
+    ts = timestamp or datetime.now().strftime("%Y-%m-%d")
+    sheet = get_business_sheet("stage_entity_relations")
+    headers = sheet.row_values(1)
+    new_relation_ids = generate_next_ids("stage_entity_relations", len(to_create))
+
+    rows = []
+    created_records = []
+    for candidate, new_id in zip(to_create, new_relation_ids):
+        values = {**candidate, "Relation ID": new_id, "Created At": ts, "Updated At": ts}
+        rows.append(row_from_header_map(headers, values))
+        created_records.append(values)
+
+    try:
+        batch_append_business_rows("stage_entity_relations", rows)
+    except Exception as exc:
+        return CopyRelationsResult(
+            template_stage_id=template_stage_id, stage_id="",
+            skipped_duplicates=tuple(skipped_duplicates),
+            errors=(("__write_failure__", (str(exc),)),),
+            ok=False,
+        )
+
+    return CopyRelationsResult(
+        template_stage_id=template_stage_id, stage_id="",
+        created=tuple(created_records),
+        skipped_duplicates=tuple(skipped_duplicates),
     )
 
 

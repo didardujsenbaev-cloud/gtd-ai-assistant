@@ -4654,6 +4654,132 @@ def sync_stage_sop_knowledge(stage_id: str, dry_run: bool = True) -> dict:
     }
 
 
+def sync_stage_output_requirements(stage_id: str, confirm: bool = False) -> dict:
+    """
+    Phase A (Stage Output Foundation): resolves the Template Stage for
+    `stage_id`, reads its active required_output relations, and creates
+    the missing Output Instances (STAGE_OUTPUT_INSTANCES) for the live
+    Stage — idempotent per (Output Template ID, Stage ID) via
+    stage_output_manager.create_output_instance()'s own idempotency
+    check.
+
+    Unlike sync_stage_document_requirements()/sync_stage_sop_knowledge(),
+    there is no legacy comma-list fallback here — Required Output has no
+    legacy column anywhere (explicit Phase A decision, item 21) and never
+    will; STAGE_ENTITY_RELATIONS (Entity Type="required_output",
+    Template-Stage-scoped only) is the sole source from day one. Also
+    unlike those two sibling functions, a required_output relation is
+    NEVER copied down into a Stage-scoped relation row — the "instance"
+    for Required Output is a full STAGE_OUTPUT_INSTANCES row, not a
+    relation copy (see stage_entity_relations.
+    create_required_output_relation_for_template_stage()'s docstring for
+    why the relation stays template-scoped only).
+
+    An active relation whose Output Template is itself inactive (Status
+    != "active") is excluded from creation and reported separately in
+    `skipped_inactive_templates` — it is neither an error nor silently
+    treated as "to_add".
+
+    Never writes ROADMAP_STAGES, never touches Status/Responsible/Due
+    Date/Priority/Progress, never evaluates or affects any Stage
+    Completion Gate (Required/Blocking are copied onto the created
+    instance for future use only — see stage_output_manager module
+    docstring).
+
+    confirm=False (the default, used for /syncoutputs' preview step):
+    every read/resolution step runs and the result reports what WOULD be
+    created, without writing anything.
+
+    Returns:
+        {
+            "ok": bool, "code": str, "error": str | None,
+            "stage_id": str, "template_stage_id": str,
+            "to_add": tuple[str, ...],                     # Output Template IDs without an instance yet
+            "already_present": tuple[str, ...],            # Output Template IDs with an instance already
+            "created": tuple[str, ...],                    # actually created (confirm=True only)
+            "skipped_inactive_templates": tuple[str, ...], # active relation, but Output Template itself inactive
+        }
+    """
+    from business_core.roadmap_manager import resolve_template_stage_for_stage
+    from business_core.stage_entity_relations import get_relations_for_template_stage
+    from business_core.stage_output_manager import (
+        find_output_template_by_id, create_output_instance, list_output_instances_for_stage,
+    )
+
+    empty = {
+        "stage_id": stage_id, "template_stage_id": "",
+        "to_add": (), "already_present": (), "created": (), "skipped_inactive_templates": (),
+    }
+
+    resolved = resolve_template_stage_for_stage(stage_id)
+    if not resolved["ok"]:
+        return {"ok": False, "code": resolved["code"], "error": resolved["error"], **empty}
+
+    template_stage_id = resolved["template_stage_id"]
+
+    # get_relations_for_template_stage() defaults to active-only rows —
+    # an inactive relation is never returned here at all, so it never
+    # reaches `to_add`/creation and is not separately reported (only an
+    # ACTIVE relation pointing at an INACTIVE Output Template is —
+    # see skipped_inactive_templates below).
+    relations = get_relations_for_template_stage(template_stage_id, entity_type="required_output")
+    if not relations:
+        return {
+            "ok": False, "code": "NO_REQUIRED_OUTPUT_RELATIONS",
+            "error": f"У Template Stage {template_stage_id} нет активных required_output relations",
+            "stage_id": stage_id, "template_stage_id": template_stage_id,
+            "to_add": (), "already_present": (), "created": (), "skipped_inactive_templates": (),
+        }
+
+    relations_by_output_template_id = {r.get("Entity ID", ""): r for r in relations}
+
+    skipped_inactive_templates = []
+    active_template_ids = []
+    for output_template_id in relations_by_output_template_id:
+        template = find_output_template_by_id(output_template_id)
+        if template is None or (template.get("Status", "") or "") != "active":
+            skipped_inactive_templates.append(output_template_id)
+        else:
+            active_template_ids.append(output_template_id)
+
+    existing_instances = list_output_instances_for_stage(stage_id)
+    existing_template_ids = {i.get("Output Template ID", "") for i in existing_instances}
+
+    to_add = tuple(otid for otid in active_template_ids if otid not in existing_template_ids)
+    already_present = tuple(otid for otid in active_template_ids if otid in existing_template_ids)
+
+    if not confirm:
+        return {
+            "ok": True, "code": "STAGE_OUTPUT_SYNC_PREVIEW", "error": None,
+            "stage_id": stage_id, "template_stage_id": template_stage_id,
+            "to_add": to_add, "already_present": already_present, "created": (),
+            "skipped_inactive_templates": tuple(skipped_inactive_templates),
+        }
+
+    roadmap = resolved.get("roadmap") or {}
+    created = []
+    for output_template_id in to_add:
+        relation = relations_by_output_template_id[output_template_id]
+        result = create_output_instance(
+            output_template_id, stage_id,
+            roadmap_id=roadmap.get("roadmap_id", ""),
+            business_id=roadmap.get("business_id", ""),
+            service_id=roadmap.get("service_id", ""),
+            object_id=roadmap.get("object_id", ""),
+            required=relation.get("Required"),
+            blocking=relation.get("Blocking"),
+        )
+        if result["ok"]:
+            created.append(output_template_id)
+
+    return {
+        "ok": True, "code": "STAGE_OUTPUT_SYNCED", "error": None,
+        "stage_id": stage_id, "template_stage_id": template_stage_id,
+        "to_add": to_add, "already_present": already_present, "created": tuple(created),
+        "skipped_inactive_templates": tuple(skipped_inactive_templates),
+    }
+
+
 def transition_document_status(document_id: str, target_status: str) -> dict:
     """
     Phase 37D (ADR-020 §15/§11/§12): the sole canonical Document-

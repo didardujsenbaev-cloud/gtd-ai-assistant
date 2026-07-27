@@ -523,7 +523,10 @@ class TestArchitectureGuards(unittest.TestCase):
         import importlib
         ser = importlib.import_module("business_core.stage_entity_relations")
         self.assertNotIn("contractor_person", ser.ENTITY_TYPE_DISPATCH)
-        self.assertEqual(set(ser.ENTITY_TYPE_DISPATCH.keys()), {"document_template", "role", "sop"})
+        self.assertEqual(
+            set(ser.ENTITY_TYPE_DISPATCH.keys()),
+            {"document_template", "role", "sop", "required_output"},
+        )
 
     def test_no_automatic_hierarchy_escalation_reference(self):
         """resolve_stage_responsibility()'s executable body must never

@@ -85,6 +85,13 @@ BUSINESS_SHEET_NAMES: dict[str, str] = {
     # trail for /updatestage's force=yes bypass of the Stage document
     # completion gate (see business_builder.transition_stage_status()).
     "stage_completion_overrides":     "STAGE_COMPLETION_OVERRIDES",
+    # Phase A (Stage Output Foundation): Required Output — the actual
+    # deliverable/result of a Stage, distinct from Document/Checklist/SOP/
+    # Milestone. Two-table Template+Instance pair, mirroring
+    # checklist_registry/checklist_instances. Explicitly NOT part of any
+    # Stage Completion Gate in this phase — see business_builder.py.
+    "stage_output_templates":         "STAGE_OUTPUT_TEMPLATES",
+    "stage_output_instances":         "STAGE_OUTPUT_INSTANCES",
 }
 
 BUSINESS_HEADERS: dict[str, list[str]] = {
@@ -505,6 +512,35 @@ BUSINESS_HEADERS: dict[str, list[str]] = {
         "Missing Checklist Instance IDs", "Missing Checklist Item IDs",
         "Missing Checklist Item Titles",
     ],
+    # Phase A (Stage Output Foundation): Required Output. Template layer
+    # (reference/config, mirrors sop_registry/checklist_registry) +
+    # Instance layer (live-Stage lifecycle, mirrors checklist_instances).
+    # Deliberately NOT participating in transition_stage_status() or any
+    # Stage Completion Gate in this phase — Required/Blocking are stored
+    # for future use only. No legacy comma-list column exists or is
+    # planned for Required Output (unlike SOP/Document/Checklist) — the
+    # relation model (ENTITY_TYPE_DISPATCH["required_output"]) is the only
+    # source from the start.
+    "stage_output_templates": [
+        "Output Template ID", "Biz ID", "Service ID", "Template ID", "Template Stage ID",
+        "Title", "Description", "Output Type", "Verification Method",
+        "Related Document Template ID", "Related Checklist ID",
+        "Default Required", "Default Blocking", "Status", "Notes",
+        "Created At", "Last Updated",
+    ],
+    "stage_output_instances": [
+        "Output Instance ID", "Output Template ID", "Business ID", "Service ID", "Object ID",
+        "Roadmap ID", "Stage ID",
+        "Title Snapshot", "Description Snapshot", "Output Type Snapshot", "Verification Method Snapshot",
+        "Related Document Template ID", "Related Checklist ID",
+        "Required", "Blocking", "Status",
+        "Evidence Type", "Evidence Value",
+        "Submitted By", "Submitted At",
+        "Accepted By", "Accepted At",
+        "Rejected By", "Rejected At", "Rejection Reason",
+        "Waived By", "Waived At", "Waiver Reason",
+        "Created At", "Last Updated", "Notes",
+    ],
 }
 
 # ID-префиксы для generate_next_id
@@ -567,6 +603,10 @@ _ID_PREFIXES: dict[str, str] = {
     # Phase 43: checked against every existing prefix above — no
     # collisions.
     "stage_completion_overrides":     "SCO",
+    # Phase A (Stage Output Foundation): checked against every existing
+    # prefix above — no collisions.
+    "stage_output_templates":         "SOUT",
+    "stage_output_instances":         "SOUTI",
 }
 
 
