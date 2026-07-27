@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from datetime import datetime
 from typing import Optional
 
@@ -4581,4 +4582,1239 @@ def update_checklist_admin_fields(checklist_instance_id: str, updates: dict) -> 
         ok=result["ok"], code=result.get("code", ""), error=result.get("error"),
         checklist_instance_id=checklist_instance_id, business_id=instance.get("Business ID", ""),
         changed=result.get("changed", False), retry_safe=True,
+    )
+
+
+# ─────────────────────────────────────────────────────────────
+# Phase 39C (ADR-022): Payment/Milestone Domain orchestration.
+#
+# business_builder.py is the sole cross-domain Payment orchestration
+# owner: Template validation, amount/currency normalization, relation
+# validation, Obligation creation, Transaction creation/confirmation/
+# reversal, overpayment prevention, balance calculation, Obligation
+# status synchronization, idempotency zero/one/multiple handling,
+# structured result assembly. business_core.payment_manager.py
+# (persistence) is called from here — never the reverse. No Telegram
+# caller exists yet (Phase 39D); nothing here is called by
+# telegram_handlers.py in this phase. COMMERCIAL_MILESTONES_MAP
+# (roadmap_manager.py) and /milestones remain completely untouched —
+# this is a wholly separate, new persistence layer (ADR-022 §24).
+# ─────────────────────────────────────────────────────────────
+
+from decimal import Decimal, InvalidOperation
+
+_CURRENCY_CODE_RE = re.compile(r"^[A-Z]{3}$")
+
+_COMMERCIAL_MILESTONE_TEMPLATE_ORDINARY_TRANSITIONS: dict[str, tuple[str, ...]] = {
+    "active":   ("active", "inactive", "archived"),
+    "inactive": ("inactive", "archived"),
+    "archived": ("archived",),
+}
+
+_PAYMENT_OBLIGATION_ORDINARY_TRANSITIONS: dict[str, tuple[str, ...]] = {
+    "draft":          ("draft", "issued", "cancelled", "archived"),
+    "issued":         ("issued", "cancelled", "archived"),
+    "partially_paid": ("partially_paid", "cancelled", "archived"),
+    "paid":           ("paid", "archived"),
+    "cancelled":      ("cancelled", "archived"),
+    "archived":       ("archived",),
+}
+_PAYMENT_OBLIGATION_SYNC_ONLY_STATUSES = frozenset({"partially_paid", "paid"})
+
+_PAYMENT_TRANSACTION_ORDINARY_TRANSITIONS: dict[str, tuple[str, ...]] = {
+    "pending":   ("pending", "confirmed", "failed"),
+    "confirmed": ("confirmed", "reversed"),
+    "reversed":  ("reversed",),
+    "failed":    ("failed",),
+}
+
+
+def _payment_result(
+    *, ok: bool, code: str, error: str | None,
+    commercial_milestone_template_id: str = "", payment_obligation_id: str = "", payment_transaction_id: str = "",
+    business_id: str = "", client_id: str = "", object_id: str = "", service_id: str = "",
+    roadmap_id: str = "", stage_id: str = "", document_id: str = "",
+    amount: str = "", currency: str = "", paid_amount: str = "", remaining_amount: str = "",
+    previous_status: str = "", requested_status: str = "", final_status: str = "",
+    created: bool = False, reused: bool = False, changed: bool = False,
+    confirmed: bool = False, reversed: bool = False, completed: bool = False,
+    conflicting_ids: tuple = (), warnings: tuple = (), retry_safe: bool = True,
+) -> dict:
+    """Shared result-builder for every Payment orchestration function
+    (ADR-022 §25/§32) — the stable, structured contract every caller
+    reads instead of a bare exception or ad-hoc dict shape. Never
+    carries a raw exception object or a raw Sheets row."""
+    return {
+        "ok": ok, "code": code, "error": error,
+        "commercial_milestone_template_id": commercial_milestone_template_id,
+        "payment_obligation_id": payment_obligation_id, "payment_transaction_id": payment_transaction_id,
+        "business_id": business_id, "client_id": client_id, "object_id": object_id, "service_id": service_id,
+        "roadmap_id": roadmap_id, "stage_id": stage_id, "document_id": document_id,
+        "amount": amount, "currency": currency, "paid_amount": paid_amount, "remaining_amount": remaining_amount,
+        "previous_status": previous_status, "requested_status": requested_status, "final_status": final_status,
+        "created": created, "reused": reused, "changed": changed,
+        "confirmed": confirmed, "reversed": reversed, "completed": completed,
+        "conflicting_ids": tuple(conflicting_ids), "warnings": tuple(warnings), "retry_safe": retry_safe,
+    }
+
+
+def normalize_payment_amount(raw) -> dict:
+    """
+    Phase 39C (ADR-022 §12/§9): the sole canonical Decimal amount
+    normalization helper. Decimal only — float input rejected outright
+    (money must never be represented as binary floating point).
+    Canonical storage as a decimal string with exactly 2 fractional
+    digits. No scientific notation, no thousands separators. An input
+    with more than 2 fractional digits BLOCKS rather than being
+    silently quantized away — this function never rounds a caller's
+    input, it only re-serializes an already-2-decimal value.
+
+    Returns:
+        {"ok": bool, "code": str, "error": str | None, "amount": Decimal | None, "normalized": str}
+    """
+    if isinstance(raw, float):
+        return {"ok": False, "code": "INVALID_PAYMENT_AMOUNT", "error": "Сумма не может быть float — используйте Decimal или строку", "amount": None, "normalized": ""}
+    if raw is None or raw == "":
+        return {"ok": False, "code": "INVALID_PAYMENT_AMOUNT", "error": "Сумма обязательна", "amount": None, "normalized": ""}
+
+    text = str(raw).strip()
+    if not text:
+        return {"ok": False, "code": "INVALID_PAYMENT_AMOUNT", "error": "Сумма обязательна", "amount": None, "normalized": ""}
+    if "," in text:
+        return {"ok": False, "code": "INVALID_PAYMENT_AMOUNT", "error": "Сумма не может содержать разделители тысяч (',')", "amount": None, "normalized": ""}
+    if "e" in text.lower():
+        return {"ok": False, "code": "INVALID_PAYMENT_AMOUNT", "error": "Сумма не может использовать экспоненциальную запись", "amount": None, "normalized": ""}
+
+    try:
+        value = Decimal(text)
+    except InvalidOperation:
+        return {"ok": False, "code": "INVALID_PAYMENT_AMOUNT", "error": f"Не удаётся разобрать сумму '{raw}'", "amount": None, "normalized": ""}
+
+    exponent = value.as_tuple().exponent
+    if isinstance(exponent, int) and exponent < -2:
+        return {"ok": False, "code": "INVALID_PAYMENT_AMOUNT_SCALE", "error": "Сумма не может иметь более 2 знаков после запятой", "amount": None, "normalized": ""}
+
+    if value <= 0:
+        return {"ok": False, "code": "PAYMENT_AMOUNT_MUST_BE_POSITIVE", "error": "Сумма должна быть больше нуля", "amount": None, "normalized": ""}
+
+    quantized = value.quantize(Decimal("0.01"))
+    return {"ok": True, "code": "", "error": None, "amount": quantized, "normalized": str(quantized)}
+
+
+def normalize_payment_currency(raw) -> dict:
+    """
+    Phase 39C (ADR-022 §13/§10): the sole canonical currency
+    normalization helper. Required, uppercased, exactly 3 ASCII
+    letters — no implicit default.
+
+    Returns:
+        {"ok": bool, "code": str, "error": str | None, "currency": str}
+    """
+    if raw is None:
+        return {"ok": False, "code": "INVALID_PAYMENT_CURRENCY", "error": "Валюта обязательна", "currency": ""}
+    text = str(raw).strip().upper()
+    if not text:
+        return {"ok": False, "code": "INVALID_PAYMENT_CURRENCY", "error": "Валюта обязательна", "currency": ""}
+    if not _CURRENCY_CODE_RE.match(text):
+        return {"ok": False, "code": "INVALID_PAYMENT_CURRENCY", "error": f"Недопустимый код валюты '{raw}' — требуется 3 буквы ASCII в верхнем регистре", "currency": ""}
+    return {"ok": True, "code": "", "error": None, "currency": text}
+
+
+def _compute_payment_balance(obligation_amount: str, transactions: list[dict]) -> dict:
+    """
+    Phase 39C (ADR-022 §14/§21): canonical balance calculator. Paid
+    Amount = sum of `confirmed`-status Transaction amounts only.
+    pending/failed/reversed are excluded. No float — Decimal
+    throughout. No caller-side calculation is ever performed outside
+    this function.
+    """
+    from business_core.payment_manager import TRANSACTION_STATUS
+
+    try:
+        obligation_decimal = Decimal(obligation_amount or "0")
+    except InvalidOperation:
+        return {"ok": False, "code": "INVALID_PAYMENT_AMOUNT", "error": "Obligation Amount повреждён", "paid_amount": "", "remaining_amount": ""}
+
+    paid_decimal = Decimal("0.00")
+    for txn in transactions:
+        status = txn.get("Status", "")
+        if status not in TRANSACTION_STATUS:
+            return {"ok": False, "code": "INVALID_PAYMENT_TRANSACTION_STATUS", "error": f"Неизвестный статус Transaction: '{status}'", "paid_amount": "", "remaining_amount": ""}
+        if status == "confirmed":
+            try:
+                paid_decimal += Decimal(txn.get("Amount", "0"))
+            except InvalidOperation:
+                return {"ok": False, "code": "INVALID_PAYMENT_AMOUNT", "error": f"Amount Transaction {txn.get('Payment Transaction ID', '')} повреждён", "paid_amount": "", "remaining_amount": ""}
+
+    remaining_decimal = obligation_decimal - paid_decimal
+    if remaining_decimal < 0:
+        return {"ok": False, "code": "PAYMENT_TRANSACTION_OVERPAYMENT_BLOCKED", "error": "Сумма подтверждённых платежей превышает Obligation Amount", "paid_amount": "", "remaining_amount": ""}
+
+    return {
+        "ok": True, "code": "", "error": None,
+        "paid_amount": str(paid_decimal.quantize(Decimal("0.01"))),
+        "remaining_amount": str(remaining_decimal.quantize(Decimal("0.01"))),
+    }
+
+
+def _synchronize_payment_obligation_after_transaction_change(payment_obligation_id: str) -> dict:
+    """
+    Phase 39C (ADR-022 §14/§22): recomputes Paid/Remaining Amount from
+    every Transaction row belonging to this Obligation and synchronizes
+    Obligation Status accordingly. Never called manually — only from
+    confirm_payment_transaction()/reverse_payment_transaction() after
+    their own write succeeds. `cancelled`/`archived` are protected —
+    synchronization never overwrites those statuses. Bounded timestamp
+    policy (ADR-022 §22): Paid At is cleared whenever the Obligation
+    leaves `paid` (no separate payment-history table exists yet to
+    otherwise preserve a meaningful "first paid" timestamp across a
+    reversal).
+    """
+    from business_core.payment_manager import (
+        find_payment_obligation_by_id, list_payment_transactions, update_payment_obligation_balance,
+    )
+
+    obligation = find_payment_obligation_by_id(payment_obligation_id)
+    if obligation is None:
+        return {"ok": False, "code": "PAYMENT_OBLIGATION_NOT_FOUND", "error": f"Payment Obligation {payment_obligation_id} не найден"}
+
+    transactions = list_payment_transactions(payment_obligation_id=payment_obligation_id)
+    balance = _compute_payment_balance(obligation.get("Obligation Amount", "0"), transactions)
+    if not balance["ok"]:
+        return balance
+
+    paid_amount = balance["paid_amount"]
+    remaining_amount = balance["remaining_amount"]
+    current_status = obligation.get("Status", "")
+
+    try:
+        paid_decimal = Decimal(paid_amount)
+        obligation_decimal = Decimal(obligation.get("Obligation Amount", "0"))
+    except InvalidOperation:
+        return {"ok": False, "code": "INVALID_PAYMENT_AMOUNT", "error": "Не удалось разобрать сумму для синхронизации"}
+
+    if current_status in ("cancelled", "archived"):
+        new_status = current_status
+    elif paid_decimal <= 0:
+        new_status = "issued" if current_status in ("issued", "partially_paid", "paid") else current_status
+    elif paid_decimal < obligation_decimal:
+        new_status = "partially_paid"
+    elif paid_decimal == obligation_decimal:
+        new_status = "paid"
+    else:
+        return {"ok": False, "code": "PAYMENT_TRANSACTION_OVERPAYMENT_BLOCKED", "error": "Paid Amount превышает Obligation Amount"}
+
+    previously_paid_at = obligation.get("Paid At", "")
+    clear_paid_at = bool(new_status != "paid" and previously_paid_at)
+    paid_at = _now_utc_str() if (new_status == "paid" and not previously_paid_at) else ""
+
+    write_result = update_payment_obligation_balance(
+        payment_obligation_id, status=new_status, paid_amount=paid_amount, remaining_amount=remaining_amount,
+        paid_at=paid_at, clear_paid_at=clear_paid_at,
+    )
+    if not write_result["ok"]:
+        return {"ok": False, "code": "PAYMENT_PERSISTENCE_FAILED", "error": write_result.get("error")}
+
+    verify = find_payment_obligation_by_id(payment_obligation_id)
+    if (
+        verify is None
+        or verify.get("Paid Amount", "") != paid_amount
+        or verify.get("Remaining Amount", "") != remaining_amount
+        or verify.get("Status", "") != new_status
+    ):
+        return {"ok": False, "code": "PAYMENT_OBLIGATION_POST_WRITE_VERIFICATION_FAILED", "error": "Не удалось верифицировать синхронизацию баланса Obligation"}
+
+    return {"ok": True, "code": "", "error": None, "paid_amount": paid_amount, "remaining_amount": remaining_amount, "status": new_status}
+
+
+# ─────────────────────────────────────────────────────────────
+# Commercial Milestone Template
+# ─────────────────────────────────────────────────────────────
+
+def create_commercial_milestone_template(
+    title: str, calculation_type: str,
+    *, roadmap_template_id: str = "", service_id: str = "", description: str = "",
+    sequence: int = 1, trigger_description: str = "",
+    fixed_amount: str = "", percentage: str = "", currency: str = "",
+    created_by: str = "", notes: str = "",
+) -> dict:
+    """
+    Phase 39C (ADR-022 §9/§10/§14): the sole canonical Commercial
+    Milestone Template creation orchestration boundary. ADR-022 did not
+    approve a caller-idempotency field for Templates, so identity is
+    the exact normalized tuple (Roadmap Template ID, Service ID,
+    Sequence, Title) — never fuzzy, never first-pick.
+    """
+    from business_core.payment_manager import (
+        find_templates_by_identity, create_commercial_milestone_template as pm_create_template,
+        find_commercial_milestone_template_by_id, CALCULATION_TYPES,
+    )
+
+    if not title:
+        return _payment_result(ok=False, code="", error="title обязателен")
+    if calculation_type not in CALCULATION_TYPES:
+        return _payment_result(
+            ok=False, code="INVALID_MILESTONE_CALCULATION_TYPE",
+            error=f"Недопустимый Calculation Type '{calculation_type}'. Допустимые значения: {', '.join(CALCULATION_TYPES)}",
+        )
+    try:
+        sequence_int = int(sequence)
+    except (TypeError, ValueError):
+        return _payment_result(ok=False, code="", error="sequence должен быть положительным целым числом")
+    if sequence_int <= 0:
+        return _payment_result(ok=False, code="", error="sequence должен быть положительным целым числом")
+
+    if not roadmap_template_id and not service_id:
+        return _payment_result(ok=False, code="PAYMENT_ENTITY_RELATION_MISMATCH", error="Требуется хотя бы одно: roadmap_template_id или service_id")
+
+    if roadmap_template_id:
+        from business_core.sheets import read_business_sheet
+        roadmap_templates = read_business_sheet("roadmap_template_registry")
+        if not any(t.get("Template ID", "") == roadmap_template_id for t in roadmap_templates):
+            return _payment_result(ok=False, code="ROADMAP_NOT_FOUND", error=f"Roadmap Template {roadmap_template_id} не найден")
+
+    if service_id:
+        from business_core.service_manager import find_service_by_id
+        svc = find_service_by_id(service_id)
+        if svc is None:
+            return _payment_result(ok=False, code="SERVICE_NOT_FOUND", error=f"Service {service_id} не найден")
+
+    currency_result = normalize_payment_currency(currency)
+    if not currency_result["ok"]:
+        return _payment_result(ok=False, code=currency_result["code"], error=currency_result["error"])
+    normalized_currency = currency_result["currency"]
+
+    normalized_fixed_amount = ""
+    normalized_percentage = ""
+
+    if calculation_type == "fixed":
+        if percentage:
+            return _payment_result(ok=False, code="MILESTONE_CALCULATION_FIELDS_CONFLICT", error="Percentage должен быть пуст для Calculation Type='fixed'")
+        if not fixed_amount:
+            return _payment_result(ok=False, code="MILESTONE_FIXED_AMOUNT_REQUIRED", error="Fixed Amount обязателен для Calculation Type='fixed'")
+        amount_result = normalize_payment_amount(fixed_amount)
+        if not amount_result["ok"]:
+            return _payment_result(ok=False, code=amount_result["code"], error=amount_result["error"])
+        normalized_fixed_amount = amount_result["normalized"]
+    else:
+        if fixed_amount:
+            return _payment_result(ok=False, code="MILESTONE_CALCULATION_FIELDS_CONFLICT", error="Fixed Amount должен быть пуст для Calculation Type='percentage'")
+        if not percentage:
+            return _payment_result(ok=False, code="MILESTONE_PERCENTAGE_REQUIRED", error="Percentage обязателен для Calculation Type='percentage'")
+        try:
+            percentage_decimal = Decimal(str(percentage).strip())
+        except InvalidOperation:
+            return _payment_result(ok=False, code="MILESTONE_PERCENTAGE_REQUIRED", error=f"Не удаётся разобрать Percentage '{percentage}'")
+        if percentage_decimal <= 0 or percentage_decimal > 100:
+            return _payment_result(ok=False, code="MILESTONE_PERCENTAGE_REQUIRED", error="Percentage должен быть в диапазоне (0, 100]")
+        normalized_percentage = str(percentage_decimal)
+
+    matches = find_templates_by_identity(roadmap_template_id, service_id, str(sequence_int), title)
+    if len(matches) > 1:
+        conflicting_ids = tuple(m["Commercial Milestone Template ID"] for m in matches)
+        return _payment_result(
+            ok=False, code="MULTIPLE_COMMERCIAL_MILESTONE_TEMPLATE_MATCHES",
+            error=f"Найдено несколько Commercial Milestone Template с этим ключом: {conflicting_ids}",
+            conflicting_ids=conflicting_ids, retry_safe=True,
+        )
+    if len(matches) == 1:
+        existing = matches[0]
+        return _payment_result(
+            ok=True, code="COMMERCIAL_MILESTONE_TEMPLATE_REUSED", error=None,
+            commercial_milestone_template_id=existing["Commercial Milestone Template ID"],
+            final_status=existing.get("Status", ""), reused=True, retry_safe=True,
+        )
+
+    create_result = pm_create_template(
+        title, calculation_type,
+        roadmap_template_id=roadmap_template_id, service_id=service_id, description=description,
+        sequence=sequence_int, trigger_description=trigger_description,
+        fixed_amount=normalized_fixed_amount, percentage=normalized_percentage, currency=normalized_currency,
+        status="active", created_by=created_by, notes=notes,
+    )
+    if not create_result["ok"]:
+        return _payment_result(ok=False, code=create_result.get("code") or "PAYMENT_PERSISTENCE_FAILED", error=create_result.get("error"), retry_safe=True)
+    template_id = create_result["commercial_milestone_template_id"]
+
+    saved = find_commercial_milestone_template_by_id(template_id)
+    if saved is None:
+        return _payment_result(
+            ok=False, code="COMMERCIAL_MILESTONE_TEMPLATE_POST_WRITE_VERIFICATION_FAILED",
+            error="Commercial Milestone Template записан, но проверка после записи не прошла",
+            commercial_milestone_template_id=template_id, retry_safe=False,
+        )
+
+    return _payment_result(
+        ok=True, code="COMMERCIAL_MILESTONE_TEMPLATE_CREATED", error=None,
+        commercial_milestone_template_id=template_id, currency=normalized_currency,
+        amount=normalized_fixed_amount, final_status="active", created=True, retry_safe=True,
+    )
+
+
+def update_commercial_milestone_template_admin_fields(commercial_milestone_template_id: str, updates: dict) -> dict:
+    """Phase 39C (ADR-022 §25): thin resolve-then-delegate wrapper.
+    Only Description/Trigger Description/Notes are ordinarily mutable
+    — enforced by payment_manager.update_commercial_milestone_template_
+    admin_fields() itself."""
+    from business_core.payment_manager import find_commercial_milestone_template_by_id, update_commercial_milestone_template_admin_fields as pm_update_admin
+
+    if not commercial_milestone_template_id:
+        return _payment_result(ok=False, code="COMMERCIAL_MILESTONE_TEMPLATE_NOT_FOUND", error="commercial_milestone_template_id обязателен")
+
+    template = find_commercial_milestone_template_by_id(commercial_milestone_template_id)
+    if template is None:
+        return _payment_result(ok=False, code="COMMERCIAL_MILESTONE_TEMPLATE_NOT_FOUND", error=f"Commercial Milestone Template {commercial_milestone_template_id} не найден", commercial_milestone_template_id=commercial_milestone_template_id)
+
+    result = pm_update_admin(commercial_milestone_template_id, updates)
+    return _payment_result(
+        ok=result["ok"], code=result.get("code", ""), error=result.get("error"),
+        commercial_milestone_template_id=commercial_milestone_template_id, changed=result.get("changed", False), retry_safe=True,
+    )
+
+
+def transition_commercial_milestone_template_status(commercial_milestone_template_id: str, target_status: str) -> dict:
+    """Phase 39C (ADR-022 §16): the sole canonical Commercial Milestone
+    Template transition orchestration boundary. No restore
+    implementation — attempting inactive/archived → active blocks with
+    an explicit restore-required code rather than a generic invalid-
+    transition message."""
+    from business_core.payment_manager import find_commercial_milestone_template_by_id, update_commercial_milestone_template_status, TEMPLATE_STATUS
+
+    if not commercial_milestone_template_id:
+        return _payment_result(ok=False, code="COMMERCIAL_MILESTONE_TEMPLATE_NOT_FOUND", error="commercial_milestone_template_id обязателен")
+
+    template = find_commercial_milestone_template_by_id(commercial_milestone_template_id)
+    if template is None:
+        return _payment_result(ok=False, code="COMMERCIAL_MILESTONE_TEMPLATE_NOT_FOUND", error=f"Commercial Milestone Template {commercial_milestone_template_id} не найден", commercial_milestone_template_id=commercial_milestone_template_id)
+
+    previous_status = template.get("Status", "")
+
+    if target_status not in TEMPLATE_STATUS:
+        return _payment_result(
+            ok=False, code="INVALID_COMMERCIAL_MILESTONE_TEMPLATE_STATUS",
+            error=f"Недопустимый статус '{target_status}'. Допустимые значения: {', '.join(TEMPLATE_STATUS)}",
+            commercial_milestone_template_id=commercial_milestone_template_id,
+            previous_status=previous_status, requested_status=target_status, final_status=previous_status,
+        )
+
+    if target_status == previous_status:
+        return _payment_result(
+            ok=True, code="COMMERCIAL_MILESTONE_TEMPLATE_STATUS_UNCHANGED", error=None,
+            commercial_milestone_template_id=commercial_milestone_template_id,
+            previous_status=previous_status, requested_status=target_status, final_status=previous_status, changed=False,
+        )
+
+    allowed_targets = _COMMERCIAL_MILESTONE_TEMPLATE_ORDINARY_TRANSITIONS.get(previous_status, (previous_status,))
+    if target_status not in allowed_targets:
+        code = "COMMERCIAL_MILESTONE_TEMPLATE_RESTORE_REQUIRES_EXPLICIT_ACTION" if target_status == "active" else "INVALID_COMMERCIAL_MILESTONE_TEMPLATE_STATUS"
+        return _payment_result(
+            ok=False, code=code,
+            error=f"Переход '{previous_status}' → '{target_status}' не разрешён",
+            commercial_milestone_template_id=commercial_milestone_template_id,
+            previous_status=previous_status, requested_status=target_status, final_status=previous_status,
+        )
+
+    write_result = update_commercial_milestone_template_status(commercial_milestone_template_id, target_status)
+    if not write_result["ok"]:
+        return _payment_result(
+            ok=False, code=write_result.get("code") or "PAYMENT_PERSISTENCE_FAILED", error=write_result.get("error"),
+            commercial_milestone_template_id=commercial_milestone_template_id,
+            previous_status=previous_status, requested_status=target_status, final_status=previous_status,
+        )
+
+    changed = write_result["changed"]
+    return _payment_result(
+        ok=True, code="COMMERCIAL_MILESTONE_TEMPLATE_STATUS_UPDATED" if changed else "COMMERCIAL_MILESTONE_TEMPLATE_STATUS_UNCHANGED", error=None,
+        commercial_milestone_template_id=commercial_milestone_template_id,
+        previous_status=previous_status, requested_status=target_status, final_status=target_status, changed=changed,
+    )
+
+
+# ─────────────────────────────────────────────────────────────
+# Payment Obligation
+# ─────────────────────────────────────────────────────────────
+
+def _validate_payment_obligation_relations(
+    business_id: str, client_id: str,
+    *, object_id: str = "", service_id: str = "", roadmap_id: str = "", stage_id: str = "",
+    commercial_milestone_template_id: str = "",
+) -> dict:
+    """
+    Phase 39C (ADR-022 §18/§13): canonical cross-domain Payment
+    Obligation relation-validation path, all before any write.
+    Resolution order is most-specific-first (Stage, then Roadmap,
+    deriving Object/Service) — mirrors _validate_checklist_relations()/
+    document_registry_manager.resolve_and_validate_links() exactly,
+    applied to Payment's own relation set plus Client validation.
+
+    Returns:
+        {"ok": bool, "code": str, "error": str | None, "resolved": dict | None}
+    """
+    from business_core.sheets import read_business_sheet
+
+    if not business_id:
+        return {"ok": False, "code": "BUSINESS_NOT_FOUND", "error": "business_id обязателен", "resolved": None}
+    biz_rows = read_business_sheet("biz_registry")
+    if not any(b.get("ID", "") == business_id for b in biz_rows):
+        return {"ok": False, "code": "BUSINESS_NOT_FOUND", "error": f"Business {business_id} не найден", "resolved": None}
+
+    if not client_id:
+        return {"ok": False, "code": "CLIENT_NOT_FOUND", "error": "client_id обязателен", "resolved": None}
+
+    from business_core.person_manager import find_person_by_id, is_person_archived, is_client_person, has_person_business_link
+    client = find_person_by_id(client_id)
+    if client is None:
+        return {"ok": False, "code": "CLIENT_NOT_FOUND", "error": f"Client {client_id} не найден", "resolved": None}
+    if is_person_archived(client):
+        return {"ok": False, "code": "CLIENT_NOT_FOUND", "error": f"Client {client_id} архивирован", "resolved": None}
+    if not is_client_person(client):
+        return {"ok": False, "code": "CLIENT_NOT_FOUND", "error": f"{client_id} не является Client", "resolved": None}
+    if not has_person_business_link(client, business_id):
+        return {"ok": False, "code": "PAYMENT_ENTITY_RELATION_MISMATCH", "error": f"Client {client_id} не связан с Business {business_id}", "resolved": None}
+
+    resolved_stage_id = stage_id
+    resolved_roadmap_id = roadmap_id
+    resolved_object_id = object_id
+    resolved_service_id = service_id
+
+    if resolved_stage_id:
+        stages = read_business_sheet("roadmap_stages")
+        stage = next((s for s in stages if s.get("Stage ID", "") == resolved_stage_id), None)
+        if stage is None:
+            return {"ok": False, "code": "STAGE_NOT_FOUND", "error": f"Stage {resolved_stage_id} не найден", "resolved": None}
+        stage_roadmap_id = stage.get("Roadmap ID", "")
+        if resolved_roadmap_id and stage_roadmap_id and resolved_roadmap_id != stage_roadmap_id:
+            return {
+                "ok": False, "code": "PAYMENT_OBLIGATION_RELATION_MISMATCH",
+                "error": f"Stage {resolved_stage_id} принадлежит Roadmap {stage_roadmap_id}, а указан Roadmap {resolved_roadmap_id}",
+                "resolved": None,
+            }
+        resolved_roadmap_id = resolved_roadmap_id or stage_roadmap_id
+
+    if resolved_roadmap_id:
+        roadmaps = read_business_sheet("roadmaps")
+        rm = next((r for r in roadmaps if r.get("Roadmap ID", "") == resolved_roadmap_id), None)
+        if rm is None:
+            return {"ok": False, "code": "ROADMAP_NOT_FOUND", "error": f"Roadmap {resolved_roadmap_id} не найден", "resolved": None}
+        rm_biz_id = rm.get("Business ID", "")
+        if rm_biz_id and rm_biz_id != business_id:
+            return {
+                "ok": False, "code": "PAYMENT_OBLIGATION_RELATION_MISMATCH",
+                "error": f"Roadmap {resolved_roadmap_id} принадлежит бизнесу {rm_biz_id}, а указан Business {business_id}",
+                "resolved": None,
+            }
+        rm_object_id = rm.get("Object ID", "")
+        if resolved_object_id and rm_object_id and resolved_object_id != rm_object_id:
+            return {
+                "ok": False, "code": "PAYMENT_OBLIGATION_RELATION_MISMATCH",
+                "error": f"Roadmap {resolved_roadmap_id} связан с Object {rm_object_id}, а указан Object {resolved_object_id}",
+                "resolved": None,
+            }
+        resolved_object_id = resolved_object_id or rm_object_id
+        rm_service_id = rm.get("Service ID", "")
+        if resolved_service_id and rm_service_id and resolved_service_id != rm_service_id:
+            return {
+                "ok": False, "code": "PAYMENT_OBLIGATION_RELATION_MISMATCH",
+                "error": f"Roadmap {resolved_roadmap_id} связан с Service {rm_service_id}, а указан Service {resolved_service_id}",
+                "resolved": None,
+            }
+        resolved_service_id = resolved_service_id or rm_service_id
+
+    if resolved_object_id:
+        from business_core.object_manager import find_object_by_id
+        obj = find_object_by_id(resolved_object_id)
+        if obj is None:
+            return {"ok": False, "code": "OBJECT_NOT_FOUND", "error": f"Object {resolved_object_id} не найден", "resolved": None}
+        obj_biz_id = obj.get("biz_id", "")
+        if obj_biz_id and obj_biz_id != business_id:
+            return {
+                "ok": False, "code": "PAYMENT_OBLIGATION_RELATION_MISMATCH",
+                "error": f"Object {resolved_object_id} принадлежит бизнесу {obj_biz_id}, а указан Business {business_id}",
+                "resolved": None,
+            }
+
+    if resolved_service_id:
+        from business_core.service_manager import find_service_by_id
+        svc = find_service_by_id(resolved_service_id)
+        if svc is None:
+            return {"ok": False, "code": "SERVICE_NOT_FOUND", "error": f"Service {resolved_service_id} не найден", "resolved": None}
+        svc_biz_id = svc.get("biz_id", "")
+        if svc_biz_id and svc_biz_id != business_id:
+            return {
+                "ok": False, "code": "PAYMENT_OBLIGATION_RELATION_MISMATCH",
+                "error": f"Service {resolved_service_id} принадлежит бизнесу {svc_biz_id}, а указан Business {business_id}",
+                "resolved": None,
+            }
+
+    resolved_template_id = commercial_milestone_template_id
+    if resolved_template_id:
+        from business_core.payment_manager import find_commercial_milestone_template_by_id
+        tmpl = find_commercial_milestone_template_by_id(resolved_template_id)
+        if tmpl is None:
+            return {"ok": False, "code": "COMMERCIAL_MILESTONE_TEMPLATE_NOT_FOUND", "error": f"Commercial Milestone Template {resolved_template_id} не найден", "resolved": None}
+
+    return {
+        "ok": True, "code": "", "error": None,
+        "resolved": {
+            "business_id": business_id, "client_id": client_id,
+            "object_id": resolved_object_id, "service_id": resolved_service_id,
+            "roadmap_id": resolved_roadmap_id, "stage_id": resolved_stage_id,
+            "commercial_milestone_template_id": resolved_template_id,
+        },
+    }
+
+
+def create_payment_obligation(
+    business_id: str, client_id: str, obligation_amount, currency: str,
+    *, object_id: str = "", service_id: str = "", roadmap_id: str = "", stage_id: str = "",
+    commercial_milestone_template_id: str = "", caller_idempotency_key: str = "",
+    title: str = "", description: str = "", due_date: str = "",
+    created_by: str = "", notes: str = "", obligation_sequence: str = "",
+) -> dict:
+    """
+    Phase 39C (ADR-022 §11/§16/§19): the sole canonical Payment
+    Obligation creation orchestration boundary.
+
+    Validation order, all before any write:
+      A. required business_id / client_id
+      B. amount/currency normalization
+      C. idempotency-source precondition (caller key, OR a complete
+         Template+Roadmap+Stage+Sequence fallback tuple)
+      D. Client + relation validation (+ Template existence if supplied)
+      E. idempotency lookup (zero/one/multiple)
+      F. Obligation ID generated only after A-E pass
+      G. low-level persistence
+      H. post-write verification
+      I. structured result
+    """
+    from business_core.payment_manager import (
+        find_obligations_by_caller_key, find_obligations_by_template_fallback_key,
+        create_payment_obligation as pm_create_obligation, find_payment_obligation_by_id,
+    )
+
+    if not business_id:
+        return _payment_result(ok=False, code="BUSINESS_NOT_FOUND", error="business_id обязателен")
+    if not client_id:
+        return _payment_result(ok=False, code="CLIENT_NOT_FOUND", error="client_id обязателен", business_id=business_id)
+
+    amount_result = normalize_payment_amount(obligation_amount)
+    if not amount_result["ok"]:
+        return _payment_result(ok=False, code=amount_result["code"], error=amount_result["error"], business_id=business_id, client_id=client_id)
+    normalized_amount = amount_result["normalized"]
+
+    currency_result = normalize_payment_currency(currency)
+    if not currency_result["ok"]:
+        return _payment_result(ok=False, code=currency_result["code"], error=currency_result["error"], business_id=business_id, client_id=client_id)
+    normalized_currency = currency_result["currency"]
+
+    has_template_fallback = bool(commercial_milestone_template_id and roadmap_id and stage_id and obligation_sequence)
+    if not caller_idempotency_key and not has_template_fallback:
+        return _payment_result(
+            ok=False, code="PAYMENT_OBLIGATION_IDEMPOTENCY_CONFLICT",
+            error="Требуется caller_idempotency_key либо полный Template+Roadmap+Stage+Sequence fallback",
+            business_id=business_id, client_id=client_id,
+        )
+
+    relation_result = _validate_payment_obligation_relations(
+        business_id, client_id, object_id=object_id, service_id=service_id,
+        roadmap_id=roadmap_id, stage_id=stage_id, commercial_milestone_template_id=commercial_milestone_template_id,
+    )
+    if not relation_result["ok"]:
+        return _payment_result(ok=False, code=relation_result["code"], error=relation_result["error"], business_id=business_id, client_id=client_id)
+    resolved = relation_result["resolved"]
+
+    if caller_idempotency_key:
+        matches = find_obligations_by_caller_key(business_id, caller_idempotency_key)
+    else:
+        matches = find_obligations_by_template_fallback_key(
+            business_id, resolved["commercial_milestone_template_id"], resolved["roadmap_id"], resolved["stage_id"],
+        )
+
+    if len(matches) > 1:
+        conflicting_ids = tuple(m["Payment Obligation ID"] for m in matches)
+        return _payment_result(
+            ok=False, code="MULTIPLE_PAYMENT_OBLIGATION_MATCHES",
+            error=f"Найдено несколько Payment Obligation с этим ключом: {conflicting_ids}",
+            business_id=business_id, client_id=client_id, conflicting_ids=conflicting_ids, retry_safe=True,
+        )
+    if len(matches) == 1:
+        existing = matches[0]
+        return _payment_result(
+            ok=True, code="PAYMENT_OBLIGATION_REUSED", error=None,
+            payment_obligation_id=existing["Payment Obligation ID"], business_id=business_id, client_id=client_id,
+            object_id=existing.get("Object ID", ""), service_id=existing.get("Service ID", ""),
+            roadmap_id=existing.get("Roadmap ID", ""), stage_id=existing.get("Stage ID", ""),
+            commercial_milestone_template_id=existing.get("Commercial Milestone Template ID", ""),
+            amount=existing.get("Obligation Amount", ""), currency=existing.get("Currency", ""),
+            paid_amount=existing.get("Paid Amount", ""), remaining_amount=existing.get("Remaining Amount", ""),
+            final_status=existing.get("Status", ""), reused=True, retry_safe=True,
+        )
+
+    create_result = pm_create_obligation(
+        business_id, client_id, normalized_amount, normalized_currency,
+        object_id=resolved["object_id"], service_id=resolved["service_id"],
+        roadmap_id=resolved["roadmap_id"], stage_id=resolved["stage_id"],
+        commercial_milestone_template_id=resolved["commercial_milestone_template_id"],
+        caller_idempotency_key=caller_idempotency_key,
+        title_snapshot=title, description_snapshot=description, due_date=due_date,
+        created_by=created_by, notes=notes,
+    )
+    if not create_result["ok"]:
+        return _payment_result(ok=False, code="PAYMENT_OBLIGATION_PERSISTENCE_FAILED", error=create_result.get("error"), business_id=business_id, client_id=client_id, retry_safe=True)
+    obligation_id = create_result["payment_obligation_id"]
+
+    saved = find_payment_obligation_by_id(obligation_id)
+    if saved is None:
+        return _payment_result(
+            ok=False, code="PAYMENT_OBLIGATION_POST_WRITE_VERIFICATION_FAILED",
+            error="Payment Obligation записан, но проверка после записи не прошла",
+            payment_obligation_id=obligation_id, business_id=business_id, client_id=client_id, retry_safe=False,
+        )
+
+    return _payment_result(
+        ok=True, code="PAYMENT_OBLIGATION_CREATED", error=None,
+        payment_obligation_id=obligation_id, business_id=business_id, client_id=client_id,
+        object_id=resolved["object_id"], service_id=resolved["service_id"],
+        roadmap_id=resolved["roadmap_id"], stage_id=resolved["stage_id"],
+        commercial_milestone_template_id=resolved["commercial_milestone_template_id"],
+        amount=normalized_amount, currency=normalized_currency,
+        paid_amount="0.00", remaining_amount=normalized_amount,
+        final_status="draft", created=True, retry_safe=True,
+    )
+
+
+def transition_payment_obligation_status(payment_obligation_id: str, target_status: str) -> dict:
+    """
+    Phase 39C (ADR-022 §17/§22): the sole canonical Payment Obligation
+    manual-transition orchestration boundary. Ordinary manual calls can
+    never set partially_paid/paid — those are synchronized only from
+    Transaction truth via _synchronize_payment_obligation_after_
+    transaction_change(). Cancellation blocks when Paid Amount > 0.
+    """
+    from business_core.payment_manager import find_payment_obligation_by_id, update_payment_obligation_status, OBLIGATION_STATUS
+
+    if not payment_obligation_id:
+        return _payment_result(ok=False, code="PAYMENT_OBLIGATION_NOT_FOUND", error="payment_obligation_id обязателен")
+
+    obligation = find_payment_obligation_by_id(payment_obligation_id)
+    if obligation is None:
+        return _payment_result(ok=False, code="PAYMENT_OBLIGATION_NOT_FOUND", error=f"Payment Obligation {payment_obligation_id} не найден", payment_obligation_id=payment_obligation_id)
+
+    business_id = obligation.get("Business ID", "")
+    previous_status = obligation.get("Status", "")
+    paid_amount = obligation.get("Paid Amount", "0.00")
+
+    if target_status not in OBLIGATION_STATUS:
+        return _payment_result(
+            ok=False, code="INVALID_PAYMENT_OBLIGATION_STATUS",
+            error=f"Недопустимый статус '{target_status}'. Допустимые значения: {', '.join(OBLIGATION_STATUS)}",
+            payment_obligation_id=payment_obligation_id, business_id=business_id,
+            previous_status=previous_status, requested_status=target_status, final_status=previous_status,
+        )
+
+    if target_status in _PAYMENT_OBLIGATION_SYNC_ONLY_STATUSES:
+        return _payment_result(
+            ok=False, code="INVALID_PAYMENT_OBLIGATION_TRANSITION",
+            error=f"Статус '{target_status}' устанавливается только автоматической синхронизацией баланса, не обычным переходом",
+            payment_obligation_id=payment_obligation_id, business_id=business_id,
+            previous_status=previous_status, requested_status=target_status, final_status=previous_status,
+        )
+
+    if target_status == previous_status:
+        return _payment_result(
+            ok=True, code="PAYMENT_OBLIGATION_STATUS_UNCHANGED", error=None,
+            payment_obligation_id=payment_obligation_id, business_id=business_id,
+            previous_status=previous_status, requested_status=target_status, final_status=previous_status, changed=False,
+        )
+
+    allowed_targets = _PAYMENT_OBLIGATION_ORDINARY_TRANSITIONS.get(previous_status, (previous_status,))
+    if target_status not in allowed_targets:
+        return _payment_result(
+            ok=False, code="INVALID_PAYMENT_OBLIGATION_TRANSITION",
+            error=f"Переход '{previous_status}' → '{target_status}' не разрешён",
+            payment_obligation_id=payment_obligation_id, business_id=business_id,
+            previous_status=previous_status, requested_status=target_status, final_status=previous_status,
+        )
+
+    if target_status == "cancelled":
+        try:
+            paid_decimal = Decimal(paid_amount or "0")
+        except InvalidOperation:
+            paid_decimal = Decimal("0")
+        if paid_decimal > 0:
+            return _payment_result(
+                ok=False, code="PAYMENT_OBLIGATION_HAS_CONFIRMED_PAYMENTS",
+                error=f"Payment Obligation {payment_obligation_id} имеет подтверждённые платежи (Paid Amount={paid_amount}) — отмена заблокирована",
+                payment_obligation_id=payment_obligation_id, business_id=business_id,
+                previous_status=previous_status, requested_status=target_status, final_status=previous_status,
+                paid_amount=paid_amount,
+            )
+
+    issued_at = _now_utc_str() if (target_status == "issued" and previous_status != "issued") else ""
+    cancelled_at = _now_utc_str() if target_status == "cancelled" else ""
+
+    write_result = update_payment_obligation_status(payment_obligation_id, target_status, issued_at=issued_at, cancelled_at=cancelled_at)
+    if not write_result["ok"]:
+        return _payment_result(
+            ok=False, code=write_result.get("code") or "PAYMENT_PERSISTENCE_FAILED", error=write_result.get("error"),
+            payment_obligation_id=payment_obligation_id, business_id=business_id,
+            previous_status=previous_status, requested_status=target_status, final_status=previous_status,
+        )
+
+    changed = write_result["changed"]
+    return _payment_result(
+        ok=True, code="PAYMENT_OBLIGATION_STATUS_UPDATED" if changed else "PAYMENT_OBLIGATION_STATUS_UNCHANGED", error=None,
+        payment_obligation_id=payment_obligation_id, business_id=business_id,
+        previous_status=previous_status, requested_status=target_status, final_status=target_status, changed=changed,
+    )
+
+
+def update_payment_obligation_admin_fields(payment_obligation_id: str, updates: dict) -> dict:
+    """Phase 39C (ADR-022 §25): thin resolve-then-delegate wrapper.
+    Only Notes is ordinarily mutable."""
+    from business_core.payment_manager import find_payment_obligation_by_id, update_payment_obligation_admin_fields as pm_update_admin
+
+    if not payment_obligation_id:
+        return _payment_result(ok=False, code="PAYMENT_OBLIGATION_NOT_FOUND", error="payment_obligation_id обязателен")
+
+    obligation = find_payment_obligation_by_id(payment_obligation_id)
+    if obligation is None:
+        return _payment_result(ok=False, code="PAYMENT_OBLIGATION_NOT_FOUND", error=f"Payment Obligation {payment_obligation_id} не найден", payment_obligation_id=payment_obligation_id)
+
+    result = pm_update_admin(payment_obligation_id, updates)
+    return _payment_result(
+        ok=result["ok"], code=result.get("code", ""), error=result.get("error"),
+        payment_obligation_id=payment_obligation_id, business_id=obligation.get("Business ID", ""),
+        changed=result.get("changed", False), retry_safe=True,
+    )
+
+
+# ─────────────────────────────────────────────────────────────
+# Payment Transaction
+# ─────────────────────────────────────────────────────────────
+
+def create_payment_transaction(
+    business_id: str, payment_obligation_id: str, client_id: str, amount, currency: str, payment_date: str,
+    *, payment_method: str = "", external_transaction_id: str = "", caller_idempotency_key: str = "",
+    evidence_document_id: str = "", created_by: str = "", notes: str = "",
+) -> dict:
+    """
+    Phase 39C (ADR-022 §15/§20/§21): the sole canonical Payment
+    Transaction creation orchestration boundary. Never confirms during
+    creation — Status is always `pending` (ADR-022 §15).
+    """
+    from business_core.payment_manager import (
+        find_payment_obligation_by_id, find_transactions_by_external_id, find_transactions_by_caller_key,
+        create_payment_transaction as pm_create_transaction, find_payment_transaction_by_id,
+    )
+
+    if not business_id:
+        return _payment_result(ok=False, code="BUSINESS_NOT_FOUND", error="business_id обязателен")
+    if not payment_obligation_id:
+        return _payment_result(ok=False, code="PAYMENT_OBLIGATION_NOT_FOUND", error="payment_obligation_id обязателен", business_id=business_id)
+    if not client_id:
+        return _payment_result(ok=False, code="CLIENT_NOT_FOUND", error="client_id обязателен", business_id=business_id)
+    if not payment_date:
+        return _payment_result(ok=False, code="", error="payment_date обязателен", business_id=business_id)
+    if not external_transaction_id and not caller_idempotency_key:
+        return _payment_result(
+            ok=False, code="PAYMENT_TRANSACTION_IDEMPOTENCY_REQUIRED",
+            error="Требуется external_transaction_id или caller_idempotency_key",
+            business_id=business_id, payment_obligation_id=payment_obligation_id, client_id=client_id,
+        )
+
+    amount_result = normalize_payment_amount(amount)
+    if not amount_result["ok"]:
+        return _payment_result(ok=False, code=amount_result["code"], error=amount_result["error"], business_id=business_id, payment_obligation_id=payment_obligation_id, client_id=client_id)
+    normalized_amount = amount_result["normalized"]
+
+    currency_result = normalize_payment_currency(currency)
+    if not currency_result["ok"]:
+        return _payment_result(ok=False, code=currency_result["code"], error=currency_result["error"], business_id=business_id, payment_obligation_id=payment_obligation_id, client_id=client_id)
+    normalized_currency = currency_result["currency"]
+
+    obligation = find_payment_obligation_by_id(payment_obligation_id)
+    if obligation is None:
+        return _payment_result(ok=False, code="PAYMENT_OBLIGATION_NOT_FOUND", error=f"Payment Obligation {payment_obligation_id} не найден", business_id=business_id, payment_obligation_id=payment_obligation_id, client_id=client_id)
+
+    if obligation.get("Business ID", "") != business_id:
+        return _payment_result(
+            ok=False, code="PAYMENT_ENTITY_RELATION_MISMATCH",
+            error=f"Payment Obligation {payment_obligation_id} принадлежит другому Business",
+            business_id=business_id, payment_obligation_id=payment_obligation_id, client_id=client_id,
+        )
+    if obligation.get("Client ID", "") != client_id:
+        return _payment_result(
+            ok=False, code="PAYMENT_ENTITY_RELATION_MISMATCH",
+            error=f"Client {client_id} не совпадает с плательщиком Obligation ({obligation.get('Client ID', '')})",
+            business_id=business_id, payment_obligation_id=payment_obligation_id, client_id=client_id,
+        )
+    if obligation.get("Currency", "") != normalized_currency:
+        return _payment_result(
+            ok=False, code="PAYMENT_CURRENCY_MISMATCH",
+            error=f"Валюта Transaction ({normalized_currency}) не совпадает с валютой Obligation ({obligation.get('Currency', '')})",
+            business_id=business_id, payment_obligation_id=payment_obligation_id, client_id=client_id,
+        )
+
+    if evidence_document_id:
+        from business_core.document_manager import find_document_by_id
+        doc = find_document_by_id(evidence_document_id)
+        if doc is None:
+            return _payment_result(ok=False, code="DOCUMENT_NOT_FOUND", error=f"Document {evidence_document_id} не найден", business_id=business_id, payment_obligation_id=payment_obligation_id, client_id=client_id)
+        if doc.get("business_id", "") != business_id:
+            return _payment_result(
+                ok=False, code="PAYMENT_ENTITY_RELATION_MISMATCH",
+                error=f"Document {evidence_document_id} принадлежит другому Business",
+                business_id=business_id, payment_obligation_id=payment_obligation_id, client_id=client_id,
+            )
+
+    if external_transaction_id:
+        matches = find_transactions_by_external_id(business_id, external_transaction_id)
+    else:
+        matches = find_transactions_by_caller_key(business_id, caller_idempotency_key)
+
+    if len(matches) > 1:
+        conflicting_ids = tuple(m["Payment Transaction ID"] for m in matches)
+        return _payment_result(
+            ok=False, code="MULTIPLE_PAYMENT_TRANSACTION_MATCHES",
+            error=f"Найдено несколько Payment Transaction с этим ключом: {conflicting_ids}",
+            business_id=business_id, payment_obligation_id=payment_obligation_id, client_id=client_id,
+            conflicting_ids=conflicting_ids, retry_safe=True,
+        )
+    if len(matches) == 1:
+        existing = matches[0]
+        existing_compatible = (
+            existing.get("Payment Obligation ID", "") == payment_obligation_id
+            and existing.get("Amount", "") == normalized_amount
+            and existing.get("Currency", "") == normalized_currency
+        )
+        if not existing_compatible:
+            return _payment_result(
+                ok=False, code="PAYMENT_TRANSACTION_IDEMPOTENCY_CONFLICT",
+                error=f"Ключ идемпотентности уже используется другим Payment Transaction ({existing.get('Payment Transaction ID', '')}) с иными параметрами",
+                business_id=business_id, payment_obligation_id=payment_obligation_id, client_id=client_id,
+                conflicting_ids=(existing.get("Payment Transaction ID", ""),), retry_safe=True,
+            )
+        return _payment_result(
+            ok=True, code="PAYMENT_TRANSACTION_REUSED", error=None,
+            payment_transaction_id=existing["Payment Transaction ID"], business_id=business_id,
+            payment_obligation_id=payment_obligation_id, client_id=client_id,
+            amount=existing.get("Amount", ""), currency=existing.get("Currency", ""),
+            final_status=existing.get("Status", ""), reused=True, retry_safe=True,
+        )
+
+    create_result = pm_create_transaction(
+        business_id, payment_obligation_id, client_id, normalized_amount, normalized_currency, payment_date,
+        payment_method=payment_method, external_transaction_id=external_transaction_id,
+        caller_idempotency_key=caller_idempotency_key, evidence_document_id=evidence_document_id,
+        created_by=created_by, notes=notes,
+    )
+    if not create_result["ok"]:
+        return _payment_result(
+            ok=False, code=create_result.get("code") or "PAYMENT_TRANSACTION_PERSISTENCE_FAILED", error=create_result.get("error"),
+            business_id=business_id, payment_obligation_id=payment_obligation_id, client_id=client_id, retry_safe=True,
+        )
+    transaction_id = create_result["payment_transaction_id"]
+
+    saved = find_payment_transaction_by_id(transaction_id)
+    if saved is None:
+        return _payment_result(
+            ok=False, code="PAYMENT_TRANSACTION_POST_WRITE_VERIFICATION_FAILED",
+            error="Payment Transaction записан, но проверка после записи не прошла",
+            payment_transaction_id=transaction_id, business_id=business_id, payment_obligation_id=payment_obligation_id,
+            client_id=client_id, retry_safe=False,
+        )
+
+    return _payment_result(
+        ok=True, code="PAYMENT_TRANSACTION_CREATED", error=None,
+        payment_transaction_id=transaction_id, business_id=business_id, payment_obligation_id=payment_obligation_id,
+        client_id=client_id, amount=normalized_amount, currency=normalized_currency,
+        final_status="pending", created=True, retry_safe=True,
+    )
+
+
+def confirm_payment_transaction(payment_transaction_id: str, confirmed_by: str) -> dict:
+    """
+    Phase 39C (ADR-022 §17/§18/§22): the sole canonical Payment
+    Transaction confirmation orchestration boundary. Recomputes the
+    Obligation balance EXCLUDING this Transaction first, then checks
+    whether confirming it would overpay — blocks rather than silently
+    allowing. On success, synchronizes the Obligation's cached balance/
+    status from the full Transaction ledger.
+    """
+    from business_core.payment_manager import (
+        find_payment_transaction_by_id, find_payment_obligation_by_id, list_payment_transactions,
+        update_payment_transaction_status,
+    )
+
+    if not payment_transaction_id:
+        return _payment_result(ok=False, code="PAYMENT_TRANSACTION_NOT_FOUND", error="payment_transaction_id обязателен")
+
+    txn = find_payment_transaction_by_id(payment_transaction_id)
+    if txn is None:
+        return _payment_result(ok=False, code="PAYMENT_TRANSACTION_NOT_FOUND", error=f"Payment Transaction {payment_transaction_id} не найден", payment_transaction_id=payment_transaction_id)
+
+    business_id = txn.get("Business ID", "")
+    obligation_id = txn.get("Payment Obligation ID", "")
+    previous_status = txn.get("Status", "")
+
+    if previous_status == "confirmed":
+        return _payment_result(
+            ok=True, code="PAYMENT_TRANSACTION_CONFIRMATION_UNCHANGED", error=None,
+            payment_transaction_id=payment_transaction_id, business_id=business_id, payment_obligation_id=obligation_id,
+            previous_status=previous_status, requested_status="confirmed", final_status=previous_status,
+            changed=False, confirmed=True,
+        )
+    if previous_status != "pending":
+        return _payment_result(
+            ok=False, code="INVALID_PAYMENT_TRANSACTION_TRANSITION",
+            error=f"Transaction {payment_transaction_id} имеет статус '{previous_status}' — подтверждение возможно только из 'pending'",
+            payment_transaction_id=payment_transaction_id, business_id=business_id, payment_obligation_id=obligation_id,
+            previous_status=previous_status, requested_status="confirmed", final_status=previous_status,
+        )
+    if not confirmed_by:
+        return _payment_result(
+            ok=False, code="PAYMENT_TRANSACTION_CONFIRMATION_METADATA_REQUIRED", error="confirmed_by обязателен",
+            payment_transaction_id=payment_transaction_id, business_id=business_id, payment_obligation_id=obligation_id,
+            previous_status=previous_status, requested_status="confirmed", final_status=previous_status,
+        )
+
+    obligation = find_payment_obligation_by_id(obligation_id)
+    if obligation is None:
+        return _payment_result(
+            ok=False, code="PAYMENT_OBLIGATION_NOT_FOUND", error=f"Payment Obligation {obligation_id} не найден",
+            payment_transaction_id=payment_transaction_id, business_id=business_id, payment_obligation_id=obligation_id,
+        )
+
+    other_transactions = [
+        t for t in list_payment_transactions(payment_obligation_id=obligation_id)
+        if t.get("Payment Transaction ID", "") != payment_transaction_id
+    ]
+    balance_before = _compute_payment_balance(obligation.get("Obligation Amount", "0"), other_transactions)
+    if not balance_before["ok"]:
+        return _payment_result(
+            ok=False, code=balance_before["code"], error=balance_before["error"],
+            payment_transaction_id=payment_transaction_id, business_id=business_id, payment_obligation_id=obligation_id,
+        )
+
+    try:
+        remaining_before = Decimal(balance_before["remaining_amount"])
+        txn_amount = Decimal(txn.get("Amount", "0"))
+    except InvalidOperation:
+        return _payment_result(
+            ok=False, code="INVALID_PAYMENT_AMOUNT", error="Не удалось разобрать сумму Transaction",
+            payment_transaction_id=payment_transaction_id, business_id=business_id, payment_obligation_id=obligation_id,
+        )
+
+    if txn_amount > remaining_before:
+        return _payment_result(
+            ok=False, code="PAYMENT_TRANSACTION_OVERPAYMENT_BLOCKED",
+            error=f"Подтверждение Transaction на сумму {txn_amount} превысит Remaining Amount ({remaining_before})",
+            payment_transaction_id=payment_transaction_id, business_id=business_id, payment_obligation_id=obligation_id,
+            amount=str(txn_amount), remaining_amount=str(remaining_before),
+        )
+
+    now = _now_utc_str()
+    write_result = update_payment_transaction_status(payment_transaction_id, "confirmed", confirmed_at=now, confirmed_by=confirmed_by)
+    if not write_result["ok"]:
+        return _payment_result(
+            ok=False, code="PAYMENT_PERSISTENCE_FAILED", error=write_result.get("error"),
+            payment_transaction_id=payment_transaction_id, business_id=business_id, payment_obligation_id=obligation_id,
+            previous_status=previous_status, requested_status="confirmed", final_status=previous_status,
+        )
+
+    verify_txn = find_payment_transaction_by_id(payment_transaction_id)
+    if verify_txn is None or verify_txn.get("Status", "") != "confirmed":
+        return _payment_result(
+            ok=False, code="PAYMENT_TRANSACTION_POST_WRITE_VERIFICATION_FAILED",
+            error="Transaction помечен confirmed, но проверка после записи не прошла",
+            payment_transaction_id=payment_transaction_id, business_id=business_id, payment_obligation_id=obligation_id,
+            previous_status=previous_status, requested_status="confirmed", final_status=previous_status, retry_safe=False,
+        )
+
+    sync_result = _synchronize_payment_obligation_after_transaction_change(obligation_id)
+    if not sync_result["ok"]:
+        return _payment_result(
+            ok=False, code="PAYMENT_OBLIGATION_POST_WRITE_VERIFICATION_FAILED",
+            error=f"Transaction подтверждён, но синхронизация баланса Obligation не удалась: {sync_result.get('error')}",
+            payment_transaction_id=payment_transaction_id, business_id=business_id, payment_obligation_id=obligation_id,
+            previous_status=previous_status, requested_status="confirmed", final_status="confirmed",
+            confirmed=True, changed=True, retry_safe=False,
+        )
+
+    return _payment_result(
+        ok=True, code="PAYMENT_TRANSACTION_CONFIRMED", error=None,
+        payment_transaction_id=payment_transaction_id, business_id=business_id, payment_obligation_id=obligation_id,
+        amount=txn.get("Amount", ""), currency=txn.get("Currency", ""),
+        paid_amount=sync_result["paid_amount"], remaining_amount=sync_result["remaining_amount"],
+        previous_status=previous_status, requested_status="confirmed", final_status="confirmed",
+        changed=True, confirmed=True, retry_safe=True,
+    )
+
+
+def reverse_payment_transaction(payment_transaction_id: str, reversal_reason: str, reversed_by: str) -> dict:
+    """
+    Phase 39C (ADR-022 §13/§19/§22): the sole canonical Payment
+    Transaction reversal orchestration boundary. Status-based reversal
+    on the original row — never a second offsetting Transaction row.
+    Financial fields (Amount/Currency/Payment Date) are verified
+    unchanged after the write, as a structural immutability guarantee.
+    """
+    from business_core.payment_manager import find_payment_transaction_by_id, update_payment_transaction_status
+
+    if not payment_transaction_id:
+        return _payment_result(ok=False, code="PAYMENT_TRANSACTION_NOT_FOUND", error="payment_transaction_id обязателен")
+
+    txn = find_payment_transaction_by_id(payment_transaction_id)
+    if txn is None:
+        return _payment_result(ok=False, code="PAYMENT_TRANSACTION_NOT_FOUND", error=f"Payment Transaction {payment_transaction_id} не найден", payment_transaction_id=payment_transaction_id)
+
+    business_id = txn.get("Business ID", "")
+    obligation_id = txn.get("Payment Obligation ID", "")
+    previous_status = txn.get("Status", "")
+
+    if previous_status == "reversed":
+        return _payment_result(
+            ok=True, code="PAYMENT_TRANSACTION_REVERSAL_UNCHANGED", error=None,
+            payment_transaction_id=payment_transaction_id, business_id=business_id, payment_obligation_id=obligation_id,
+            previous_status=previous_status, requested_status="reversed", final_status=previous_status,
+            changed=False, reversed=True,
+        )
+    if previous_status != "confirmed":
+        return _payment_result(
+            ok=False, code="INVALID_PAYMENT_TRANSACTION_TRANSITION",
+            error=f"Transaction {payment_transaction_id} имеет статус '{previous_status}' — реверс возможен только из 'confirmed'",
+            payment_transaction_id=payment_transaction_id, business_id=business_id, payment_obligation_id=obligation_id,
+            previous_status=previous_status, requested_status="reversed", final_status=previous_status,
+        )
+    if not reversal_reason:
+        return _payment_result(
+            ok=False, code="PAYMENT_TRANSACTION_REVERSAL_REASON_REQUIRED", error="reversal_reason обязателен",
+            payment_transaction_id=payment_transaction_id, business_id=business_id, payment_obligation_id=obligation_id,
+            previous_status=previous_status, requested_status="reversed", final_status=previous_status,
+        )
+    if not reversed_by:
+        return _payment_result(
+            ok=False, code="PAYMENT_TRANSACTION_REVERSAL_REASON_REQUIRED", error="reversed_by обязателен",
+            payment_transaction_id=payment_transaction_id, business_id=business_id, payment_obligation_id=obligation_id,
+            previous_status=previous_status, requested_status="reversed", final_status=previous_status,
+        )
+
+    now = _now_utc_str()
+    write_result = update_payment_transaction_status(
+        payment_transaction_id, "reversed", reversed_at=now, reversed_by=reversed_by, reversal_reason=reversal_reason,
+    )
+    if not write_result["ok"]:
+        return _payment_result(
+            ok=False, code="PAYMENT_PERSISTENCE_FAILED", error=write_result.get("error"),
+            payment_transaction_id=payment_transaction_id, business_id=business_id, payment_obligation_id=obligation_id,
+            previous_status=previous_status, requested_status="reversed", final_status=previous_status,
+        )
+
+    verify_txn = find_payment_transaction_by_id(payment_transaction_id)
+    if verify_txn is None or verify_txn.get("Status", "") != "reversed":
+        return _payment_result(
+            ok=False, code="PAYMENT_TRANSACTION_POST_WRITE_VERIFICATION_FAILED",
+            error="Transaction помечен reversed, но проверка после записи не прошла",
+            payment_transaction_id=payment_transaction_id, business_id=business_id, payment_obligation_id=obligation_id,
+            previous_status=previous_status, requested_status="reversed", final_status=previous_status, retry_safe=False,
+        )
+    if (
+        verify_txn.get("Amount", "") != txn.get("Amount", "")
+        or verify_txn.get("Currency", "") != txn.get("Currency", "")
+        or verify_txn.get("Payment Date", "") != txn.get("Payment Date", "")
+    ):
+        return _payment_result(
+            ok=False, code="PAYMENT_TRANSACTION_IMMUTABLE",
+            error="Финансовые поля Transaction изменились при реверсе — недопустимо",
+            payment_transaction_id=payment_transaction_id, business_id=business_id, payment_obligation_id=obligation_id,
+            previous_status=previous_status, requested_status="reversed", final_status=previous_status, retry_safe=False,
+        )
+
+    sync_result = _synchronize_payment_obligation_after_transaction_change(obligation_id)
+    if not sync_result["ok"]:
+        return _payment_result(
+            ok=False, code="PAYMENT_OBLIGATION_POST_WRITE_VERIFICATION_FAILED",
+            error=f"Transaction реверснут, но синхронизация баланса Obligation не удалась: {sync_result.get('error')}",
+            payment_transaction_id=payment_transaction_id, business_id=business_id, payment_obligation_id=obligation_id,
+            previous_status=previous_status, requested_status="reversed", final_status="reversed",
+            reversed=True, changed=True, retry_safe=False,
+        )
+
+    return _payment_result(
+        ok=True, code="PAYMENT_TRANSACTION_REVERSED", error=None,
+        payment_transaction_id=payment_transaction_id, business_id=business_id, payment_obligation_id=obligation_id,
+        amount=txn.get("Amount", ""), currency=txn.get("Currency", ""),
+        paid_amount=sync_result["paid_amount"], remaining_amount=sync_result["remaining_amount"],
+        previous_status=previous_status, requested_status="reversed", final_status="reversed",
+        changed=True, reversed=True, retry_safe=True,
+    )
+
+
+def fail_payment_transaction(payment_transaction_id: str) -> dict:
+    """Phase 39C (ADR-022 §12/§19): the sole canonical pending→failed
+    orchestration boundary. failed never affects Obligation balance —
+    no synchronization call is made here."""
+    from business_core.payment_manager import find_payment_transaction_by_id, update_payment_transaction_status
+
+    if not payment_transaction_id:
+        return _payment_result(ok=False, code="PAYMENT_TRANSACTION_NOT_FOUND", error="payment_transaction_id обязателен")
+
+    txn = find_payment_transaction_by_id(payment_transaction_id)
+    if txn is None:
+        return _payment_result(ok=False, code="PAYMENT_TRANSACTION_NOT_FOUND", error=f"Payment Transaction {payment_transaction_id} не найден", payment_transaction_id=payment_transaction_id)
+
+    business_id = txn.get("Business ID", "")
+    obligation_id = txn.get("Payment Obligation ID", "")
+    previous_status = txn.get("Status", "")
+
+    if previous_status == "failed":
+        return _payment_result(
+            ok=True, code="PAYMENT_TRANSACTION_FAILED", error=None,
+            payment_transaction_id=payment_transaction_id, business_id=business_id, payment_obligation_id=obligation_id,
+            previous_status=previous_status, requested_status="failed", final_status=previous_status, changed=False,
+        )
+    if previous_status != "pending":
+        return _payment_result(
+            ok=False, code="INVALID_PAYMENT_TRANSACTION_TRANSITION",
+            error=f"Transaction {payment_transaction_id} имеет статус '{previous_status}' — переход в 'failed' возможен только из 'pending'",
+            payment_transaction_id=payment_transaction_id, business_id=business_id, payment_obligation_id=obligation_id,
+            previous_status=previous_status, requested_status="failed", final_status=previous_status,
+        )
+
+    write_result = update_payment_transaction_status(payment_transaction_id, "failed")
+    if not write_result["ok"]:
+        return _payment_result(
+            ok=False, code="PAYMENT_PERSISTENCE_FAILED", error=write_result.get("error"),
+            payment_transaction_id=payment_transaction_id, business_id=business_id, payment_obligation_id=obligation_id,
+            previous_status=previous_status, requested_status="failed", final_status=previous_status,
+        )
+
+    changed = write_result["changed"]
+    return _payment_result(
+        ok=True, code="PAYMENT_TRANSACTION_FAILED", error=None,
+        payment_transaction_id=payment_transaction_id, business_id=business_id, payment_obligation_id=obligation_id,
+        previous_status=previous_status, requested_status="failed", final_status="failed", changed=changed,
+    )
+
+
+def update_payment_transaction_admin_fields(payment_transaction_id: str, updates: dict) -> dict:
+    """Phase 39C (ADR-022 §25): thin resolve-then-delegate wrapper.
+    Only Notes is ordinarily mutable, and only while pending —
+    enforced by payment_manager.update_payment_transaction_admin_
+    fields() itself."""
+    from business_core.payment_manager import find_payment_transaction_by_id, update_payment_transaction_admin_fields as pm_update_admin
+
+    if not payment_transaction_id:
+        return _payment_result(ok=False, code="PAYMENT_TRANSACTION_NOT_FOUND", error="payment_transaction_id обязателен")
+
+    txn = find_payment_transaction_by_id(payment_transaction_id)
+    if txn is None:
+        return _payment_result(ok=False, code="PAYMENT_TRANSACTION_NOT_FOUND", error=f"Payment Transaction {payment_transaction_id} не найден", payment_transaction_id=payment_transaction_id)
+
+    result = pm_update_admin(payment_transaction_id, updates)
+    return _payment_result(
+        ok=result["ok"], code=result.get("code", ""), error=result.get("error"),
+        payment_transaction_id=payment_transaction_id, business_id=txn.get("Business ID", ""),
+        payment_obligation_id=txn.get("Payment Obligation ID", ""), changed=result.get("changed", False), retry_safe=True,
     )

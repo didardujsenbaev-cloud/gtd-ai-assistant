@@ -187,11 +187,21 @@ _CHECKLIST_KNOWLEDGE_TEST_FILES = frozenset({
     "test_checklist_caller_ux.py",
 })
 
+# Phase 39C (ADR-022): Payment/Milestone Domain Foundation — registered
+# BEFORE any test logic was written, per the PRS-003 precedent this
+# conftest.py exists to prevent.
+_PAYMENT_DOMAIN_TEST_FILES = frozenset({
+    "test_payment_manager.py",
+    "test_business_payment_foundation.py",
+    "test_payment_architecture_guards.py",
+    "test_payment_mock_completeness.py",
+})
+
 _HARD_SOCKET_BLOCK_TEST_FILES = (
     _CLIENT_DOMAIN_TEST_FILES | _ROADMAP_DOMAIN_TEST_FILES
     | _ORGANIZATION_DOMAIN_TEST_FILES | _OTHER_HARDENED_TEST_FILES
     | _TASK_DOMAIN_TEST_FILES | _DOCUMENT_DOMAIN_TEST_FILES
-    | _CHECKLIST_KNOWLEDGE_TEST_FILES
+    | _CHECKLIST_KNOWLEDGE_TEST_FILES | _PAYMENT_DOMAIN_TEST_FILES
 )
 
 

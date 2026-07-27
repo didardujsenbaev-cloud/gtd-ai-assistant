@@ -67,6 +67,10 @@ BUSINESS_SHEET_NAMES: dict[str, str] = {
     # separate from the Phase 8C checklist_registry Template layer above.
     "checklist_instances":         "CHECKLIST_INSTANCES",
     "checklist_instance_items":    "CHECKLIST_INSTANCE_ITEMS",
+    # Phase 39C (ADR-022): Payment/Milestone Domain Foundation.
+    "commercial_milestone_templates": "COMMERCIAL_MILESTONE_TEMPLATES",
+    "payment_obligations":            "PAYMENT_OBLIGATIONS",
+    "payment_transactions":           "PAYMENT_TRANSACTIONS",
 }
 
 BUSINESS_HEADERS: dict[str, list[str]] = {
@@ -377,6 +381,39 @@ BUSINESS_HEADERS: dict[str, list[str]] = {
         "Task ID", "Document ID", "SOP ID",
         "Completed At", "Completed By", "Created At", "Updated At", "Notes",
     ],
+    # Phase 39C (ADR-022): Payment/Milestone Domain Foundation. Three
+    # registries — Commercial Milestone Template (reference layer) +
+    # Payment Obligation (expected money) + Payment Transaction (actual
+    # money), formally separated per ADR-022 §1/§8. No Allocation
+    # registry (ADR-022 §1.D, deferred). `Caller Idempotency Key` was
+    # added to payment_obligations (not in the original brief) as the
+    # primary Obligation dedup key (ADR-022 §2/§16). `Reversal Of
+    # Transaction ID` was deliberately omitted from payment_transactions
+    # — the approved reversal model (ADR-022 §13/§19) mutates the
+    # original row's status rather than creating a second linked row.
+    "commercial_milestone_templates": [
+        "Commercial Milestone Template ID", "Roadmap Template ID", "Service ID",
+        "Title", "Description", "Sequence", "Trigger Description",
+        "Calculation Type", "Fixed Amount", "Percentage", "Currency", "Status",
+        "Created At", "Created By", "Updated At", "Notes",
+    ],
+    "payment_obligations": [
+        "Payment Obligation ID", "Business ID", "Client ID", "Object ID", "Service ID",
+        "Roadmap ID", "Stage ID", "Commercial Milestone Template ID",
+        "Caller Idempotency Key", "Title Snapshot", "Description Snapshot",
+        "Obligation Amount", "Currency", "Due Date", "Status",
+        "Paid Amount", "Remaining Amount",
+        "Created At", "Created By", "Issued At", "Paid At", "Cancelled At",
+        "Updated At", "Notes",
+    ],
+    "payment_transactions": [
+        "Payment Transaction ID", "Business ID", "Payment Obligation ID", "Client ID",
+        "Amount", "Currency", "Payment Date", "Payment Method",
+        "External Transaction ID", "Caller Idempotency Key", "Evidence Document ID",
+        "Status", "Reversal Reason",
+        "Confirmed At", "Confirmed By", "Reversed At", "Reversed By",
+        "Created At", "Created By", "Updated At", "Notes",
+    ],
 }
 
 # ID-префиксы для generate_next_id
@@ -417,6 +454,11 @@ _ID_PREFIXES: dict[str, str] = {
     # ADR-021 §6.
     "checklist_instances":         "CLIN",
     "checklist_instance_items":    "CLII",
+    # Phase 39C (ADR-022): checked against every existing prefix above —
+    # no collisions.
+    "commercial_milestone_templates": "PMT",
+    "payment_obligations":            "POB",
+    "payment_transactions":           "PTXN",
 }
 
 

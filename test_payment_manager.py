@@ -1,0 +1,329 @@
+"""
+Tests for Phase 39C — Payment/Milestone Domain Foundation: business_core/
+payment_manager.py (ADR-022). Covers Commercial Milestone Template /
+Payment Obligation / Payment Transaction ID generation, low-level
+creation, admin-field update rules, status persistence, and read-only
+idempotency-tuple lookups. No cross-entity eligibility, no Decimal/
+currency normalization, no balance calculation — that's
+business_builder.py's job, covered separately in
+test_business_payment_foundation.py.
+
+No live Sheets writes — mocks only. Registered in conftest.py's hard
+socket-block set before this file's logic was written.
+"""
+
+from __future__ import annotations
+
+import sys
+import unittest
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+WORKSPACE = Path(__file__).parent
+sys.path.insert(0, str(WORKSPACE))
+
+TEMPLATE_HEADERS = [
+    "Commercial Milestone Template ID", "Roadmap Template ID", "Service ID",
+    "Title", "Description", "Sequence", "Trigger Description",
+    "Calculation Type", "Fixed Amount", "Percentage", "Currency", "Status",
+    "Created At", "Created By", "Updated At", "Notes",
+]
+
+OBLIGATION_HEADERS = [
+    "Payment Obligation ID", "Business ID", "Client ID", "Object ID", "Service ID",
+    "Roadmap ID", "Stage ID", "Commercial Milestone Template ID",
+    "Caller Idempotency Key", "Title Snapshot", "Description Snapshot",
+    "Obligation Amount", "Currency", "Due Date", "Status",
+    "Paid Amount", "Remaining Amount",
+    "Created At", "Created By", "Issued At", "Paid At", "Cancelled At",
+    "Updated At", "Notes",
+]
+
+TRANSACTION_HEADERS = [
+    "Payment Transaction ID", "Business ID", "Payment Obligation ID", "Client ID",
+    "Amount", "Currency", "Payment Date", "Payment Method",
+    "External Transaction ID", "Caller Idempotency Key", "Evidence Document ID",
+    "Status", "Reversal Reason",
+    "Confirmed At", "Confirmed By", "Reversed At", "Reversed By",
+    "Created At", "Created By", "Updated At", "Notes",
+]
+
+TEMPLATE_ROW = [
+    "PMT-001", "RMT-001", "", "Этап 1", "Описание", "1", "Триггер",
+    "fixed", "150000.00", "", "KZT", "active",
+    "2026-01-01 00:00:00 UTC", "dida", "2026-01-01 00:00:00 UTC", "",
+]
+
+OBLIGATION_ROW = [
+    "POB-001", "BIZ-001", "PRS-001", "", "", "RM-001", "STAGE-001", "PMT-001",
+    "CALLKEY-1", "Этап 1", "", "150000.00", "KZT", "", "draft",
+    "0.00", "150000.00",
+    "2026-01-01 00:00:00 UTC", "dida", "", "", "",
+    "2026-01-01 00:00:00 UTC", "",
+]
+
+TRANSACTION_ROW = [
+    "PTXN-001", "BIZ-001", "POB-001", "PRS-001",
+    "50000.00", "KZT", "2026-01-05", "bank_transfer",
+    "EXT-1", "", "",
+    "pending", "",
+    "", "", "", "",
+    "2026-01-05 00:00:00 UTC", "dida", "2026-01-05 00:00:00 UTC", "",
+]
+
+
+def _fresh_pm():
+    import importlib
+    import business_core.payment_manager as pm
+    return importlib.reload(pm)
+
+
+def _make_sheet(headers, rows):
+    sheet = MagicMock()
+    values = [headers] + rows
+    sheet.get_all_values.return_value = values
+    sheet.row_values.side_effect = lambda r: values[r - 1] if 0 <= r - 1 < len(values) else []
+    return sheet
+
+
+class TestSchema(unittest.TestCase):
+    def test_template_headers_exact(self):
+        from business_core.sheets import BUSINESS_HEADERS
+        self.assertEqual(BUSINESS_HEADERS["commercial_milestone_templates"], TEMPLATE_HEADERS)
+
+    def test_obligation_headers_exact(self):
+        from business_core.sheets import BUSINESS_HEADERS
+        self.assertEqual(BUSINESS_HEADERS["payment_obligations"], OBLIGATION_HEADERS)
+
+    def test_transaction_headers_exact(self):
+        from business_core.sheets import BUSINESS_HEADERS
+        self.assertEqual(BUSINESS_HEADERS["payment_transactions"], TRANSACTION_HEADERS)
+
+    def test_id_prefixes(self):
+        from business_core.sheets import _ID_PREFIXES
+        self.assertEqual(_ID_PREFIXES["commercial_milestone_templates"], "PMT")
+        self.assertEqual(_ID_PREFIXES["payment_obligations"], "POB")
+        self.assertEqual(_ID_PREFIXES["payment_transactions"], "PTXN")
+
+    def test_no_payment_allocation_registry(self):
+        from business_core.sheets import BUSINESS_HEADERS, BUSINESS_SHEET_NAMES
+        self.assertNotIn("payment_allocations", BUSINESS_HEADERS)
+        self.assertNotIn("payment_allocations", BUSINESS_SHEET_NAMES)
+
+    def test_no_invoice_expense_revenue_registry(self):
+        from business_core.sheets import BUSINESS_HEADERS
+        for forbidden in ("invoice_registry", "expense_registry", "revenue_registry", "ledger_registry"):
+            self.assertNotIn(forbidden, BUSINESS_HEADERS)
+
+    def test_commercial_milestones_map_unaffected(self):
+        """The Phase-9 hardcoded config must remain completely untouched."""
+        from business_core.roadmap_manager import COMMERCIAL_MILESTONES_MAP
+        self.assertIn("RMT-IZH-ALM-STANDARD-002", COMMERCIAL_MILESTONES_MAP)
+        self.assertEqual(len(COMMERCIAL_MILESTONES_MAP), 1)
+
+
+class TestIdGeneration(unittest.TestCase):
+    def test_generate_next_template_id_empty_sheet(self):
+        pm = _fresh_pm()
+        sheet = MagicMock()
+        sheet.get_all_values.return_value = [TEMPLATE_HEADERS]
+        with patch("business_core.sheets.get_business_sheet", return_value=sheet):
+            self.assertEqual(pm.generate_next_template_id(), "PMT-001")
+
+    def test_generate_next_template_id_increments(self):
+        pm = _fresh_pm()
+        sheet = _make_sheet(TEMPLATE_HEADERS, [TEMPLATE_ROW])
+        with patch("business_core.sheets.get_business_sheet", return_value=sheet):
+            self.assertEqual(pm.generate_next_template_id(), "PMT-002")
+
+    def test_generate_next_obligation_id_empty_sheet(self):
+        pm = _fresh_pm()
+        sheet = MagicMock()
+        sheet.get_all_values.return_value = [OBLIGATION_HEADERS]
+        with patch("business_core.sheets.get_business_sheet", return_value=sheet):
+            self.assertEqual(pm.generate_next_obligation_id(), "POB-001")
+
+    def test_generate_next_transaction_id_empty_sheet(self):
+        pm = _fresh_pm()
+        sheet = MagicMock()
+        sheet.get_all_values.return_value = [TRANSACTION_HEADERS]
+        with patch("business_core.sheets.get_business_sheet", return_value=sheet):
+            self.assertEqual(pm.generate_next_transaction_id(), "PTXN-001")
+
+    def test_malformed_existing_template_ids_ignored(self):
+        pm = _fresh_pm()
+        bad_row = list(TEMPLATE_ROW)
+        bad_row[0] = "NOT-A-VALID-ID"
+        sheet = _make_sheet(TEMPLATE_HEADERS, [bad_row])
+        with patch("business_core.sheets.get_business_sheet", return_value=sheet):
+            self.assertEqual(pm.generate_next_template_id(), "PMT-001")
+
+
+class TestTemplateReadsAndFind(unittest.TestCase):
+    def test_find_by_id_not_found(self):
+        pm = _fresh_pm()
+        with patch("business_core.sheets.find_row_by_id", return_value=None):
+            self.assertIsNone(pm.find_commercial_milestone_template_by_id("PMT-999"))
+
+    def test_find_by_id_found(self):
+        pm = _fresh_pm()
+        row_dict = dict(zip(TEMPLATE_HEADERS, TEMPLATE_ROW))
+        with patch("business_core.sheets.find_row_by_id", return_value=(2, row_dict)):
+            result = pm.find_commercial_milestone_template_by_id("PMT-001")
+        self.assertEqual(result["Title"], "Этап 1")
+
+    def test_find_templates_by_identity_exact_match_only(self):
+        pm = _fresh_pm()
+        sheet = _make_sheet(TEMPLATE_HEADERS, [TEMPLATE_ROW])
+        with patch("business_core.sheets.get_business_sheet", return_value=sheet):
+            matches = pm.find_templates_by_identity("RMT-001", "", "1", "Этап 1")
+        self.assertEqual(len(matches), 1)
+
+    def test_find_templates_by_identity_no_match(self):
+        pm = _fresh_pm()
+        sheet = _make_sheet(TEMPLATE_HEADERS, [TEMPLATE_ROW])
+        with patch("business_core.sheets.get_business_sheet", return_value=sheet):
+            matches = pm.find_templates_by_identity("RMT-001", "", "2", "Этап 1")
+        self.assertEqual(matches, [])
+
+
+class TestObligationReadsAndIdempotency(unittest.TestCase):
+    def test_find_obligations_by_caller_key(self):
+        pm = _fresh_pm()
+        sheet = _make_sheet(OBLIGATION_HEADERS, [OBLIGATION_ROW])
+        with patch("business_core.sheets.get_business_sheet", return_value=sheet):
+            matches = pm.find_obligations_by_caller_key("BIZ-001", "CALLKEY-1")
+        self.assertEqual(len(matches), 1)
+
+    def test_find_obligations_by_caller_key_no_match(self):
+        pm = _fresh_pm()
+        sheet = _make_sheet(OBLIGATION_HEADERS, [OBLIGATION_ROW])
+        with patch("business_core.sheets.get_business_sheet", return_value=sheet):
+            matches = pm.find_obligations_by_caller_key("BIZ-001", "OTHER-KEY")
+        self.assertEqual(matches, [])
+
+    def test_find_obligations_requires_both_args(self):
+        pm = _fresh_pm()
+        self.assertEqual(pm.find_obligations_by_caller_key("", "KEY"), [])
+        self.assertEqual(pm.find_obligations_by_caller_key("BIZ-001", ""), [])
+
+    def test_find_obligations_by_template_fallback_key(self):
+        pm = _fresh_pm()
+        sheet = _make_sheet(OBLIGATION_HEADERS, [OBLIGATION_ROW])
+        with patch("business_core.sheets.get_business_sheet", return_value=sheet):
+            matches = pm.find_obligations_by_template_fallback_key("BIZ-001", "PMT-001", "RM-001", "STAGE-001")
+        self.assertEqual(len(matches), 1)
+
+
+class TestTransactionReadsAndIdempotency(unittest.TestCase):
+    def test_find_transactions_by_external_id(self):
+        pm = _fresh_pm()
+        sheet = _make_sheet(TRANSACTION_HEADERS, [TRANSACTION_ROW])
+        with patch("business_core.sheets.get_business_sheet", return_value=sheet):
+            matches = pm.find_transactions_by_external_id("BIZ-001", "EXT-1")
+        self.assertEqual(len(matches), 1)
+
+    def test_find_transactions_by_caller_key_no_match(self):
+        pm = _fresh_pm()
+        sheet = _make_sheet(TRANSACTION_HEADERS, [TRANSACTION_ROW])
+        with patch("business_core.sheets.get_business_sheet", return_value=sheet):
+            matches = pm.find_transactions_by_caller_key("BIZ-001", "NOPE")
+        self.assertEqual(matches, [])
+
+
+class TestLowLevelCreation(unittest.TestCase):
+    def test_create_commercial_milestone_template_requires_title(self):
+        pm = _fresh_pm()
+        result = pm.create_commercial_milestone_template("", "fixed")
+        self.assertFalse(result["ok"])
+
+    def test_create_commercial_milestone_template_invalid_calculation_type(self):
+        pm = _fresh_pm()
+        result = pm.create_commercial_milestone_template("Title", "bogus")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "INVALID_MILESTONE_CALCULATION_TYPE")
+
+    def test_create_payment_obligation_requires_business_id(self):
+        pm = _fresh_pm()
+        result = pm.create_payment_obligation("", "PRS-001", "100.00", "KZT")
+        self.assertFalse(result["ok"])
+
+    def test_create_payment_transaction_requires_idempotency_source(self):
+        pm = _fresh_pm()
+        result = pm.create_payment_transaction("BIZ-001", "POB-001", "PRS-001", "100.00", "KZT", "2026-01-01")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "PAYMENT_TRANSACTION_IDEMPOTENCY_REQUIRED")
+
+    def test_create_payment_transaction_defaults_to_pending(self):
+        pm = _fresh_pm()
+        sheet = MagicMock()
+        sheet.get_all_values.return_value = [TRANSACTION_HEADERS]
+        appended = {}
+
+        def _capture_append(sheet_key, values):
+            appended["row"] = values
+            return 2
+
+        with patch("business_core.sheets.get_business_sheet", return_value=sheet), \
+             patch("business_core.sheets.append_business_row", side_effect=_capture_append):
+            result = pm.create_payment_transaction(
+                "BIZ-001", "POB-001", "PRS-001", "100.00", "KZT", "2026-01-01",
+                external_transaction_id="EXT-9",
+            )
+        self.assertTrue(result["ok"])
+        idx = TRANSACTION_HEADERS.index("Status")
+        self.assertEqual(appended["row"][idx], "pending")
+
+
+class TestAdminFieldImmutability(unittest.TestCase):
+    def test_template_identity_fields_blocked(self):
+        pm = _fresh_pm()
+        result = pm.update_commercial_milestone_template_admin_fields("PMT-001", {"Fixed Amount": "999.00"})
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "PAYMENT_TRANSACTION_IMMUTABLE")
+
+    def test_obligation_identity_fields_blocked(self):
+        pm = _fresh_pm()
+        result = pm.update_payment_obligation_admin_fields("POB-001", {"Obligation Amount": "999.00"})
+        self.assertFalse(result["ok"])
+
+    def test_obligation_status_not_editable_via_admin(self):
+        pm = _fresh_pm()
+        result = pm.update_payment_obligation_admin_fields("POB-001", {"Status": "paid"})
+        self.assertFalse(result["ok"])
+
+    def test_transaction_identity_fields_blocked(self):
+        pm = _fresh_pm()
+        result = pm.update_payment_transaction_admin_fields("PTXN-001", {"Amount": "999.00"})
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "PAYMENT_TRANSACTION_IMMUTABLE")
+
+    def test_transaction_notes_blocked_once_confirmed(self):
+        pm = _fresh_pm()
+        confirmed_row = dict(zip(TRANSACTION_HEADERS, TRANSACTION_ROW))
+        confirmed_row["Status"] = "confirmed"
+        with patch("business_core.sheets.find_row_by_id", return_value=(2, confirmed_row)):
+            result = pm.update_payment_transaction_admin_fields("PTXN-001", {"Notes": "updated"})
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "PAYMENT_TRANSACTION_IMMUTABLE")
+
+    def test_transaction_notes_allowed_while_pending(self):
+        pm = _fresh_pm()
+        pending_row = dict(zip(TRANSACTION_HEADERS, TRANSACTION_ROW))
+        sheet = MagicMock()
+        sheet.row_values.return_value = TRANSACTION_HEADERS
+        with patch("business_core.sheets.find_row_by_id", return_value=(2, pending_row)), \
+             patch("business_core.sheets.get_business_sheet", return_value=sheet):
+            result = pm.update_payment_transaction_admin_fields("PTXN-001", {"Notes": "updated"})
+        self.assertTrue(result["ok"])
+
+
+class TestNoHardDelete(unittest.TestCase):
+    def test_no_delete_function_exists(self):
+        pm = _fresh_pm()
+        names = [n for n in dir(pm) if "delete" in n.lower()]
+        self.assertEqual(names, [])
+
+
+if __name__ == "__main__":
+    unittest.main()

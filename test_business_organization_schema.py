@@ -204,13 +204,15 @@ class TestExistingRegistriesUntouched(unittest.TestCase):
         # 20 pre-existing (per Phase 18C-1 baseline) + 4 new (Phase 21A) = 24.
         # Phase 36C (ADR-019) legitimately added 2 more (task_registry,
         # task_assignments) = 26. Phase 38C (ADR-021) legitimately added
-        # 2 more (checklist_instances, checklist_instance_items) = 28 —
-        # this point-in-time closeout check is updated here rather than
-        # treated as a durable count invariant (same precedent as the
-        # removed git-diff-based TestAdditiveOnly guard in
-        # test_business_organization_commands.py).
-        self.assertEqual(len(s.BUSINESS_SHEET_NAMES), 28)
-        self.assertEqual(len(s.BUSINESS_HEADERS), 28)
+        # 2 more (checklist_instances, checklist_instance_items) = 28.
+        # Phase 39C (ADR-022) legitimately added 3 more
+        # (commercial_milestone_templates, payment_obligations,
+        # payment_transactions) = 31 — this point-in-time closeout check
+        # is updated here rather than treated as a durable count
+        # invariant (same precedent as the removed git-diff-based
+        # TestAdditiveOnly guard in test_business_organization_commands.py).
+        self.assertEqual(len(s.BUSINESS_SHEET_NAMES), 31)
+        self.assertEqual(len(s.BUSINESS_HEADERS), 31)
 
 
 class TestGTDAndEnvUntouched(unittest.TestCase):
