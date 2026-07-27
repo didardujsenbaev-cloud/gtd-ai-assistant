@@ -972,9 +972,22 @@ class TestBoundaries(unittest.TestCase):
         names = [n for n in dir(bb) if "deal" in n.lower()]
         self.assertEqual(names, [])
 
-    def test_no_lead_interaction_registry_functions(self):
-        names = [n for n in dir(bb) if n.lower().startswith("create_lead_interaction") or n.lower().startswith("create_interaction")]
+    def test_no_lead_specific_interaction_registry_functions(self):
+        """Lead itself must never implement its own ad-hoc interaction-
+        creation function — Phase 42C (ADR-025) since introduced a
+        legitimate, wholly separate Interaction domain with its own
+        create_interaction() orchestration function; this guard now
+        checks that Lead's own functions never call it, not that no
+        such function may ever exist (see test_no_interaction_call_in_
+        lead_functions below)."""
+        names = [n for n in dir(bb) if n.lower().startswith("create_lead_interaction")]
         self.assertEqual(names, [])
+
+    def test_no_interaction_call_in_lead_functions(self):
+        import inspect
+        for fn_name in ("create_lead", "contact_lead", "qualify_lead", "unqualify_lead", "lose_lead", "convert_lead", "update_lead"):
+            source = inspect.getsource(getattr(bb, fn_name))
+            self.assertNotIn("create_interaction(", source)
 
     def test_no_relationship_capital_write_in_lead_functions(self):
         import inspect

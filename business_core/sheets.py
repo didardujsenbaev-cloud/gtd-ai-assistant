@@ -75,6 +75,12 @@ BUSINESS_SHEET_NAMES: dict[str, str] = {
     "commercial_offers":              "COMMERCIAL_OFFERS",
     # Phase 41C (ADR-024): Lead / Sales Funnel Domain Foundation.
     "leads":                          "LEADS",
+    # Phase 42C (ADR-025): Interaction / Communication History Domain
+    # Foundation. Sheet key deliberately avoids "interactions"/
+    # "interaction_registry"/"lead_interactions" — those exact strings
+    # are already forbidden by pre-existing Lead architecture guards
+    # (ADR-025 §3/Phase 42A prerequisite).
+    "interaction_log":                "INTERACTION_LOG",
 }
 
 BUSINESS_HEADERS: dict[str, list[str]] = {
@@ -454,6 +460,22 @@ BUSINESS_HEADERS: dict[str, list[str]] = {
         "Converted Client ID", "Converted At", "Converted By",
         "Created At", "Created By", "Updated At", "Archived At", "Notes",
     ],
+    # Phase 42C (ADR-025): Interaction / Communication History Domain
+    # Foundation. One registry — canonical immutable Interaction event,
+    # channel-neutral, fully separate from RelationshipTouch/
+    # relationship_capital (ADR-025 §1/§2) and from technical Audit
+    # Events (ADR-025 §26). Exactly one primary subject required: Lead
+    # ID XOR Client ID (ADR-025 §8). No Object/Service/Roadmap/Payment/
+    # Task relation column, no message-body/transcript/attachment/
+    # provider-payload field.
+    "interaction_log": [
+        "Interaction ID", "Business ID", "Caller Idempotency Key",
+        "Interaction Type", "Direction", "Channel ID", "Occurred At",
+        "Summary", "Outcome",
+        "Lead ID", "Client ID", "Commercial Offer ID", "Assigned Person ID",
+        "External Reference", "Status",
+        "Created At", "Created By", "Updated At", "Archived At", "Notes",
+    ],
 }
 
 # ID-префиксы для generate_next_id
@@ -508,6 +530,11 @@ _ID_PREFIXES: dict[str, str] = {
     # Phase 41C (ADR-024): checked against every existing prefix above —
     # no collisions.
     "leads":                          "LED",
+    # Phase 42C (ADR-025): "INT" already taken by integration_registry
+    # and "TCH" is legacy-tainted by relationship_capital.py's orphaned
+    # RelationshipTouch code — ACT chosen instead, checked against every
+    # existing prefix above, no collisions.
+    "interaction_log":                "ACT",
 }
 
 

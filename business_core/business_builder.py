@@ -7563,3 +7563,495 @@ def is_lead_follow_up_due(lead: dict, *, reference_datetime: datetime | None = N
     from datetime import timezone as _timezone
     now = reference_datetime or datetime.now(_timezone.utc)
     return follow_up_at <= now
+
+
+# ─────────────────────────────────────────────────────────────
+# Interaction / Communication History Domain (Phase 42C, ADR-025)
+#
+# Canonical immutable Interaction event, channel-neutral, fully
+# separate from RelationshipTouch/relationship_capital (ADR-025 §1/§2)
+# and from technical Audit Events (ADR-025 §26) — no reuse, no write,
+# no import anywhere in this section. interaction_manager.py is the
+# sole persistence owner; every function below is this domain's sole
+# orchestration boundary, exactly mirroring the Lead/Payment/Commercial
+# Offer sections above.
+#
+# Exactly one primary subject is required: Lead ID XOR Client ID
+# (ADR-025 §8) — never both, never neither, never arbitrarily chosen.
+# ─────────────────────────────────────────────────────────────
+
+_INTERACTION_TYPES = ("call", "message", "email", "meeting", "note", "other")
+_INTERACTION_DIRECTIONS = ("inbound", "outbound", "internal")
+_INTERACTION_DIRECTION_OPTIONAL_TYPES = frozenset({"note"})
+
+_INTERACTION_SUMMARY_MAX_LENGTH = 2000
+_INTERACTION_OUTCOME_MAX_LENGTH = 1000
+_INTERACTION_NOTES_MAX_LENGTH = 5000
+_INTERACTION_EXTERNAL_REFERENCE_MAX_LENGTH = 500
+from datetime import timedelta as _timedelta
+
+_INTERACTION_OCCURRED_AT_FUTURE_TOLERANCE = _timedelta(minutes=5)
+
+_INTERACTION_ORDINARY_TRANSITIONS: dict[str, tuple[str, ...]] = {
+    "active":   ("active", "archived"),
+    "archived": ("archived",),
+}
+
+
+def _interaction_result(
+    *, ok: bool, code: str, error: str | None,
+    interaction_id: str = "", business_id: str = "",
+    lead_id: str = "", client_id: str = "", commercial_offer_id: str = "",
+    channel_id: str = "", assigned_person_id: str = "",
+    interaction_type: str = "", direction: str = "", occurred_at: str = "",
+    previous_status: str = "", requested_status: str = "", final_status: str = "",
+    created: bool = False, reused: bool = False, changed: bool = False, archived: bool = False,
+    conflicting_ids: tuple = (), warnings: tuple = (), retry_safe: bool = True,
+) -> dict:
+    """Shared result-builder for every Interaction orchestration
+    function (ADR-025 §27) — the stable, structured contract every
+    caller reads instead of a bare exception or ad-hoc dict shape.
+    Never carries Summary/Outcome/Notes/External Reference, a raw
+    exception, a raw Sheets row, or any Telegram-specific Russian
+    string."""
+    return {
+        "ok": ok, "code": code, "error": error,
+        "interaction_id": interaction_id, "business_id": business_id,
+        "lead_id": lead_id, "client_id": client_id, "commercial_offer_id": commercial_offer_id,
+        "channel_id": channel_id, "assigned_person_id": assigned_person_id,
+        "interaction_type": interaction_type, "direction": direction, "occurred_at": occurred_at,
+        "previous_status": previous_status, "requested_status": requested_status, "final_status": final_status,
+        "created": created, "reused": reused, "changed": changed, "archived": archived,
+        "conflicting_ids": tuple(conflicting_ids), "warnings": tuple(warnings), "retry_safe": retry_safe,
+    }
+
+
+# ─────────────────────────────────────────────────────────────
+# Normalization
+# ─────────────────────────────────────────────────────────────
+
+def normalize_interaction_type(raw) -> dict:
+    """ADR-025 §11: closed vocabulary. Required, trimmed, lowercased.
+    WhatsApp/Telegram are Channel values, never Interaction Type."""
+    text = str(raw or "").strip().lower()
+    if not text:
+        return {"ok": False, "code": "INTERACTION_TYPE_REQUIRED", "error": "interaction_type обязателен", "normalized": ""}
+    if text not in _INTERACTION_TYPES:
+        return {
+            "ok": False, "code": "INVALID_INTERACTION_TYPE",
+            "error": f"Недопустимый interaction_type '{raw}'. Допустимые значения: {', '.join(_INTERACTION_TYPES)}",
+            "normalized": "",
+        }
+    return {"ok": True, "code": "", "error": None, "normalized": text}
+
+
+def normalize_interaction_direction(raw, interaction_type: str) -> dict:
+    """
+    ADR-025 §12/§14: Direction required for every Interaction Type
+    except `note`, where it is optional. No implicit default is ever
+    invented — an empty value for a required type blocks; a blank value
+    for `note` stays blank.
+    """
+    text = str(raw or "").strip().lower()
+    if not text:
+        if interaction_type in _INTERACTION_DIRECTION_OPTIONAL_TYPES:
+            return {"ok": True, "code": "", "error": None, "normalized": ""}
+        return {"ok": False, "code": "INTERACTION_DIRECTION_REQUIRED", "error": "direction обязателен для этого interaction_type", "normalized": ""}
+
+    if text not in _INTERACTION_DIRECTIONS:
+        return {
+            "ok": False, "code": "INVALID_INTERACTION_DIRECTION",
+            "error": f"Недопустимый direction '{raw}'. Допустимые значения: {', '.join(_INTERACTION_DIRECTIONS)}",
+            "normalized": "",
+        }
+    return {"ok": True, "code": "", "error": None, "normalized": text}
+
+
+def normalize_interaction_occurred_at(raw, *, reference_datetime: datetime | None = None) -> dict:
+    """
+    ADR-025 §13: deterministic ISO-8601/RFC3339 validation for Occurred
+    At. Required. Requires an explicit timezone offset (a trailing "Z"
+    is accepted as UTC shorthand) — timezone-naive values are rejected
+    outright. Historical values are allowed; values later than
+    reference time + 5 minutes block (small clock-skew tolerance only).
+
+    Returns:
+        {"ok": bool, "code": str, "error": str | None, "normalized": str}
+    """
+    text = str(raw or "").strip()
+    if not text:
+        return {"ok": False, "code": "INTERACTION_OCCURRED_AT_REQUIRED", "error": "occurred_at обязателен", "normalized": ""}
+
+    candidate = text[:-1] + "+00:00" if text.endswith("Z") else text
+    try:
+        parsed = datetime.fromisoformat(candidate)
+    except ValueError:
+        return {"ok": False, "code": "INVALID_INTERACTION_OCCURRED_AT", "error": f"Некорректная дата/время '{raw}' — требуется ISO-8601 с явным часовым поясом", "normalized": ""}
+
+    if parsed.tzinfo is None:
+        return {"ok": False, "code": "INVALID_INTERACTION_OCCURRED_AT", "error": f"'{raw}' не содержит явного часового пояса", "normalized": ""}
+
+    from datetime import timezone as _timezone
+    now = reference_datetime or datetime.now(_timezone.utc)
+    if parsed > now + _INTERACTION_OCCURRED_AT_FUTURE_TOLERANCE:
+        return {"ok": False, "code": "INTERACTION_OCCURRED_AT_IN_FUTURE", "error": f"occurred_at ({text}) не может быть в будущем более чем на 5 минут", "normalized": ""}
+
+    return {"ok": True, "code": "", "error": None, "normalized": parsed.isoformat()}
+
+
+def _validate_interaction_summary(raw) -> dict:
+    """ADR-025 §14: required, trimmed, bounded. Never logged by any
+    caller."""
+    text = str(raw or "").strip()
+    if not text:
+        return {"ok": False, "code": "INTERACTION_SUMMARY_REQUIRED", "error": "summary обязателен", "normalized": ""}
+    if len(text) > _INTERACTION_SUMMARY_MAX_LENGTH:
+        return {"ok": False, "code": "INTERACTION_SUMMARY_TOO_LONG", "error": f"summary превышает {_INTERACTION_SUMMARY_MAX_LENGTH} символов", "normalized": ""}
+    return {"ok": True, "code": "", "error": None, "normalized": text}
+
+
+def _validate_interaction_outcome(raw) -> dict:
+    """ADR-025 §14: optional, trimmed, bounded."""
+    text = str(raw or "").strip()
+    if not text:
+        return {"ok": True, "code": "", "error": None, "normalized": ""}
+    if len(text) > _INTERACTION_OUTCOME_MAX_LENGTH:
+        return {"ok": False, "code": "INTERACTION_OUTCOME_TOO_LONG", "error": f"outcome превышает {_INTERACTION_OUTCOME_MAX_LENGTH} символов", "normalized": ""}
+    return {"ok": True, "code": "", "error": None, "normalized": text}
+
+
+def _validate_interaction_notes(raw) -> dict:
+    """ADR-025 §14: optional, bounded, mutable after creation."""
+    text = str(raw or "").strip()
+    if not text:
+        return {"ok": True, "code": "", "error": None, "normalized": ""}
+    if len(text) > _INTERACTION_NOTES_MAX_LENGTH:
+        return {"ok": False, "code": "INTERACTION_NOTES_TOO_LONG", "error": f"notes превышает {_INTERACTION_NOTES_MAX_LENGTH} символов", "normalized": ""}
+    return {"ok": True, "code": "", "error": None, "normalized": text}
+
+
+def _validate_interaction_external_reference(raw) -> dict:
+    """ADR-025 §16/§18: optional, bounded, never identity, never
+    logged, no provider-specific parsing."""
+    text = str(raw or "").strip()
+    if not text:
+        return {"ok": True, "code": "", "error": None, "normalized": ""}
+    if len(text) > _INTERACTION_EXTERNAL_REFERENCE_MAX_LENGTH:
+        return {"ok": False, "code": "INTERACTION_EXTERNAL_REFERENCE_TOO_LONG", "error": f"external_reference превышает {_INTERACTION_EXTERNAL_REFERENCE_MAX_LENGTH} символов", "normalized": ""}
+    return {"ok": True, "code": "", "error": None, "normalized": text}
+
+
+# ─────────────────────────────────────────────────────────────
+# Relation validation
+# ─────────────────────────────────────────────────────────────
+
+def _validate_interaction_subject(business_id: str, lead_id: str, client_id: str) -> dict:
+    """
+    ADR-025 §8/§10: exactly one primary subject — Lead ID XOR Client
+    ID. Neither present blocks; both present block. Never an arbitrary
+    selection. Read-only existence + same-Business validation only —
+    never mutates Lead or Client.
+    """
+    has_lead = bool(lead_id)
+    has_client = bool(client_id)
+
+    if not has_lead and not has_client:
+        return {"ok": False, "code": "INTERACTION_SUBJECT_REQUIRED", "error": "требуется ровно один субъект: lead_id либо client_id"}
+    if has_lead and has_client:
+        return {"ok": False, "code": "INTERACTION_SUBJECT_CONFLICT", "error": "нельзя одновременно указать lead_id и client_id"}
+
+    if has_lead:
+        from business_core.lead_manager import find_lead_by_id
+        lead = find_lead_by_id(lead_id)
+        if lead is None:
+            return {"ok": False, "code": "LEAD_NOT_FOUND", "error": f"Lead {lead_id} не найден"}
+        if lead.get("Business ID", "") != business_id:
+            return {"ok": False, "code": "INTERACTION_RELATION_MISMATCH", "error": f"Lead {lead_id} принадлежит другому Business"}
+        return {"ok": True, "code": "", "error": None}
+
+    from business_core.person_manager import find_person_by_id, is_person_archived, is_client_person, has_person_business_link
+    client = find_person_by_id(client_id)
+    if client is None:
+        return {"ok": False, "code": "CLIENT_NOT_FOUND", "error": f"Client {client_id} не найден"}
+    if is_person_archived(client):
+        return {"ok": False, "code": "CLIENT_NOT_FOUND", "error": f"Client {client_id} архивирован"}
+    if not is_client_person(client):
+        return {"ok": False, "code": "CLIENT_NOT_FOUND", "error": f"{client_id} не является Client"}
+    if not has_person_business_link(client, business_id):
+        return {"ok": False, "code": "INTERACTION_RELATION_MISMATCH", "error": f"Client {client_id} не связан с Business {business_id}"}
+    return {"ok": True, "code": "", "error": None}
+
+
+def _validate_interaction_relations(
+    business_id: str, *, commercial_offer_id: str = "", channel_id: str = "", assigned_person_id: str = "",
+) -> dict:
+    """ADR-025 §9: optional read-only context references. Exact
+    existence + same-Business validation. Never mutates Commercial
+    Offer/Channel/Person/Organization."""
+    from business_core.sheets import read_business_sheet
+
+    if commercial_offer_id:
+        from business_core.offer_manager import find_commercial_offer_by_id
+        offer = find_commercial_offer_by_id(commercial_offer_id)
+        if offer is None:
+            return {"ok": False, "code": "COMMERCIAL_OFFER_NOT_FOUND", "error": f"Commercial Offer {commercial_offer_id} не найден"}
+        if offer.get("Business ID", "") != business_id:
+            return {"ok": False, "code": "INTERACTION_RELATION_MISMATCH", "error": f"Commercial Offer {commercial_offer_id} принадлежит другому Business"}
+
+    if channel_id:
+        channels = read_business_sheet("channel_registry")
+        channel = next((c for c in channels if c.get("ID", "") == channel_id), None)
+        if channel is None:
+            return {"ok": False, "code": "CHANNEL_NOT_FOUND", "error": f"Channel {channel_id} не найден"}
+        ch_biz_id = channel.get("Бизнес ID", "")
+        if ch_biz_id and ch_biz_id != business_id:
+            return {"ok": False, "code": "INTERACTION_RELATION_MISMATCH", "error": f"Channel {channel_id} принадлежит другому Business"}
+
+    if assigned_person_id:
+        from business_core.person_manager import find_person_by_id, is_person_archived, has_person_business_link
+        person = find_person_by_id(assigned_person_id)
+        if person is None:
+            return {"ok": False, "code": "PERSON_NOT_FOUND", "error": f"Person {assigned_person_id} не найден"}
+        if is_person_archived(person):
+            return {"ok": False, "code": "PERSON_NOT_FOUND", "error": f"Person {assigned_person_id} архивирован"}
+        if not has_person_business_link(person, business_id):
+            return {"ok": False, "code": "INTERACTION_RELATION_MISMATCH", "error": f"Person {assigned_person_id} не связан с Business {business_id}"}
+
+    return {"ok": True, "code": "", "error": None}
+
+
+# ─────────────────────────────────────────────────────────────
+# Creation
+# ─────────────────────────────────────────────────────────────
+
+def create_interaction(
+    business_id: str, interaction_type: str, occurred_at: str, summary: str,
+    *, created_by: str, caller_idempotency_key: str,
+    direction: str = "", channel_id: str = "", outcome: str = "",
+    lead_id: str = "", client_id: str = "", commercial_offer_id: str = "",
+    assigned_person_id: str = "", external_reference: str = "", notes: str = "",
+) -> dict:
+    """
+    Phase 42C (ADR-025 §17): the sole canonical Interaction creation
+    orchestration boundary.
+
+    Validation order, all before any write:
+      A. required business_id / created_by / caller_idempotency_key
+      B. Interaction Type normalization
+      C. Direction normalization (type-dependent requirement)
+      D. Occurred At normalization
+      E. Summary/Outcome/Notes/External Reference validation
+      F. Business existence
+      G. primary-subject XOR validation (Lead ID XOR Client ID)
+      H. optional relation validation (Offer/Channel/Assigned Person)
+      I. idempotency lookup (zero/one/multiple)
+      J. Interaction ID generated only after A-I pass
+      K. low-level persistence
+      L. post-write verification
+      M. structured result
+    """
+    from business_core.sheets import read_business_sheet
+    from business_core.interaction_manager import (
+        find_interactions_by_idempotency_key, create_interaction as im_create_interaction,
+        find_interaction_by_id,
+    )
+
+    if not business_id:
+        return _interaction_result(ok=False, code="BUSINESS_NOT_FOUND", error="business_id обязателен")
+    if not created_by:
+        return _interaction_result(ok=False, code="INTERACTION_PERSISTENCE_FAILED", error="created_by обязателен", business_id=business_id)
+    if not caller_idempotency_key:
+        return _interaction_result(ok=False, code="INTERACTION_IDEMPOTENCY_REQUIRED", error="caller_idempotency_key обязателен", business_id=business_id)
+
+    type_result = normalize_interaction_type(interaction_type)
+    if not type_result["ok"]:
+        return _interaction_result(ok=False, code=type_result["code"], error=type_result["error"], business_id=business_id)
+    normalized_type = type_result["normalized"]
+
+    direction_result = normalize_interaction_direction(direction, normalized_type)
+    if not direction_result["ok"]:
+        return _interaction_result(ok=False, code=direction_result["code"], error=direction_result["error"], business_id=business_id)
+    normalized_direction = direction_result["normalized"]
+
+    occurred_result = normalize_interaction_occurred_at(occurred_at)
+    if not occurred_result["ok"]:
+        return _interaction_result(ok=False, code=occurred_result["code"], error=occurred_result["error"], business_id=business_id)
+    normalized_occurred_at = occurred_result["normalized"]
+
+    summary_result = _validate_interaction_summary(summary)
+    if not summary_result["ok"]:
+        return _interaction_result(ok=False, code=summary_result["code"], error=summary_result["error"], business_id=business_id)
+    normalized_summary = summary_result["normalized"]
+
+    outcome_result = _validate_interaction_outcome(outcome)
+    if not outcome_result["ok"]:
+        return _interaction_result(ok=False, code=outcome_result["code"], error=outcome_result["error"], business_id=business_id)
+    normalized_outcome = outcome_result["normalized"]
+
+    notes_result = _validate_interaction_notes(notes)
+    if not notes_result["ok"]:
+        return _interaction_result(ok=False, code=notes_result["code"], error=notes_result["error"], business_id=business_id)
+    normalized_notes = notes_result["normalized"]
+
+    external_ref_result = _validate_interaction_external_reference(external_reference)
+    if not external_ref_result["ok"]:
+        return _interaction_result(ok=False, code=external_ref_result["code"], error=external_ref_result["error"], business_id=business_id)
+    normalized_external_reference = external_ref_result["normalized"]
+
+    biz_rows = read_business_sheet("biz_registry")
+    if not any(b.get("ID", "") == business_id for b in biz_rows):
+        return _interaction_result(ok=False, code="BUSINESS_NOT_FOUND", error=f"Business {business_id} не найден", business_id=business_id)
+
+    subject_result = _validate_interaction_subject(business_id, lead_id, client_id)
+    if not subject_result["ok"]:
+        return _interaction_result(ok=False, code=subject_result["code"], error=subject_result["error"], business_id=business_id)
+
+    relation_result = _validate_interaction_relations(
+        business_id, commercial_offer_id=commercial_offer_id, channel_id=channel_id, assigned_person_id=assigned_person_id,
+    )
+    if not relation_result["ok"]:
+        return _interaction_result(ok=False, code=relation_result["code"], error=relation_result["error"], business_id=business_id)
+
+    matches = find_interactions_by_idempotency_key(business_id, caller_idempotency_key)
+    if len(matches) > 1:
+        conflicting_ids = tuple(m["Interaction ID"] for m in matches)
+        return _interaction_result(
+            ok=False, code="MULTIPLE_INTERACTION_MATCHES",
+            error=f"Найдено несколько Interaction с этим ключом: {conflicting_ids}",
+            business_id=business_id, conflicting_ids=conflicting_ids, retry_safe=True,
+        )
+    if len(matches) == 1:
+        existing = matches[0]
+        return _interaction_result(
+            ok=True, code="INTERACTION_REUSED", error=None,
+            interaction_id=existing["Interaction ID"], business_id=business_id,
+            lead_id=existing.get("Lead ID", ""), client_id=existing.get("Client ID", ""),
+            commercial_offer_id=existing.get("Commercial Offer ID", ""), channel_id=existing.get("Channel ID", ""),
+            assigned_person_id=existing.get("Assigned Person ID", ""),
+            interaction_type=existing.get("Interaction Type", ""), direction=existing.get("Direction", ""),
+            occurred_at=existing.get("Occurred At", ""),
+            final_status=existing.get("Status", ""), reused=True, retry_safe=True,
+        )
+
+    create_result = im_create_interaction(
+        business_id, normalized_type, normalized_occurred_at, normalized_summary,
+        caller_idempotency_key=caller_idempotency_key, direction=normalized_direction, channel_id=channel_id,
+        outcome=normalized_outcome, lead_id=lead_id, client_id=client_id,
+        commercial_offer_id=commercial_offer_id, assigned_person_id=assigned_person_id,
+        external_reference=normalized_external_reference, created_by=created_by, notes=normalized_notes,
+    )
+    if not create_result["ok"]:
+        return _interaction_result(ok=False, code="INTERACTION_PERSISTENCE_FAILED", error=create_result.get("error"), business_id=business_id, retry_safe=True)
+    interaction_id = create_result["interaction_id"]
+
+    saved = find_interaction_by_id(interaction_id)
+    if saved is None:
+        return _interaction_result(
+            ok=False, code="INTERACTION_POST_WRITE_VERIFICATION_FAILED",
+            error="Interaction записан, но проверка после записи не прошла",
+            interaction_id=interaction_id, business_id=business_id, retry_safe=False,
+        )
+
+    return _interaction_result(
+        ok=True, code="INTERACTION_CREATED", error=None,
+        interaction_id=interaction_id, business_id=business_id,
+        lead_id=lead_id, client_id=client_id, commercial_offer_id=commercial_offer_id,
+        channel_id=channel_id, assigned_person_id=assigned_person_id,
+        interaction_type=normalized_type, direction=normalized_direction, occurred_at=normalized_occurred_at,
+        final_status="active", created=True, retry_safe=True,
+    )
+
+
+# ─────────────────────────────────────────────────────────────
+# Lifecycle
+# ─────────────────────────────────────────────────────────────
+
+def archive_interaction(interaction_id: str) -> dict:
+    """
+    Phase 42C (ADR-025 §19/§22): the sole canonical active → archived
+    orchestration boundary. Terminal — no restore, no hard delete.
+    Exact-ID read still works afterward.
+    """
+    from business_core.interaction_manager import find_interaction_by_id, update_interaction_status, INTERACTION_STATUS
+
+    if not interaction_id:
+        return _interaction_result(ok=False, code="INTERACTION_NOT_FOUND", error="interaction_id обязателен")
+    interaction = find_interaction_by_id(interaction_id)
+    if interaction is None:
+        return _interaction_result(ok=False, code="INTERACTION_NOT_FOUND", error=f"Interaction {interaction_id} не найден", interaction_id=interaction_id)
+
+    business_id = interaction.get("Business ID", "")
+    previous_status = interaction.get("Status", "")
+    target_status = "archived"
+
+    if target_status == previous_status:
+        return _interaction_result(
+            ok=True, code="INTERACTION_STATUS_UNCHANGED", error=None,
+            interaction_id=interaction_id, business_id=business_id,
+            previous_status=previous_status, requested_status=target_status, final_status=previous_status, changed=False,
+        )
+
+    allowed_targets = _INTERACTION_ORDINARY_TRANSITIONS.get(previous_status, (previous_status,))
+    if target_status not in allowed_targets:
+        return _interaction_result(
+            ok=False, code="INVALID_INTERACTION_TRANSITION",
+            error=f"Переход '{previous_status}' → '{target_status}' не разрешён",
+            interaction_id=interaction_id, business_id=business_id,
+            previous_status=previous_status, requested_status=target_status, final_status=previous_status,
+        )
+
+    now = _now_utc_str()
+    write_result = update_interaction_status(interaction_id, target_status, archived_at=now)
+    if not write_result["ok"]:
+        return _interaction_result(
+            ok=False, code=write_result.get("code") or "INTERACTION_PERSISTENCE_FAILED", error=write_result.get("error"),
+            interaction_id=interaction_id, business_id=business_id,
+            previous_status=previous_status, requested_status=target_status, final_status=previous_status,
+        )
+
+    changed = write_result["changed"]
+    return _interaction_result(
+        ok=True, code="INTERACTION_ARCHIVED" if changed else "INTERACTION_STATUS_UNCHANGED", error=None,
+        interaction_id=interaction_id, business_id=business_id,
+        previous_status=previous_status, requested_status=target_status,
+        final_status=target_status if changed else previous_status, changed=changed, archived=changed,
+    )
+
+
+def update_interaction_notes(interaction_id: str, notes: str) -> dict:
+    """
+    Phase 42C (ADR-025 §21/§23): thin resolve-then-delegate wrapper.
+    Only Notes is ordinarily mutable, in every status (active and
+    archived) — every other Interaction fact is immutable and has no
+    update path.
+    """
+    from business_core.interaction_manager import find_interaction_by_id, update_interaction_admin_fields as im_update_admin
+
+    if not interaction_id:
+        return _interaction_result(ok=False, code="INTERACTION_NOT_FOUND", error="interaction_id обязателен")
+    interaction = find_interaction_by_id(interaction_id)
+    if interaction is None:
+        return _interaction_result(ok=False, code="INTERACTION_NOT_FOUND", error=f"Interaction {interaction_id} не найден", interaction_id=interaction_id)
+
+    notes_result = _validate_interaction_notes(notes)
+    if not notes_result["ok"]:
+        return _interaction_result(
+            ok=False, code=notes_result["code"], error=notes_result["error"],
+            interaction_id=interaction_id, business_id=interaction.get("Business ID", ""),
+            previous_status=interaction.get("Status", ""), final_status=interaction.get("Status", ""),
+        )
+
+    write_result = im_update_admin(interaction_id, {"Notes": notes_result["normalized"]})
+    if not write_result["ok"]:
+        return _interaction_result(
+            ok=False, code=write_result.get("code") or "INTERACTION_IMMUTABLE", error=write_result.get("error"),
+            interaction_id=interaction_id, business_id=interaction.get("Business ID", ""),
+            previous_status=interaction.get("Status", ""), final_status=interaction.get("Status", ""),
+        )
+
+    changed = write_result["changed"]
+    return _interaction_result(
+        ok=True, code="INTERACTION_NOTES_UPDATED" if changed else "INTERACTION_NOTES_UNCHANGED", error=None,
+        interaction_id=interaction_id, business_id=interaction.get("Business ID", ""),
+        previous_status=interaction.get("Status", ""), final_status=interaction.get("Status", ""), changed=changed,
+    )
