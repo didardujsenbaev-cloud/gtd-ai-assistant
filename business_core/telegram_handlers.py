@@ -6284,8 +6284,22 @@ async def newsop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 async def newchecklist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    /newchecklist biz_id=BIZ-001 template_stage_id=TSTG-001 title="Чек-лист документов"
+    /newchecklist biz_id=BIZ-001 title="Чек-лист документов"
                   items="Удостоверение; Правоустанавливающий; Техпаспорт"
+                  required_items="Удостоверение; Правоустанавливающий" optional_items="Техпаспорт"
+
+    template_stage_id=TSTG-001 — опционально, привязка к этапу шаблона.
+
+    required_items=/optional_items= — основной, документированный синтаксис
+    для классификации пунктов (совпадает с названиями колонок
+    checklist_registry."Required Items"/"Optional Items"). Пункт,
+    отсутствующий в обоих списках, по умолчанию становится required
+    (safest default — см. business_builder.parse_checklist_template_items()).
+
+    required=/optional= — короткие алиасы, поддерживаются для обратной
+    совместимости, но не документируются как основной вариант. Если
+    передано И длинное, И короткое имя одновременно — побеждает длинное
+    (required_items=/optional_items=).
     """
     if not _is_bc_enabled():
         await _reply(update, _bc_disabled_msg())
@@ -6296,12 +6310,19 @@ async def newchecklist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if not title:
         await _reply(update,
             "❌ Укажи title.\n\nПример:\n"
-            '`/newchecklist biz_id=BIZ-001 template_stage_id=TSTG-001 '
-            'title="Документы клиента" items="Удостоверение; Техпаспорт"`'
+            '`/newchecklist biz_id=BIZ-001 title="Документы клиента" '
+            'items="Удостоверение; Техпаспорт" required_items="Удостоверение" optional_items="Техпаспорт"`'
         )
         return
     try:
         from business_core.knowledge_manager import create_checklist_record
+
+        # required_items=/optional_items= — документированное основное имя;
+        # required=/optional= — короткий алиас для обратной совместимости.
+        # Явно переданное длинное имя всегда побеждает короткое.
+        required_items = args.get("required_items") or args.get("required", "")
+        optional_items = args.get("optional_items") or args.get("optional", "")
+
         result = create_checklist_record(
             title=             title,
             biz_id=            args.get("biz_id",            ""),
@@ -6309,8 +6330,8 @@ async def newchecklist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             template_id=       args.get("template_id",        ""),
             template_stage_id= args.get("template_stage_id",  ""),
             items=             args.get("items",              ""),
-            required_items=    args.get("required",           ""),
-            optional_items=    args.get("optional",           ""),
+            required_items=    required_items,
+            optional_items=    optional_items,
             completion_criteria=args.get("criteria",          ""),
             owner_role=        args.get("owner_role",         ""),
             notes=             args.get("notes",              ""),

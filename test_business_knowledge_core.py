@@ -338,6 +338,110 @@ class TestKnowledgeCommands(unittest.TestCase):
             self.assertIn("CHK-001", msg)
         asyncio.run(run())
 
+    def test_N_newchecklist_required_items_optional_items_forwarded(self):
+        """N (fix): required_items=/optional_items= (the documented,
+        schema-matching long form) must reach create_checklist_record()
+        with their exact non-empty values — this is the live-production
+        bug (CHK-003) this fix addresses."""
+        import asyncio
+        self._setup()
+        from business_core.telegram_handlers import newchecklist_cmd
+        update, context = self._update(
+            'title=Тест items="A; B; C" required_items="A; B" optional_items="C"'
+        )
+        async def run():
+            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
+                 patch("business_core.knowledge_manager.create_checklist_record",
+                       return_value={"ok": True, "checklist_id": "CHK-001", "error": None}) as mock_create:
+                await newchecklist_cmd(update, context)
+            kwargs = mock_create.call_args.kwargs
+            self.assertEqual(kwargs["required_items"], "A; B")
+            self.assertEqual(kwargs["optional_items"], "C")
+        asyncio.run(run())
+
+    def test_N_newchecklist_short_form_backward_compatible(self):
+        """N (fix): the short required=/optional= aliases must keep
+        working exactly as before, for backward compatibility."""
+        import asyncio
+        self._setup()
+        from business_core.telegram_handlers import newchecklist_cmd
+        update, context = self._update(
+            'title=Тест items="A; B; C" required="A; B" optional="C"'
+        )
+        async def run():
+            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
+                 patch("business_core.knowledge_manager.create_checklist_record",
+                       return_value={"ok": True, "checklist_id": "CHK-001", "error": None}) as mock_create:
+                await newchecklist_cmd(update, context)
+            kwargs = mock_create.call_args.kwargs
+            self.assertEqual(kwargs["required_items"], "A; B")
+            self.assertEqual(kwargs["optional_items"], "C")
+        asyncio.run(run())
+
+    def test_N_newchecklist_required_items_takes_priority_over_required(self):
+        """N (fix): when BOTH the long and short form are passed at
+        once, the long (documented) form wins."""
+        import asyncio
+        self._setup()
+        from business_core.telegram_handlers import newchecklist_cmd
+        update, context = self._update(
+            'title=Тест items="A; B" required_items="NEW" required="OLD"'
+        )
+        async def run():
+            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
+                 patch("business_core.knowledge_manager.create_checklist_record",
+                       return_value={"ok": True, "checklist_id": "CHK-001", "error": None}) as mock_create:
+                await newchecklist_cmd(update, context)
+            kwargs = mock_create.call_args.kwargs
+            self.assertEqual(kwargs["required_items"], "NEW")
+        asyncio.run(run())
+
+    def test_N_newchecklist_optional_items_takes_priority_over_optional(self):
+        """N (fix): same priority rule, for optional_items= vs optional=."""
+        import asyncio
+        self._setup()
+        from business_core.telegram_handlers import newchecklist_cmd
+        update, context = self._update(
+            'title=Тест items="A; B" optional_items="NEW" optional="OLD"'
+        )
+        async def run():
+            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
+                 patch("business_core.knowledge_manager.create_checklist_record",
+                       return_value={"ok": True, "checklist_id": "CHK-001", "error": None}) as mock_create:
+                await newchecklist_cmd(update, context)
+            kwargs = mock_create.call_args.kwargs
+            self.assertEqual(kwargs["optional_items"], "NEW")
+        asyncio.run(run())
+
+    def test_N_newchecklist_items_only_unchanged_safe_default(self):
+        """N (fix): items= without any required/optional classification
+        must behave exactly as before — both forwarded as empty strings,
+        letting parse_checklist_template_items()'s existing
+        "unclassified defaults to required" policy apply unchanged."""
+        import asyncio
+        self._setup()
+        from business_core.telegram_handlers import newchecklist_cmd
+        update, context = self._update('title=Тест items="A; B; C"')
+        async def run():
+            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
+                 patch("business_core.knowledge_manager.create_checklist_record",
+                       return_value={"ok": True, "checklist_id": "CHK-001", "error": None}) as mock_create:
+                await newchecklist_cmd(update, context)
+            kwargs = mock_create.call_args.kwargs
+            self.assertEqual(kwargs["required_items"], "")
+            self.assertEqual(kwargs["optional_items"], "")
+        asyncio.run(run())
+
+    def test_N_newchecklist_docstring_documents_required_items_optional_items(self):
+        """N (fix): the documented/primary syntax shown to a reader of
+        the command's own docstring must use required_items=/optional_items=
+        (matching checklist_registry's own column names), not just the
+        short required=/optional= aliases."""
+        from business_core.telegram_handlers import newchecklist_cmd
+        doc = newchecklist_cmd.__doc__ or ""
+        self.assertIn("required_items=", doc)
+        self.assertIn("optional_items=", doc)
+
     def test_O_newdoctemplate_creates(self):
         """O: /newdoctemplate создает шаблон документа."""
         import asyncio
