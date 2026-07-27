@@ -178,6 +178,12 @@ BUSINESS_HEADERS: dict[str, list[str]] = {
         # Status намеренно не добавлены — Phase 14A ограничена базовым
         # управлением этапом (см. Phase 14A scope decision).
         "Start Date", "Priority", "Blocking Reason",
+        # /unblockstage fix: remembers the Status a Stage had immediately
+        # before /blockstage set it to "blocked", so /unblockstage can
+        # restore that exact status (pending or in_progress) instead of
+        # always resetting to "pending". Header-safe append — old rows
+        # read as "" and fall back to the pre-existing "pending" default.
+        "Status Before Block",
     ],
     "materials": [
         "Material ID", "Source", "Received At", "GTD Reference Row",

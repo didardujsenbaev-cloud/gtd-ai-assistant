@@ -32,13 +32,15 @@ STAGE_HEADERS = [
     "SOP IDs", "Checklist IDs", "Materials IDs",
     "Document Template IDs", "FAQ IDs",
     "Start Date", "Priority", "Blocking Reason",
+    "Status Before Block",
 ]
 
 
 def _row(stage_id="STAGE-001", roadmap_id="RM-001", order="1", name="Диагностика",
          status="pending", due_date="", completed_at="", responsible="",
          docs_required="паспорт", docs_received="", notes="",
-         checklist_ids="", start_date="", priority="", blocking_reason=""):
+         checklist_ids="", start_date="", priority="", blocking_reason="",
+         status_before_block=""):
     idx = {h: i for i, h in enumerate(STAGE_HEADERS)}
     row = [""] * len(STAGE_HEADERS)
     row[idx["Stage ID"]] = stage_id
@@ -56,6 +58,7 @@ def _row(stage_id="STAGE-001", roadmap_id="RM-001", order="1", name="Диагн�
     row[idx["Start Date"]] = start_date
     row[idx["Priority"]] = priority
     row[idx["Blocking Reason"]] = blocking_reason
+    row[idx["Status Before Block"]] = status_before_block
     return row
 
 
@@ -114,7 +117,7 @@ class TestSchemaBackwardCompatibility(unittest.TestCase):
     def test_new_columns_added_exactly_once(self):
         from business_core.sheets import BUSINESS_HEADERS
         headers = BUSINESS_HEADERS["roadmap_stages"]
-        for col in ("Start Date", "Priority", "Blocking Reason"):
+        for col in ("Start Date", "Priority", "Blocking Reason", "Status Before Block"):
             self.assertEqual(headers.count(col), 1, f"{col} must appear exactly once")
         # Явно НЕ добавлены в Phase 14A
         self.assertNotIn("Checklist Status", headers)
@@ -547,6 +550,110 @@ class TestBlockUnblockStage(unittest.TestCase):
             th, th.unblockstage_start, "/unblockstage stage_id=STAGE-001", row=row)
         card = update_start.message.reply_text.call_args[0][0]
         self.assertIn("ждём документы от клиента", card)
+
+    # ── /unblockstage fix: restore the exact prior status, not always pending ──
+
+    def test_blockstage_from_pending_stores_status_before_block(self):
+        th = _fresh_th()
+        row = _row(status="pending")
+        _, _, context, sheet = _run_start(
+            th, th.blockstage_start,
+            '/blockstage stage_id=STAGE-001 reason="ждём документы"', row=row)
+        _run_confirm_with_active_roadmap(th, th.blockstage_confirm, context, sheet, row=row)
+
+        sbb_col = STAGE_HEADERS.index("Status Before Block") + 1
+        status_col = STAGE_HEADERS.index("Status") + 1
+        self.assertEqual(sheet._updates.get((2, sbb_col)), "pending")
+        self.assertEqual(sheet._updates.get((2, status_col)), "blocked")
+
+    def test_blockstage_from_in_progress_stores_status_before_block(self):
+        th = _fresh_th()
+        row = _row(status="in_progress")
+        _, _, context, sheet = _run_start(
+            th, th.blockstage_start,
+            '/blockstage stage_id=STAGE-001 reason="ждём документы"', row=row)
+        _run_confirm_with_active_roadmap(th, th.blockstage_confirm, context, sheet, row=row)
+
+        sbb_col = STAGE_HEADERS.index("Status Before Block") + 1
+        status_col = STAGE_HEADERS.index("Status") + 1
+        self.assertEqual(sheet._updates.get((2, sbb_col)), "in_progress")
+        self.assertEqual(sheet._updates.get((2, status_col)), "blocked")
+
+    def test_blockstage_repeat_does_not_overwrite_stored_status(self):
+        """Re-blocking an already-blocked stage (no-op transition) must
+        never overwrite the originally-stored pre-block status."""
+        th = _fresh_th()
+        row = _row(status="blocked", status_before_block="in_progress")
+        _, _, context, sheet = _run_start(
+            th, th.blockstage_start,
+            '/blockstage stage_id=STAGE-001 reason="ещё причина"', row=row)
+        _run_confirm_with_active_roadmap(th, th.blockstage_confirm, context, sheet, row=row)
+
+        sbb_col = STAGE_HEADERS.index("Status Before Block") + 1
+        self.assertNotIn((2, sbb_col), sheet._updates)
+
+    def test_unblockstage_restores_in_progress(self):
+        """Core fix: in_progress → blocked → in_progress, not pending."""
+        th = _fresh_th()
+        row = _row(status="blocked", blocking_reason="ждём документы",
+                   status_before_block="in_progress")
+        _, _, context, sheet = _run_start(
+            th, th.unblockstage_start, "/unblockstage stage_id=STAGE-001", row=row)
+        _run_confirm_with_active_roadmap(th, th.unblockstage_confirm, context, sheet, row=row)
+
+        status_col = STAGE_HEADERS.index("Status") + 1
+        reason_col = STAGE_HEADERS.index("Blocking Reason") + 1
+        sbb_col = STAGE_HEADERS.index("Status Before Block") + 1
+        self.assertEqual(sheet._updates.get((2, status_col)), "in_progress")
+        self.assertEqual(sheet._updates.get((2, reason_col)), "")
+        self.assertEqual(sheet._updates.get((2, sbb_col)), "")
+
+    def test_unblockstage_restores_pending(self):
+        """pending → blocked → pending still works with the new field."""
+        th = _fresh_th()
+        row = _row(status="blocked", blocking_reason="ждём документы",
+                   status_before_block="pending")
+        _, _, context, sheet = _run_start(
+            th, th.unblockstage_start, "/unblockstage stage_id=STAGE-001", row=row)
+        _run_confirm_with_active_roadmap(th, th.unblockstage_confirm, context, sheet, row=row)
+
+        status_col = STAGE_HEADERS.index("Status") + 1
+        self.assertEqual(sheet._updates.get((2, status_col)), "pending")
+
+    def test_unblockstage_legacy_row_without_stored_status_falls_back_to_pending(self):
+        """A stage blocked before this fix shipped has no Status Before
+        Block value — must still unblock safely, defaulting to pending
+        exactly like the prior behavior."""
+        th = _fresh_th()
+        row = _row(status="blocked", blocking_reason="ждём документы", status_before_block="")
+        _, _, context, sheet = _run_start(
+            th, th.unblockstage_start, "/unblockstage stage_id=STAGE-001", row=row)
+        _run_confirm_with_active_roadmap(th, th.unblockstage_confirm, context, sheet, row=row)
+
+        status_col = STAGE_HEADERS.index("Status") + 1
+        self.assertEqual(sheet._updates.get((2, status_col)), "pending")
+
+    def test_unblockstage_preserves_start_date(self):
+        th = _fresh_th()
+        row = _row(status="blocked", blocking_reason="ждём документы",
+                   status_before_block="in_progress", start_date="2026-01-05")
+        _, _, context, sheet = _run_start(
+            th, th.unblockstage_start, "/unblockstage stage_id=STAGE-001", row=row)
+        _run_confirm_with_active_roadmap(th, th.unblockstage_confirm, context, sheet, row=row)
+
+        start_col = STAGE_HEADERS.index("Start Date") + 1
+        self.assertNotIn((2, start_col), sheet._updates)
+
+    def test_blockstage_preserves_start_date(self):
+        th = _fresh_th()
+        row = _row(status="in_progress", start_date="2026-01-05")
+        _, _, context, sheet = _run_start(
+            th, th.blockstage_start,
+            '/blockstage stage_id=STAGE-001 reason="ждём документы"', row=row)
+        _run_confirm_with_active_roadmap(th, th.blockstage_confirm, context, sheet, row=row)
+
+        start_col = STAGE_HEADERS.index("Start Date") + 1
+        self.assertNotIn((2, start_col), sheet._updates)
 
 
 class TestCommandsExcludedFromPhase14A(unittest.TestCase):

@@ -192,6 +192,10 @@ class TestExistingRegistriesUntouched(unittest.TestCase):
                 "SOP IDs", "Checklist IDs", "Materials IDs",
                 "Document Template IDs", "FAQ IDs",
                 "Start Date", "Priority", "Blocking Reason",
+                # /unblockstage fix: added so /unblockstage can restore
+                # the exact pre-block status instead of always "pending"
+                # (see test_business_stage_management.py::TestBlockUnblockStage).
+                "Status Before Block",
             ],
         )
 

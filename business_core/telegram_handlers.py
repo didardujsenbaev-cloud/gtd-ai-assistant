@@ -3410,9 +3410,17 @@ async def blockstage_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await update.message.reply_text(f"❌ Этап {stage_id} не найден.")
         return ConversationHandler.END
 
+    writes = {"Blocking Reason": reason, "Status": "blocked"}
+    # Запоминаем текущий статус ДО блокировки, чтобы /unblockstage мог
+    # вернуть именно его (pending или in_progress), а не всегда pending.
+    # Если этап уже blocked (повторный вызов /blockstage — no-op перехода),
+    # не перезаписываем уже сохранённый исходный статус.
+    if stage.get("status") != "blocked":
+        writes["Status Before Block"] = stage.get("status", "")
+
     return await _stage_edit_start(
         update, context, stage_id=stage_id, field_label="Блокировка (Status → blocked)",
-        writes={"Blocking Reason": reason, "Status": "blocked"},
+        writes=writes,
         old_value_display=stage.get("blocking_reason", ""),
         new_value_display=reason,
         snapshot_key="se_block",
@@ -3441,17 +3449,24 @@ async def unblockstage_start(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text("❌ Использование:\n/unblockstage stage_id=STAGE-001")
         return ConversationHandler.END
 
-    from business_core.roadmap_manager import find_stage_by_id
+    from business_core.roadmap_manager import find_stage_by_id, STAGE_STATUS_CANONICAL
     stage = find_stage_by_id(stage_id)
     if not stage:
         await update.message.reply_text(f"❌ Этап {stage_id} не найден.")
         return ConversationHandler.END
 
     writes = {"Blocking Reason": ""}
-    # Возвращаем в pending только если этап действительно был blocked —
-    # не трогаем Status, если он уже done/skipped/in_progress по другой причине.
+    # Возвращаем в статус, который был ДО блокировки (pending или
+    # in_progress) — не трогаем Status, если этап уже done/skipped/
+    # in_progress по другой причине (т.е. не сейчас blocked).
     if stage.get("raw_status", "") == "blocked":
-        writes["Status"] = "pending"
+        restored_status = stage.get("status_before_block", "")
+        if restored_status not in STAGE_STATUS_CANONICAL:
+            # Старые строки без сохранённого статуса (до этого фикса) —
+            # прежнее поведение "всегда pending" как безопасный fallback.
+            restored_status = "pending"
+        writes["Status"] = restored_status
+        writes["Status Before Block"] = ""
 
     return await _stage_edit_start(
         update, context, stage_id=stage_id, field_label="Разблокировка",
