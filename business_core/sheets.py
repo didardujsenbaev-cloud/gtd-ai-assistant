@@ -73,6 +73,8 @@ BUSINESS_SHEET_NAMES: dict[str, str] = {
     "payment_transactions":           "PAYMENT_TRANSACTIONS",
     # Phase 40C (ADR-023): Commercial Offer Domain Foundation.
     "commercial_offers":              "COMMERCIAL_OFFERS",
+    # Phase 41C (ADR-024): Lead / Sales Funnel Domain Foundation.
+    "leads":                          "LEADS",
 }
 
 BUSINESS_HEADERS: dict[str, list[str]] = {
@@ -435,6 +437,23 @@ BUSINESS_HEADERS: dict[str, list[str]] = {
         "Cancelled At", "Cancelled By", "Cancellation Reason",
         "Archived At", "Notes",
     ],
+    # Phase 41C (ADR-024): Lead / Sales Funnel Domain Foundation. One
+    # registry — canonical pre-Client Lead entity, fully separate from
+    # Person/Client (ADR-024 §1/§3). No Deal/Interaction/Campaign
+    # registry, no Object/Roadmap/Commercial Offer/Payment/Task relation
+    # column. "Disposition Reason" (not "Loss Reason") is shared by
+    # both unqualified/lost outcomes (ADR-024 §18/§20).
+    "leads": [
+        "Lead ID", "Business ID", "Caller Idempotency Key",
+        "Contact Name Snapshot", "Phone Snapshot", "WhatsApp Snapshot",
+        "Email Snapshot", "Company Snapshot",
+        "Service ID", "Source", "Channel ID", "Status",
+        "Qualification Notes", "Disposition Reason",
+        "Expected Value", "Currency",
+        "Next Follow-up At", "Last Contacted At", "Assigned Person ID",
+        "Converted Client ID", "Converted At", "Converted By",
+        "Created At", "Created By", "Updated At", "Archived At", "Notes",
+    ],
 }
 
 # ID-префиксы для generate_next_id
@@ -486,6 +505,9 @@ _ID_PREFIXES: dict[str, str] = {
     # Series) — generate_next_id() is called with an explicit prefix
     # override for OFS since both identities live in the same sheet.
     "commercial_offers":              "OFR",
+    # Phase 41C (ADR-024): checked against every existing prefix above —
+    # no collisions.
+    "leads":                          "LED",
 }
 
 

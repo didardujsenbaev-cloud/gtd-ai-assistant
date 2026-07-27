@@ -208,13 +208,14 @@ class TestExistingRegistriesUntouched(unittest.TestCase):
         # Phase 39C (ADR-022) legitimately added 3 more
         # (commercial_milestone_templates, payment_obligations,
         # payment_transactions) = 31. Phase 40C (ADR-023) legitimately
-        # added 1 more (commercial_offers) = 32 — this point-in-time
+        # added 1 more (commercial_offers) = 32. Phase 41C (ADR-024)
+        # legitimately added 1 more (leads) = 33 — this point-in-time
         # closeout check is updated here rather than treated as a
         # durable count invariant (same precedent as the removed
         # git-diff-based TestAdditiveOnly guard in
         # test_business_organization_commands.py).
-        self.assertEqual(len(s.BUSINESS_SHEET_NAMES), 32)
-        self.assertEqual(len(s.BUSINESS_HEADERS), 32)
+        self.assertEqual(len(s.BUSINESS_SHEET_NAMES), 33)
+        self.assertEqual(len(s.BUSINESS_HEADERS), 33)
 
 
 class TestGTDAndEnvUntouched(unittest.TestCase):

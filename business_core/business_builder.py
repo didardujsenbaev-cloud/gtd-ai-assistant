@@ -6688,3 +6688,878 @@ def is_commercial_offer_effectively_expired(offer: dict, *, reference_date: _dat
     from datetime import timezone as _timezone
     today = reference_date or datetime.now(_timezone.utc).date()
     return valid_until < today
+
+
+# ─────────────────────────────────────────────────────────────
+# Lead / Sales Funnel Domain (Phase 41C, ADR-024)
+#
+# Canonical pre-Client Lead entity, fully separate from Person/Client
+# (ADR-024 §1/§3) — no automatic Client creation or mutation anywhere
+# in this section. lead_manager.py is the sole persistence owner;
+# every function below is this domain's sole orchestration boundary,
+# exactly mirroring the Payment/Commercial Offer sections above.
+#
+# Idempotency (Business ID + Caller Idempotency Key) and duplicate-
+# contact detection (exact-match, warning-only) are two structurally
+# distinct mechanisms (ADR-024 §9/§10) — never conflated below.
+# ─────────────────────────────────────────────────────────────
+
+_LEAD_CURRENCY_CODE_RE = re.compile(r"^[A-Z]{3}$")
+_LEAD_PHONE_LIKE_RE = re.compile(r"^\+?\d{7,15}$")
+_LEAD_CONTACT_NAME_MAX_LENGTH = 300
+_LEAD_COMPANY_MAX_LENGTH = 300
+_LEAD_EMAIL_MAX_LENGTH = 254
+
+_LEAD_ORDINARY_TRANSITIONS: dict[str, tuple[str, ...]] = {
+    "new":          ("new", "contacted", "qualified", "unqualified", "lost", "converted", "archived"),
+    "contacted":    ("contacted", "qualified", "unqualified", "lost", "converted", "archived"),
+    "qualified":    ("qualified", "contacted", "unqualified", "lost", "converted", "archived"),
+    "unqualified":  ("unqualified", "archived"),
+    "converted":    ("converted", "archived"),
+    "lost":         ("lost", "archived"),
+    "archived":     ("archived",),
+}
+_LEAD_DISPOSITION_REQUIRED_STATUSES = frozenset({"unqualified", "lost"})
+_LEAD_ACTIVE_STATUSES = frozenset({"new", "contacted", "qualified"})
+
+
+def _lead_result(
+    *, ok: bool, code: str, error: str | None,
+    lead_id: str = "", business_id: str = "", service_id: str = "", channel_id: str = "",
+    assigned_person_id: str = "", converted_client_id: str = "",
+    expected_value: str = "", currency: str = "",
+    next_follow_up_at: str = "", last_contacted_at: str = "",
+    previous_status: str = "", requested_status: str = "", final_status: str = "",
+    created: bool = False, reused: bool = False, changed: bool = False,
+    contacted: bool = False, qualified: bool = False, unqualified: bool = False,
+    converted: bool = False, lost: bool = False, archived: bool = False,
+    duplicate_contact_ids: tuple = (), conflicting_ids: tuple = (),
+    warnings: tuple = (), retry_safe: bool = True,
+) -> dict:
+    """Shared result-builder for every Lead orchestration function
+    (ADR-024 §26) — the stable, structured contract every caller reads
+    instead of a bare exception or ad-hoc dict shape. Never carries
+    contact name/phone/WhatsApp/email/company values, qualification/
+    disposition/Notes text, a raw exception, a raw Sheets row, or any
+    Telegram-specific Russian string."""
+    return {
+        "ok": ok, "code": code, "error": error,
+        "lead_id": lead_id, "business_id": business_id, "service_id": service_id, "channel_id": channel_id,
+        "assigned_person_id": assigned_person_id, "converted_client_id": converted_client_id,
+        "expected_value": expected_value, "currency": currency,
+        "next_follow_up_at": next_follow_up_at, "last_contacted_at": last_contacted_at,
+        "previous_status": previous_status, "requested_status": requested_status, "final_status": final_status,
+        "created": created, "reused": reused, "changed": changed,
+        "contacted": contacted, "qualified": qualified, "unqualified": unqualified,
+        "converted": converted, "lost": lost, "archived": archived,
+        "duplicate_contact_ids": tuple(duplicate_contact_ids), "conflicting_ids": tuple(conflicting_ids),
+        "warnings": tuple(warnings), "retry_safe": retry_safe,
+    }
+
+
+# ─────────────────────────────────────────────────────────────
+# Normalization
+# ─────────────────────────────────────────────────────────────
+
+def _validate_lead_contact_name(raw) -> dict:
+    """ADR-024 §7: required, trimmed, bounded length, never used for
+    identity. Returns {"ok", "code", "error", "name"}."""
+    text = str(raw or "").strip()
+    if not text:
+        return {"ok": False, "code": "LEAD_CONTACT_NAME_REQUIRED", "error": "contact_name_snapshot обязателен", "name": ""}
+    if len(text) > _LEAD_CONTACT_NAME_MAX_LENGTH:
+        return {"ok": False, "code": "LEAD_CONTACT_NAME_REQUIRED", "error": f"contact_name_snapshot превышает {_LEAD_CONTACT_NAME_MAX_LENGTH} символов", "name": ""}
+    return {"ok": True, "code": "", "error": None, "name": text}
+
+
+def _normalize_lead_company(raw) -> str:
+    """ADR-024 §7: optional, trimmed, bounded — never used for identity,
+    never blocks creation."""
+    text = str(raw or "").strip()
+    return text[:_LEAD_COMPANY_MAX_LENGTH]
+
+
+def _normalize_lead_phone_like(raw, code: str) -> dict:
+    """
+    ADR-024 §8: shared Phone/WhatsApp normalization. Optional — blank
+    stays blank. Trims whitespace, removes safe formatting characters
+    (spaces, parentheses, hyphens), preserves an optional leading `+`.
+    Remaining content must be 7-15 digits. Never infers a country code,
+    never silently prepends +7, never converts a local number into an
+    international one.
+    """
+    if raw is None:
+        return {"ok": True, "code": "", "error": None, "normalized": ""}
+    text = str(raw).strip()
+    if not text:
+        return {"ok": True, "code": "", "error": None, "normalized": ""}
+
+    cleaned = re.sub(r"[\s()\-]", "", text)
+    if not _LEAD_PHONE_LIKE_RE.match(cleaned):
+        return {"ok": False, "code": code, "error": f"Недопустимый номер '{raw}'", "normalized": ""}
+    return {"ok": True, "code": "", "error": None, "normalized": cleaned}
+
+
+def normalize_lead_phone(raw) -> dict:
+    return _normalize_lead_phone_like(raw, "INVALID_LEAD_PHONE")
+
+
+def normalize_lead_whatsapp(raw) -> dict:
+    return _normalize_lead_phone_like(raw, "INVALID_LEAD_WHATSAPP")
+
+
+def normalize_lead_email(raw) -> dict:
+    """
+    ADR-024 §9: optional, trimmed, lowercased for canonical exact
+    matching, exactly one `@`, non-empty local/domain parts, bounded
+    length, no internal whitespace, no deliverability claim.
+    """
+    if raw is None:
+        return {"ok": True, "code": "", "error": None, "normalized": ""}
+    text = str(raw).strip()
+    if not text:
+        return {"ok": True, "code": "", "error": None, "normalized": ""}
+    if any(ch.isspace() for ch in text):
+        return {"ok": False, "code": "INVALID_LEAD_EMAIL", "error": f"Email '{raw}' не может содержать пробелы", "normalized": ""}
+    if len(text) > _LEAD_EMAIL_MAX_LENGTH:
+        return {"ok": False, "code": "INVALID_LEAD_EMAIL", "error": f"Email превышает {_LEAD_EMAIL_MAX_LENGTH} символов", "normalized": ""}
+    if text.count("@") != 1:
+        return {"ok": False, "code": "INVALID_LEAD_EMAIL", "error": f"Email '{raw}' должен содержать ровно один '@'", "normalized": ""}
+    local, domain = text.split("@")
+    if not local or not domain:
+        return {"ok": False, "code": "INVALID_LEAD_EMAIL", "error": f"Email '{raw}' некорректен", "normalized": ""}
+    return {"ok": True, "code": "", "error": None, "normalized": text.lower()}
+
+
+def _validate_lead_contact_channel(phone: str, whatsapp: str, email: str) -> dict:
+    """ADR-024 §10: at least one of the three normalized channels must
+    be non-blank. Name alone is not sufficient."""
+    if not (phone or whatsapp or email):
+        return {"ok": False, "code": "LEAD_CONTACT_CHANNEL_REQUIRED", "error": "требуется хотя бы один контактный канал: Phone, WhatsApp или Email"}
+    return {"ok": True, "code": "", "error": None}
+
+
+def normalize_lead_expected_value(raw) -> dict:
+    """
+    ADR-024 §14: optional Decimal-only estimate. Never canonical
+    commercial truth. Mirrors normalize_payment_amount()'s discipline
+    with Lead-local result codes (never leaks a PAYMENT_* code).
+
+    Returns:
+        {"ok": bool, "code": str, "error": str | None, "normalized": str}
+    """
+    if isinstance(raw, float):
+        return {"ok": False, "code": "INVALID_LEAD_EXPECTED_VALUE", "error": "Expected Value не может быть float — используйте Decimal или строку", "normalized": ""}
+
+    text = str(raw).strip()
+    if "," in text:
+        return {"ok": False, "code": "INVALID_LEAD_EXPECTED_VALUE", "error": "Expected Value не может содержать разделители тысяч (',')", "normalized": ""}
+    if "e" in text.lower():
+        return {"ok": False, "code": "INVALID_LEAD_EXPECTED_VALUE", "error": "Expected Value не может использовать экспоненциальную запись", "normalized": ""}
+
+    try:
+        value = Decimal(text)
+    except InvalidOperation:
+        return {"ok": False, "code": "INVALID_LEAD_EXPECTED_VALUE", "error": f"Не удаётся разобрать Expected Value '{raw}'", "normalized": ""}
+
+    exponent = value.as_tuple().exponent
+    if isinstance(exponent, int) and exponent < -2:
+        return {"ok": False, "code": "INVALID_LEAD_EXPECTED_VALUE_SCALE", "error": "Expected Value не может иметь более 2 знаков после запятой", "normalized": ""}
+
+    if value <= 0:
+        return {"ok": False, "code": "LEAD_EXPECTED_VALUE_MUST_BE_POSITIVE", "error": "Expected Value должен быть больше нуля", "normalized": ""}
+
+    quantized = value.quantize(Decimal("0.01"))
+    return {"ok": True, "code": "", "error": None, "normalized": str(quantized)}
+
+
+def normalize_lead_currency(raw) -> dict:
+    """ADR-024 §14: required whenever Expected Value is present.
+    Uppercased, exactly 3 ASCII letters, no implicit default."""
+    text = str(raw or "").strip().upper()
+    if not text:
+        return {"ok": False, "code": "INVALID_LEAD_CURRENCY", "error": "Currency обязателен", "currency": ""}
+    if not _LEAD_CURRENCY_CODE_RE.match(text):
+        return {"ok": False, "code": "INVALID_LEAD_CURRENCY", "error": f"Недопустимый код валюты '{raw}' — требуется 3 буквы ASCII в верхнем регистре", "currency": ""}
+    return {"ok": True, "code": "", "error": None, "currency": text}
+
+
+def _validate_lead_expected_value_pair(expected_value_raw, currency_raw) -> dict:
+    """ADR-024 §14: Expected Value and Currency are both blank or both
+    present — never propagated to Commercial Offer or Payment."""
+    ev_blank = expected_value_raw is None or str(expected_value_raw).strip() == ""
+    cur_blank = currency_raw is None or str(currency_raw).strip() == ""
+
+    if ev_blank and cur_blank:
+        return {"ok": True, "code": "", "error": None, "expected_value": "", "currency": ""}
+    if ev_blank != cur_blank:
+        return {"ok": False, "code": "INVALID_LEAD_EXPECTED_VALUE", "error": "Expected Value и Currency должны быть указаны вместе либо оба пусты", "expected_value": "", "currency": ""}
+
+    amount_result = normalize_lead_expected_value(expected_value_raw)
+    if not amount_result["ok"]:
+        return {"ok": False, "code": amount_result["code"], "error": amount_result["error"], "expected_value": "", "currency": ""}
+
+    currency_result = normalize_lead_currency(currency_raw)
+    if not currency_result["ok"]:
+        return {"ok": False, "code": currency_result["code"], "error": currency_result["error"], "expected_value": "", "currency": ""}
+
+    return {"ok": True, "code": "", "error": None, "expected_value": amount_result["normalized"], "currency": currency_result["currency"]}
+
+
+def normalize_lead_datetime(raw) -> dict:
+    """
+    ADR-024 §15: deterministic ISO-8601/RFC3339 validation for Next
+    Follow-up At / Last Contacted At. Optional — blank stays blank.
+    Requires an explicit timezone offset (a trailing "Z" is accepted as
+    UTC shorthand) — timezone-naive values are rejected outright to
+    avoid ambiguity. No local-time guessing, no scheduler.
+
+    Returns:
+        {"ok": bool, "code": str, "error": str | None, "normalized": str}
+    """
+    if raw is None:
+        return {"ok": True, "code": "", "error": None, "normalized": ""}
+    text = str(raw).strip()
+    if not text:
+        return {"ok": True, "code": "", "error": None, "normalized": ""}
+
+    candidate = text[:-1] + "+00:00" if text.endswith("Z") else text
+    try:
+        parsed = datetime.fromisoformat(candidate)
+    except ValueError:
+        return {"ok": False, "code": "INVALID_LEAD_DATETIME", "error": f"Некорректная дата/время '{raw}' — требуется ISO-8601 с явным часовым поясом", "normalized": ""}
+
+    if parsed.tzinfo is None:
+        return {"ok": False, "code": "INVALID_LEAD_DATETIME", "error": f"'{raw}' не содержит явного часового пояса", "normalized": ""}
+
+    return {"ok": True, "code": "", "error": None, "normalized": parsed.isoformat()}
+
+
+# ─────────────────────────────────────────────────────────────
+# Relation validation
+# ─────────────────────────────────────────────────────────────
+
+def _validate_lead_relations(
+    business_id: str, *, service_id: str = "", channel_id: str = "", assigned_person_id: str = "",
+) -> dict:
+    """
+    ADR-024 §13: Business required; Service/Channel/Assigned Person
+    optional but must exist and belong to the same Business when
+    supplied. Converted Client ID is validated separately, only at
+    conversion time (_validate_lead_conversion_target()) — it is never
+    part of ordinary creation/update relation validation.
+    """
+    from business_core.sheets import read_business_sheet
+
+    if not business_id:
+        return {"ok": False, "code": "BUSINESS_NOT_FOUND", "error": "business_id обязателен"}
+    biz_rows = read_business_sheet("biz_registry")
+    if not any(b.get("ID", "") == business_id for b in biz_rows):
+        return {"ok": False, "code": "BUSINESS_NOT_FOUND", "error": f"Business {business_id} не найден"}
+
+    if service_id:
+        from business_core.service_manager import find_service_by_id
+        svc = find_service_by_id(service_id)
+        if svc is None:
+            return {"ok": False, "code": "SERVICE_NOT_FOUND", "error": f"Service {service_id} не найден"}
+        svc_biz_id = svc.get("biz_id", "")
+        if svc_biz_id and svc_biz_id != business_id:
+            return {"ok": False, "code": "LEAD_RELATION_MISMATCH", "error": f"Service {service_id} принадлежит бизнесу {svc_biz_id}, а указан Business {business_id}"}
+
+    if channel_id:
+        channels = read_business_sheet("channel_registry")
+        channel = next((c for c in channels if c.get("ID", "") == channel_id), None)
+        if channel is None:
+            return {"ok": False, "code": "CHANNEL_NOT_FOUND", "error": f"Channel {channel_id} не найден"}
+        ch_biz_id = channel.get("Бизнес ID", "")
+        if ch_biz_id and ch_biz_id != business_id:
+            return {"ok": False, "code": "LEAD_RELATION_MISMATCH", "error": f"Channel {channel_id} принадлежит бизнесу {ch_biz_id}, а указан Business {business_id}"}
+
+    if assigned_person_id:
+        from business_core.person_manager import find_person_by_id, is_person_archived, has_person_business_link
+        person = find_person_by_id(assigned_person_id)
+        if person is None:
+            return {"ok": False, "code": "PERSON_NOT_FOUND", "error": f"Person {assigned_person_id} не найден"}
+        if is_person_archived(person):
+            return {"ok": False, "code": "PERSON_NOT_FOUND", "error": f"Person {assigned_person_id} архивирован"}
+        if not has_person_business_link(person, business_id):
+            return {"ok": False, "code": "LEAD_RELATION_MISMATCH", "error": f"Person {assigned_person_id} не связан с Business {business_id}"}
+
+    return {"ok": True, "code": "", "error": None}
+
+
+def _validate_lead_conversion_target(business_id: str, converted_client_id: str) -> dict:
+    """ADR-024 §19: Converted Client ID must reference an existing,
+    non-archived, valid Client belonging to the same Business. Never
+    creates, never mutates the Client."""
+    from business_core.person_manager import find_person_by_id, is_person_archived, is_client_person, has_person_business_link
+
+    client = find_person_by_id(converted_client_id)
+    if client is None:
+        return {"ok": False, "code": "CLIENT_NOT_FOUND", "error": f"Client {converted_client_id} не найден"}
+    if is_person_archived(client):
+        return {"ok": False, "code": "CLIENT_NOT_FOUND", "error": f"Client {converted_client_id} архивирован"}
+    if not is_client_person(client):
+        return {"ok": False, "code": "CLIENT_NOT_FOUND", "error": f"{converted_client_id} не является Client"}
+    if not has_person_business_link(client, business_id):
+        return {"ok": False, "code": "LEAD_RELATION_MISMATCH", "error": f"Client {converted_client_id} не связан с Business {business_id}"}
+    return {"ok": True, "code": "", "error": None}
+
+
+# ─────────────────────────────────────────────────────────────
+# Creation
+# ─────────────────────────────────────────────────────────────
+
+def create_lead(
+    business_id: str, contact_name_snapshot: str,
+    *, created_by: str, caller_idempotency_key: str,
+    phone_snapshot: str = "", whatsapp_snapshot: str = "", email_snapshot: str = "",
+    company_snapshot: str = "", service_id: str = "", source: str = "", channel_id: str = "",
+    qualification_notes: str = "", expected_value="", currency: str = "",
+    next_follow_up_at: str = "", last_contacted_at: str = "", assigned_person_id: str = "",
+    notes: str = "",
+) -> dict:
+    """
+    Phase 41C (ADR-024 §16): the sole canonical Lead creation
+    orchestration boundary.
+
+    Validation order, all before any write:
+      A. required business_id / contact_name_snapshot / created_by / caller_idempotency_key
+      B. contact-name normalization
+      C. Phone/WhatsApp/Email normalization
+      D. contact-channel requirement (at least one of Phone/WhatsApp/Email)
+      E. Expected Value/Currency pairing + normalization
+      F. Next Follow-up At / Last Contacted At normalization
+      G. relation validation (Business/Service/Channel/Assigned Person)
+      H. idempotency lookup (zero/one/multiple)
+      I. duplicate-contact-warning lookup (zero-match path only)
+      J. Lead ID generated only after A-I pass
+      K. low-level persistence
+      L. post-write verification
+      M. structured result, including any duplicate_contact_ids warning
+    """
+    from business_core.lead_manager import (
+        find_leads_by_idempotency_key, find_leads_by_exact_contact_channels,
+        create_lead as lm_create_lead, find_lead_by_id,
+    )
+
+    if not business_id:
+        return _lead_result(ok=False, code="BUSINESS_NOT_FOUND", error="business_id обязателен")
+    if not created_by:
+        return _lead_result(ok=False, code="LEAD_PERSISTENCE_FAILED", error="created_by обязателен", business_id=business_id)
+    if not caller_idempotency_key:
+        return _lead_result(ok=False, code="LEAD_IDEMPOTENCY_REQUIRED", error="caller_idempotency_key обязателен", business_id=business_id)
+
+    name_result = _validate_lead_contact_name(contact_name_snapshot)
+    if not name_result["ok"]:
+        return _lead_result(ok=False, code=name_result["code"], error=name_result["error"], business_id=business_id)
+    normalized_name = name_result["name"]
+
+    phone_result = normalize_lead_phone(phone_snapshot)
+    if not phone_result["ok"]:
+        return _lead_result(ok=False, code=phone_result["code"], error=phone_result["error"], business_id=business_id)
+    normalized_phone = phone_result["normalized"]
+
+    whatsapp_result = normalize_lead_whatsapp(whatsapp_snapshot)
+    if not whatsapp_result["ok"]:
+        return _lead_result(ok=False, code=whatsapp_result["code"], error=whatsapp_result["error"], business_id=business_id)
+    normalized_whatsapp = whatsapp_result["normalized"]
+
+    email_result = normalize_lead_email(email_snapshot)
+    if not email_result["ok"]:
+        return _lead_result(ok=False, code=email_result["code"], error=email_result["error"], business_id=business_id)
+    normalized_email = email_result["normalized"]
+
+    channel_check = _validate_lead_contact_channel(normalized_phone, normalized_whatsapp, normalized_email)
+    if not channel_check["ok"]:
+        return _lead_result(ok=False, code=channel_check["code"], error=channel_check["error"], business_id=business_id)
+
+    normalized_company = _normalize_lead_company(company_snapshot)
+
+    value_result = _validate_lead_expected_value_pair(expected_value, currency)
+    if not value_result["ok"]:
+        return _lead_result(ok=False, code=value_result["code"], error=value_result["error"], business_id=business_id)
+    normalized_expected_value = value_result["expected_value"]
+    normalized_currency = value_result["currency"]
+
+    follow_up_result = normalize_lead_datetime(next_follow_up_at)
+    if not follow_up_result["ok"]:
+        return _lead_result(ok=False, code=follow_up_result["code"], error=follow_up_result["error"], business_id=business_id)
+    normalized_follow_up = follow_up_result["normalized"]
+
+    contacted_result = normalize_lead_datetime(last_contacted_at)
+    if not contacted_result["ok"]:
+        return _lead_result(ok=False, code=contacted_result["code"], error=contacted_result["error"], business_id=business_id)
+    normalized_last_contacted = contacted_result["normalized"]
+
+    relation_result = _validate_lead_relations(
+        business_id, service_id=service_id, channel_id=channel_id, assigned_person_id=assigned_person_id,
+    )
+    if not relation_result["ok"]:
+        return _lead_result(ok=False, code=relation_result["code"], error=relation_result["error"], business_id=business_id)
+
+    matches = find_leads_by_idempotency_key(business_id, caller_idempotency_key)
+    if len(matches) > 1:
+        conflicting_ids = tuple(m["Lead ID"] for m in matches)
+        return _lead_result(
+            ok=False, code="MULTIPLE_LEAD_MATCHES",
+            error=f"Найдено несколько Lead с этим ключом: {conflicting_ids}",
+            business_id=business_id, conflicting_ids=conflicting_ids, retry_safe=True,
+        )
+    if len(matches) == 1:
+        existing = matches[0]
+        return _lead_result(
+            ok=True, code="LEAD_REUSED", error=None,
+            lead_id=existing["Lead ID"], business_id=business_id,
+            service_id=existing.get("Service ID", ""), channel_id=existing.get("Channel ID", ""),
+            assigned_person_id=existing.get("Assigned Person ID", ""),
+            converted_client_id=existing.get("Converted Client ID", ""),
+            expected_value=existing.get("Expected Value", ""), currency=existing.get("Currency", ""),
+            next_follow_up_at=existing.get("Next Follow-up At", ""), last_contacted_at=existing.get("Last Contacted At", ""),
+            final_status=existing.get("Status", ""), reused=True, retry_safe=True,
+        )
+
+    duplicate_matches = find_leads_by_exact_contact_channels(
+        business_id, phone=normalized_phone, whatsapp=normalized_whatsapp, email=normalized_email,
+    )
+    duplicate_contact_ids = tuple(m["Lead ID"] for m in duplicate_matches)
+    warnings = ("LEAD_CONTACT_DUPLICATE_WARNING",) if duplicate_contact_ids else ()
+
+    create_result = lm_create_lead(
+        business_id, normalized_name,
+        caller_idempotency_key=caller_idempotency_key,
+        phone_snapshot=normalized_phone, whatsapp_snapshot=normalized_whatsapp, email_snapshot=normalized_email,
+        company_snapshot=normalized_company, service_id=service_id, source=source, channel_id=channel_id,
+        qualification_notes=qualification_notes, expected_value=normalized_expected_value, currency=normalized_currency,
+        next_follow_up_at=normalized_follow_up, last_contacted_at=normalized_last_contacted,
+        assigned_person_id=assigned_person_id, created_by=created_by, notes=notes,
+    )
+    if not create_result["ok"]:
+        return _lead_result(ok=False, code="LEAD_PERSISTENCE_FAILED", error=create_result.get("error"), business_id=business_id, retry_safe=True)
+    lead_id = create_result["lead_id"]
+
+    saved = find_lead_by_id(lead_id)
+    if saved is None:
+        return _lead_result(
+            ok=False, code="LEAD_POST_WRITE_VERIFICATION_FAILED",
+            error="Lead записан, но проверка после записи не прошла",
+            lead_id=lead_id, business_id=business_id, retry_safe=False,
+        )
+
+    return _lead_result(
+        ok=True, code="LEAD_CREATED", error=None,
+        lead_id=lead_id, business_id=business_id, service_id=service_id, channel_id=channel_id,
+        assigned_person_id=assigned_person_id,
+        expected_value=normalized_expected_value, currency=normalized_currency,
+        next_follow_up_at=normalized_follow_up, last_contacted_at=normalized_last_contacted,
+        final_status="new", created=True, retry_safe=True,
+        duplicate_contact_ids=duplicate_contact_ids, warnings=warnings,
+    )
+
+
+# ─────────────────────────────────────────────────────────────
+# Lifecycle
+# ─────────────────────────────────────────────────────────────
+
+def _transition_lead(
+    lead_id: str, target_status: str, *,
+    qualification_notes: str = "", disposition_reason: str = "", last_contacted_at: str = "",
+) -> dict:
+    """Internal shared transition engine for contacted/qualified/
+    unqualified/lost/archived (ADR-024 §17-§23/§25). Conversion has its
+    own dedicated function (convert_lead()) since it carries additional
+    required fields and idempotent-target semantics."""
+    from business_core.lead_manager import find_lead_by_id, update_lead_status, LEAD_STATUS
+
+    if not lead_id:
+        return _lead_result(ok=False, code="LEAD_NOT_FOUND", error="lead_id обязателен")
+    lead = find_lead_by_id(lead_id)
+    if lead is None:
+        return _lead_result(ok=False, code="LEAD_NOT_FOUND", error=f"Lead {lead_id} не найден", lead_id=lead_id)
+
+    business_id = lead.get("Business ID", "")
+    previous_status = lead.get("Status", "")
+
+    if target_status not in LEAD_STATUS:
+        return _lead_result(
+            ok=False, code="INVALID_LEAD_STATUS",
+            error=f"Недопустимый статус '{target_status}'. Допустимые значения: {', '.join(LEAD_STATUS)}",
+            lead_id=lead_id, business_id=business_id, previous_status=previous_status, requested_status=target_status, final_status=previous_status,
+        )
+
+    if target_status == previous_status:
+        return _lead_result(
+            ok=True, code="LEAD_STATUS_UNCHANGED", error=None,
+            lead_id=lead_id, business_id=business_id, previous_status=previous_status, requested_status=target_status, final_status=previous_status, changed=False,
+        )
+
+    allowed_targets = _LEAD_ORDINARY_TRANSITIONS.get(previous_status, (previous_status,))
+    if target_status not in allowed_targets:
+        code = "LEAD_RESTORE_REQUIRES_EXPLICIT_ACTION" if (target_status in _LEAD_ACTIVE_STATUSES and previous_status in ("unqualified", "lost", "archived")) else "INVALID_LEAD_TRANSITION"
+        return _lead_result(
+            ok=False, code=code, error=f"Переход '{previous_status}' → '{target_status}' не разрешён",
+            lead_id=lead_id, business_id=business_id, previous_status=previous_status, requested_status=target_status, final_status=previous_status,
+        )
+
+    if target_status in _LEAD_DISPOSITION_REQUIRED_STATUSES and not disposition_reason:
+        return _lead_result(
+            ok=False, code="LEAD_DISPOSITION_REASON_REQUIRED", error="disposition_reason обязателен",
+            lead_id=lead_id, business_id=business_id, previous_status=previous_status, requested_status=target_status, final_status=previous_status,
+        )
+
+    archived_at = _now_utc_str() if target_status == "archived" else ""
+    write_result = update_lead_status(
+        lead_id, target_status,
+        qualification_notes=qualification_notes, disposition_reason=disposition_reason,
+        last_contacted_at=last_contacted_at, archived_at=archived_at,
+    )
+    if not write_result["ok"]:
+        return _lead_result(
+            ok=False, code=write_result.get("code") or "LEAD_PERSISTENCE_FAILED", error=write_result.get("error"),
+            lead_id=lead_id, business_id=business_id, previous_status=previous_status, requested_status=target_status, final_status=previous_status,
+        )
+
+    changed = write_result["changed"]
+    success_codes = {
+        "contacted": "LEAD_CONTACTED", "qualified": "LEAD_QUALIFIED",
+        "unqualified": "LEAD_UNQUALIFIED", "lost": "LEAD_LOST", "archived": "LEAD_ARCHIVED",
+    }
+    code = success_codes.get(target_status, "LEAD_STATUS_UPDATED") if changed else "LEAD_STATUS_UNCHANGED"
+    final_status = target_status if changed else previous_status
+
+    return _lead_result(
+        ok=True, code=code, error=None,
+        lead_id=lead_id, business_id=business_id,
+        previous_status=previous_status, requested_status=target_status, final_status=final_status, changed=changed,
+        contacted=(changed and target_status == "contacted"), qualified=(changed and target_status == "qualified"),
+        unqualified=(changed and target_status == "unqualified"), lost=(changed and target_status == "lost"),
+        archived=(changed and target_status == "archived"),
+    )
+
+
+def contact_lead(lead_id: str, *, last_contacted_at: str = "") -> dict:
+    """ADR-024 §20: explicit new/qualified → contacted. Last Contacted
+    At is set only when an explicit datetime is supplied — never
+    auto-set to "now", never triggers Task/Interaction creation."""
+    normalized_last_contacted = ""
+    if last_contacted_at:
+        dt_result = normalize_lead_datetime(last_contacted_at)
+        if not dt_result["ok"]:
+            from business_core.lead_manager import find_lead_by_id
+            lead = find_lead_by_id(lead_id) or {}
+            return _lead_result(
+                ok=False, code=dt_result["code"], error=dt_result["error"],
+                lead_id=lead_id, business_id=lead.get("Business ID", ""),
+                previous_status=lead.get("Status", ""), requested_status="contacted", final_status=lead.get("Status", ""),
+            )
+        normalized_last_contacted = dt_result["normalized"]
+    return _transition_lead(lead_id, "contacted", last_contacted_at=normalized_last_contacted)
+
+
+def qualify_lead(lead_id: str, *, qualification_notes: str = "") -> dict:
+    """ADR-024 §21: explicit allowed → qualified. Never creates a
+    Commercial Offer, never auto-converts, never mutates Service."""
+    return _transition_lead(lead_id, "qualified", qualification_notes=qualification_notes)
+
+
+def unqualify_lead(lead_id: str, *, disposition_reason: str) -> dict:
+    """ADR-024 §22: explicit allowed → unqualified. Disposition Reason
+    required, set once, never logged. Terminal except archive."""
+    return _transition_lead(lead_id, "unqualified", disposition_reason=disposition_reason)
+
+
+def lose_lead(lead_id: str, *, disposition_reason: str) -> dict:
+    """ADR-024 §23: explicit allowed → lost. Same privacy/immutability
+    discipline as unqualify_lead(). Terminal except archive."""
+    return _transition_lead(lead_id, "lost", disposition_reason=disposition_reason)
+
+
+def archive_lead(lead_id: str) -> dict:
+    """ADR-024 §25: explicit allowed → archived. Terminal — no restore,
+    no hard delete. Exact-ID read still works afterward."""
+    return _transition_lead(lead_id, "archived")
+
+
+def convert_lead(lead_id: str, converted_client_id: str, converted_by: str) -> dict:
+    """
+    Phase 41C (ADR-024 §19/§24): the sole canonical Lead-to-Client
+    conversion orchestration boundary. Converted Client ID must
+    reference an existing, valid, same-Business Client — never creates
+    or mutates a Client, never mutates Person fields. Naturally
+    idempotent by status+target check (ADR-024 Option A): repeated
+    conversion to the same Client is a safe no-op; conversion to a
+    different Client after conversion already occurred is a conflict.
+    """
+    from business_core.lead_manager import find_lead_by_id, update_lead_status
+
+    if not lead_id:
+        return _lead_result(ok=False, code="LEAD_NOT_FOUND", error="lead_id обязателен")
+    lead = find_lead_by_id(lead_id)
+    if lead is None:
+        return _lead_result(ok=False, code="LEAD_NOT_FOUND", error=f"Lead {lead_id} не найден", lead_id=lead_id)
+
+    business_id = lead.get("Business ID", "")
+    previous_status = lead.get("Status", "")
+
+    if not converted_client_id:
+        return _lead_result(
+            ok=False, code="LEAD_CONVERSION_CLIENT_REQUIRED", error="converted_client_id обязателен",
+            lead_id=lead_id, business_id=business_id, previous_status=previous_status, requested_status="converted", final_status=previous_status,
+        )
+    if not converted_by:
+        return _lead_result(
+            ok=False, code="LEAD_CONVERSION_ACTOR_REQUIRED", error="converted_by обязателен",
+            lead_id=lead_id, business_id=business_id, previous_status=previous_status, requested_status="converted", final_status=previous_status,
+        )
+
+    existing_converted_client_id = lead.get("Converted Client ID", "")
+    if previous_status == "converted":
+        if existing_converted_client_id == converted_client_id:
+            return _lead_result(
+                ok=True, code="LEAD_STATUS_UNCHANGED", error=None,
+                lead_id=lead_id, business_id=business_id,
+                service_id=lead.get("Service ID", ""), channel_id=lead.get("Channel ID", ""),
+                assigned_person_id=lead.get("Assigned Person ID", ""), converted_client_id=existing_converted_client_id,
+                previous_status=previous_status, requested_status="converted", final_status="converted", changed=False,
+            )
+        return _lead_result(
+            ok=False, code="LEAD_CONVERSION_TARGET_CONFLICT",
+            error=f"Lead {lead_id} уже конвертирован в Client {existing_converted_client_id} — конверсия в другой Client запрещена",
+            lead_id=lead_id, business_id=business_id, converted_client_id=existing_converted_client_id,
+            previous_status=previous_status, requested_status="converted", final_status="converted",
+        )
+
+    allowed_targets = _LEAD_ORDINARY_TRANSITIONS.get(previous_status, (previous_status,))
+    if "converted" not in allowed_targets:
+        return _lead_result(
+            ok=False, code="INVALID_LEAD_TRANSITION", error=f"Переход '{previous_status}' → 'converted' не разрешён",
+            lead_id=lead_id, business_id=business_id, previous_status=previous_status, requested_status="converted", final_status=previous_status,
+        )
+
+    client_check = _validate_lead_conversion_target(business_id, converted_client_id)
+    if not client_check["ok"]:
+        return _lead_result(
+            ok=False, code=client_check["code"], error=client_check["error"],
+            lead_id=lead_id, business_id=business_id, previous_status=previous_status, requested_status="converted", final_status=previous_status,
+        )
+
+    now = _now_utc_str()
+    write_result = update_lead_status(lead_id, "converted", converted_client_id=converted_client_id, converted_at=now, converted_by=converted_by)
+    if not write_result["ok"]:
+        return _lead_result(
+            ok=False, code=write_result.get("code") or "LEAD_PERSISTENCE_FAILED", error=write_result.get("error"),
+            lead_id=lead_id, business_id=business_id, previous_status=previous_status, requested_status="converted", final_status=previous_status,
+        )
+
+    changed = write_result["changed"]
+    return _lead_result(
+        ok=True, code="LEAD_CONVERTED" if changed else "LEAD_STATUS_UNCHANGED", error=None,
+        lead_id=lead_id, business_id=business_id, converted_client_id=converted_client_id,
+        previous_status=previous_status, requested_status="converted", final_status="converted", changed=changed, converted=changed,
+    )
+
+
+# ─────────────────────────────────────────────────────────────
+# Active-Lead updates
+# ─────────────────────────────────────────────────────────────
+
+def update_lead(lead_id: str, updates: dict) -> dict:
+    """
+    Phase 41C (ADR-024 §23/§26): active-status commercial/contact-field
+    update. Mutable only while Status is new/contacted/qualified.
+    Every supplied override is revalidated exactly like creation; the
+    contact-channel requirement must remain satisfied after the update;
+    duplicate-contact warning is recalculated when any contact channel
+    changes. Identity/Business/idempotency/status/conversion/audit
+    fields are never accepted here — use the dedicated transition/
+    conversion/admin functions instead.
+    """
+    from business_core.lead_manager import find_lead_by_id, update_lead_active_fields
+
+    if not lead_id:
+        return _lead_result(ok=False, code="LEAD_NOT_FOUND", error="lead_id обязателен")
+    lead = find_lead_by_id(lead_id)
+    if lead is None:
+        return _lead_result(ok=False, code="LEAD_NOT_FOUND", error=f"Lead {lead_id} не найден", lead_id=lead_id)
+
+    business_id = lead.get("Business ID", "")
+    status = lead.get("Status", "")
+
+    if status not in _LEAD_ACTIVE_STATUSES:
+        return _lead_result(
+            ok=False, code="LEAD_IMMUTABLE", error=f"Lead {lead_id} в статусе '{status}' — коммерческие/контактные поля более не изменяемы",
+            lead_id=lead_id, business_id=business_id, previous_status=status, final_status=status,
+        )
+
+    resolved_name = lead.get("Contact Name Snapshot", "")
+    if "Contact Name Snapshot" in updates:
+        name_result = _validate_lead_contact_name(updates["Contact Name Snapshot"])
+        if not name_result["ok"]:
+            return _lead_result(ok=False, code=name_result["code"], error=name_result["error"], lead_id=lead_id, business_id=business_id, previous_status=status, final_status=status)
+        resolved_name = name_result["name"]
+
+    resolved_phone = lead.get("Phone Snapshot", "")
+    if "Phone Snapshot" in updates:
+        phone_result = normalize_lead_phone(updates["Phone Snapshot"])
+        if not phone_result["ok"]:
+            return _lead_result(ok=False, code=phone_result["code"], error=phone_result["error"], lead_id=lead_id, business_id=business_id, previous_status=status, final_status=status)
+        resolved_phone = phone_result["normalized"]
+
+    resolved_whatsapp = lead.get("WhatsApp Snapshot", "")
+    if "WhatsApp Snapshot" in updates:
+        whatsapp_result = normalize_lead_whatsapp(updates["WhatsApp Snapshot"])
+        if not whatsapp_result["ok"]:
+            return _lead_result(ok=False, code=whatsapp_result["code"], error=whatsapp_result["error"], lead_id=lead_id, business_id=business_id, previous_status=status, final_status=status)
+        resolved_whatsapp = whatsapp_result["normalized"]
+
+    resolved_email = lead.get("Email Snapshot", "")
+    if "Email Snapshot" in updates:
+        email_result = normalize_lead_email(updates["Email Snapshot"])
+        if not email_result["ok"]:
+            return _lead_result(ok=False, code=email_result["code"], error=email_result["error"], lead_id=lead_id, business_id=business_id, previous_status=status, final_status=status)
+        resolved_email = email_result["normalized"]
+
+    channel_touched = any(f in updates for f in ("Phone Snapshot", "WhatsApp Snapshot", "Email Snapshot"))
+    channel_check = _validate_lead_contact_channel(resolved_phone, resolved_whatsapp, resolved_email)
+    if not channel_check["ok"]:
+        return _lead_result(ok=False, code=channel_check["code"], error=channel_check["error"], lead_id=lead_id, business_id=business_id, previous_status=status, final_status=status)
+
+    prepared: dict = {}
+    if "Contact Name Snapshot" in updates:
+        prepared["Contact Name Snapshot"] = resolved_name
+    if "Phone Snapshot" in updates:
+        prepared["Phone Snapshot"] = resolved_phone
+    if "WhatsApp Snapshot" in updates:
+        prepared["WhatsApp Snapshot"] = resolved_whatsapp
+    if "Email Snapshot" in updates:
+        prepared["Email Snapshot"] = resolved_email
+    if "Company Snapshot" in updates:
+        prepared["Company Snapshot"] = _normalize_lead_company(updates["Company Snapshot"])
+
+    resolved_expected_value = lead.get("Expected Value", "")
+    resolved_currency = lead.get("Currency", "")
+    if "Expected Value" in updates or "Currency" in updates:
+        value_result = _validate_lead_expected_value_pair(
+            updates.get("Expected Value", lead.get("Expected Value", "")),
+            updates.get("Currency", lead.get("Currency", "")),
+        )
+        if not value_result["ok"]:
+            return _lead_result(ok=False, code=value_result["code"], error=value_result["error"], lead_id=lead_id, business_id=business_id, previous_status=status, final_status=status)
+        resolved_expected_value = value_result["expected_value"]
+        resolved_currency = value_result["currency"]
+        prepared["Expected Value"] = resolved_expected_value
+        prepared["Currency"] = resolved_currency
+
+    if "Next Follow-up At" in updates:
+        follow_up_result = normalize_lead_datetime(updates["Next Follow-up At"])
+        if not follow_up_result["ok"]:
+            return _lead_result(ok=False, code=follow_up_result["code"], error=follow_up_result["error"], lead_id=lead_id, business_id=business_id, previous_status=status, final_status=status)
+        prepared["Next Follow-up At"] = follow_up_result["normalized"]
+
+    if "Last Contacted At" in updates:
+        contacted_result = normalize_lead_datetime(updates["Last Contacted At"])
+        if not contacted_result["ok"]:
+            return _lead_result(ok=False, code=contacted_result["code"], error=contacted_result["error"], lead_id=lead_id, business_id=business_id, previous_status=status, final_status=status)
+        prepared["Last Contacted At"] = contacted_result["normalized"]
+
+    resolved_service_id = updates.get("Service ID", lead.get("Service ID", ""))
+    resolved_channel_id = updates.get("Channel ID", lead.get("Channel ID", ""))
+    resolved_assigned_person_id = updates.get("Assigned Person ID", lead.get("Assigned Person ID", ""))
+    if any(f in updates for f in ("Service ID", "Channel ID", "Assigned Person ID")):
+        relation_result = _validate_lead_relations(
+            business_id, service_id=resolved_service_id, channel_id=resolved_channel_id, assigned_person_id=resolved_assigned_person_id,
+        )
+        if not relation_result["ok"]:
+            return _lead_result(ok=False, code=relation_result["code"], error=relation_result["error"], lead_id=lead_id, business_id=business_id, previous_status=status, final_status=status)
+        for field in ("Service ID", "Channel ID", "Assigned Person ID"):
+            if field in updates:
+                prepared[field] = updates[field]
+
+    if "Source" in updates:
+        prepared["Source"] = updates["Source"]
+    if "Qualification Notes" in updates:
+        prepared["Qualification Notes"] = updates["Qualification Notes"]
+    if "Notes" in updates:
+        prepared["Notes"] = updates["Notes"]
+
+    duplicate_contact_ids: tuple = ()
+    warnings: tuple = ()
+    if channel_touched:
+        from business_core.lead_manager import find_leads_by_exact_contact_channels
+        duplicate_matches = find_leads_by_exact_contact_channels(
+            business_id, phone=resolved_phone, whatsapp=resolved_whatsapp, email=resolved_email, exclude_lead_id=lead_id,
+        )
+        duplicate_contact_ids = tuple(m["Lead ID"] for m in duplicate_matches)
+        warnings = ("LEAD_CONTACT_DUPLICATE_WARNING",) if duplicate_contact_ids else ()
+
+    write_result = update_lead_active_fields(lead_id, prepared)
+    if not write_result["ok"]:
+        return _lead_result(
+            ok=False, code=write_result.get("code") or "LEAD_IMMUTABLE", error=write_result.get("error"),
+            lead_id=lead_id, business_id=business_id, previous_status=status, final_status=status,
+        )
+
+    changed = write_result["changed"]
+    return _lead_result(
+        ok=True, code="LEAD_UPDATED" if changed else "LEAD_UPDATE_UNCHANGED", error=None,
+        lead_id=lead_id, business_id=business_id, service_id=resolved_service_id, channel_id=resolved_channel_id,
+        assigned_person_id=resolved_assigned_person_id, expected_value=resolved_expected_value, currency=resolved_currency,
+        previous_status=status, final_status=status, changed=changed,
+        duplicate_contact_ids=duplicate_contact_ids, warnings=warnings,
+    )
+
+
+def update_lead_admin_fields(lead_id: str, updates: dict) -> dict:
+    """Phase 41C (ADR-024 §27): thin resolve-then-delegate wrapper.
+    Only Notes is ordinarily mutable, in every status including
+    terminal ones — Notes is never logged."""
+    from business_core.lead_manager import find_lead_by_id, update_lead_admin_fields as lm_update_admin
+
+    if not lead_id:
+        return _lead_result(ok=False, code="LEAD_NOT_FOUND", error="lead_id обязателен")
+    lead = find_lead_by_id(lead_id)
+    if lead is None:
+        return _lead_result(ok=False, code="LEAD_NOT_FOUND", error=f"Lead {lead_id} не найден", lead_id=lead_id)
+
+    write_result = lm_update_admin(lead_id, updates)
+    if not write_result["ok"]:
+        return _lead_result(
+            ok=False, code=write_result.get("code") or "LEAD_IMMUTABLE", error=write_result.get("error"),
+            lead_id=lead_id, business_id=lead.get("Business ID", ""), previous_status=lead.get("Status", ""), final_status=lead.get("Status", ""),
+        )
+
+    changed = write_result["changed"]
+    return _lead_result(
+        ok=True, code="LEAD_UPDATED" if changed else "LEAD_UPDATE_UNCHANGED", error=None,
+        lead_id=lead_id, business_id=lead.get("Business ID", ""),
+        previous_status=lead.get("Status", ""), final_status=lead.get("Status", ""), changed=changed,
+    )
+
+
+# ─────────────────────────────────────────────────────────────
+# Follow-up due (stateless read-only helper)
+# ─────────────────────────────────────────────────────────────
+
+def is_lead_follow_up_due(lead: dict, *, reference_datetime: datetime | None = None) -> bool:
+    """
+    Phase 41C (ADR-024 §29): stateless read-only helper — never writes,
+    never mutates Status, never creates a Task. archived/converted/
+    lost/unqualified Leads never qualify, regardless of Next Follow-up
+    At, since no further sales action is expected on them.
+    """
+    if lead.get("Status", "") not in _LEAD_ACTIVE_STATUSES:
+        return False
+    raw = lead.get("Next Follow-up At", "")
+    if not raw:
+        return False
+    try:
+        candidate = raw[:-1] + "+00:00" if raw.endswith("Z") else raw
+        follow_up_at = datetime.fromisoformat(candidate)
+    except ValueError:
+        return False
+    if follow_up_at.tzinfo is None:
+        return False
+
+    from datetime import timezone as _timezone
+    now = reference_datetime or datetime.now(_timezone.utc)
+    return follow_up_at <= now

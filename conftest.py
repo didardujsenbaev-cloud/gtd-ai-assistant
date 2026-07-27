@@ -214,12 +214,22 @@ _OFFER_DOMAIN_TEST_FILES = frozenset({
     "test_offer_caller_ux.py",
 })
 
+# Phase 41C (ADR-024): Lead / Sales Funnel Domain Foundation —
+# registered BEFORE any test logic was written, per the PRS-003
+# precedent.
+_LEAD_DOMAIN_TEST_FILES = frozenset({
+    "test_lead_manager.py",
+    "test_business_lead_foundation.py",
+    "test_lead_architecture_guards.py",
+    "test_lead_mock_completeness.py",
+})
+
 _HARD_SOCKET_BLOCK_TEST_FILES = (
     _CLIENT_DOMAIN_TEST_FILES | _ROADMAP_DOMAIN_TEST_FILES
     | _ORGANIZATION_DOMAIN_TEST_FILES | _OTHER_HARDENED_TEST_FILES
     | _TASK_DOMAIN_TEST_FILES | _DOCUMENT_DOMAIN_TEST_FILES
     | _CHECKLIST_KNOWLEDGE_TEST_FILES | _PAYMENT_DOMAIN_TEST_FILES
-    | _OFFER_DOMAIN_TEST_FILES
+    | _OFFER_DOMAIN_TEST_FILES | _LEAD_DOMAIN_TEST_FILES
 )
 
 
