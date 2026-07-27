@@ -4342,3 +4342,855 @@ Sheets не менялась; существующие 14 рядов `checklist_
 relations` не изменены. GTD Core не затронут. Ни один закрытый домен
 (Object/Client/Service/Roadmap/Stage/Organization/Task/Document) не
 переоткрыт.
+
+## ADR-022 — Payment/Milestone Domain Architecture Decision (Phase 39B)
+
+### 0. Контекст
+
+Phase 39A (Next Domain Selection Audit) и Phase 39A.1 (Payment Domain Scope
+and Financial-Integrity Clarification) установили: единственный оставшийся
+домен с реальным code footprint — Payment/Milestone. Никакого
+`milestone_registry` не существует; `COMMERCIAL_MILESTONES_MAP` в
+`roadmap_manager.py` — это hardcoded Python dict (одна запись, шаблон
+`RMT-IZH-ALM-STANDARD-002`, 3 фиксированные milestone-суммы), не Sheets
+registry. `/milestones` — read-only команда без мутаций. Ни operational, ни
+Template Sheets-слоя не существует ни в каком виде — это более "чистый"
+greenfield, чем был Checklist Domain перед своим Foundation (у Checklist уже
+был зрелый производственный Template-слой; здесь нет и его).
+
+Ключевая находка Phase 39A.1, формально утверждаемая здесь: expected money
+(что должны) и actual money (что реально получено) — это два разных факта,
+которые никогда не должны жить в одной операционной строке. Одна строка с
+полями "Expected Amount"/"Paid Amount" уничтожает возможность аудита истории
+платежей (перезапись при исправлении, невозможность различить два частичных
+платежа, невозможность отличить "ожидаем" от "подтверждено получено").
+
+Это ADR утверждает архитектуру Payment/Milestone Domain Foundation
+(Phase 39C) — Template + Obligation + Transaction, без Allocation-реестра,
+без миграции, без Telegram-команд, без деплоя.
+
+### 1. Канонические концепции
+
+**A. Commercial Milestone Template** — переиспользуемое определение
+коммерческого графика платежей. Reference/config-слой. Привязан к Roadmap
+Template и/или Service. Никогда не хранит фактическую историю платежей и
+не хранит live paid-статус.
+
+**B. Payment Obligation** — каноническая expected-money сущность. Одна
+сумма к оплате, одна явная валюта, один Business, один payer/Client,
+опциональные Object/Service/Roadmap/Stage/Template-ссылки, due date,
+операционный receivable-lifecycle.
+
+**C. Payment Transaction** — каноническое actual-money событие. Одна запись
+о фактическом платеже, одна явная валюта, ровно один Payment Obligation (в
+Foundation), дата платежа, метод, внешняя транзакционная ссылка,
+опциональный evidence Document ID, immutable после подтверждения.
+
+**D. Payment Allocation** — НЕ Foundation-сущность, отложена. Foundation
+поддерживает: один Transaction → один Obligation; один Obligation → много
+Transactions. Оплата нескольких Obligation одним платежом фиксируется как
+отдельные Transaction-записи, каждая — на свой Obligation.
+
+```
+PAYMENT_OBLIGATION_IS_EXPECTED_MONEY_ENTITY = YES
+PAYMENT_TRANSACTION_IS_ACTUAL_MONEY_ENTITY = YES
+EXPECTED_AND_ACTUAL_MONEY_ARE_SEPARATE = YES
+PAYMENT_ALLOCATION_REGISTRY_REQUIRED_IN_FOUNDATION = NO
+```
+
+### 2. Registry design
+
+Три новых registry, все — будущая работа Phase 39C, ничего не создаётся
+этим ADR.
+
+**A. `commercial_milestone_templates`**
+
+```
+Commercial Milestone Template ID
+Roadmap Template ID
+Service ID
+Title
+Description
+Sequence
+Trigger Description
+Calculation Type
+Fixed Amount
+Percentage
+Currency
+Status
+Created At
+Created By
+Updated At
+Notes
+```
+
+**B. `payment_obligations`**
+
+```
+Payment Obligation ID
+Business ID
+Client ID
+Object ID
+Service ID
+Roadmap ID
+Stage ID
+Commercial Milestone Template ID
+Caller Idempotency Key
+Title Snapshot
+Description Snapshot
+Obligation Amount
+Currency
+Due Date
+Status
+Paid Amount
+Remaining Amount
+Created At
+Created By
+Issued At
+Paid At
+Cancelled At
+Updated At
+Notes
+```
+
+Единственное отклонение от предложенного в задании набора полей: добавлено
+`Caller Idempotency Key` (см. решение 19 ниже) — без него нет безопасного
+основного idempotency-ключа для Obligation, создаваемых не строго из
+Template/Roadmap/Stage triple.
+
+**C. `payment_transactions`**
+
+```
+Payment Transaction ID
+Business ID
+Payment Obligation ID
+Client ID
+Amount
+Currency
+Payment Date
+Payment Method
+External Transaction ID
+Caller Idempotency Key
+Evidence Document ID
+Status
+Reversal Reason
+Confirmed At
+Confirmed By
+Reversed At
+Reversed By
+Created At
+Created By
+Updated At
+Notes
+```
+
+Единственное отклонение от предложенного набора: поле `Reversal Of
+Transaction ID` из задания — не включено. Причина: решение 16 (модель
+реверса) утверждает status-based reversal НА ТОЙ ЖЕ строке (не отдельная
+reversal-транзакция), поэтому поле-ссылка "reversal of" не имеет объекта
+для ссылки в Foundation — второй транзакционной строки не создаётся.
+Поле сознательно не резервируется как "для будущей совместимости", чтобы
+не вводить в схему поле без единого производителя/потребителя в Foundation
+(тот же принцип "не формализовать код без runtime-вызова", что закрыл
+Phase 37F находку по Document Domain).
+
+Требуемые решения:
+
+```
+- payment_allocations в Foundation не создаётся;
+- invoice-реестр в Foundation не создаётся;
+- expense/revenue/ledger-реестры не создаются;
+- generic JSON relation-поля не используются;
+- comma-separated relation-поля не используются;
+- скрытая expected/actual гибридная строка запрещена.
+```
+
+### 3. Persistence ownership
+
+Выбрано: **один `payment_manager.py`** — единственный persistence owner
+для всех трёх registry (`commercial_milestone_templates`,
+`payment_obligations`, `payment_transactions`).
+
+Обоснование против разделения на `payment_template_manager.py` +
+отдельный operational manager: в первой версии домена искусственное
+разделение на два файла-владельца создаёт две параллельные, но пустые в
+день 1, поверхности с почти нулевой независимой сложностью каждая (тот же
+паттерн, что уже использовался — `document_manager.py`,
+`checklist_manager.py`, `task_manager.py` — каждый владеет всеми своими
+registry одним файлом). Разделение может быть сделано позже, если Template
+persistence разрастётся достаточно, чтобы оправдать отдельный модуль —
+не предвосхищается здесь.
+
+`payment_manager.py` владеет: точечные reads, list/filter reads, ID
+generation (PMT/POB/PTXN), низкоуровневое create/update/status persistence,
+idempotency-lookup примитивы, verification подтверждённой Transaction-
+строки после записи, персистентность derived-balance кэша.
+
+`payment_manager.py` НЕ владеет: cross-domain relation-валидацию, деловую
+policy-оркестрацию (overpayment/lifecycle/idempotency-decision), Telegram
+UX, автоматическую мутацию Roadmap/Stage/Document.
+
+### 4. Orchestration ownership
+
+`business_builder.py` — единственный cross-domain owner Payment-
+оркестрации. Владеет: Template-валидацию, amount/currency normalization,
+relation-валидацию, создание Obligation, создание/подтверждение/реверс
+Transaction, overpayment-предотвращение, balance-calculation,
+status-synchronization, idempotency zero/one/multiple handling,
+structured result assembly.
+
+Направление зависимостей (без реверса, как во всех закрытых доменах):
+
+```
+telegram_handlers
+  → business_builder
+    → payment_manager
+      → sheets
+```
+
+```
+PAYMENT_MANAGER_IS_APPROVED_PERSISTENCE_OWNER = YES
+BUSINESS_BUILDER_IS_APPROVED_PAYMENT_ORCHESTRATION_OWNER = YES
+```
+
+### 5. Identity policy
+
+```
+Commercial Milestone Template: PMT-NNN
+Payment Obligation:            POB-NNN
+Payment Transaction:           PTXN-NNN
+```
+
+Проверка коллизий с существующими `_ID_PREFIXES` (`CLIN`, `CLII`, `TSK`,
+`DOC`, `RM`, `RMS`, `OBJ`, `SVC`, `BIZ`, `PRS`, `CHK`, `DT`, `FAQ`, `SOP`,
+`DEPT`, `ROLE` и др.) — `PMT`/`POB`/`PTXN` не пересекаются ни с одним
+существующим префиксом.
+
+Правила: ровно один генератор на identity, оба живут в `payment_manager.py`
+через `sheets.generate_next_id`/`generate_next_ids`; никакой caller-side
+генерации; malformed ID безопасно игнорируются (как во всех прочих
+доменах); ID генерируются только после полной валидации и idempotency-
+проверки (никогда — до); никакой title-based или amount/date-based
+identity; никакого повторного использования Roadmap/Stage/Document ID как
+платёжной identity.
+
+```
+COMMERCIAL_MILESTONE_TEMPLATE_IDENTITY_APPROVED = YES
+PAYMENT_OBLIGATION_IDENTITY_APPROVED = YES
+PAYMENT_TRANSACTION_IDENTITY_APPROVED = YES
+```
+
+### 6. Amount policy
+
+Python `Decimal` исключительно, никогда `float`. Персистентность —
+канонической decimal-строкой (например `"150000.00"`). Фиксированный scale
+= 2 дробных знака для всех валют, включая KZT (единообразие важнее
+KZT-специфичного целочисленного исключения — единственный реальный пример
+(`150_000`/`500_000`/`300_000`) не требует тийин, но и не противоречит
+scale=2). Amount обязателен и строго > 0 (отрицательные и нулевые суммы
+запрещены и для Obligation, и для Transaction). Никакой scientific
+notation, никаких locale-разделителей в хранимом значении (только в
+Telegram-отображении, как уже делает `/milestones`). Детерминированная
+нормализация на входе. Все суммы и totals считаются исключительно через
+`Decimal`. Ввод с более чем 2 дробными знаками блокируется, а не тихо
+округляется.
+
+```
+INVALID_PAYMENT_AMOUNT
+INVALID_PAYMENT_AMOUNT_SCALE
+PAYMENT_AMOUNT_MUST_BE_POSITIVE
+```
+
+```
+PAYMENT_USES_DECIMAL_NOT_FLOAT = YES
+PAYMENT_AMOUNT_SCALE_IS_EXPLICIT = YES
+```
+
+### 7. Currency policy
+
+Обязателен явный 3-буквенный uppercase ISO-style код. `KZT` поддерживается
+изначально (совпадает с дефолтом `service_catalog`). Никакой пустой/
+implicit валюты ни на каком уровне персистентности. Template/Obligation/
+Transaction — валюта всегда явная. Transaction currency обязана совпадать
+с Obligation currency — иначе блок. Никакой кросс-валютной агрегации.
+Никакой FX-конвертации в Foundation.
+
+```
+INVALID_PAYMENT_CURRENCY
+PAYMENT_CURRENCY_MISMATCH
+MULTI_CURRENCY_AGGREGATION_NOT_ALLOWED
+```
+
+```
+PAYMENT_CURRENCY_IS_EXPLICIT = YES
+MULTI_CURRENCY_AGGREGATION_IS_ALLOWED = NO
+```
+
+### 8. Template calculation policy
+
+Ровно два режима, взаимоисключающих: `fixed`, `percentage`.
+
+`fixed`: `Fixed Amount` обязателен, `Percentage` пуст, `Currency`
+обязательна.
+`percentage`: `Percentage` обязателен, `Fixed Amount` пуст, `Currency`
+обязательна; percentage в Foundation — исключительно reference-метаданные;
+никакого автоматического расчёта суммы без явного canonical pricing basis
+(см. решение 9).
+
+Противоречие (оба поля заполнены, оба пусты, либо поле не соответствует
+заявленному Calculation Type) блокируется.
+
+```
+INVALID_MILESTONE_CALCULATION_TYPE
+MILESTONE_FIXED_AMOUNT_REQUIRED
+MILESTONE_PERCENTAGE_REQUIRED
+MILESTONE_CALCULATION_FIELDS_CONFLICT
+```
+
+### 9. Pricing-basis policy
+
+Foundation требует явную сумму Payment Obligation при создании. `fixed`-
+Template может предложить amount по умолчанию (используется как есть).
+`percentage`-Template НЕ может самостоятельно породить каноническую сумму:
+Contract/Commercial Offer сущности не существуют нигде в кодовой базе —
+единственный canonical price source отсутствует. Никакого автоматического
+расчёта из `service_catalog`'s `Цена мин`/`Цена макс` (это price-range
+reference-поля закрытого Service Domain, не операционная цена). Операционная
+сумма снапшотится в Payment Obligation в момент создания; последующие
+изменения Template или Service-цены никогда не переписывают уже созданные
+Obligation (тот же snapshot-not-live-reference паттерн, что уже используют
+Document/Checklist Domains).
+
+```
+FOUNDATION_REQUIRES_EXPLICIT_OBLIGATION_AMOUNT = YES
+PERCENTAGE_TEMPLATE_AUTO_CALCULATION_IS_FOUNDATION_SCOPE = NO
+```
+
+### 10. Commercial Milestone Template lifecycle
+
+Статусы: `active`, `inactive`, `archived`.
+
+`active` — доступен для использования в новых Obligation. `inactive`
+блокирует создание новых Obligation (существующие не затрагиваются).
+`archived` блокирует любое новое использование. Никакого hard delete.
+Восстановление (`active` ← `inactive`/`archived`) НЕ реализуется в
+Foundation, но защита от случайного "ordinary"-перехода в обратную сторону
+обязательна (тот же reopen-gated паттерн, что и в Document/Checklist).
+
+### 11. Payment Obligation lifecycle
+
+Статусы: `draft`, `issued`, `partially_paid`, `paid`, `cancelled`,
+`archived`.
+
+```
+draft:           draft, issued, cancelled, archived
+issued:          issued, partially_paid, paid, cancelled, archived
+partially_paid:  partially_paid, paid, archived
+                 → cancelled ТОЛЬКО если Paid Amount = 0, иначе блок
+paid:            paid, archived
+cancelled:       cancelled, archived
+archived:        archived (только)
+```
+
+`partially_paid` и `paid` — синхронизируются исключительно из Transaction-
+truth (§14), никогда не устанавливаются обычным ручным переходом без
+соответствующего фактического баланса. `overdue` — derived at read-time
+(due date просрочена И статус не в paid/cancelled/archived), никогда не
+хранится как канонический статус. Никакого ordinary reopen из терминальных
+состояний. Никакого hard delete.
+
+Отмена (`cancelled`) после любого подтверждённого платежа запрещена: если
+`Paid Amount > 0`, `cancelled` блокируется — сначала требуется реверс всех
+confirmed Transaction до восстановления `Paid Amount = 0`, только после
+этого отмена Obligation становится доступной.
+
+### 12. Payment Transaction lifecycle
+
+Статусы: `pending`, `confirmed`, `reversed`, `failed`.
+
+```
+pending:    pending, confirmed, failed
+confirmed:  confirmed, reversed
+reversed:   reversed (только)
+failed:     failed (только)
+```
+
+`pending` не влияет на баланс. `failed` не влияет на баланс. `confirmed`
+влияет на баланс. `reversed` перестаёт влиять на баланс. Финансовые поля
+`confirmed`-строки immutable (Amount/Currency/Payment Date/External
+Transaction ID/Created At). Реверс — явное, отдельное действие, не
+"обычный" переход. Никакого ordinary reopen из терминальных состояний.
+Никакого hard delete. Отрицательные суммы при реверсе запрещены (реверс —
+это смена статуса на существующей строке, не компенсирующая транзакция с
+отрицательной суммой).
+
+### 13. Reversal model
+
+Выбрана простая, ограниченная модель: **status-based reversal на исходной
+строке**, НЕ отдельная reversal-транзакция.
+
+- исходная `confirmed` Transaction меняет статус на `reversed`;
+- `Reversal Reason`, `Reversed At`, `Reversed By` обязательны при этом
+  переходе;
+- исходные финансовые поля (Amount/Currency/Payment Date/External
+  Transaction ID/Created At) остаются НЕИЗМЕНЕННЫМИ — переписывается
+  только статус и добавляются reversal-метаданные;
+- никакая вторая (offset/negative) Transaction-строка не создаётся в
+  Foundation;
+- баланс (Paid Amount/Remaining Amount) пересчитывается заново после
+  реверса, автоматически исключая эту строку из суммы confirmed (§14).
+
+Отклонена альтернатива "отдельная reversal-транзакция, связанная с
+исходной через `Reversal Of Transaction ID`" — она добавляет вторую
+транзакционную строку и поле-ссылку без демонстрированной необходимости в
+Foundation (см. решение 34.G и раздел 2 про исключённое поле).
+
+```
+TRANSACTION_REVERSAL_IS_FOUNDATION_SCOPE = YES
+TRANSACTION_HARD_DELETE_IS_ALLOWED = NO
+```
+
+### 14. Partial payments и derived truth
+
+```
+Paid Amount      = сумма Amount по confirmed (и НЕ reversed) Transaction.
+Remaining Amount = Obligation Amount − Paid Amount.
+```
+
+`pending` и `failed` Transaction исключены из Paid Amount. `reversed`
+Transaction исключены из Paid Amount (после реверса эффект её confirmed-
+состояния аннулируется). Синхронизация статуса Obligation:
+
+```
+Paid Amount = 0                       → draft/issued остаются как есть
+0 < Paid Amount < Obligation Amount   → partially_paid
+Paid Amount = Obligation Amount       → paid
+Paid Amount > Obligation Amount       → недопустимо, блокируется ДО
+                                         подтверждения транзакции (см. §15)
+```
+
+`Paid Amount`/`Remaining Amount` могут персистироваться как verified
+cache на строке Obligation (для быстрого чтения), но каноническая истина —
+всегда `Obligation Amount` + фактические строки Transaction. Никаких
+caller-side totals — вся арифметика в `business_builder.py`/
+`payment_manager.py`.
+
+```
+PARTIAL_PAYMENTS_ARE_SUPPORTED = YES
+PAID_AMOUNT_IS_DERIVED_FROM_TRANSACTIONS = YES
+REMAINING_AMOUNT_IS_DERIVED = YES
+```
+
+### 15. Overpayment policy
+
+Overpayment запрещён в Foundation: подтверждение (`pending → confirmed`)
+Transaction блокируется, если оно сделало бы суммарные confirmed-платежи
+больше `Remaining Amount` на момент подтверждения. Никакого credit-
+баланса, никакого silent over-allocation, никакого автоматического
+разбиения суммы между несколькими Obligation.
+
+```
+PAYMENT_TRANSACTION_OVERPAYMENT_BLOCKED
+```
+
+```
+OVERPAYMENT_IS_ALLOWED_IN_FOUNDATION = NO
+```
+
+### 16. Obligation idempotency
+
+Канонический ключ:
+
+**Primary**: `Business ID` + `Caller Idempotency Key` (новое поле,
+добавленное в схему §2 именно для этого).
+
+**Fallback** (только когда Obligation явно инстанцируется из Template без
+явного caller-ключа): `Business ID` + `Commercial Milestone Template ID` +
+`Roadmap ID` + `Stage ID` + explicit Obligation Sequence.
+
+Обоснование: тот же Template/Roadmap/Stage triple теоретически может
+повториться (например, второй цикл этапа), поэтому единственный надёжный
+основной механизм — явный caller-ключ; produced-from-Template fallback
+используется только при явной Template-инстанциации с последовательным
+Sequence.
+
+Amount/date/client НЕ могут быть частью дедупликационного ключа: два
+подлинно различных платежа (два одинаковых по сумме планомерных частичных
+платежа, либо два разных клиента, платящих одну и ту же milestone-сумму в
+один день) неотличимы по этим полям — это либо молча сольёт два реальных
+платежа в один, либо молча отбросит второй.
+
+Правила: zero creates; ровно один совместимый match — reuse; несколько
+matches — блок с полным списком конфликтующих ID; никакого first-pick;
+никакого title-based или amount/date-based dedup.
+
+```
+PAYMENT_OBLIGATION_IDEMPOTENCY_IS_APPROVED = YES
+PAYMENT_TITLE_BASED_DEDUP_IS_ALLOWED = NO
+PAYMENT_AMOUNT_DATE_BASED_DEDUP_IS_ALLOWED = NO
+MULTIPLE_PAYMENT_IDEMPOTENCY_MATCHES_MUST_BLOCK = YES
+```
+
+### 17. Transaction idempotency
+
+**Primary**: `Business ID` + `External Transaction ID`, когда он передан
+(банк/платёжный шлюз предоставляет свою ссылку).
+
+**Fallback**: `Business ID` + `Caller Idempotency Key`, когда внешней
+ссылки нет.
+
+Хотя бы одно из двух — `External Transaction ID` или `Caller Idempotency
+Key` — обязательно; создание Transaction без обоих блокируется
+(`PAYMENT_TRANSACTION_IDEMPOTENCY_REQUIRED`). Amount/date/client не
+являются dedup-ключом по той же причине, что и для Obligation. Zero
+creates; один совместимый match — reuse; несколько matches — блок;
+конфликт идемпотентности с несовместимым payload (тот же ключ, но другой
+Obligation/Amount/Currency) — отдельный блокирующий код, не reuse.
+
+```
+PAYMENT_TRANSACTION_REUSED
+MULTIPLE_PAYMENT_TRANSACTION_MATCHES
+PAYMENT_TRANSACTION_IDEMPOTENCY_CONFLICT
+PAYMENT_TRANSACTION_IDEMPOTENCY_REQUIRED
+```
+
+```
+PAYMENT_TRANSACTION_IDEMPOTENCY_IS_APPROVED = YES
+```
+
+### 18. Relation policy
+
+**Commercial Milestone Template** обязателен: `Roadmap Template ID` ИЛИ
+`Service ID` — минимум одна каноническая context-связь.
+
+**Payment Obligation** обязателен: `Business ID`, `Client ID`, `Obligation
+Amount`, `Currency`. Опционально: `Object ID`, `Service ID`, `Roadmap ID`,
+`Stage ID`, `Commercial Milestone Template ID`. Все переданные сущности
+должны существовать; одна и та же Business на всех связанных сущностях;
+Stage обязан принадлежать указанному Roadmap; Roadmap может служить
+источником Client/Object/Service context там, где это канонично (тот же
+паттерн, что уже использует `_validate_document_relations`/
+`_validate_checklist_relations`); противоречия блокируются; никакого
+auto-repair; никакого движения между Business; никаких generic
+many-to-many связей.
+
+**Payment Transaction** обязателен: `Business ID`, `Payment Obligation
+ID`, `Client ID`, `Amount`, `Currency`, `Payment Date`, источник
+идемпотентности (§17). Obligation должен существовать; та же Business;
+Client Transaction должен совпадать с Client Obligation (см. §19);
+валюта должна совпадать с валютой Obligation; никакой unallocated
+Transaction в Foundation; никакой multi-obligation Transaction.
+
+```
+PAYMENT_ENTITY_RELATION_MISMATCH
+PAYMENT_RELATION_POLICY_IS_APPROVED = YES
+```
+
+### 19. Client/payer policy
+
+Foundation-упрощение: `Client ID` — обязательная payer identity.
+Third-party payer (кто-то платит не за себя) НЕ поддерживается в
+Foundation — `Client ID` Transaction обязан совпадать с `Client ID`
+Obligation, иначе блок. Снапшот имени плательщика не хранится отдельно
+(достаточно `Client ID` + существующий `people_registry`). Обновления
+Client (имя, статус) никогда не переписывают уже сохранённые исторические
+финансовые поля. Никакой кросс-Business payer-связи.
+
+```
+THIRD_PARTY_PAYER_IS_FOUNDATION_SCOPE = NO
+```
+
+### 20. Document boundary
+
+`Evidence Document ID` — опциональное поле на Transaction, только
+ссылка. Payment Domain не владеет файловым хранилищем, не реализует
+upload-логику, не мутирует статус Document, не дублирует Document
+Requirement логику. При передаче `Evidence Document ID` — валидация
+существования и совпадения Business (тот же принцип, что во всех
+cross-domain ссылках этого ADR), но никакой мутации Document-строки.
+
+```
+PAYMENT_EVIDENCE_MAY_REFERENCE_DOCUMENT = YES
+PAYMENT_CAN_MUTATE_DOCUMENT_STATUS = NO
+```
+
+### 21. Roadmap/Stage boundary
+
+Payment может ссылаться на Roadmap и Stage (опционально, только чтение/
+валидация существования). Никакого автоматического создания Obligation из
+`/startroadmap` в Foundation. Никакого завершения Stage от платежа.
+Никакого завершения Roadmap от платежа. Никакой блокировки Stage-переходов
+неоплаченным Obligation. Никакого lifecycle-каскада в любую сторону. Любая
+будущая интеграция такого рода требует отдельного ADR.
+
+```
+PAYMENT_CAN_MUTATE_STAGE = NO
+PAYMENT_CAN_MUTATE_ROADMAP = NO
+AUTOMATIC_ROADMAP_PAYMENT_INSTANTIATION_IS_FOUNDATION_SCOPE = NO
+```
+
+### 22. Service/Commercial Offer/Contract boundary
+
+`service_catalog`'s `Цена мин`/`Цена макс` остаются исключительно price-
+range reference-полями закрытого Service Domain — не переосмысливаются и
+не трогаются. Никакого canonical agreed-price source не существует.
+Commercial Offer сущность не создаётся в Foundation. Contract сущность не
+создаётся в Foundation. `fixed`-Template может предложить сумму по
+умолчанию; явная сумма Obligation обязательна (§9). Никакого
+автоматического расчёта процента.
+
+### 23. Expense/accounting exclusions
+
+Явно исключены из Foundation и из объёма этого ADR: расходы (expenses),
+выплаты поставщикам, исходящие платежи, полноценный бухгалтерский леджер,
+признание выручки (revenue recognition), P&L, налоги, комиссии, кассовые
+операции, банковская сверка (reconciliation), генерация счетов (invoice
+generation), исполнение возвратов (refund execution) сверх ограниченного
+внутреннего реверса (§13).
+
+```
+EXPENSE_ACCOUNTING_IS_FOUNDATION_SCOPE = NO
+FULL_ACCOUNTING_LEDGER_IS_FOUNDATION_SCOPE = NO
+```
+
+### 24. Hardcoded-map compatibility
+
+`COMMERCIAL_MILESTONES_MAP` остаётся полностью нетронутым в Phase 39C.
+`/milestones` остаётся read-only и неизменным. Никакого автоматического
+перехода на новый Template registry. Никакой production-миграции.
+Никакого удаления map. Будущая миграция потребует отдельной явно
+утверждённой фазы.
+
+```
+CURRENT_COMMERCIAL_MILESTONES_MAP_REWRITE_REQUIRED = NO
+PRODUCTION_PAYMENT_MIGRATION_REQUIRED = NO
+```
+
+### 25. Структурированный result contract
+
+Единый канонический future Payment result contract (используется всеми
+будущими `business_builder.py` Payment-функциями):
+
+```
+ok, code, error,
+commercial_milestone_template_id, payment_obligation_id,
+payment_transaction_id,
+business_id, client_id, object_id, service_id, roadmap_id, stage_id,
+document_id,
+amount, currency, paid_amount, remaining_amount,
+previous_status, requested_status, final_status,
+created, reused, changed, confirmed, reversed, completed,
+conflicting_ids, warnings, retry_safe
+```
+
+Каждое поле присутствует всегда (даже если `None`/пусто/`False`). Никакого
+raw exception объекта. Никакой raw row. Никакого Telegram-специфичного
+текста в manager/orchestration слоях — только в будущем `telegram_
+handlers.py`.
+
+```
+PAYMENT_RESULT_CONTRACT_APPROVED = YES
+```
+
+### 26. Result-code vocabulary
+
+Утверждены как канонические (без синонимов) — реализуются в Phase 39C
+только там, где есть реальный runtime-вызов, порождающий этот код (не
+формализуются "про запас", тот же принцип, что закрыл находку Phase 37F):
+
+```
+Template:
+  COMMERCIAL_MILESTONE_TEMPLATE_CREATED
+  COMMERCIAL_MILESTONE_TEMPLATE_REUSED
+  COMMERCIAL_MILESTONE_TEMPLATE_NOT_FOUND
+  COMMERCIAL_MILESTONE_TEMPLATE_INACTIVE
+  COMMERCIAL_MILESTONE_TEMPLATE_ARCHIVED
+  INVALID_COMMERCIAL_MILESTONE_TEMPLATE_STATUS
+  INVALID_MILESTONE_CALCULATION_TYPE
+  MILESTONE_FIXED_AMOUNT_REQUIRED
+  MILESTONE_PERCENTAGE_REQUIRED
+  MILESTONE_CALCULATION_FIELDS_CONFLICT
+
+Amount/currency:
+  INVALID_PAYMENT_AMOUNT
+  INVALID_PAYMENT_AMOUNT_SCALE
+  PAYMENT_AMOUNT_MUST_BE_POSITIVE
+  INVALID_PAYMENT_CURRENCY
+  PAYMENT_CURRENCY_MISMATCH
+
+Obligation:
+  PAYMENT_OBLIGATION_CREATED
+  PAYMENT_OBLIGATION_REUSED
+  PAYMENT_OBLIGATION_NOT_FOUND
+  MULTIPLE_PAYMENT_OBLIGATION_MATCHES
+  PAYMENT_OBLIGATION_IDEMPOTENCY_CONFLICT
+  PAYMENT_OBLIGATION_RELATION_MISMATCH
+  INVALID_PAYMENT_OBLIGATION_STATUS
+  INVALID_PAYMENT_OBLIGATION_TRANSITION
+  PAYMENT_OBLIGATION_STATUS_UPDATED
+  PAYMENT_OBLIGATION_STATUS_UNCHANGED
+  PAYMENT_OBLIGATION_HAS_CONFIRMED_PAYMENTS
+  PAYMENT_OBLIGATION_PERSISTENCE_FAILED
+  PAYMENT_OBLIGATION_POST_WRITE_VERIFICATION_FAILED
+
+Transaction:
+  PAYMENT_TRANSACTION_CREATED
+  PAYMENT_TRANSACTION_REUSED
+  PAYMENT_TRANSACTION_NOT_FOUND
+  MULTIPLE_PAYMENT_TRANSACTION_MATCHES
+  PAYMENT_TRANSACTION_IDEMPOTENCY_REQUIRED
+  PAYMENT_TRANSACTION_IDEMPOTENCY_CONFLICT
+  PAYMENT_TRANSACTION_CONFIRMED
+  PAYMENT_TRANSACTION_CONFIRMATION_UNCHANGED
+  PAYMENT_TRANSACTION_REVERSED
+  PAYMENT_TRANSACTION_REVERSAL_UNCHANGED
+  PAYMENT_TRANSACTION_FAILED
+  INVALID_PAYMENT_TRANSACTION_STATUS
+  INVALID_PAYMENT_TRANSACTION_TRANSITION
+  PAYMENT_TRANSACTION_IMMUTABLE
+  PAYMENT_TRANSACTION_OVERPAYMENT_BLOCKED
+  PAYMENT_TRANSACTION_REVERSAL_REASON_REQUIRED
+  PAYMENT_TRANSACTION_CONFIRMATION_METADATA_REQUIRED
+  PAYMENT_TRANSACTION_PERSISTENCE_FAILED
+  PAYMENT_TRANSACTION_POST_WRITE_VERIFICATION_FAILED
+
+Generic:
+  BUSINESS_NOT_FOUND
+  CLIENT_NOT_FOUND
+  OBJECT_NOT_FOUND
+  SERVICE_NOT_FOUND
+  ROADMAP_NOT_FOUND
+  STAGE_NOT_FOUND
+  DOCUMENT_NOT_FOUND
+  PAYMENT_ENTITY_RELATION_MISMATCH
+  PAYMENT_PERSISTENCE_FAILED
+```
+
+### 27. Privacy и логирование
+
+Разрешено в логах: внутренние ID, result code, статусы, валюта,
+ограниченные amount-поля только когда необходимо для диагностики,
+флаги created/reused/changed, ID и count конфликтов, `retry_safe`.
+
+Запрещено в логах: полное тело Telegram-сообщения, банковские/карточные/
+счётные реквизиты, содержимое чеков/квитанций, персональные
+идентификаторы сверх ID, поле `Notes`, детали метода платежа при их
+чувствительности, `External Transaction ID` в открытом виде, содержимое
+Document, raw rows, raw exceptions, credentials/токены.
+
+```
+PAYMENT_PRIVACY_LOGGING_POLICY_APPROVED = YES
+```
+
+### 28. Тестовые требования для Phase 39C
+
+Категории обязательных изолированных тестов: schema (точные заголовки
+трёх registry, отсутствие мутации существующей схемы), IDs (генерация
+PMT/POB/PTXN, malformed игнорируются, никакой caller-side генерации),
+amounts (Decimal only, scale, positivity, отсутствие float/scientific
+notation, точное суммирование), currencies (обязательность, uppercase,
+блок при mismatch, отсутствие смешанной агрегации), Template (fixed/
+percentage режимы, конфликты полей, inactive/archived, стабильность
+снапшота), relations (та же Business, совпадение Client, согласованность
+Roadmap/Stage, опциональная валидация evidence Document, отсутствие
+мутации закрытых доменов), idempotency (zero/one/multiple, конфликт при
+несовместимом reuse, отсутствие title/amount-date dedup, полный список
+конфликтующих ID), obligations (дефолты создания, явная сумма, отсутствие
+авто-расчёта процента, lifecycle-переходы, блокировка отмены при
+платежах, отсутствие reopen/hard delete), transactions (создание, pending,
+подтверждение, частичный платёж, блок overpayment, несколько частичных
+платежей, реверс, immutability, отсутствие отрицательных сумм, отсутствие
+hard delete), balances (только confirmed, исключение pending/failed/
+reversed, точность paid/remaining, синхронизация статуса, верификация
+кэша), boundaries (отсутствие мутации Roadmap/Stage/Document/Checklist,
+отсутствие интеграции с `/startroadmap`, неизменность hardcoded map),
+isolation (все Payment-тесты — hard socket-block, mock-completeness guard,
+отсутствие live Sheets/Drive/Telegram/Railway/socket).
+
+### 29. Production migration policy
+
+Никакой production-миграции в Phase 39C. Никакой перезаписи map. Никакого
+backfill Template-строк. Никакого создания живых строк Obligation/
+Transaction. Схемы могут быть определены только в коде (`BUSINESS_
+SHEET_NAMES`/`BUSINESS_HEADERS`), физические вкладки Google Sheets могут
+отсутствовать до отдельного будущего утверждённого шага записи. Сверка
+(reconciliation) не требуется, поскольку никаких production
+payment-строк не существует.
+
+### 30. Bounded scope Phase 39C
+
+Phase 39C реализует ТОЛЬКО: три схемы registry (в коде); генерацию ID
+PMT/POB/PTXN; `payment_manager.py`; Decimal/currency нормализацию; точные
+reads/filters; Foundation создания/чтения/обновления/статуса Commercial
+Milestone Template; Foundation создания/чтения/статуса Payment Obligation;
+Foundation создания/чтения/подтверждения/реверса Payment Transaction;
+derived balance/status синхронизацию; idempotency; immutability;
+relation-валидацию; структурированные result contracts;
+architecture/isolation guards; тесты.
+
+Явно запрещено в Phase 39C: Telegram caller UX; деплой; миграция
+`/milestones`; автоматическая интеграция с Roadmap; автоматическое
+создание Obligation; Payment Allocation; счета (invoices); расходы
+(expenses); исходящие платежи; возвраты (refunds) сверх реверса;
+Contract/Commercial Offer; hard delete; restore/reopen; полный accounting;
+записи в production-данные.
+
+```
+PAYMENT_FOUNDATION_SCOPE_IS_BOUNDED = YES
+```
+
+### 31. Отклонённые альтернативы
+
+**A. Одна Milestone-строка с Expected Amount + Paid Amount.** Отклонено:
+уничтожает transaction-level auditability, невозможно безопасно
+исправить ошибку без перезаписи единственной записи о факте.
+
+**B. Полноценный accounting ledger сейчас.** Отклонено: слишком широкий
+объём, не подтверждённый текущими деловыми свидетельствами (единственный
+реальный пример — 3 фиксированные milestone-суммы одного Roadmap
+Template).
+
+**C. Payment Allocation registry в Foundation.** Отклонено: отсутствует
+продемонстрированная many-to-many потребность; Option A (1 Transaction →
+1 Obligation) покрывает единственный реальный сценарий без избыточной
+инфраструктуры.
+
+**D. Автоматический расчёт процента из `service_catalog` min/max.**
+Отклонено: нет канонической согласованной цены — min/max это диапазон
+для reference, не операционная сумма.
+
+**E. Автоматическое создание Obligation из `/startroadmap`.**
+Отклонено: cross-domain автоматизация такого рода не утверждена этим ADR
+и требует отдельного решения после того, как Payment Domain
+продемонстрирует стабильность.
+
+**F. Немедленная перезапись `COMMERCIAL_MILESTONES_MAP`.** Отклонено:
+риск совместимости и миграции без демонстрированной необходимости —
+`/milestones` продолжает работать от текущего map до отдельно
+утверждённого шага миграции.
+
+**G. Перезапись полей подтверждённой Transaction.** Отклонено: уничтожает
+финансовую историю — тот же принцип, что и решение A, применённый к
+Transaction-слою; корректировка — только через explicit reversal (§13).
+
+### 32. Cross-ADR consistency
+
+Проверено на отсутствие противоречий с ADR по Roadmap/Stage (ADR-016/
+ADR-017), Client, Service, Document (ADR-020), Checklist (ADR-021), Task
+(ADR-019), Organization (ADR-018): ни один closed-домен не мутируется
+Payment Foundation (§21, §22, §20 явно запрещают мутацию Roadmap/Stage/
+Service/Document); Payment ссылается на их ID только для чтения/
+валидации существования, тем же паттерном, что уже используют Document и
+Checklist Domains для своих cross-domain связей.
+
+### 33. Статус
+
+Утверждено для реализации (Phase 39C) с bounded scope, определённым в
+решении 30. Ничего не реализовано в рамках этого ADR — только
+архитектурное решение. `payment_manager.py` не создан; `commercial_
+milestone_templates`/`payment_obligations`/`payment_transactions` не
+существуют; `COMMERCIAL_MILESTONES_MAP` и `/milestones` не изменены; ни
+один production-caller не мигрирован; ни один код не изменён; схема
+Google Sheets не менялась; GTD Core не затронут. Ни один закрытый домен
+(Object/Client/Service/Roadmap/Stage/Organization/Task/Document/
+Checklist) не переоткрыт.
