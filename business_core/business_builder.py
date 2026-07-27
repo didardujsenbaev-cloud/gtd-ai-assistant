@@ -3786,6 +3786,104 @@ def update_document_admin_fields(document_id: str, updates: dict) -> dict:
     )
 
 
+def relink_document(document_id: str, *, roadmap_id: str | None = None, stage_id: str | None = None, dry_run: bool = False) -> dict:
+    """
+    The sole canonical Document relation-relink orchestration boundary
+    — deliberately narrow: only Roadmap ID and Stage ID may ever be
+    changed through this function (audit finding: Object ID relink
+    carries an unresolved physical-Drive-folder-move risk; Business ID
+    is Document identity, never relinkable; Client ID/Document Template
+    ID are left untouched alongside Object ID for this same reason).
+    Business ID/Client ID/Object ID/Document Template ID are always
+    read from the document's own existing row and passed to relation
+    validation as fixed anchors — never accepted as parameters here —
+    so a new Roadmap/Stage that would imply a different Object or
+    Client is caught as a contradiction by resolve_and_validate_links()
+    exactly like any other cross-entity mismatch, not silently allowed.
+
+    A value of None for roadmap_id/stage_id means "keep the document's
+    current value" — passing "" explicitly would mean "clear it", which
+    this narrow feature does not need and does not attempt.
+
+    dry_run=True validates the requested relink fully (existence +
+    Stage->Roadmap->Object->Client->Business consistency) and returns
+    what WOULD change, without writing anything — used for the /updatedoc
+    preview step, so the preview and the actual apply share exactly one
+    validation path, never two.
+
+    Validation order, all before any write:
+      A. required document_id
+      B. Document exists (DOCUMENT_NOT_FOUND)
+      C. relation validation via the existing resolve_and_validate_links()
+         (reused via _validate_document_relations()), anchored to the
+         document's own Business/Client/Object/Template — never caller-supplied
+      D. (dry_run only) return preview, no write
+      E. low-level persistence (Roadmap ID/Stage ID only)
+      F. structured result
+
+    Returns:
+        See _document_result() for the full field list. roadmap_id/
+        stage_id in the result are always the NEW (resolved) values;
+        the caller already has the OLD values from find_document_by_id()
+        for rendering a before/after preview.
+    """
+    from business_core.document_manager import find_document_by_id, update_document_relations
+
+    if not document_id:
+        return _document_result(ok=False, code="DOCUMENT_NOT_FOUND", error="document_id обязателен")
+
+    document = find_document_by_id(document_id)
+    if document is None:
+        return _document_result(ok=False, code="DOCUMENT_NOT_FOUND", error=f"Document {document_id} не найден", document_id=document_id)
+
+    business_id = document.get("business_id", "")
+    client_id = document.get("client_id", "")
+    object_id = document.get("object_id", "")
+    document_template_id = document.get("document_template_id", "")
+    current_roadmap_id = document.get("roadmap_id", "")
+    current_stage_id = document.get("stage_id", "")
+
+    target_roadmap_id = current_roadmap_id if roadmap_id is None else roadmap_id
+    target_stage_id = current_stage_id if stage_id is None else stage_id
+
+    relation_result = _validate_document_relations(
+        business_id, client_id=client_id, object_id=object_id,
+        roadmap_id=target_roadmap_id, stage_id=target_stage_id,
+        document_template_id=document_template_id,
+    )
+    if not relation_result["ok"]:
+        return _document_result(
+            ok=False, code=relation_result["code"], error=relation_result["error"],
+            document_id=document_id, business_id=business_id,
+            roadmap_id=current_roadmap_id, stage_id=current_stage_id,
+        )
+    resolved = relation_result["resolved"]
+
+    if dry_run:
+        return _document_result(
+            ok=True, code="DOCUMENT_RELINK_PREVIEW", error=None,
+            document_id=document_id, business_id=business_id,
+            roadmap_id=resolved["roadmap_id"], stage_id=resolved["stage_id"],
+        )
+
+    write_result = update_document_relations(document_id, {
+        "Roadmap ID": resolved["roadmap_id"], "Stage ID": resolved["stage_id"],
+    })
+    if not write_result["ok"]:
+        return _document_result(
+            ok=False, code=write_result.get("code") or "", error=write_result.get("error"),
+            document_id=document_id, business_id=business_id,
+            roadmap_id=current_roadmap_id, stage_id=current_stage_id,
+        )
+
+    changed = write_result["changed"]
+    return _document_result(
+        ok=True, code="DOCUMENT_RELATION_UPDATED" if changed else "DOCUMENT_RELATION_UNCHANGED", error=None,
+        document_id=document_id, business_id=business_id,
+        roadmap_id=resolved["roadmap_id"], stage_id=resolved["stage_id"], changed=changed,
+    )
+
+
 def transition_document_status(document_id: str, target_status: str) -> dict:
     """
     Phase 37D (ADR-020 §15/§11/§12): the sole canonical Document-

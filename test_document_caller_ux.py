@@ -498,5 +498,358 @@ class TestUpdateDocCmd(unittest.TestCase):
         self.assertIn("❌", msg)
 
 
+# ────────────────────────────────────────────────────────────
+# /updatedoc — relink mode (Roadmap ID / Stage ID only)
+# ────────────────────────────────────────────────────────────
+
+_RELINK_DOCUMENT = {
+    "document_id": "DREG-003", "business_id": "BIZ-001", "client_id": "PRS-004",
+    "object_id": "OBJ-002", "document_template_id": "",
+    "roadmap_id": "RM-003", "stage_id": "STAGE-010",
+}
+
+
+class TestUpdateDocRelinkForbiddenFields(unittest.TestCase):
+    """business_id/client_id/object_id/document_template_id must be an
+    explicit, visible rejection — never a silent no-op."""
+
+    def _assert_rejected(self, cmdline: str, forbidden_key: str):
+        update, context = _cmd(cmdline)
+
+        async def run():
+            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+                await th.updatedoc_cmd(update, context)
+
+        asyncio.run(run())
+        msg = update.message.reply_text.call_args[0][0]
+        self.assertIn("❌", msg)
+        self.assertIn(forbidden_key, msg)
+
+    def test_business_id_rejected(self):
+        self._assert_rejected("/updatedoc document_id=DREG-003 business_id=BIZ-002", "business_id")
+
+    def test_client_id_rejected(self):
+        self._assert_rejected("/updatedoc document_id=DREG-003 client_id=PRS-005", "client_id")
+
+    def test_object_id_rejected(self):
+        self._assert_rejected("/updatedoc document_id=DREG-003 object_id=OBJ-009", "object_id")
+
+    def test_document_template_id_rejected(self):
+        self._assert_rejected(
+            "/updatedoc document_id=DREG-003 document_template_id=DOCT-001", "document_template_id",
+        )
+
+    def test_forbidden_field_never_reaches_relink_document(self):
+        update, context = _cmd("/updatedoc document_id=DREG-003 object_id=OBJ-009 stage_id=STAGE-014")
+
+        with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
+             patch("business_core.business_builder.relink_document") as mock_fn:
+            asyncio.run(th.updatedoc_cmd(update, context))
+
+        mock_fn.assert_not_called()
+
+
+class TestUpdateDocRelinkModeConflict(unittest.TestCase):
+    def test_relink_and_status_together_rejected(self):
+        update, context = _cmd("/updatedoc document_id=DREG-003 status=under_review stage_id=STAGE-014")
+
+        async def run():
+            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+                await th.updatedoc_cmd(update, context)
+
+        asyncio.run(run())
+        msg = update.message.reply_text.call_args[0][0]
+        self.assertIn("одновременно", msg.lower())
+
+    def test_relink_and_admin_together_rejected(self):
+        update, context = _cmd('/updatedoc document_id=DREG-003 name="X" roadmap_id=RM-003')
+
+        async def run():
+            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+                await th.updatedoc_cmd(update, context)
+
+        asyncio.run(run())
+        msg = update.message.reply_text.call_args[0][0]
+        self.assertIn("одновременно", msg.lower())
+
+
+class TestUpdateDocRelinkPreviewAndApply(unittest.TestCase):
+    """The first call (no confirm=yes) must only preview — never write.
+    The second call with confirm=yes must re-validate and apply."""
+
+    def test_preview_call_does_not_write_and_shows_before_after(self):
+        update, context = _cmd("/updatedoc document_id=DREG-003 stage_id=STAGE-014")
+
+        with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
+             patch("business_core.document_manager.find_document_by_id", return_value=dict(_RELINK_DOCUMENT)), \
+             patch("business_core.business_builder.relink_document",
+                   return_value={"ok": True, "code": "DOCUMENT_RELINK_PREVIEW", "error": None,
+                                 "roadmap_id": "RM-003", "stage_id": "STAGE-014"}) as mock_fn:
+            asyncio.run(th.updatedoc_cmd(update, context))
+
+        _, kwargs = mock_fn.call_args
+        self.assertEqual(kwargs.get("dry_run"), True)
+        msg = update.message.reply_text.call_args[0][0]
+        self.assertIn("STAGE-010", msg)
+        self.assertIn("STAGE-014", msg)
+        self.assertIn("confirm=yes", msg)
+        self.assertIn("Drive", msg)
+
+    def test_confirm_yes_calls_relink_document_with_dry_run_false(self):
+        update, context = _cmd("/updatedoc document_id=DREG-003 stage_id=STAGE-014 confirm=yes")
+
+        with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
+             patch("business_core.document_manager.find_document_by_id", return_value=dict(_RELINK_DOCUMENT)), \
+             patch("business_core.business_builder.relink_document",
+                   return_value={"ok": True, "code": "DOCUMENT_RELATION_UPDATED", "error": None,
+                                 "roadmap_id": "RM-003", "stage_id": "STAGE-014"}) as mock_fn:
+            asyncio.run(th.updatedoc_cmd(update, context))
+
+        args, kwargs = mock_fn.call_args
+        self.assertEqual(args[0], "DREG-003")
+        self.assertEqual(kwargs.get("stage_id"), "STAGE-014")
+        self.assertEqual(kwargs.get("dry_run"), False)
+        msg = update.message.reply_text.call_args[0][0]
+        self.assertIn("✅", msg)
+        self.assertIn("Drive", msg)
+
+    def test_document_not_found_before_calling_relink_document(self):
+        update, context = _cmd("/updatedoc document_id=DREG-999 stage_id=STAGE-014")
+
+        with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
+             patch("business_core.document_manager.find_document_by_id", return_value=None), \
+             patch("business_core.business_builder.relink_document") as mock_fn:
+            asyncio.run(th.updatedoc_cmd(update, context))
+
+        mock_fn.assert_not_called()
+        msg = update.message.reply_text.call_args[0][0]
+        self.assertIn("❌", msg)
+        self.assertIn("DREG-999", msg)
+
+    def test_incompatible_stage_shows_error_not_preview(self):
+        update, context = _cmd("/updatedoc document_id=DREG-003 stage_id=STAGE-099")
+
+        with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
+             patch("business_core.document_manager.find_document_by_id", return_value=dict(_RELINK_DOCUMENT)), \
+             patch("business_core.business_builder.relink_document",
+                   return_value={"ok": False, "code": "DOCUMENT_ENTITY_RELATION_MISMATCH",
+                                 "error": "Противоречие: Stage STAGE-099 принадлежит Roadmap RM-999, "
+                                          "а указан Roadmap RM-003.",
+                                 "roadmap_id": "", "stage_id": ""}):
+            asyncio.run(th.updatedoc_cmd(update, context))
+
+        msg = update.message.reply_text.call_args[0][0]
+        self.assertIn("❌", msg)
+        self.assertIn("STAGE-099", msg)
+
+    def test_nonexistent_stage_shows_error_not_preview(self):
+        update, context = _cmd("/updatedoc document_id=DREG-003 stage_id=STAGE-999")
+
+        with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
+             patch("business_core.document_manager.find_document_by_id", return_value=dict(_RELINK_DOCUMENT)), \
+             patch("business_core.business_builder.relink_document",
+                   return_value={"ok": False, "code": "DOCUMENT_ENTITY_RELATION_MISMATCH",
+                                 "error": "Stage STAGE-999 не найден.", "roadmap_id": "", "stage_id": ""}):
+            asyncio.run(th.updatedoc_cmd(update, context))
+
+        msg = update.message.reply_text.call_args[0][0]
+        self.assertIn("❌", msg)
+        self.assertIn("STAGE-999", msg)
+
+    def test_roadmap_and_stage_changed_together(self):
+        update, context = _cmd(
+            "/updatedoc document_id=DREG-003 roadmap_id=RM-003 stage_id=STAGE-014 confirm=yes",
+        )
+
+        with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
+             patch("business_core.document_manager.find_document_by_id", return_value=dict(_RELINK_DOCUMENT)), \
+             patch("business_core.business_builder.relink_document",
+                   return_value={"ok": True, "code": "DOCUMENT_RELATION_UPDATED", "error": None,
+                                 "roadmap_id": "RM-003", "stage_id": "STAGE-014"}) as mock_fn:
+            asyncio.run(th.updatedoc_cmd(update, context))
+
+        args, kwargs = mock_fn.call_args
+        self.assertEqual(kwargs.get("roadmap_id"), "RM-003")
+        self.assertEqual(kwargs.get("stage_id"), "STAGE-014")
+        msg = update.message.reply_text.call_args[0][0]
+        self.assertIn("✅", msg)
+
+
+# ────────────────────────────────────────────────────────────
+# business_builder.relink_document() — orchestration unit tests
+# ────────────────────────────────────────────────────────────
+
+class TestRelinkDocumentOrchestration(unittest.TestCase):
+    def test_dry_run_true_does_not_write(self):
+        import business_core.business_builder as bb
+
+        with patch("business_core.document_manager.find_document_by_id", return_value=dict(_RELINK_DOCUMENT)), \
+             patch.object(bb, "_validate_document_relations",
+                          return_value={"ok": True, "code": "", "error": None,
+                                        "resolved": {"roadmap_id": "RM-003", "stage_id": "STAGE-014"}}), \
+             patch("business_core.document_manager.update_document_relations") as mock_write:
+            result = bb.relink_document("DREG-003", stage_id="STAGE-014", dry_run=True)
+
+        mock_write.assert_not_called()
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["code"], "DOCUMENT_RELINK_PREVIEW")
+        self.assertEqual(result["stage_id"], "STAGE-014")
+
+    def test_dry_run_false_writes_via_update_document_relations(self):
+        import business_core.business_builder as bb
+
+        with patch("business_core.document_manager.find_document_by_id", return_value=dict(_RELINK_DOCUMENT)), \
+             patch.object(bb, "_validate_document_relations",
+                          return_value={"ok": True, "code": "", "error": None,
+                                        "resolved": {"roadmap_id": "RM-003", "stage_id": "STAGE-014"}}), \
+             patch("business_core.document_manager.update_document_relations",
+                   return_value={"ok": True, "changed": True, "updated_fields": ("Stage ID",),
+                                 "code": "DOCUMENT_RELATION_UPDATED", "error": None}) as mock_write:
+            result = bb.relink_document("DREG-003", stage_id="STAGE-014", dry_run=False)
+
+        mock_write.assert_called_once_with(
+            "DREG-003", {"Roadmap ID": "RM-003", "Stage ID": "STAGE-014"},
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["code"], "DOCUMENT_RELATION_UPDATED")
+
+    def test_anchors_are_read_from_document_not_caller(self):
+        """business_id/client_id/object_id/document_template_id must always
+        come from the document's own row, never be caller-suppliable —
+        relink_document() has no parameters for them at all."""
+        import business_core.business_builder as bb
+        import inspect
+
+        sig = inspect.signature(bb.relink_document)
+        self.assertNotIn("business_id", sig.parameters)
+        self.assertNotIn("client_id", sig.parameters)
+        self.assertNotIn("object_id", sig.parameters)
+        self.assertNotIn("document_template_id", sig.parameters)
+
+    def test_incompatible_stage_blocked_before_write(self):
+        import business_core.business_builder as bb
+
+        with patch("business_core.document_manager.find_document_by_id", return_value=dict(_RELINK_DOCUMENT)), \
+             patch.object(bb, "_validate_document_relations",
+                          return_value={"ok": False, "code": "DOCUMENT_ENTITY_RELATION_MISMATCH",
+                                        "error": "Противоречие: Stage STAGE-099 принадлежит Roadmap RM-999, "
+                                                 "а указан Roadmap RM-003.", "resolved": None}), \
+             patch("business_core.document_manager.update_document_relations") as mock_write:
+            result = bb.relink_document("DREG-003", stage_id="STAGE-099", dry_run=False)
+
+        mock_write.assert_not_called()
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "DOCUMENT_ENTITY_RELATION_MISMATCH")
+
+    def test_nonexistent_stage_blocked_before_write(self):
+        import business_core.business_builder as bb
+
+        with patch("business_core.document_manager.find_document_by_id", return_value=dict(_RELINK_DOCUMENT)), \
+             patch.object(bb, "_validate_document_relations",
+                          return_value={"ok": False, "code": "DOCUMENT_ENTITY_RELATION_MISMATCH",
+                                        "error": "Stage STAGE-999 не найден.", "resolved": None}), \
+             patch("business_core.document_manager.update_document_relations") as mock_write:
+            result = bb.relink_document("DREG-003", stage_id="STAGE-999", dry_run=False)
+
+        mock_write.assert_not_called()
+        self.assertFalse(result["ok"])
+
+    def test_document_not_found(self):
+        import business_core.business_builder as bb
+
+        with patch("business_core.document_manager.find_document_by_id", return_value=None):
+            result = bb.relink_document("DREG-999", stage_id="STAGE-014", dry_run=True)
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "DOCUMENT_NOT_FOUND")
+
+    def test_drive_fields_and_identity_untouched_by_write_call(self):
+        """The write path only ever sends Roadmap ID / Stage ID — Drive
+        File ID/URL, Document ID, Family ID, Version are never part of
+        the payload passed to update_document_relations()."""
+        import business_core.business_builder as bb
+
+        with patch("business_core.document_manager.find_document_by_id", return_value=dict(_RELINK_DOCUMENT)), \
+             patch.object(bb, "_validate_document_relations",
+                          return_value={"ok": True, "code": "", "error": None,
+                                        "resolved": {"roadmap_id": "RM-003", "stage_id": "STAGE-014"}}), \
+             patch("business_core.document_manager.update_document_relations",
+                   return_value={"ok": True, "changed": True, "updated_fields": ("Stage ID",),
+                                 "code": "DOCUMENT_RELATION_UPDATED", "error": None}) as mock_write:
+            bb.relink_document("DREG-003", stage_id="STAGE-014", dry_run=False)
+
+        payload = mock_write.call_args[0][1]
+        self.assertEqual(set(payload.keys()), {"Roadmap ID", "Stage ID"})
+
+
+# ────────────────────────────────────────────────────────────
+# document_manager.update_document_relations() — low-level unit tests
+# ────────────────────────────────────────────────────────────
+
+class TestUpdateDocumentRelations(unittest.TestCase):
+    def test_unknown_field_rejected(self):
+        import business_core.document_manager as dm
+
+        result = dm.update_document_relations("DREG-003", {"Object ID": "OBJ-009"})
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "DOCUMENT_RELATION_FIELD_NOT_RELINKABLE")
+
+    def test_business_id_field_rejected(self):
+        import business_core.document_manager as dm
+
+        result = dm.update_document_relations("DREG-003", {"Business ID": "BIZ-002"})
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "DOCUMENT_RELATION_FIELD_NOT_RELINKABLE")
+
+    def test_document_not_found(self):
+        import business_core.document_manager as dm
+
+        with patch.object(dm, "_find_document_row", return_value=None):
+            result = dm.update_document_relations("DREG-999", {"Stage ID": "STAGE-014"})
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "DOCUMENT_NOT_FOUND")
+
+    def test_writes_only_stage_id_when_roadmap_unchanged(self):
+        import business_core.document_manager as dm
+
+        current = {"Roadmap ID": "RM-003", "Stage ID": "STAGE-010"}
+        mock_sheet = MagicMock()
+        mock_sheet.row_values.return_value = ["Roadmap ID", "Stage ID", "Updated At"]
+
+        with patch.object(dm, "_find_document_row", return_value=(5, current)), \
+             patch("business_core.sheets.get_business_sheet", return_value=mock_sheet), \
+             patch("business_core.sheets.get_header_index_map",
+                   return_value={"Roadmap ID": 0, "Stage ID": 1, "Updated At": 2}):
+            result = dm.update_document_relations(
+                "DREG-003", {"Roadmap ID": "RM-003", "Stage ID": "STAGE-014"},
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["changed"])
+        self.assertEqual(result["updated_fields"], ("Stage ID",))
+        mock_sheet.update_cell.assert_any_call(5, 2, "STAGE-014")
+
+    def test_unchanged_values_produce_no_write(self):
+        import business_core.document_manager as dm
+
+        current = {"Roadmap ID": "RM-003", "Stage ID": "STAGE-010"}
+        mock_sheet = MagicMock()
+        mock_sheet.row_values.return_value = ["Roadmap ID", "Stage ID", "Updated At"]
+
+        with patch.object(dm, "_find_document_row", return_value=(5, current)), \
+             patch("business_core.sheets.get_business_sheet", return_value=mock_sheet), \
+             patch("business_core.sheets.get_header_index_map",
+                   return_value={"Roadmap ID": 0, "Stage ID": 1, "Updated At": 2}):
+            result = dm.update_document_relations(
+                "DREG-003", {"Roadmap ID": "RM-003", "Stage ID": "STAGE-010"},
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["changed"])
+        self.assertEqual(result["code"], "DOCUMENT_RELATION_UNCHANGED")
+        mock_sheet.update_cell.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -425,6 +425,86 @@ def update_document_admin_fields(document_id: str, updates: dict) -> dict:
         return {"ok": False, "changed": False, "updated_fields": (), "code": "", "error": str(exc)}
 
 
+# ─────────────────────────────────────────────────────────────
+# Relation relink (Roadmap ID / Stage ID only)
+# ─────────────────────────────────────────────────────────────
+
+# Deliberately narrow: only the two relation fields business_builder.
+# relink_document() is approved to change. Client ID/Object ID/Document
+# Template ID remain unreachable through ANY generic write path — a
+# future explicit action for those (if ever approved) must be its own
+# separate function, never an expansion of this allowlist, since
+# Object ID relink carries the unresolved physical-Drive-folder-move
+# risk flagged during the audit for this feature.
+_DOCUMENT_RELINK_EDITABLE_FIELDS = ("Roadmap ID", "Stage ID")
+
+
+def update_document_relations(document_id: str, updates: dict) -> dict:
+    """
+    Update Roadmap ID and/or Stage ID only. Does not itself validate
+    that the new values form a consistent Stage->Roadmap->Object->
+    Client->Business chain — business_builder.relink_document() already
+    did that (via the existing resolve_and_validate_links()) before
+    calling this function. Business ID/Client ID/Object ID/Document
+    Template ID/Drive fields/identity/version fields are all rejected
+    outright, regardless of value — this function's allowlist makes
+    changing them structurally impossible, exactly like
+    update_document_admin_fields() already does for Status/Drive/
+    review fields.
+
+    Returns:
+        {"ok": bool, "changed": bool, "updated_fields": tuple, "code": str, "error": str | None}
+    """
+    if not document_id:
+        return {"ok": False, "changed": False, "updated_fields": (), "code": "", "error": "document_id не указан"}
+
+    unknown = [k for k in updates if k not in _DOCUMENT_RELINK_EDITABLE_FIELDS]
+    if unknown:
+        return {
+            "ok": False, "changed": False, "updated_fields": (), "code": "DOCUMENT_RELATION_FIELD_NOT_RELINKABLE",
+            "error": f"Поля {', '.join(unknown)} нельзя изменить через relink — разрешены только Roadmap ID и Stage ID",
+        }
+
+    found = _find_document_row(document_id)
+    if not found:
+        return {"ok": False, "changed": False, "updated_fields": (), "code": "DOCUMENT_NOT_FOUND", "error": f"Document '{document_id}' не найден"}
+    row_num, current = found
+
+    try:
+        from business_core.sheets import get_business_sheet, get_header_index_map
+        from datetime import datetime, timezone
+
+        sheet = get_business_sheet("document_registry")
+        headers = sheet.row_values(1)
+        idx = get_header_index_map(headers)
+
+        updated_fields = []
+        changed = False
+        for header, new_value in updates.items():
+            if header not in idx:
+                continue
+            old_value = current.get(header, "")
+            if str(old_value) == str(new_value):
+                continue
+            sheet.update_cell(row_num, idx[header] + 1, new_value)
+            updated_fields.append(header)
+            changed = True
+
+        if changed and "Updated At" in idx:
+            now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+            sheet.update_cell(row_num, idx["Updated At"] + 1, now)
+
+        log.info(f"update_document_relations: {document_id} fields={updated_fields}")
+        return {
+            "ok": True, "changed": changed, "updated_fields": tuple(updated_fields),
+            "code": "DOCUMENT_RELATION_UPDATED" if changed else "DOCUMENT_RELATION_UNCHANGED",
+            "error": None,
+        }
+    except Exception as exc:
+        log.error(f"update_document_relations({document_id}) error: {exc}")
+        return {"ok": False, "changed": False, "updated_fields": (), "code": "", "error": str(exc)}
+
+
 def update_document_status(document_id: str, status: str) -> dict:
     """
     Low-level Status write. Does not check the transition matrix or

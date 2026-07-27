@@ -3742,6 +3742,59 @@ def _document_transition_message(result: dict, document_id: str) -> str:
     return f"❌ Ошибка ({code or 'unknown'}): {result.get('error') or 'см. логи'}"
 
 
+def _document_relink_message(result: dict, document_id: str) -> str:
+    """Render any business_builder.relink_document() result (both the
+    dry_run preview and the applied outcome share this mapping, except
+    for the dedicated DOCUMENT_RELINK_PREVIEW case handled by
+    _document_relink_preview_message() before falling back here)."""
+    code = result.get("code", "")
+
+    if code == "DOCUMENT_RELATION_UPDATED":
+        return "\n".join([
+            "✅ Связи Document обновлены",
+            f"Document ID: {document_id}",
+            f"Roadmap ID: {result.get('roadmap_id', '') or '—'}",
+            f"Stage ID: {result.get('stage_id', '') or '—'}",
+            "Drive File ID и Drive URL не изменились.",
+        ])
+
+    if code == "DOCUMENT_RELATION_UNCHANGED":
+        return f"ℹ️ Document {document_id} — новые значения совпадают с текущими, изменений нет."
+
+    if code == "DOCUMENT_NOT_FOUND":
+        return f"❌ Document {document_id} не найден."
+
+    if code == "BUSINESS_NOT_FOUND":
+        return f"❌ {result.get('error') or 'Business не найден.'}"
+
+    if code == "DOCUMENT_ENTITY_RELATION_MISMATCH":
+        return f"❌ {result.get('error') or 'Указанные связи несовместимы.'}"
+
+    log.warning(f"_document_relink_message: unmapped code={code!r} document_id={document_id}")
+    return f"❌ Ошибка ({code or 'unknown'}): {result.get('error') or 'см. логи'}"
+
+
+def _document_relink_preview_message(result: dict, document_id: str, old_roadmap_id: str, old_stage_id: str) -> str:
+    """Render the dry_run preview step of /updatedoc's relink mode —
+    shows old->new Roadmap/Stage and explicitly confirms Drive File ID/
+    URL will not change. Any validation failure (incompatible/missing
+    Stage, etc.) falls through to the same mapping the applied outcome
+    uses, so a bad request never silently looks like a valid preview."""
+    if result.get("code") == "DOCUMENT_RELINK_PREVIEW":
+        return "\n".join([
+            "📋 Подтверди перепривязку Document:",
+            "",
+            f"Document ID: {document_id}",
+            f"Roadmap ID — было: {old_roadmap_id or '—'} → станет: {result.get('roadmap_id', '') or '—'}",
+            f"Stage ID — было: {old_stage_id or '—'} → станет: {result.get('stage_id', '') or '—'}",
+            "",
+            "Drive File ID и Drive URL не изменятся.",
+            "",
+            "Чтобы применить, повтори команду с confirm=yes.",
+        ])
+    return _document_relink_message(result, document_id)
+
+
 async def registerdoc_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """
     /registerdoc business=BIZ-001 name="Технический паспорт" drive=<file_id_or_url>
@@ -4028,12 +4081,23 @@ async def updatedoc_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     """
     /updatedoc document_id=DREG-001 name="..." notes="..."
     /updatedoc document_id=DREG-001 status=under_review
+    /updatedoc document_id=DREG-001 stage_id=STAGE-014
+    /updatedoc document_id=DREG-001 roadmap_id=RM-... stage_id=STAGE-... confirm=yes
 
     Phase 37E (ADR-020 §14/§15/§20): status and admin fields are never
     mixed in one call — mirrors /updatetask's Phase 36D foundation UX
     exactly, so admin-field policy and transition policy never share a
-    single ambiguous write. No relink, no review fields, no Drive-field
-    repair, no restore.
+    single ambiguous write. No review fields, no Drive-field repair, no
+    restore.
+
+    Relink mode (roadmap_id/stage_id only — narrow, audit-approved
+    scope): the first call (no confirm=yes) only validates and shows a
+    before/after preview via business_builder.relink_document(...,
+    dry_run=True) — nothing is written. Repeating the exact same call
+    with confirm=yes re-validates (staleness guard) and applies it.
+    Business ID/Client ID/Object ID/Document Template ID can never be
+    changed this way — passing any of them is an explicit, visible
+    rejection, never a silent no-op.
     """
     if not _is_bc_enabled():
         await _reply(update, _bc_disabled_msg())
@@ -4048,26 +4112,42 @@ async def updatedoc_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             update,
             "❌ Укажи document_id.\n\nПример:\n"
             '`/updatedoc document_id=DREG-001 name="..." notes="..."`\n'
-            "`/updatedoc document_id=DREG-001 status=under_review`",
+            "`/updatedoc document_id=DREG-001 status=under_review`\n"
+            "`/updatedoc document_id=DREG-001 stage_id=STAGE-014`",
+        )
+        return
+
+    forbidden_relink_keys = ("business_id", "client_id", "object_id", "document_template_id")
+    forbidden_present = [k for k in forbidden_relink_keys if k in args]
+    if forbidden_present:
+        forbidden_list = ", ".join(f"`{k}`" for k in forbidden_present)
+        await _reply(
+            update,
+            f"❌ Изменение полей {forbidden_list} через /updatedoc не поддерживается.\n"
+            "Через relink можно менять только `roadmap_id` и `stage_id`.",
         )
         return
 
     admin_keys = {"name", "notes"}
+    relink_keys = {"roadmap_id", "stage_id"}
     has_status = "status" in args
     has_admin = any(k in args for k in admin_keys)
+    has_relink = any(k in args for k in relink_keys)
 
-    if has_status and has_admin:
+    modes_selected = sum((has_status, has_admin, has_relink))
+    if modes_selected > 1:
         await _reply(
             update,
-            "❌ Нельзя одновременно менять статус и admin-поля.\n"
-            "Отправь две отдельные команды:\n"
+            "❌ Нельзя одновременно менять статус, admin-поля и связи (`roadmap_id`/`stage_id`).\n"
+            "Отправь отдельные команды:\n"
             "`/updatedoc document_id=... status=...`\n"
-            '`/updatedoc document_id=... name="..." notes="..."`',
+            '`/updatedoc document_id=... name="..." notes="..."`\n'
+            "`/updatedoc document_id=... stage_id=...`",
         )
         return
 
-    if not has_status and not has_admin:
-        await _reply(update, "❌ Укажи либо status=..., либо admin-поля (name/notes).")
+    if modes_selected == 0:
+        await _reply(update, "❌ Укажи либо status=..., либо admin-поля (name/notes), либо `roadmap_id`/`stage_id` для перепривязки.")
         return
 
     try:
@@ -4075,6 +4155,33 @@ async def updatedoc_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             from business_core.business_builder import transition_document_status
             result = transition_document_status(document_id, args["status"])
             await _reply(update, _document_transition_message(result, document_id))
+            return
+
+        if has_relink:
+            from business_core.document_manager import find_document_by_id
+            from business_core.business_builder import relink_document
+
+            document = find_document_by_id(document_id)
+            if document is None:
+                await _reply(update, f"❌ Document {document_id} не найден.")
+                return
+
+            new_roadmap_id = args.get("roadmap_id")
+            new_stage_id = args.get("stage_id")
+            confirmed = args.get("confirm", "").strip().lower() == "yes"
+
+            result = relink_document(
+                document_id, roadmap_id=new_roadmap_id, stage_id=new_stage_id, dry_run=not confirmed,
+            )
+            if confirmed:
+                await _reply(update, _document_relink_message(result, document_id))
+            else:
+                await _reply(
+                    update,
+                    _document_relink_preview_message(
+                        result, document_id, document.get("roadmap_id", ""), document.get("stage_id", ""),
+                    ),
+                )
             return
 
         from business_core.business_builder import update_document_admin_fields
