@@ -129,11 +129,23 @@ def _make_sheet_dispatcher(stage_row, roadmaps_row, stage_row_num=2, roadmaps_ro
         lambda r: ROADMAPS_HEADERS if r == 1 else roadmaps_row
     )
 
+    # Phase 43 (Document Completion Gate): transition_stage_status() now
+    # calls document_requirements_query.evaluate_scope() for every
+    # in_progress->done transition, which reads these additional sheets
+    # via read_business_sheet(). Empty results here mean "no structured
+    # requirements configured" — the gate allows completion, exactly the
+    # pre-existing behavior these tests already assume/verify.
+    empty_sheet = MagicMock()
+    empty_sheet.get_all_values.return_value = []
+
     def dispatcher(key):
         if key == "roadmap_stages":
             return stages_sheet
         if key == "roadmaps":
             return roadmaps_sheet
+        if key in ("stage_entity_relations", "document_registry",
+                   "roadmap_template_stages", "document_template_registry"):
+            return empty_sheet
         raise AssertionError(f"неожиданный лист '{key}'")
 
     return dispatcher, stages_sheet, roadmaps_sheet

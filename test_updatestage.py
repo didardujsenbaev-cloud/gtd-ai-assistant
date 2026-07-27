@@ -454,7 +454,8 @@ class TestUpdateStageCommand(unittest.TestCase):
         )
         captured = {}
 
-        def fake_transition(stage_id, target_status, notes=None, admin_fields=None):
+        def fake_transition(stage_id, target_status, notes=None, admin_fields=None,
+                            force=False, reason=None, actor=""):
             captured["notes"] = notes
             return {
                 "ok": True, "code": "STAGE_STATUS_UPDATED", "error": None,

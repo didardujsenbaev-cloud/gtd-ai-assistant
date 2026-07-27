@@ -331,3 +331,50 @@ def _default_roadmap_cross_domain_validation_mocks(request):
          patch("business_core.person_manager.is_client_person", return_value=True), \
          patch("business_core.person_manager.has_person_business_link", return_value=True):
         yield
+
+
+def _default_evaluate_scope(scope_type, scope_id):
+    """'Everything satisfied, nothing configured' ScopeEvaluationResult —
+    same shape evaluate_stage_requirements() returns for a stage with
+    zero configured document requirements, which is exactly the correct
+    default for every pre-existing test (none of them configure any
+    document_template requirement on their fixture stages)."""
+    from business_core.document_requirements_query import ScopeEvaluationResult
+    from business_core.document_requirements import RequirementsSummary
+    return ScopeEvaluationResult(
+        scope_type=scope_type, scope_id=scope_id, exists=True,
+        summary=RequirementsSummary(scope_type=scope_type, scope_id=scope_id),
+    )
+
+
+@pytest.fixture(autouse=True)
+def _default_stage_document_gate_mocks(request):
+    """
+    Phase 43 (Document Completion Gate): business_builder.
+    transition_stage_status() now calls document_requirements_query.
+    evaluate_scope("stage", stage_id) for every in_progress->done
+    transition. Every pre-existing Stage-transition test in
+    _ROADMAP_DOMAIN_TEST_FILES was written before this gate existed, so
+    none of them mock this new call point — without this fixture, every
+    "done" transition test in that set would either fail (no
+    document_template_registry/roadmap_stages/stage_entity_relations
+    mocks matching what evaluate_scope() actually reads) or silently
+    reach real Google Sheets (the exact PRS-003 failure mode this
+    conftest.py exists to catch).
+
+    Default: "nothing configured, everything satisfied" — blocking_missing=0,
+    has_configuration_errors=False — so the gate never blocks any
+    pre-existing test. A test that specifically wants to exercise the
+    gate itself (blocked/configuration-error/override paths) adds its
+    own nested `with patch("business_core.document_requirements_query.
+    evaluate_scope", ...)` inside the test body, which overrides this
+    default for that call only (standard unittest.mock.patch stacking),
+    then reverts to this default once that nested `with` block exits.
+    """
+    test_file_name = request.node.fspath.basename
+    if test_file_name not in _ROADMAP_DOMAIN_TEST_FILES:
+        yield
+        return
+
+    with patch("business_core.document_requirements_query.evaluate_scope", side_effect=_default_evaluate_scope):
+        yield

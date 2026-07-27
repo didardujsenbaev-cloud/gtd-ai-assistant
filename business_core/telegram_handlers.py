@@ -2816,6 +2816,37 @@ def _stage_transition_failure_message(result: dict, stage_id: str, status: str) 
             f"Причина: {result.get('error') or 'не удалось подтверждённо записать статус'}",
         ])
 
+    if code == "STAGE_DOCUMENT_GATE_BLOCKED":
+        missing = result.get("missing_blocking_doc_ids", ())
+        return "\n".join([
+            "🔒 Завершение заблокировано — не хватает обязательных документов",
+            f"Этап: `{stage_id}`",
+            f"Roadmap: `{roadmap_id}`",
+            f"Missing Blocking Document Template IDs: {', '.join(missing) if missing else '—'}",
+            "",
+            "Чтобы всё же завершить этап, используй явный override:",
+            f"`/updatestage stage_id={stage_id} status=done force=yes reason=\"...\"`",
+        ])
+
+    if code == "STAGE_DOCUMENT_REQUIREMENTS_CONFIGURATION_ERROR":
+        return "\n".join([
+            "⚠️ Завершение заблокировано — повреждена настройка требований к документам",
+            f"Этап: `{stage_id}`",
+            f"Roadmap: `{roadmap_id}`",
+            f"Детали: {result.get('configuration_error_details') or result.get('error') or '—'}",
+            "Требуется проверка администратора настроек этапа.",
+            "",
+            "Чтобы всё же завершить этап, используй явный override:",
+            f"`/updatestage stage_id={stage_id} status=done force=yes reason=\"...\"`",
+        ])
+
+    if code == "STAGE_DOCUMENT_GATE_OVERRIDE_REASON_REQUIRED":
+        return "\n".join([
+            "❌ force=yes требует явную причину",
+            f"Этап: `{stage_id}`",
+            f"`/updatestage stage_id={stage_id} status=done force=yes reason=\"...\"`",
+        ])
+
     known_message = _STAGE_TRANSITION_ERROR_MESSAGES.get(code)
     if known_message:
         return "\n".join([
@@ -2903,6 +2934,16 @@ def _stage_transition_success_lines(result: dict, stage_id: str, notes: Optional
         if roadmap_status_before == "active" and roadmap_status_after == "completed":
             lines.append(f"🎉 Все этапы завершены. Roadmap `{roadmap_id}` переведена в статус «Завершена».")
 
+    if not partial_success:
+        for w in result.get("warnings", ()):
+            lines.append(f"⚠️ {w}")
+
+    if result.get("override_applied"):
+        lines.append(
+            f"🔓 Применён override документного гейта (force=yes). "
+            f"Override ID: `{result.get('override_id') or '—'}`, тип: {result.get('override_type') or '—'}."
+        )
+
     if notes is not None:
         lines.append(f"Notes обновлены: {notes}")
 
@@ -2916,6 +2957,7 @@ async def updatestage_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     Форматы:
       /updatestage stage_id=STAGE-xxx status=done
       /updatestage stage_id=STAGE-xxx status=blocked notes="Ожидаем документы клиента"
+      /updatestage stage_id=STAGE-xxx status=done force=yes reason="..."
 
     status принимает только: pending, in_progress, blocked, done, skipped.
     notes с пробелами нужно указывать в кавычках (как и в остальных командах).
@@ -2927,6 +2969,13 @@ async def updatestage_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     переводит его в completed (Phase 9E.2) — вызывается только если статус
     этапа валиден и этап найден. Не пишет историю, не делает массовых
     обновлений, не открывает completed обратно в active.
+
+    Phase 43 (Document Completion Gate): переход in_progress→done
+    проверяет закрытость обязательных (blocking) требований к документам
+    этапа. Явный override — только через параметры команды (`force=yes`
+    и обязательный непустой `reason="..."`), никогда через свободный
+    текст-«подтверждение» (это ушло бы в GTD Inbox, а не в эту команду).
+    `force` без `status=done` не имеет эффекта на другие переходы.
     """
     if not _is_bc_enabled():
         await _reply(update, _bc_disabled_msg())
@@ -2942,6 +2991,8 @@ async def updatestage_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     stage_id = args.get("stage_id") or args.get("_pos0", "")
     status   = args.get("status")   or args.get("_pos1", "")
     notes    = args.get("notes")
+    force    = args.get("force", "").strip().lower() == "yes"
+    reason   = args.get("reason")
 
     if not stage_id or not status:
         from business_core.roadmap_manager import STAGE_STATUS_CANONICAL
@@ -2951,7 +3002,8 @@ async def updatestage_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             "Примеры:\n"
             "`/updatestage stage_id=STAGE-001-01 status=done`\n"
             "`/updatestage stage_id=STAGE-001-01 status=blocked "
-            "notes=\"Ожидаем документы клиента\"`"
+            "notes=\"Ожидаем документы клиента\"`\n"
+            "`/updatestage stage_id=STAGE-001-01 status=done force=yes reason=\"...\"`"
         )
         return
 
@@ -2962,12 +3014,17 @@ async def updatestage_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         # canonical orchestration boundary — it resolves the Stage, the
         # parent Roadmap, checks Roadmap eligibility (active/on_hold/
         # completed/cancelled), validates the current→target transition
-        # (including the done/skipped explicit-reopen block), persists
-        # Status, recalculates Progress %, and maybe auto-completes the
-        # Roadmap. This handler only parses input and renders the
-        # structured result — it no longer calls update_stage_status_in_sheet,
-        # recalculate_roadmap_progress, or maybe_complete_roadmap itself.
-        result = transition_stage_status(stage_id, status, notes=notes)
+        # (including the done/skipped explicit-reopen block), enforces
+        # the Phase 43 document completion gate for in_progress→done,
+        # persists Status, recalculates Progress %, and maybe auto-
+        # completes the Roadmap. This handler only parses input and
+        # renders the structured result — it no longer calls
+        # update_stage_status_in_sheet, recalculate_roadmap_progress, or
+        # maybe_complete_roadmap itself.
+        result = transition_stage_status(
+            stage_id, status, notes=notes,
+            force=force, reason=reason, actor=_telegram_username(update),
+        )
 
         log.info(
             "updatestage_cmd result: ok=%s code=%s stage_id=%s roadmap_id=%s "

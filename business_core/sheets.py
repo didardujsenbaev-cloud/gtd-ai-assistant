@@ -81,6 +81,10 @@ BUSINESS_SHEET_NAMES: dict[str, str] = {
     # are already forbidden by pre-existing Lead architecture guards
     # (ADR-025 §3/Phase 42A prerequisite).
     "interaction_log":                "INTERACTION_LOG",
+    # Phase 43: Document Completion Gate — append-only override audit
+    # trail for /updatestage's force=yes bypass of the Stage document
+    # completion gate (see business_builder.transition_stage_status()).
+    "stage_completion_overrides":     "STAGE_COMPLETION_OVERRIDES",
 }
 
 BUSINESS_HEADERS: dict[str, list[str]] = {
@@ -482,6 +486,16 @@ BUSINESS_HEADERS: dict[str, list[str]] = {
         "External Reference", "Status",
         "Created At", "Created By", "Updated At", "Archived At", "Notes",
     ],
+    # Phase 43: Document Completion Gate override audit trail.
+    # Append-only — no update/delete path anywhere in this codebase.
+    # One row per successful force=yes bypass of the gate (never
+    # written when the gate wasn't actually blocking — see
+    # business_builder.transition_stage_status()).
+    "stage_completion_overrides": [
+        "Override ID", "Stage ID", "Roadmap ID", "User", "Overridden At",
+        "Reason", "Missing Blocking Doc IDs", "Previous Status", "Target Status",
+        "Override Type", "Configuration Error Details",
+    ],
 }
 
 # ID-префиксы для generate_next_id
@@ -541,6 +555,9 @@ _ID_PREFIXES: dict[str, str] = {
     # RelationshipTouch code — ACT chosen instead, checked against every
     # existing prefix above, no collisions.
     "interaction_log":                "ACT",
+    # Phase 43: checked against every existing prefix above — no
+    # collisions.
+    "stage_completion_overrides":     "SCO",
 }
 
 

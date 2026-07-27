@@ -64,25 +64,114 @@ def _completion_result(ok=True, old="active", new="active", changed=False, roadm
             "old_status": old, "new_status": new, "changed": changed}
 
 
+# ─────────────────────────────────────────────────────────────
+# Phase 43 (Document Completion Gate) — evaluate_scope() result builders.
+# Built from the REAL dataclasses (document_requirements_query.
+# ScopeEvaluationResult / document_requirements.RequirementsSummary/
+# DocumentRequirement/DocumentRequirementStatus) rather than ad-hoc dicts,
+# so a test failure here would also catch a real contract drift in those
+# classes, not just in this test file's assumptions about their shape.
+# ─────────────────────────────────────────────────────────────
+
+def _satisfied_scope_result(stage_id="STAGE-001"):
+    """No structured requirements configured (or everything already
+    satisfied) — the default for every test that doesn't care about the
+    gate at all."""
+    from business_core.document_requirements_query import ScopeEvaluationResult
+    from business_core.document_requirements import RequirementsSummary
+    return ScopeEvaluationResult(
+        scope_type="stage", scope_id=stage_id, exists=True,
+        summary=RequirementsSummary(scope_type="stage", scope_id=stage_id),
+    )
+
+
+def _blocking_missing_scope_result(stage_id="STAGE-001", doc_ids=("DOC-008",)):
+    from business_core.document_requirements_query import ScopeEvaluationResult
+    from business_core.document_requirements import (
+        RequirementsSummary, DocumentRequirement, DocumentRequirementStatus,
+    )
+    items = tuple(
+        DocumentRequirementStatus(
+            requirement=DocumentRequirement(
+                requirement_id=f"REQ-{i}", document_template_id=doc_id,
+                stage_id=stage_id, blocking=True,
+            ),
+            status="missing",
+        )
+        for i, doc_id in enumerate(doc_ids, start=1)
+    )
+    return ScopeEvaluationResult(
+        scope_type="stage", scope_id=stage_id, exists=True,
+        summary=RequirementsSummary(
+            scope_type="stage", scope_id=stage_id, items=items,
+            total_required=len(doc_ids), missing_required=len(doc_ids),
+            blocking_missing=len(doc_ids), completion_percentage=0.0, is_complete=False,
+        ),
+    )
+
+
+def _optional_missing_scope_result(stage_id="STAGE-001", optional_missing=1):
+    from business_core.document_requirements_query import ScopeEvaluationResult
+    from business_core.document_requirements import RequirementsSummary
+    return ScopeEvaluationResult(
+        scope_type="stage", scope_id=stage_id, exists=True,
+        summary=RequirementsSummary(
+            scope_type="stage", scope_id=stage_id, optional_missing=optional_missing,
+        ),
+    )
+
+
+def _configuration_error_scope_result(stage_id="STAGE-001", errors=(("STAGE-001", "REL-999", "dangling entity"),)):
+    from business_core.document_requirements_query import ScopeEvaluationResult
+    from business_core.document_requirements import RequirementsSummary
+    return ScopeEvaluationResult(
+        scope_type="stage", scope_id=stage_id, exists=True,
+        summary=RequirementsSummary(
+            scope_type="stage", scope_id=stage_id, configuration_errors=tuple(errors),
+            has_configuration_errors=True, is_complete=False,
+        ),
+    )
+
+
+def _override_write_result(ok=True, override_id="SCO-001", error=None):
+    return {"ok": ok, "override_id": override_id if ok else "", "error": error}
+
+
 _UNSET = object()
 
 
 class _BaseTransitionTestCase(unittest.TestCase):
     def _call(self, target_status="in_progress", notes=None, admin_fields=None,
               stage=_UNSET, roadmap=_UNSET, write_result=None, progress_result=None,
-              completion_result=None, stage_id="STAGE-001"):
+              completion_result=None, stage_id="STAGE-001",
+              force=False, reason=None, actor="",
+              evaluate_scope_result=_UNSET, record_override_result=None):
         bb = _fresh_bb()
         with patch("business_core.roadmap_manager.find_stage_by_id",
                    return_value=_stage() if stage is _UNSET else stage), \
              patch("business_core.roadmap_manager.find_roadmap_by_id",
                    return_value=_roadmap() if roadmap is _UNSET else roadmap), \
              patch("business_core.roadmap_manager.update_stage_status_in_sheet",
-                   return_value=write_result if write_result is not None else _write_result(new=target_status)), \
+                   return_value=write_result if write_result is not None else _write_result(new=target_status)) as mock_write, \
              patch("business_core.roadmap_manager.recalculate_roadmap_progress",
-                   return_value=progress_result if progress_result is not None else _progress_result()), \
+                   return_value=progress_result if progress_result is not None else _progress_result()) as mock_progress, \
              patch("business_core.roadmap_manager.maybe_complete_roadmap",
-                   return_value=completion_result if completion_result is not None else _completion_result()):
-            return bb.transition_stage_status(stage_id, target_status, notes=notes, admin_fields=admin_fields)
+                   return_value=completion_result if completion_result is not None else _completion_result()), \
+             patch("business_core.document_requirements_query.evaluate_scope",
+                   return_value=(_satisfied_scope_result(stage_id) if evaluate_scope_result is _UNSET
+                                 else evaluate_scope_result)) as mock_evaluate_scope, \
+             patch("business_core.roadmap_manager.record_stage_completion_override",
+                   return_value=(record_override_result if record_override_result is not None
+                                 else _override_write_result())) as mock_record_override:
+            result = bb.transition_stage_status(
+                stage_id, target_status, notes=notes, admin_fields=admin_fields,
+                force=force, reason=reason, actor=actor,
+            )
+            self._last_mock_record_override = mock_record_override
+            self._last_mock_evaluate_scope = mock_evaluate_scope
+            self._last_mock_write = mock_write
+            self._last_mock_progress = mock_progress
+            return result
 
 
 class TestStageResolution(_BaseTransitionTestCase):
@@ -455,6 +544,210 @@ class TestArchitecture(unittest.TestCase):
                 for alias in node.names:
                     found.add(alias.name.split(".")[-1])
         self.assertEqual(found & forbidden, set())
+
+
+# ─────────────────────────────────────────────────────────────
+# Phase 43: Document Completion Gate
+# ─────────────────────────────────────────────────────────────
+
+class TestDocumentCompletionGate(_BaseTransitionTestCase):
+    def test_blocking_zero_allows_done(self):
+        result = self._call(
+            target_status="done", stage=_stage(status="in_progress"),
+            evaluate_scope_result=_satisfied_scope_result(),
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["code"], "STAGE_STATUS_UPDATED")
+        self.assertEqual(result["final_status"], "done")
+
+    def test_only_optional_missing_allows_done_with_warning(self):
+        result = self._call(
+            target_status="done", stage=_stage(status="in_progress"),
+            evaluate_scope_result=_optional_missing_scope_result(optional_missing=2),
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["code"], "STAGE_STATUS_UPDATED")
+        self.assertTrue(any("optional" in w.lower() or "необязательных" in w.lower() for w in result["warnings"]))
+
+    def test_zero_configured_requirements_allows_done(self):
+        """No structured requirements at all is not an error — same
+        result shape as 'everything satisfied'."""
+        result = self._call(
+            target_status="done", stage=_stage(status="in_progress"),
+            evaluate_scope_result=_satisfied_scope_result(),
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["final_status"], "done")
+
+    def test_blocking_missing_rejects_without_force(self):
+        result = self._call(
+            target_status="done", stage=_stage(status="in_progress"),
+            evaluate_scope_result=_blocking_missing_scope_result(doc_ids=("DOC-008",)),
+        )
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "STAGE_DOCUMENT_GATE_BLOCKED")
+        self.assertEqual(result["missing_blocking_doc_ids"], ("DOC-008",))
+        self.assertEqual(result["final_status"], "in_progress")
+
+    def test_blocking_missing_does_not_write_status_or_progress(self):
+        self._call(
+            target_status="done", stage=_stage(status="in_progress"),
+            evaluate_scope_result=_blocking_missing_scope_result(),
+        )
+        self._last_mock_write.assert_not_called()
+        self._last_mock_progress.assert_not_called()
+
+    def test_force_without_reason_rejected(self):
+        result = self._call(
+            target_status="done", stage=_stage(status="in_progress"),
+            evaluate_scope_result=_blocking_missing_scope_result(), force=True, reason=None,
+        )
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "STAGE_DOCUMENT_GATE_OVERRIDE_REASON_REQUIRED")
+
+    def test_force_with_blank_reason_rejected(self):
+        result = self._call(
+            target_status="done", stage=_stage(status="in_progress"),
+            evaluate_scope_result=_blocking_missing_scope_result(), force=True, reason="   ",
+        )
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "STAGE_DOCUMENT_GATE_OVERRIDE_REASON_REQUIRED")
+
+    def test_force_with_reason_and_blocking_missing_completes_and_audits(self):
+        result = self._call(
+            target_status="done", stage=_stage(status="in_progress"),
+            evaluate_scope_result=_blocking_missing_scope_result(doc_ids=("DOC-008", "DOC-009")),
+            force=True, reason="manager approved", actor="dida",
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["final_status"], "done")
+        self.assertTrue(result["override_applied"])
+        self.assertEqual(result["override_type"], "missing_blocking_documents")
+        self.assertEqual(result["override_id"], "SCO-001")
+
+        self._last_mock_record_override.assert_called_once_with(
+            stage_id="STAGE-001", roadmap_id="RM-001", user="dida", reason="manager approved",
+            missing_blocking_doc_ids=("DOC-008", "DOC-009"),
+            previous_status="in_progress", target_status="done",
+            override_type="missing_blocking_documents", configuration_error_details="",
+        )
+
+    def test_force_with_reason_and_blocking_zero_completes_without_audit(self):
+        result = self._call(
+            target_status="done", stage=_stage(status="in_progress"),
+            evaluate_scope_result=_satisfied_scope_result(),
+            force=True, reason="just in case",
+        )
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["override_applied"])
+        self.assertEqual(result["override_id"], "")
+        self._last_mock_record_override.assert_not_called()
+
+    def test_configuration_error_rejects_without_force(self):
+        result = self._call(
+            target_status="done", stage=_stage(status="in_progress"),
+            evaluate_scope_result=_configuration_error_scope_result(
+                errors=(("STAGE-001", "REL-999", "dangling entity"),),
+            ),
+        )
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "STAGE_DOCUMENT_REQUIREMENTS_CONFIGURATION_ERROR")
+        self.assertIn("REL-999", result["configuration_error_details"])
+        self.assertNotEqual(result["code"], "STAGE_DOCUMENT_GATE_BLOCKED")
+
+    def test_configuration_error_with_force_completes_and_audits_with_correct_type(self):
+        result = self._call(
+            target_status="done", stage=_stage(status="in_progress"),
+            evaluate_scope_result=_configuration_error_scope_result(
+                errors=(("STAGE-001", "REL-999", "dangling entity"),),
+            ),
+            force=True, reason="fixing later",
+        )
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["override_applied"])
+        self.assertEqual(result["override_type"], "configuration_error")
+        self._last_mock_record_override.assert_called_once()
+        _, kwargs = self._last_mock_record_override.call_args
+        self.assertEqual(kwargs["override_type"], "configuration_error")
+        self.assertIn("REL-999", kwargs["configuration_error_details"])
+
+    def test_skipped_transition_does_not_go_through_gate(self):
+        result = self._call(target_status="skipped", stage=_stage(status="in_progress"))
+        self._last_mock_evaluate_scope.assert_not_called()
+        self.assertTrue(result["ok"])
+
+    def test_blocked_to_skipped_does_not_go_through_gate(self):
+        result = self._call(target_status="skipped", stage=_stage(status="blocked"))
+        self._last_mock_evaluate_scope.assert_not_called()
+        self.assertTrue(result["ok"])
+
+    def test_pending_to_in_progress_does_not_go_through_gate(self):
+        result = self._call(target_status="in_progress", stage=_stage(status="pending"))
+        self._last_mock_evaluate_scope.assert_not_called()
+        self.assertTrue(result["ok"])
+
+    def test_audit_not_created_when_status_write_fails(self):
+        result = self._call(
+            target_status="done", stage=_stage(status="in_progress"),
+            evaluate_scope_result=_blocking_missing_scope_result(),
+            write_result=_write_result(ok=False, error="sheets exploded"),
+            force=True, reason="approved",
+        )
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "STAGE_WRITE_PARTIAL_FAILURE")
+        self._last_mock_record_override.assert_not_called()
+
+    def test_audit_write_failure_after_successful_done_returns_warning_but_status_stays_done(self):
+        result = self._call(
+            target_status="done", stage=_stage(status="in_progress"),
+            evaluate_scope_result=_blocking_missing_scope_result(),
+            force=True, reason="approved",
+            record_override_result=_override_write_result(ok=False, error="append failed"),
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["final_status"], "done")
+        self.assertTrue(result["partial_success"])
+        self.assertTrue(any("append failed" in f for f in result["downstream_failures"]))
+
+    def test_repeated_done_does_not_create_new_override_audit(self):
+        """A second 'done' call after the Stage is already done is a
+        no-op self-loop (STAGE_STATUS_UNCHANGED, done->done is allowed
+        by _STAGE_ORDINARY_TRANSITIONS as an identity transition) — the
+        gate only ever activates for previous_status=="in_progress", so
+        it's never reached here and no second override audit row is
+        ever created."""
+        result = self._call(
+            target_status="done", stage=_stage(status="done"),
+            write_result=_write_result(previous="done", new="done", changed=False),
+        )
+        self._last_mock_evaluate_scope.assert_not_called()
+        self._last_mock_record_override.assert_not_called()
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["code"], "STAGE_STATUS_UNCHANGED")
+        self.assertFalse(result["changed"])
+
+    def test_gate_only_calls_evaluate_scope_with_stage_id(self):
+        self._call(target_status="done", stage=_stage(status="in_progress"), stage_id="STAGE-001")
+        self._last_mock_evaluate_scope.assert_called_once_with("stage", "STAGE-001")
+
+
+class TestUpdateStageStatusInSheetStillDocumentAgnostic(unittest.TestCase):
+    """Phase 43 architectural guard: the gate lives ONLY in
+    business_builder.transition_stage_status() — roadmap_manager.
+    update_stage_status_in_sheet() must remain completely unaware of
+    documents/relations, exactly as test_updatestage_reliability.py's
+    TestNoCouplingToDocumentsOrRelationsOrGTD already locks in. Re-
+    asserted here as a cross-file guard so a future edit to THIS phase
+    can't accidentally weaken that invariant without a second, loud
+    failure."""
+
+    def test_update_stage_status_in_sheet_has_no_document_requirements_import(self):
+        import business_core.roadmap_manager as rm
+        import inspect
+        src = inspect.getsource(rm.update_stage_status_in_sheet)
+        self.assertNotIn("document_requirements", src)
+        self.assertNotIn("evaluate_scope", src)
+        self.assertNotIn("stage_entity_relations", src)
 
 
 if __name__ == "__main__":

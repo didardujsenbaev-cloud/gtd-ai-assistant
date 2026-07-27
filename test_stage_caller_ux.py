@@ -386,5 +386,103 @@ class TestAdminUX(_AsyncTestCase):
         self.assertNotIn("Traceback", reply)
 
 
+# ─────────────────────────────────────────────────────────────
+# Phase 43: Document Completion Gate — /updatestage force/reason/User wiring
+# ─────────────────────────────────────────────────────────────
+
+class TestDocumentCompletionGateCallerUX(_AsyncTestCase):
+    def _invoke(self, th, result: dict, cmdline: str, effective_user=None):
+        update, context = _make_update(cmdline, cmdline.split()[1:])
+        if effective_user is not None:
+            update.effective_user = effective_user
+        with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
+             patch("business_core.business_builder.transition_stage_status", return_value=result) as mock_transition:
+            self.run_async(th.updatestage_cmd(update, context))
+        return _last_reply(update), mock_transition
+
+    def test_force_yes_and_reason_and_actor_passed_through(self):
+        th = _fresh_th()
+        user = MagicMock(username="dida", id=123)
+        result = _transition_result(
+            previous_status="in_progress", requested_status="done", final_status="done",
+            override_applied=True, override_type="missing_blocking_documents", override_id="SCO-001",
+        )
+        reply, mock_transition = self._invoke(
+            th, result,
+            '/updatestage stage_id=STAGE-001 status=done force=yes reason="manager approved"',
+            effective_user=user,
+        )
+        args, kwargs = mock_transition.call_args
+        self.assertEqual(args[0], "STAGE-001")
+        self.assertEqual(args[1], "done")
+        self.assertTrue(kwargs.get("force"))
+        self.assertEqual(kwargs.get("reason"), "manager approved")
+        self.assertEqual(kwargs.get("actor"), "dida")
+        self.assertIn("✅", reply)
+        self.assertIn("SCO-001", reply)
+
+    def test_force_omitted_defaults_to_false(self):
+        th = _fresh_th()
+        result = _transition_result(previous_status="in_progress", requested_status="done", final_status="done")
+        _, mock_transition = self._invoke(th, result, "/updatestage stage_id=STAGE-001 status=done")
+        _, kwargs = mock_transition.call_args
+        self.assertFalse(kwargs.get("force"))
+        self.assertIsNone(kwargs.get("reason"))
+
+    def test_force_no_without_reason_is_not_treated_as_force(self):
+        th = _fresh_th()
+        result = _transition_result(previous_status="in_progress", requested_status="done", final_status="done")
+        _, mock_transition = self._invoke(th, result, "/updatestage stage_id=STAGE-001 status=done force=no")
+        _, kwargs = mock_transition.call_args
+        self.assertFalse(kwargs.get("force"))
+
+    def test_gate_blocked_message_shows_missing_doc_ids(self):
+        th = _fresh_th()
+        result = {
+            "ok": False, "code": "STAGE_DOCUMENT_GATE_BLOCKED",
+            "error": "У этапа STAGE-001 есть незакрытые обязательные требования: DOC-008",
+            "stage_id": "STAGE-001", "roadmap_id": "RM-001",
+            "previous_status": "in_progress", "requested_status": "done", "final_status": "in_progress",
+            "missing_blocking_doc_ids": ("DOC-008",),
+        }
+        reply, _ = self._invoke(th, result, "/updatestage stage_id=STAGE-001 status=done")
+        self.assertIn("DOC-008", reply)
+        self.assertIn("force=yes", reply)
+
+    def test_configuration_error_message_distinct_from_gate_blocked(self):
+        th = _fresh_th()
+        result = {
+            "ok": False, "code": "STAGE_DOCUMENT_REQUIREMENTS_CONFIGURATION_ERROR",
+            "error": "broken", "stage_id": "STAGE-001", "roadmap_id": "RM-001",
+            "previous_status": "in_progress", "requested_status": "done", "final_status": "in_progress",
+            "configuration_error_details": "STAGE-001/REL-999: dangling entity",
+        }
+        reply, _ = self._invoke(th, result, "/updatestage stage_id=STAGE-001 status=done")
+        self.assertIn("REL-999", reply)
+        self.assertNotIn("DOC-", reply)
+
+    def test_override_reason_required_message(self):
+        th = _fresh_th()
+        result = {
+            "ok": False, "code": "STAGE_DOCUMENT_GATE_OVERRIDE_REASON_REQUIRED",
+            "error": "force=yes требует reason", "stage_id": "STAGE-001", "roadmap_id": "RM-001",
+            "previous_status": "in_progress", "requested_status": "done", "final_status": "in_progress",
+        }
+        reply, _ = self._invoke(th, result, "/updatestage stage_id=STAGE-001 status=done force=yes")
+        self.assertIn("❌", reply)
+        self.assertIn("force=yes", reply)
+
+    def test_no_free_text_confirm_word_used_anywhere_in_command_source(self):
+        """Phase 43 audit п.22: the override must never rely on a free-
+        text 'подтвердить' — only explicit force=/reason= parameters."""
+        from pathlib import Path
+        path = Path(__file__).parent / "business_core" / "telegram_handlers.py"
+        src = path.read_text(encoding="utf-8")
+        start = src.index("async def updatestage_cmd")
+        end = src.index("\nasync def ", start + 10)
+        body = src[start:end]
+        self.assertNotIn("подтвердить", body.lower())
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

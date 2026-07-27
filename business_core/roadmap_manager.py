@@ -2360,3 +2360,69 @@ def update_stage_fields(stage_id: str, writes: dict) -> dict:
     except Exception as exc:
         log.error(f"update_stage_fields({stage_id}) error: {exc}")
         return {"ok": False, "stage_id": stage_id, "written_fields": (), "error": str(exc)}
+
+
+def record_stage_completion_override(
+    *, stage_id: str, roadmap_id: str, user: str, reason: str,
+    missing_blocking_doc_ids: tuple = (), previous_status: str = "", target_status: str = "done",
+    override_type: str = "missing_blocking_documents", configuration_error_details: str = "",
+    timestamp: str | None = None,
+) -> dict:
+    """
+    Phase 43 (Document Completion Gate): sole write primitive for the
+    STAGE_COMPLETION_OVERRIDES audit trail — append-only, one row per
+    successful force=yes bypass of business_builder.
+    transition_stage_status()'s document completion gate. Never called
+    for a Stage transition the gate would have allowed anyway (the
+    caller decides that; this function only ever appends what it's
+    given).
+
+    No update/delete path exists anywhere for this registry — it is a
+    pure historical record. Never touches ROADMAP_STAGES or ROADMAPS.
+
+    Args:
+        override_type: "missing_blocking_documents" or
+            "configuration_error" — which failure mode was overridden;
+            never both in one row (the gate itself decides which one
+            applied for a given call).
+
+    Returns:
+        {"ok": bool, "override_id": str, "error": str | None}
+    """
+    if not stage_id or not roadmap_id or not reason:
+        return {
+            "ok": False, "override_id": "",
+            "error": "stage_id, roadmap_id и reason обязательны",
+        }
+
+    try:
+        from business_core.sheets import (
+            append_business_row, generate_next_id, get_business_sheet, row_from_header_map,
+        )
+
+        ts = timestamp or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        override_id = generate_next_id("stage_completion_overrides")
+
+        sheet = get_business_sheet("stage_completion_overrides")
+        headers = sheet.row_values(1)
+        values = {
+            "Override ID": override_id,
+            "Stage ID": stage_id,
+            "Roadmap ID": roadmap_id,
+            "User": user,
+            "Overridden At": ts,
+            "Reason": reason,
+            "Missing Blocking Doc IDs": ", ".join(missing_blocking_doc_ids),
+            "Previous Status": previous_status,
+            "Target Status": target_status,
+            "Override Type": override_type,
+            "Configuration Error Details": configuration_error_details,
+        }
+        row = row_from_header_map(headers, values)
+        append_business_row("stage_completion_overrides", row)
+
+        return {"ok": True, "override_id": override_id, "error": None}
+
+    except Exception as exc:
+        log.error(f"record_stage_completion_override({stage_id}) error: {exc}")
+        return {"ok": False, "override_id": "", "error": str(exc)}

@@ -2177,12 +2177,20 @@ def _stage_transition_result(
     progress_before: int | None = None, progress_after: int | None = None,
     roadmap_status_before: str = "", roadmap_status_after: str = "",
     retry_safe: bool = True,
+    missing_blocking_doc_ids: tuple = (), configuration_error_details: str = "",
+    override_applied: bool = False, override_type: str = "", override_id: str = "",
 ) -> dict:
     """
     Shared result-builder for transition_stage_status() and
     update_stage_admin_fields() (ADR-017 Decision 12) — the stable,
     structured contract every caller (Telegram or otherwise) reads
     instead of a bare exception or ad-hoc dict shape.
+
+    Phase 43 (Document Completion Gate) additive fields:
+    missing_blocking_doc_ids/configuration_error_details/override_applied/
+    override_type/override_id all default to their empty/False state, so
+    any result built without the gate (which is every result for every
+    transition other than in_progress->done) is unaffected.
     """
     return {
         "ok": ok,
@@ -2203,6 +2211,11 @@ def _stage_transition_result(
         "roadmap_status_before": roadmap_status_before,
         "roadmap_status_after": roadmap_status_after,
         "retry_safe": retry_safe,
+        "missing_blocking_doc_ids": tuple(missing_blocking_doc_ids),
+        "configuration_error_details": configuration_error_details,
+        "override_applied": override_applied,
+        "override_type": override_type,
+        "override_id": override_id,
     }
 
 
@@ -2234,6 +2247,9 @@ def transition_stage_status(
     target_status: str,
     notes: Optional[str] = None,
     admin_fields: Optional[dict] = None,
+    force: bool = False,
+    reason: Optional[str] = None,
+    actor: str = "",
 ) -> dict:
     """
     Phase 34C (ADR-017): the sole canonical Stage-transition
@@ -2256,11 +2272,40 @@ def transition_stage_status(
          (STAGE_REOPEN_REQUIRES_EXPLICIT_ACTION for an ordinary attempt
          to leave done/skipped; INVALID_STAGE_TRANSITION for any other
          disallowed pair)
+      F.5. Document completion gate (Phase 43) — ONLY when
+         previous_status=="in_progress" and target_status=="done";
+         every other transition (including anything to/from "skipped")
+         skips this step entirely and never calls evaluate_scope().
+         Uses document_requirements_query.evaluate_scope("stage", stage_id):
+           - no structured requirements configured, or all satisfied ->
+             allowed, not an error
+           - only optional missing -> allowed, warning appended
+           - blocking_missing > 0 -> blocked (STAGE_DOCUMENT_GATE_BLOCKED)
+             unless force=True (+ non-blank reason)
+           - has_configuration_errors -> blocked
+             (STAGE_DOCUMENT_REQUIREMENTS_CONFIGURATION_ERROR), a
+             DIFFERENT code from the missing-documents case, unless
+             force=True (+ non-blank reason)
+           - force=True with an empty/blank reason is rejected up front
+             (STAGE_DOCUMENT_GATE_OVERRIDE_REASON_REQUIRED), before
+             evaluate_scope() is even called
+         On block, Status/Completed At/Roadmap Progress are all
+         untouched — the function returns before step G, exactly like
+         every other pre-write validation failure.
       G. persist Stage status (roadmap_manager.update_stage_status_in_sheet),
          plus any admin_fields (Blocking Reason, for /blockstage/
          /unblockstage's coupled write) via roadmap_manager.
          update_stage_fields — gated behind the SAME eligibility check
          above, never a second, independent one
+      G.5. Document completion gate override audit (Phase 43) — a row is
+         appended to STAGE_COMPLETION_OVERRIDES via roadmap_manager.
+         record_stage_completion_override() ONLY when force=True
+         actually bypassed a real block above (never for a force=yes
+         call where the gate wouldn't have blocked anyway — that would
+         make the audit trail meaningless). Written only after the
+         Status write in G already succeeded. A failure recording this
+         row does NOT roll back the Status write — surfaced via
+         partial_success/downstream_failures.
       H. recalculate Roadmap progress, only if Status actually changed
       I. maybe auto-complete Roadmap, only after a successful recalculation
       J. return the structured result (ADR-017 §12)
@@ -2290,12 +2335,24 @@ def transition_stage_status(
                        back to "pending" together), so neither can bypass
                        Roadmap eligibility by splitting the two writes
                        across separate calls.
+        force:         explicit management override of the Phase 43
+                       document completion gate (in_progress->done only;
+                       has no effect on any other transition). Requires
+                       a non-blank `reason`.
+        reason:        required (non-blank) whenever force=True; recorded
+                       verbatim in the STAGE_COMPLETION_OVERRIDES audit
+                       row when the override actually bypasses a block.
+        actor:         who is performing this call (e.g. Telegram
+                       username via telegram_handlers._telegram_username())
+                       — recorded as "User" in the audit row. Never
+                       required unless force actually bypasses a block.
 
     Returns:
         See _stage_transition_result() for the full field list.
     """
     from business_core.roadmap_manager import (
         STAGE_STATUS_CANONICAL, find_stage_by_id, find_roadmap_by_id,
+        record_stage_completion_override,
         update_stage_status_in_sheet, update_stage_fields,
         recalculate_roadmap_progress, maybe_complete_roadmap,
         normalize_roadmap_status,
@@ -2396,6 +2453,89 @@ def transition_stage_status(
             retry_safe=True,
         )
 
+    # F.5. Document completion gate (Phase 43) — only for the specific
+    # in_progress -> done edge; every other transition (including any
+    # path to/from "skipped") is completely unaffected and never calls
+    # evaluate_scope() at all.
+    gate_missing_blocking_doc_ids: tuple = ()
+    gate_configuration_error_details = ""
+    gate_override_type = ""
+    gate_optional_missing_warning: str | None = None
+
+    if previous_status == "in_progress" and target_status == "done":
+        if force and not (reason or "").strip():
+            return _stage_transition_result(
+                ok=False, code="STAGE_DOCUMENT_GATE_OVERRIDE_REASON_REQUIRED",
+                error="force=yes требует непустой reason.",
+                stage_id=stage_id, roadmap_id=roadmap_id,
+                previous_status=previous_status, requested_status=target_status,
+                final_status=previous_status,
+                roadmap_status_before=roadmap_status_before,
+                roadmap_status_after=roadmap_status_before,
+                retry_safe=True,
+            )
+
+        from business_core.document_requirements_query import evaluate_scope
+        scope_result = evaluate_scope("stage", stage_id)
+        summary = scope_result.summary if scope_result.exists else None
+
+        # No structured requirements configured at all (summary is None,
+        # or a real summary with zero items and no configuration errors)
+        # — completion is allowed, this is not an error (ADR — audit п.10).
+        gate_blocking = bool(summary is not None and summary.blocking_missing > 0)
+        gate_configuration_error = bool(summary is not None and summary.has_configuration_errors)
+
+        if gate_configuration_error:
+            gate_configuration_error_details = "; ".join(
+                f"{err_stage_id or '—'}/{relation_id or '—'}: {reason}"
+                for err_stage_id, relation_id, reason in summary.configuration_errors
+            )
+            if not force:
+                return _stage_transition_result(
+                    ok=False, code="STAGE_DOCUMENT_REQUIREMENTS_CONFIGURATION_ERROR",
+                    error=(
+                        f"Настройка требований к документам этапа {stage_id} повреждена: "
+                        f"{gate_configuration_error_details}"
+                    ),
+                    stage_id=stage_id, roadmap_id=roadmap_id,
+                    previous_status=previous_status, requested_status=target_status,
+                    final_status=previous_status,
+                    roadmap_status_before=roadmap_status_before,
+                    roadmap_status_after=roadmap_status_before,
+                    retry_safe=True,
+                    configuration_error_details=gate_configuration_error_details,
+                )
+            gate_override_type = "configuration_error"
+
+        elif gate_blocking:
+            gate_missing_blocking_doc_ids = tuple(
+                item.requirement.document_template_id for item in summary.items if item.is_blocking
+            )
+            if not force:
+                return _stage_transition_result(
+                    ok=False, code="STAGE_DOCUMENT_GATE_BLOCKED",
+                    error=(
+                        f"У этапа {stage_id} есть незакрытые обязательные (blocking) "
+                        f"требования к документам: {', '.join(gate_missing_blocking_doc_ids)}"
+                    ),
+                    stage_id=stage_id, roadmap_id=roadmap_id,
+                    previous_status=previous_status, requested_status=target_status,
+                    final_status=previous_status,
+                    roadmap_status_before=roadmap_status_before,
+                    roadmap_status_after=roadmap_status_before,
+                    retry_safe=True,
+                    missing_blocking_doc_ids=gate_missing_blocking_doc_ids,
+                )
+            gate_override_type = "missing_blocking_documents"
+
+        elif summary is not None and summary.optional_missing > 0:
+            # Only optional documents missing — allowed, surfaced as a
+            # warning rather than silently ignored (ADR audit п.4).
+            gate_optional_missing_warning = (
+                f"У этапа {stage_id} не хватает {summary.optional_missing} "
+                f"необязательных (optional) документов — завершение разрешено."
+            )
+
     # G. Persist Stage status (+ any coupled admin_fields).
     write_result = update_stage_status_in_sheet(stage_id, target_status, notes=notes)
     if not write_result["ok"]:
@@ -2424,6 +2564,42 @@ def transition_stage_status(
         else:
             partial_success = True
             downstream_failures.append(f"Не удалось обновить дополнительные поля: {admin_result.get('error')}")
+
+    if gate_optional_missing_warning:
+        warnings.append(gate_optional_missing_warning)
+
+    # Audit trail (Phase 43): only written when the gate actually had
+    # something to override (gate_override_type is non-empty only when
+    # force=True genuinely bypassed a real block, per the gate logic
+    # above — never for a force=yes call where nothing was blocking, so
+    # a repeat "done" call or an unnecessary force=yes never creates a
+    # second/duplicate row). Written only now, AFTER the Status write
+    # above already succeeded (changed is guaranteed True here, since
+    # previous_status="in_progress" != target_status="done" by
+    # construction) — never before, and never if that write had failed
+    # (this code path is unreachable in that case, see the early return
+    # a few lines above). A failure recording the audit row does NOT
+    # roll back the already-confirmed Status write — surfaced via
+    # partial_success/downstream_failures, the same principle already
+    # used for progress-recalculation/auto-completion failures below.
+    override_applied = False
+    override_id = ""
+    if gate_override_type:
+        override_applied = True
+        override_result = record_stage_completion_override(
+            stage_id=stage_id, roadmap_id=roadmap_id, user=actor, reason=(reason or "").strip(),
+            missing_blocking_doc_ids=gate_missing_blocking_doc_ids,
+            previous_status=previous_status, target_status=target_status,
+            override_type=gate_override_type,
+            configuration_error_details=gate_configuration_error_details,
+        )
+        if override_result["ok"]:
+            override_id = override_result["override_id"]
+        else:
+            partial_success = True
+            downstream_failures.append(
+                f"Override применён, но запись в audit trail не удалась: {override_result.get('error')}"
+            )
 
     progress_before = None
     progress_after = None
@@ -2465,6 +2641,9 @@ def transition_stage_status(
         progress_before=progress_before, progress_after=progress_after,
         roadmap_status_before=roadmap_status_before, roadmap_status_after=roadmap_status_after,
         retry_safe=True,
+        missing_blocking_doc_ids=gate_missing_blocking_doc_ids,
+        configuration_error_details=gate_configuration_error_details,
+        override_applied=override_applied, override_type=gate_override_type, override_id=override_id,
     )
 
 
