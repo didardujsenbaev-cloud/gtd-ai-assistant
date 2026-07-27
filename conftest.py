@@ -222,6 +222,10 @@ _LEAD_DOMAIN_TEST_FILES = frozenset({
     "test_business_lead_foundation.py",
     "test_lead_architecture_guards.py",
     "test_lead_mock_completeness.py",
+    # Phase 41D (ADR-024): Lead caller (Telegram) UX test file —
+    # registered BEFORE any test logic was written, per the PRS-003
+    # precedent.
+    "test_lead_caller_ux.py",
 })
 
 _HARD_SOCKET_BLOCK_TEST_FILES = (

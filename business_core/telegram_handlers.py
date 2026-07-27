@@ -8666,6 +8666,763 @@ async def archiveoffer_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await _reply(update, "❌ Не удалось архивировать Commercial Offer.", parse_mode=None)
 
 
+# ─────────────────────────────────────────────────────────────
+# Phase 41D (ADR-024): Lead / Sales Funnel Domain caller (Telegram) UX.
+#
+# Every command below is a thin resolve-args -> call-canonical-
+# orchestration -> render-message wrapper — no business logic beyond
+# what business_builder/lead_manager already returns. Centralized
+# result-code -> Russian message mapping below mirrors the Phase 40D
+# Commercial Offer UX pattern exactly. Contact values (Phone/WhatsApp/
+# Email/Contact Name) are never shown in raw form in any reply — only
+# through the masking helpers below — and are never logged.
+# ─────────────────────────────────────────────────────────────
+
+_LEAD_STATUS_RU: dict[str, str] = {
+    "new": "Новый", "contacted": "На связи", "qualified": "Квалифицирован",
+    "unqualified": "Не подходит", "converted": "Конвертирован", "lost": "Потерян", "archived": "В архиве",
+}
+
+
+def _lead_status_ru(status: str) -> str:
+    return f"{_LEAD_STATUS_RU.get(status, status)} ({status})"
+
+
+def _mask_lead_phone_like(value: str) -> str:
+    """Caller-only masking — preserves at most the final 4 digits,
+    never leaks the full number. Used for both Phone and WhatsApp."""
+    if not value:
+        return ""
+    has_plus = value.startswith("+")
+    digits = value[1:] if has_plus else value
+    if len(digits) <= 4:
+        masked = "*" * len(digits)
+    else:
+        masked = "*" * (len(digits) - 4) + digits[-4:]
+    return f"{'+' if has_plus else ''}{masked}"
+
+
+def _mask_lead_email(value: str) -> str:
+    """Caller-only masking — shows only the first local-part character
+    plus the domain, never the complete address."""
+    if not value or "@" not in value:
+        return ""
+    local, _, domain = value.partition("@")
+    if len(local) <= 1:
+        masked_local = local
+    else:
+        masked_local = local[0] + "*" * (len(local) - 1)
+    return f"{masked_local}@{domain}"
+
+
+def _mask_lead_contact_summary(lead: dict) -> str:
+    """Combined masked contact-channel summary for list/detail views —
+    never the raw Phone/WhatsApp/Email Snapshot values."""
+    parts = []
+    phone = lead.get("Phone Snapshot", "")
+    whatsapp = lead.get("WhatsApp Snapshot", "")
+    email = lead.get("Email Snapshot", "")
+    if phone:
+        parts.append(f"Тел: {_mask_lead_phone_like(phone)}")
+    if whatsapp:
+        parts.append(f"WhatsApp: {_mask_lead_phone_like(whatsapp)}")
+    if email:
+        parts.append(f"Email: {_mask_lead_email(email)}")
+    return ", ".join(parts) if parts else "—"
+
+
+def _mask_lead_contact_name(name: str) -> str:
+    """Bounded contact-name display for the exact-ID detail view only
+    (/lead) — first name plus a single last-name initial. List views
+    (/leads) never show any part of Contact Name Snapshot at all."""
+    if not name:
+        return "—"
+    parts = name.strip().split()
+    if len(parts) == 1:
+        return parts[0]
+    return f"{parts[0]} {parts[1][0]}."
+
+
+def _format_lead_expected_value(expected_value: str, currency: str) -> str:
+    """Caller-only display formatting. Always labeled as a non-binding
+    estimate — never called agreed price, Offer amount, or payable
+    amount. Never recomputes; renders exactly the canonical Decimal
+    string Foundation already produced."""
+    if not expected_value:
+        return "—"
+    return f"~{expected_value} {currency} (оценка, не является согласованной суммой)".strip()
+
+
+def _format_lead_follow_up_lines(lead: dict) -> list[str]:
+    """Display-only follow-up rendering — never writes, never mutates
+    Status. Distinguishes the stored timestamps from the derived
+    due-warning (is_lead_follow_up_due())."""
+    from business_core.business_builder import is_lead_follow_up_due
+
+    lines = []
+    next_follow_up = lead.get("Next Follow-up At", "")
+    last_contacted = lead.get("Last Contacted At", "")
+    if next_follow_up:
+        lines.append(f"Следующее касание: {next_follow_up}")
+    if last_contacted:
+        lines.append(f"Последний контакт: {last_contacted}")
+    if is_lead_follow_up_due(lead):
+        lines.append("⏰ Follow-up просрочен")
+    return lines
+
+
+def _lead_duplicate_warning_lines(result: dict) -> list[str]:
+    """Duplicate-contact warning — never blocks, never reveals matching
+    contact values, never auto-merges, never picks one arbitrarily.
+    Discloses every bounded matching Lead ID."""
+    duplicate_ids = result.get("duplicate_contact_ids", ())
+    if not duplicate_ids:
+        return []
+    ids = ", ".join(duplicate_ids)
+    return ["", f"⚠️ Похожий контакт уже встречается в Lead: {ids}", "Это только предупреждение — новая запись не объединена с ними."]
+
+
+def _lead_creation_message(result: dict) -> str:
+    """Render any business_builder.create_lead() result."""
+    code = result.get("code", "")
+
+    if code == "LEAD_CREATED":
+        lines = [
+            "✅ Lead создан",
+            f"Lead ID: {result.get('lead_id', '')}",
+            f"Статус: {_lead_status_ru(result.get('final_status', ''))}",
+        ]
+        if result.get("service_id"):
+            lines.append(f"Service: {result['service_id']}")
+        if result.get("expected_value"):
+            lines.append(f"Ожидаемая сумма: {_format_lead_expected_value(result.get('expected_value', ''), result.get('currency', ''))}")
+        lines.extend(_lead_duplicate_warning_lines(result))
+        return "\n".join(lines)
+
+    if code == "LEAD_REUSED":
+        return "\n".join([
+            "♻️ Lead с этим ключом уже существует — использована существующая запись",
+            f"Lead ID: {result.get('lead_id', '')}",
+            f"Статус: {_lead_status_ru(result.get('final_status', ''))}",
+        ])
+
+    if code == "BUSINESS_NOT_FOUND":
+        return f"❌ Business не найден: {result.get('error') or ''}"
+
+    if code == "SERVICE_NOT_FOUND":
+        return "❌ Указанный Service не найден."
+
+    if code == "CHANNEL_NOT_FOUND":
+        return "❌ Указанный Channel не найден."
+
+    if code == "PERSON_NOT_FOUND":
+        return "❌ Указанный Assigned Person не найден или архивирован."
+
+    if code == "LEAD_RELATION_MISMATCH":
+        return f"❌ Несогласованные ссылки на сущности: {result.get('error') or 'см. логи'}"
+
+    if code == "LEAD_CONTACT_NAME_REQUIRED":
+        return "❌ Укажи contact_name (не более 300 символов)."
+
+    if code == "LEAD_CONTACT_CHANNEL_REQUIRED":
+        return "❌ Укажи хотя бы один контактный канал: phone, whatsapp или email."
+
+    if code in ("INVALID_LEAD_PHONE", "INVALID_LEAD_WHATSAPP", "INVALID_LEAD_EMAIL"):
+        return f"❌ {result.get('error') or 'Недопустимый контактный канал.'}"
+
+    if code in ("INVALID_LEAD_EXPECTED_VALUE", "INVALID_LEAD_EXPECTED_VALUE_SCALE", "LEAD_EXPECTED_VALUE_MUST_BE_POSITIVE"):
+        return f"❌ {result.get('error') or 'Недопустимое значение expected_value.'}"
+
+    if code == "INVALID_LEAD_CURRENCY":
+        return f"❌ {result.get('error') or 'Недопустимая валюта.'}"
+
+    if code == "INVALID_LEAD_DATETIME":
+        return f"❌ {result.get('error') or 'Недопустимая дата/время.'}"
+
+    if code == "LEAD_IDEMPOTENCY_REQUIRED":
+        return "❌ Укажи caller_idempotency_key."
+
+    if code == "MULTIPLE_LEAD_MATCHES":
+        ids = ", ".join(result.get("conflicting_ids", ())) or "—"
+        return "\n".join([
+            "⚠️ Обнаружен конфликт целостности данных",
+            f"Найдено несколько Lead с одним ключом: {ids}",
+            "Новый Lead не создан — автоматический выбор одного из них не выполняется.",
+        ])
+
+    if code == "LEAD_PERSISTENCE_FAILED":
+        return f"❌ {result.get('error') or 'Не удалось создать Lead.'}"
+
+    if code == "LEAD_POST_WRITE_VERIFICATION_FAILED":
+        return "\n".join(["⚠️ Lead записан, но пост-проверка записи не прошла.", "Требуется ручная проверка."])
+
+    if not code and result.get("error"):
+        return f"❌ {result['error']}"
+
+    log.warning(f"_lead_creation_message: unmapped code={code!r}")
+    return "❌ Не удалось создать Lead."
+
+
+def _lead_update_message(result: dict, lead_id: str) -> str:
+    """Render any business_builder.update_lead()/update_lead_admin_fields() result."""
+    code = result.get("code", "")
+
+    if code == "LEAD_UPDATED":
+        lines = [f"✅ Lead {lead_id} обновлён."]
+        lines.extend(_lead_duplicate_warning_lines(result))
+        return "\n".join(lines)
+
+    if code == "LEAD_UPDATE_UNCHANGED":
+        return f"ℹ️ Lead {lead_id} — изменений нет (значения совпадают)."
+
+    if code == "LEAD_NOT_FOUND":
+        return f"❌ Lead {lead_id} не найден."
+
+    if code == "LEAD_IMMUTABLE":
+        return f"❌ {result.get('error') or 'Изменение недоступно — поле неизменяемо или Lead не в активном статусе.'}"
+
+    if code == "LEAD_CONTACT_CHANNEL_REQUIRED":
+        return "❌ Укажи хотя бы один контактный канал: phone, whatsapp или email."
+
+    if code in (
+        "LEAD_CONTACT_NAME_REQUIRED", "INVALID_LEAD_PHONE", "INVALID_LEAD_WHATSAPP", "INVALID_LEAD_EMAIL",
+        "INVALID_LEAD_EXPECTED_VALUE", "INVALID_LEAD_EXPECTED_VALUE_SCALE", "LEAD_EXPECTED_VALUE_MUST_BE_POSITIVE",
+        "INVALID_LEAD_CURRENCY", "INVALID_LEAD_DATETIME",
+        "SERVICE_NOT_FOUND", "CHANNEL_NOT_FOUND", "PERSON_NOT_FOUND", "LEAD_RELATION_MISMATCH",
+    ):
+        return f"❌ {result.get('error') or 'Проверьте параметры обновления.'}"
+
+    log.warning(f"_lead_update_message: unmapped code={code!r} lead_id={lead_id}")
+    return f"❌ Ошибка ({code or 'unknown'}): {result.get('error') or 'см. логи'}"
+
+
+def _lead_lifecycle_message(result: dict, lead_id: str, action_label: str) -> str:
+    """
+    Shared renderer for contact/qualify/unqualify/lose/archive results —
+    all share the same underlying _transition_lead() code family plus
+    one action-specific success code.
+    """
+    code = result.get("code", "")
+    previous_status = result.get("previous_status", "")
+
+    success_codes = {
+        "LEAD_CONTACTED": "✅ Lead помечен как 'на связи'",
+        "LEAD_QUALIFIED": "✅ Lead квалифицирован",
+        "LEAD_UNQUALIFIED": "✅ Lead помечен как не подходящий",
+        "LEAD_LOST": "✅ Lead помечен как потерянный",
+        "LEAD_ARCHIVED": "✅ Lead архивирован",
+    }
+    if code in success_codes:
+        return "\n".join([
+            success_codes[code],
+            f"Lead ID: {lead_id}",
+            f"Был: {_lead_status_ru(previous_status)}",
+            f"Стал: {_lead_status_ru(result.get('final_status', ''))}",
+        ])
+
+    if code == "LEAD_STATUS_UNCHANGED":
+        return f"ℹ️ Lead {lead_id} уже имеет статус {_lead_status_ru(previous_status)} — изменений нет."
+
+    if code == "LEAD_NOT_FOUND":
+        return f"❌ Lead {lead_id} не найден."
+
+    if code == "INVALID_LEAD_TRANSITION":
+        return f"❌ Переход '{previous_status}' → '{result.get('requested_status', '')}' не разрешён."
+
+    if code == "LEAD_RESTORE_REQUIRES_EXPLICIT_ACTION":
+        return "\n".join([
+            f"🔒 Lead {lead_id} находится в терминальном статусе {_lead_status_ru(previous_status)}",
+            f"Действие {action_label} не может вернуть его в активную работу.",
+        ])
+
+    if code == "LEAD_DISPOSITION_REASON_REQUIRED":
+        return "❌ Укажи disposition_reason."
+
+    if code == "INVALID_LEAD_DATETIME":
+        return f"❌ {result.get('error') or 'Недопустимая дата/время.'}"
+
+    if code == "LEAD_PERSISTENCE_FAILED":
+        return f"❌ Не удалось изменить статус Lead {lead_id}."
+
+    log.warning(f"_lead_lifecycle_message: unmapped code={code!r} lead_id={lead_id}")
+    return f"❌ Ошибка ({code or 'unknown'}): {result.get('error') or 'см. логи'}"
+
+
+def _lead_conversion_message(result: dict, lead_id: str) -> str:
+    """
+    Render any business_builder.convert_lead() result. The success
+    message intentionally means only that the Lead is now linked to an
+    existing Client and its status is 'converted' — never that a
+    Person/Client/Object/Commercial Offer/Payment was created, and
+    never a "deal won" implication.
+    """
+    code = result.get("code", "")
+    previous_status = result.get("previous_status", "")
+
+    if code == "LEAD_CONVERTED":
+        return "\n".join([
+            "✅ Lead связан с существующим Client и переведён в статус 'converted'",
+            f"Lead ID: {lead_id}",
+            f"Client ID: {result.get('converted_client_id', '')}",
+            f"Был: {_lead_status_ru(previous_status)}",
+        ])
+
+    if code == "LEAD_STATUS_UNCHANGED":
+        return "\n".join([
+            f"ℹ️ Lead {lead_id} уже конвертирован в этот же Client — изменений нет.",
+            f"Client ID: {result.get('converted_client_id', '')}",
+        ])
+
+    if code == "LEAD_CONVERSION_TARGET_CONFLICT":
+        return "\n".join([
+            f"🔒 Lead {lead_id} уже конвертирован в другой Client",
+            f"Текущий Client ID: {result.get('converted_client_id', '')}",
+            "Повторная конверсия в другой Client не разрешена.",
+        ])
+
+    if code == "LEAD_NOT_FOUND":
+        return f"❌ Lead {lead_id} не найден."
+
+    if code == "LEAD_CONVERSION_CLIENT_REQUIRED":
+        return "❌ Укажи converted_client_id."
+
+    if code == "LEAD_CONVERSION_ACTOR_REQUIRED":
+        return "❌ Укажи converted_by."
+
+    if code == "CLIENT_NOT_FOUND":
+        return f"❌ Client не найден: {result.get('error') or ''}"
+
+    if code == "LEAD_RELATION_MISMATCH":
+        return f"❌ {result.get('error') or 'Client принадлежит другому Business.'}"
+
+    if code == "INVALID_LEAD_TRANSITION":
+        return f"❌ Переход '{previous_status}' → 'converted' не разрешён."
+
+    if code == "LEAD_PERSISTENCE_FAILED":
+        return f"❌ Не удалось конвертировать Lead {lead_id}."
+
+    log.warning(f"_lead_conversion_message: unmapped code={code!r} lead_id={lead_id}")
+    return f"❌ Ошибка ({code or 'unknown'}): {result.get('error') or 'см. логи'}"
+
+
+async def newlead_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /newlead business_id=BIZ-001 contact_name=... caller_idempotency_key=...
+             [phone=...] [whatsapp=...] [email=...] [company=...]
+             [service_id=...] [source=...] [channel_id=...]
+             [qualification_notes=...] [expected_value=...] [currency=...]
+             [next_follow_up_at=...] [last_contacted_at=...]
+             [assigned_person_id=...] [created_by=...] [notes=...]
+
+    Creates one Lead. Idempotent via caller_idempotency_key (ADR-024
+    §10) — repeated calls with the same key reuse the existing Lead
+    rather than creating a duplicate. A duplicate-contact match is only
+    ever a warning — it never blocks creation and never auto-merges.
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg(), parse_mode=None)
+        return
+
+    raw = " ".join(context.args or [])
+    args = _parse_kv_args(raw)
+    business_id = args.get("business_id", "")
+    contact_name = args.get("contact_name", "")
+    caller_idempotency_key = args.get("caller_idempotency_key", "")
+
+    if not business_id or not contact_name or not caller_idempotency_key:
+        await _reply(
+            update,
+            "❌ Укажи business_id, contact_name и caller_idempotency_key.\n\nПример:\n"
+            "`/newlead business_id=BIZ-001 contact_name=\"Иван Иванов\" phone=+77001234567 "
+            "caller_idempotency_key=... service_id=SVC-001`", parse_mode=None)
+        return
+
+    try:
+        from business_core.business_builder import create_lead
+
+        result = create_lead(
+            business_id, contact_name,
+            created_by=args.get("created_by", "") or _telegram_username(update),
+            caller_idempotency_key=caller_idempotency_key,
+            phone_snapshot=args.get("phone", ""), whatsapp_snapshot=args.get("whatsapp", ""),
+            email_snapshot=args.get("email", ""), company_snapshot=args.get("company", ""),
+            service_id=args.get("service_id", ""), source=args.get("source", ""), channel_id=args.get("channel_id", ""),
+            qualification_notes=args.get("qualification_notes", ""),
+            expected_value=args.get("expected_value", ""), currency=args.get("currency", ""),
+            next_follow_up_at=args.get("next_follow_up_at", ""), last_contacted_at=args.get("last_contacted_at", ""),
+            assigned_person_id=args.get("assigned_person_id", ""), notes=args.get("notes", ""),
+        )
+        await _reply(update, _lead_creation_message(result), parse_mode=None)
+    except Exception as e:
+        log.error(f"newlead_cmd error: {e}")
+        await _reply(update, "❌ Не удалось создать Lead.", parse_mode=None)
+
+
+_LEADS_LIST_MAX_SHOWN = 20
+
+
+async def leads_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /leads [business_id=...] [service_id=...] [channel_id=...]
+           [assigned_person_id=...] [converted_client_id=...] [status=...]
+           [source=...] [currency=...]
+
+    Read-only, bounded, filtered list of Leads. Archived Leads are
+    excluded by default unless status=archived is explicit. Never shows
+    Contact Name Snapshot, raw Phone/WhatsApp/Email Snapshot, Company
+    Snapshot, Qualification Notes, Disposition Reason, Notes, or Caller
+    Idempotency Key — only a masked contact-channel summary.
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg(), parse_mode=None)
+        return
+
+    raw = " ".join(context.args or [])
+    args = _parse_kv_args(raw)
+    status_filter = args.get("status", "")
+
+    try:
+        from business_core.lead_manager import list_leads
+
+        leads = list_leads(
+            business_id=args.get("business_id", ""), service_id=args.get("service_id", ""),
+            channel_id=args.get("channel_id", ""), assigned_person_id=args.get("assigned_person_id", ""),
+            converted_client_id=args.get("converted_client_id", ""), status=status_filter,
+            source=args.get("source", ""), currency=args.get("currency", ""),
+            include_archived=(status_filter == "archived"),
+        )
+
+        if not leads:
+            await _reply(update, "ℹ️ Leads не найдены.", parse_mode=None)
+            return
+
+        lines = [f"📋 Leads ({len(leads)})", ""]
+        for lead in leads[:_LEADS_LIST_MAX_SHOWN]:
+            entry = f"{lead.get('Lead ID', '')} [{_lead_status_ru(lead.get('Status', ''))}] — {_mask_lead_contact_summary(lead)}"
+            if lead.get("Service ID"):
+                entry += f" | Service: {lead['Service ID']}"
+            if lead.get("Assigned Person ID"):
+                entry += f" | Ответственный: {lead['Assigned Person ID']}"
+            if lead.get("Expected Value"):
+                entry += f" | {_format_lead_expected_value(lead.get('Expected Value', ''), lead.get('Currency', ''))}"
+            lines.append(entry)
+        if len(leads) > _LEADS_LIST_MAX_SHOWN:
+            lines.append(f"\n… показаны первые {_LEADS_LIST_MAX_SHOWN} из {len(leads)}.")
+
+        await _reply(update, "\n".join(lines), parse_mode=None)
+    except Exception as e:
+        log.error(f"leads_cmd error: {e}")
+        await _reply(update, "❌ Не удалось получить список Leads.", parse_mode=None)
+
+
+async def lead_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /lead lead_id=LED-001
+
+    Read-only, exact-ID detail. Hides raw Phone/WhatsApp/Email
+    Snapshot, Company Snapshot, Qualification Notes, Disposition
+    Reason, Notes, and Caller Idempotency Key. Contact name shown only
+    in bounded form (first name + last-name initial).
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg(), parse_mode=None)
+        return
+
+    raw = " ".join(context.args or [])
+    args = _parse_kv_args(raw)
+    lead_id = args.get("lead_id") or args.get("_pos0", "")
+
+    if not lead_id:
+        await _reply(update, "❌ Укажи lead_id.\n\nПример: /lead lead_id=LED-001", parse_mode=None)
+        return
+
+    try:
+        from business_core.lead_manager import find_lead_by_id
+
+        lead = find_lead_by_id(lead_id)
+        if lead is None:
+            await _reply(update, f"❌ Lead {lead_id} не найден.", parse_mode=None)
+            return
+
+        lines = [
+            f"📋 Lead {lead.get('Lead ID', '')}",
+            "",
+            f"Business: {lead.get('Business ID', '')}",
+            f"Контакт: {_mask_lead_contact_name(lead.get('Contact Name Snapshot', ''))} ({_mask_lead_contact_summary(lead)})",
+            f"Статус: {_lead_status_ru(lead.get('Status', ''))}",
+        ]
+        for key, label in (("Service ID", "Service"), ("Source", "Источник"), ("Channel ID", "Channel"), ("Assigned Person ID", "Ответственный")):
+            if lead.get(key):
+                lines.append(f"{label}: {lead[key]}")
+        if lead.get("Expected Value"):
+            lines.append(f"Ожидаемая сумма: {_format_lead_expected_value(lead.get('Expected Value', ''), lead.get('Currency', ''))}")
+        lines.extend(_format_lead_follow_up_lines(lead))
+        if lead.get("Converted Client ID"):
+            lines.append(f"Конвертирован в Client: {lead['Converted Client ID']}")
+            if lead.get("Converted At"):
+                lines.append(f"Конвертирован: {lead['Converted At']}")
+        lines.append(f"Создан: {lead.get('Created At', '')}")
+        if lead.get("Updated At"):
+            lines.append(f"Обновлён: {lead['Updated At']}")
+
+        await _reply(update, "\n".join(lines), parse_mode=None)
+    except Exception as e:
+        log.error(f"lead_cmd error: {e}")
+        await _reply(update, "❌ Не удалось получить Lead.", parse_mode=None)
+
+
+async def updatelead_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /updatelead lead_id=LED-001 phone=... (active status only)
+    /updatelead lead_id=LED-001 notes=... (any status)
+
+    Active-field mode and Notes-only mode are mutually exclusive —
+    mirrors /updateoffer's Foundation UX exactly.
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg(), parse_mode=None)
+        return
+
+    raw = " ".join(context.args or [])
+    args = _parse_kv_args(raw)
+    lead_id = args.get("lead_id", "")
+
+    if not lead_id:
+        await _reply(
+            update,
+            "❌ Укажи lead_id.\n\nПример:\n"
+            "`/updatelead lead_id=LED-001 phone=+77001234567`\n"
+            "`/updatelead lead_id=LED-001 notes=...`", parse_mode=None)
+        return
+
+    active_field_map = {
+        "contact_name": "Contact Name Snapshot", "phone": "Phone Snapshot", "whatsapp": "WhatsApp Snapshot",
+        "email": "Email Snapshot", "company": "Company Snapshot", "service_id": "Service ID",
+        "source": "Source", "channel_id": "Channel ID", "qualification_notes": "Qualification Notes",
+        "expected_value": "Expected Value", "currency": "Currency",
+        "next_follow_up_at": "Next Follow-up At", "last_contacted_at": "Last Contacted At",
+        "assigned_person_id": "Assigned Person ID",
+    }
+    active_updates = {header: args[key] for key, header in active_field_map.items() if key in args}
+    has_notes = "notes" in args
+
+    if active_updates and has_notes:
+        await _reply(
+            update,
+            "❌ Нельзя одновременно менять контактные/коммерческие поля и Notes.\n"
+            "Отправь две отдельные команды:\n"
+            "`/updatelead lead_id=... phone=...`\n"
+            "`/updatelead lead_id=... notes=...`", parse_mode=None)
+        return
+
+    if not active_updates and not has_notes:
+        await _reply(update, "❌ Укажи хотя бы одно поле для обновления (например phone=... или notes=...).", parse_mode=None)
+        return
+
+    try:
+        if active_updates:
+            from business_core.business_builder import update_lead
+            result = update_lead(lead_id, active_updates)
+            await _reply(update, _lead_update_message(result, lead_id), parse_mode=None)
+            return
+
+        from business_core.business_builder import update_lead_admin_fields
+        result = update_lead_admin_fields(lead_id, {"Notes": args["notes"]})
+        await _reply(update, _lead_update_message(result, lead_id), parse_mode=None)
+    except Exception as e:
+        log.error(f"updatelead_cmd error: {e}")
+        await _reply(update, "❌ Не удалось обновить Lead.", parse_mode=None)
+
+
+async def contactlead_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /contactlead lead_id=LED-001 [last_contacted_at=...]
+
+    Explicit allowed → contacted. last_contacted_at is optional — if
+    omitted, Last Contacted At is left unchanged (no automatic
+    "now" is ever invented by the caller).
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg(), parse_mode=None)
+        return
+
+    raw = " ".join(context.args or [])
+    args = _parse_kv_args(raw)
+    lead_id = args.get("lead_id") or args.get("_pos0", "")
+
+    if not lead_id:
+        await _reply(update, "❌ Укажи lead_id.\n\nПример: /contactlead lead_id=LED-001", parse_mode=None)
+        return
+
+    try:
+        from business_core.business_builder import contact_lead
+
+        result = contact_lead(lead_id, last_contacted_at=args.get("last_contacted_at", ""))
+        await _reply(update, _lead_lifecycle_message(result, lead_id, "отметка контакта"), parse_mode=None)
+    except Exception as e:
+        log.error(f"contactlead_cmd error: {e}")
+        await _reply(update, "❌ Не удалось обновить статус Lead.", parse_mode=None)
+
+
+async def qualifylead_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /qualifylead lead_id=LED-001 [qualification_notes=...]
+
+    Explicit allowed → qualified. Never creates a Commercial Offer,
+    never auto-converts, never mutates Service.
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg(), parse_mode=None)
+        return
+
+    raw = " ".join(context.args or [])
+    args = _parse_kv_args(raw)
+    lead_id = args.get("lead_id") or args.get("_pos0", "")
+
+    if not lead_id:
+        await _reply(update, "❌ Укажи lead_id.\n\nПример: /qualifylead lead_id=LED-001", parse_mode=None)
+        return
+
+    try:
+        from business_core.business_builder import qualify_lead
+
+        result = qualify_lead(lead_id, qualification_notes=args.get("qualification_notes", ""))
+        await _reply(update, _lead_lifecycle_message(result, lead_id, "квалификация"), parse_mode=None)
+    except Exception as e:
+        log.error(f"qualifylead_cmd error: {e}")
+        await _reply(update, "❌ Не удалось обновить статус Lead.", parse_mode=None)
+
+
+async def unqualifylead_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /unqualifylead lead_id=LED-001 disposition_reason=...
+
+    Explicit allowed → unqualified. disposition_reason is required and
+    is never logged.
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg(), parse_mode=None)
+        return
+
+    raw = " ".join(context.args or [])
+    args = _parse_kv_args(raw)
+    lead_id = args.get("lead_id", "")
+    disposition_reason = args.get("disposition_reason", "")
+
+    if not lead_id or not disposition_reason:
+        await _reply(
+            update,
+            "❌ Укажи lead_id и disposition_reason.\n\nПример:\n"
+            "`/unqualifylead lead_id=LED-001 disposition_reason=...`", parse_mode=None)
+        return
+
+    try:
+        from business_core.business_builder import unqualify_lead
+
+        result = unqualify_lead(lead_id, disposition_reason=disposition_reason)
+        await _reply(update, _lead_lifecycle_message(result, lead_id, "отметка 'не подходит'"), parse_mode=None)
+    except Exception as e:
+        log.error(f"unqualifylead_cmd error: {e}")
+        await _reply(update, "❌ Не удалось обновить статус Lead.", parse_mode=None)
+
+
+async def loselead_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /loselead lead_id=LED-001 disposition_reason=...
+
+    Explicit allowed → lost. disposition_reason is required and is
+    never logged.
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg(), parse_mode=None)
+        return
+
+    raw = " ".join(context.args or [])
+    args = _parse_kv_args(raw)
+    lead_id = args.get("lead_id", "")
+    disposition_reason = args.get("disposition_reason", "")
+
+    if not lead_id or not disposition_reason:
+        await _reply(
+            update,
+            "❌ Укажи lead_id и disposition_reason.\n\nПример:\n"
+            "`/loselead lead_id=LED-001 disposition_reason=...`", parse_mode=None)
+        return
+
+    try:
+        from business_core.business_builder import lose_lead
+
+        result = lose_lead(lead_id, disposition_reason=disposition_reason)
+        await _reply(update, _lead_lifecycle_message(result, lead_id, "отметка 'потерян'"), parse_mode=None)
+    except Exception as e:
+        log.error(f"loselead_cmd error: {e}")
+        await _reply(update, "❌ Не удалось обновить статус Lead.", parse_mode=None)
+
+
+async def convertlead_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /convertlead lead_id=LED-001 converted_client_id=PRS-001 [converted_by=...]
+
+    Links the Lead to an existing Client and moves it to 'converted'.
+    Never creates a Person/Client, never mutates one — the Client must
+    already exist.
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg(), parse_mode=None)
+        return
+
+    raw = " ".join(context.args or [])
+    args = _parse_kv_args(raw)
+    lead_id = args.get("lead_id", "")
+    converted_client_id = args.get("converted_client_id", "")
+    converted_by = args.get("converted_by", "") or _telegram_username(update)
+
+    if not lead_id or not converted_client_id:
+        await _reply(
+            update,
+            "❌ Укажи lead_id и converted_client_id.\n\nПример:\n"
+            "`/convertlead lead_id=LED-001 converted_client_id=PRS-001`", parse_mode=None)
+        return
+
+    try:
+        from business_core.business_builder import convert_lead
+
+        result = convert_lead(lead_id, converted_client_id, converted_by)
+        await _reply(update, _lead_conversion_message(result, lead_id), parse_mode=None)
+    except Exception as e:
+        log.error(f"convertlead_cmd error: {e}")
+        await _reply(update, "❌ Не удалось конвертировать Lead.", parse_mode=None)
+
+
+async def archivelead_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /archivelead lead_id=LED-001
+
+    Any allowed status → archived. Terminal — no restore, no hard
+    delete.
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg(), parse_mode=None)
+        return
+
+    raw = " ".join(context.args or [])
+    args = _parse_kv_args(raw)
+    lead_id = args.get("lead_id") or args.get("_pos0", "")
+
+    if not lead_id:
+        await _reply(update, "❌ Укажи lead_id.\n\nПример: /archivelead lead_id=LED-001", parse_mode=None)
+        return
+
+    try:
+        from business_core.business_builder import archive_lead
+
+        result = archive_lead(lead_id)
+        await _reply(update, _lead_lifecycle_message(result, lead_id, "архивирование"), parse_mode=None)
+    except Exception as e:
+        log.error(f"archivelead_cmd error: {e}")
+        await _reply(update, "❌ Не удалось архивировать Lead.", parse_mode=None)
+
+
 async def milestones_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     /milestones roadmap_id=RM-022
@@ -10268,6 +11025,17 @@ def register_business_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("expireoffer",      expireoffer_cmd))
     app.add_handler(CommandHandler("canceloffer",      canceloffer_cmd))
     app.add_handler(CommandHandler("archiveoffer",     archiveoffer_cmd))
+    # Phase 41D (ADR-024): Lead / Sales Funnel Domain — operational commands.
+    app.add_handler(CommandHandler("newlead",          newlead_cmd))
+    app.add_handler(CommandHandler("leads",            leads_cmd))
+    app.add_handler(CommandHandler("lead",             lead_cmd))
+    app.add_handler(CommandHandler("updatelead",       updatelead_cmd))
+    app.add_handler(CommandHandler("contactlead",      contactlead_cmd))
+    app.add_handler(CommandHandler("qualifylead",      qualifylead_cmd))
+    app.add_handler(CommandHandler("unqualifylead",    unqualifylead_cmd))
+    app.add_handler(CommandHandler("loselead",         loselead_cmd))
+    app.add_handler(CommandHandler("convertlead",      convertlead_cmd))
+    app.add_handler(CommandHandler("archivelead",      archivelead_cmd))
     # Phase 8D
     app.add_handler(CommandHandler("milestones",       milestones_cmd))
     # Phase 11B

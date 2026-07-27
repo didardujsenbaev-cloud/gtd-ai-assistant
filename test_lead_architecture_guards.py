@@ -427,15 +427,247 @@ class TestLeadTestsHaveHardSocketBlock(unittest.TestCase):
             self.assertIn(filename, conftest_src, f"{filename} must be registered in conftest.py's hard socket-block set")
 
 
-class TestNoTelegramCallerYet(unittest.TestCase):
-    """Phase 41C is explicitly Foundation-only — no Telegram command
-    for Lead may exist yet (that is Phase 41D's scope)."""
+# ─────────────────────────────────────────────────────────────
+# Phase 41D (ADR-024): Lead caller (Telegram) architecture guards.
+# Mirrors the Phase 40D Commercial Offer caller guard pattern exactly.
+# ─────────────────────────────────────────────────────────────
 
-    def test_no_lead_commands_registered(self):
-        path = WORKSPACE / "business_core" / "telegram_handlers.py"
+_LEAD_COMMANDS = (
+    "newlead_cmd", "leads_cmd", "lead_cmd", "updatelead_cmd", "contactlead_cmd",
+    "qualifylead_cmd", "unqualifylead_cmd", "loselead_cmd", "convertlead_cmd", "archivelead_cmd",
+)
+
+
+def _th_function_body(fn_name: str) -> str:
+    return _function_body(BUSINESS_CORE / "telegram_handlers.py", fn_name)
+
+
+class TestLeadCommandsCallOnlyCanonicalOrchestration(unittest.TestCase):
+
+    def test_no_low_level_lead_manager_write_calls_in_mutating_commands(self):
+        forbidden = (
+            "lead_manager.create_lead(", "lead_manager.update_lead_status(",
+            "lead_manager.update_lead_active_fields(", "lead_manager.update_lead_admin_fields(",
+        )
+        for fn_name in (
+            "newlead_cmd", "updatelead_cmd", "contactlead_cmd", "qualifylead_cmd",
+            "unqualifylead_cmd", "loselead_cmd", "convertlead_cmd", "archivelead_cmd",
+        ):
+            body = _th_function_body(fn_name)
+            for call in forbidden:
+                self.assertNotIn(call, body, f"{fn_name} must not call low-level {call.rstrip('(')} directly")
+
+    def test_mutating_commands_call_business_builder_only(self):
+        expectations = {
+            "newlead_cmd": "create_lead(",
+            "contactlead_cmd": "contact_lead(",
+            "qualifylead_cmd": "qualify_lead(",
+            "unqualifylead_cmd": "unqualify_lead(",
+            "loselead_cmd": "lose_lead(",
+            "convertlead_cmd": "convert_lead(",
+            "archivelead_cmd": "archive_lead(",
+        }
+        for fn_name, call in expectations.items():
+            body = _th_function_body(fn_name)
+            self.assertIn(call, body, f"{fn_name} must call business_builder.{call.rstrip('(')}")
+
+    def test_read_commands_call_exact_lead_manager_helpers_only(self):
+        expectations = {
+            "leads_cmd": "list_leads(",
+            "lead_cmd": "find_lead_by_id(",
+        }
+        for fn_name, call in expectations.items():
+            body = _th_function_body(fn_name)
+            self.assertIn(call, body)
+            for forbidden in (
+                "create_lead(", "contact_lead(", "qualify_lead(", "unqualify_lead(",
+                "lose_lead(", "convert_lead(", "archive_lead(", "update_lead(",
+            ):
+                self.assertNotIn(forbidden, body, f"{fn_name} is read-only and must not call {forbidden.rstrip('(')}")
+
+
+class TestNoCallerSideLeadPolicy(unittest.TestCase):
+
+    def test_no_caller_side_id_generation(self):
+        for fn_name in _LEAD_COMMANDS:
+            body = _th_function_body(fn_name)
+            self.assertNotIn('"LED-"', body)
+            self.assertNotIn("generate_next_id(", body)
+            self.assertNotIn("generate_next_lead_id(", body)
+
+    def test_no_caller_side_contact_normalization(self):
+        for fn_name in _LEAD_COMMANDS:
+            body = _th_function_body(fn_name)
+            self.assertNotIn("normalize_lead_phone(", body)
+            self.assertNotIn("normalize_lead_whatsapp(", body)
+            self.assertNotIn("normalize_lead_email(", body)
+
+    def test_no_caller_side_expected_value_or_datetime_normalization(self):
+        for fn_name in _LEAD_COMMANDS:
+            body = _th_function_body(fn_name)
+            self.assertNotIn("Decimal(", body)
+            self.assertNotIn("normalize_lead_expected_value(", body)
+            self.assertNotIn("normalize_lead_currency(", body)
+            self.assertNotIn("normalize_lead_datetime(", body)
+
+    def test_no_caller_side_relation_or_idempotency_policy(self):
+        for fn_name in _LEAD_COMMANDS:
+            body = _th_function_body(fn_name)
+            self.assertNotIn("_validate_lead_relations(", body)
+            self.assertNotIn("_validate_lead_conversion_target(", body)
+            self.assertNotIn("find_leads_by_idempotency_key(", body)
+            self.assertNotIn("read_business_sheet(", body)
+
+    def test_no_caller_side_duplicate_contact_policy(self):
+        for fn_name in _LEAD_COMMANDS:
+            body = _th_function_body(fn_name)
+            self.assertNotIn("find_leads_by_exact_contact_channels(", body)
+
+    def test_no_caller_side_transition_matrix(self):
+        for fn_name in _LEAD_COMMANDS:
+            body = _th_function_body(fn_name)
+            self.assertNotIn("_LEAD_ORDINARY_TRANSITIONS", body)
+
+    def test_no_person_client_mutation_or_closed_domain_calls(self):
+        for fn_name in _LEAD_COMMANDS:
+            body = _th_function_body(fn_name)
+            for forbidden in (
+                "create_person(", "update_person(",
+                "create_commercial_offer(", "create_payment_obligation(", "create_payment_transaction(",
+                "create_business_task(", "transition_task_status(",
+                "register_document(", "transition_document_status(",
+                "instantiate_checklist(", "transition_checklist_status(",
+                "update_stage_status_in_sheet(", "recalculate_roadmap_progress(",
+            ):
+                self.assertNotIn(forbidden, body, f"{fn_name} must not mutate Person/Client/Offer/Payment/Task/Document/Checklist/Stage/Roadmap ({forbidden!r} found)")
+
+    def test_no_relationship_capital_reuse(self):
+        for fn_name in _LEAD_COMMANDS:
+            body = _th_function_body(fn_name)
+            self.assertNotIn("relationship_capital", body)
+
+
+class TestLeadCommandRegistration(unittest.TestCase):
+
+    def test_all_10_commands_registered_exactly_once(self):
+        path = BUSINESS_CORE / "telegram_handlers.py"
         src = path.read_text(encoding="utf-8")
-        for forbidden in ("newlead_cmd", "leads_cmd", "convertlead_cmd", "qualifylead_cmd"):
-            self.assertNotIn(forbidden, src)
+        for name in ("newlead", "leads", "lead", "updatelead", "contactlead", "qualifylead", "unqualifylead", "loselead", "convertlead", "archivelead"):
+            self.assertEqual(src.count(f'CommandHandler("{name}"'), 1, f"/{name} must be registered exactly once")
+
+    def test_milestones_still_registered_exactly_once(self):
+        path = BUSINESS_CORE / "telegram_handlers.py"
+        src = path.read_text(encoding="utf-8")
+        self.assertEqual(src.count('CommandHandler("milestones"'), 1)
+
+
+class TestLeadUxHelpersDefinedOnce(unittest.TestCase):
+
+    def test_helpers_defined_exactly_once(self):
+        path = BUSINESS_CORE / "telegram_handlers.py"
+        src = path.read_text(encoding="utf-8")
+        for fn in (
+            "_lead_creation_message", "_lead_update_message", "_lead_lifecycle_message", "_lead_conversion_message",
+            "_lead_status_ru", "_mask_lead_phone_like", "_mask_lead_email", "_mask_lead_contact_summary",
+            "_mask_lead_contact_name", "_format_lead_expected_value", "_format_lead_follow_up_lines",
+            "_lead_duplicate_warning_lines",
+        ):
+            self.assertEqual(src.count(f"def {fn}("), 1, f"{fn} must be defined exactly once")
+
+    def test_helpers_are_callable(self):
+        import business_core.telegram_handlers as th
+        for fn in ("_lead_creation_message", "_lead_update_message", "_lead_lifecycle_message", "_lead_conversion_message"):
+            self.assertTrue(callable(getattr(th, fn, None)))
+
+
+class TestNoSensitiveLeadFieldsLoggedGuard(unittest.TestCase):
+
+    _DISALLOWED_LOG_TOKENS = (
+        "Contact Name Snapshot", "Phone Snapshot", "WhatsApp Snapshot", "Email Snapshot",
+        "Company Snapshot", "Qualification Notes", "Disposition Reason", "Notes",
+        "Caller Idempotency Key", "update.message.text",
+    )
+
+    def test_lead_handlers_do_not_log_disallowed_fields(self):
+        for fn_name in _LEAD_COMMANDS:
+            body = _th_function_body(fn_name)
+            log_lines = [line for line in body.splitlines() if "log.error(" in line or "log.warning(" in line or "log.info(" in line]
+            for line in log_lines:
+                for token in self._DISALLOWED_LOG_TOKENS:
+                    self.assertNotIn(token, line, f"{fn_name} logs disallowed token {token!r}: {line}")
+
+
+class TestNoRawExceptionInLeadCommands(unittest.TestCase):
+
+    def test_no_raw_exception_interpolation(self):
+        for fn_name in _LEAD_COMMANDS:
+            body = _th_function_body(fn_name)
+            self.assertNotIn("Ошибка: {e}", body)
+            self.assertNotIn("str(e)", body)
+
+
+class TestLeadParserValidationOrdering(unittest.TestCase):
+
+    def test_newlead_validates_before_orchestration(self):
+        body = _th_function_body("newlead_cmd")
+        validation_idx = body.index("if not business_id or not contact_name or not caller_idempotency_key")
+        orchestration_idx = body.index("create_lead(")
+        self.assertLess(validation_idx, orchestration_idx)
+
+    def test_contactlead_validates_before_orchestration(self):
+        body = _th_function_body("contactlead_cmd")
+        validation_idx = body.index("if not lead_id")
+        orchestration_idx = body.index("contact_lead(")
+        self.assertLess(validation_idx, orchestration_idx)
+
+    def test_qualifylead_validates_before_orchestration(self):
+        body = _th_function_body("qualifylead_cmd")
+        validation_idx = body.index("if not lead_id")
+        orchestration_idx = body.index("qualify_lead(")
+        self.assertLess(validation_idx, orchestration_idx)
+
+    def test_unqualifylead_validates_before_orchestration(self):
+        body = _th_function_body("unqualifylead_cmd")
+        validation_idx = body.index("if not lead_id or not disposition_reason")
+        orchestration_idx = body.index("unqualify_lead(")
+        self.assertLess(validation_idx, orchestration_idx)
+
+    def test_loselead_validates_before_orchestration(self):
+        body = _th_function_body("loselead_cmd")
+        validation_idx = body.index("if not lead_id or not disposition_reason")
+        orchestration_idx = body.index("lose_lead(")
+        self.assertLess(validation_idx, orchestration_idx)
+
+    def test_convertlead_validates_before_orchestration(self):
+        body = _th_function_body("convertlead_cmd")
+        validation_idx = body.index("if not lead_id or not converted_client_id")
+        orchestration_idx = body.index("convert_lead(")
+        self.assertLess(validation_idx, orchestration_idx)
+
+    def test_archivelead_validates_before_orchestration(self):
+        body = _th_function_body("archivelead_cmd")
+        validation_idx = body.index("if not lead_id")
+        orchestration_idx = body.index("archive_lead(")
+        self.assertLess(validation_idx, orchestration_idx)
+
+
+class TestLeadParseModeIsNone(unittest.TestCase):
+
+    def test_all_lead_commands_pass_parse_mode_none(self):
+        for fn_name in _LEAD_COMMANDS:
+            body = _th_function_body(fn_name)
+            reply_calls = body.count("_reply(update,")
+            parse_none_calls = body.count("parse_mode=None")
+            self.assertGreaterEqual(parse_none_calls, reply_calls, f"{fn_name}: not every _reply call passes parse_mode=None")
+
+
+class TestMilestonesCommandUntouchedByLeadCallerPhase(unittest.TestCase):
+
+    def test_milestones_body_unchanged_shape(self):
+        body = _th_function_body("milestones_cmd")
+        self.assertIn("get_commercial_milestones_for_roadmap", body)
+        self.assertNotIn("lead_manager", body)
+        self.assertNotIn("create_lead", body)
 
 
 if __name__ == "__main__":

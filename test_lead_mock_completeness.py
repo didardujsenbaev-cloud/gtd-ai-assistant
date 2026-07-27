@@ -23,6 +23,8 @@ _LEAD_TEST_FILES = frozenset({
     "test_business_lead_foundation.py",
     "test_lead_architecture_guards.py",
     "test_lead_mock_completeness.py",
+    # Phase 41D (ADR-024): Lead caller (Telegram) UX test file.
+    "test_lead_caller_ux.py",
 })
 
 
