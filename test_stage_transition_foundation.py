@@ -137,6 +137,14 @@ def _override_write_result(ok=True, override_id="SCO-001", error=None):
     return {"ok": ok, "override_id": override_id if ok else "", "error": error}
 
 
+def _resolve_template_stage_not_found(stage_id="STAGE-001"):
+    """Phase B default: output_gate's Source A (relations) is safely
+    empty when Template Stage resolution fails — never an error, and
+    never a live call, since this is mocked. Existing tests (predating
+    the Output Gate) never care about this resolution at all."""
+    return {"ok": False, "code": "STAGE_NOT_FOUND", "error": "", "template_stage_id": "", "roadmap": None}
+
+
 _UNSET = object()
 
 
@@ -146,7 +154,9 @@ class _BaseTransitionTestCase(unittest.TestCase):
               completion_result=None, stage_id="STAGE-001",
               force=False, reason=None, actor="",
               evaluate_scope_result=_UNSET, record_override_result=None,
-              checklist_instances=None, checklist_items=None):
+              checklist_instances=None, checklist_items=None,
+              resolve_template_stage_result=_UNSET, output_relations=None,
+              output_instances=None, output_template_lookup=None):
         bb = _fresh_bb()
         with patch("business_core.roadmap_manager.find_stage_by_id",
                    return_value=_stage() if stage is _UNSET else stage), \
@@ -165,6 +175,15 @@ class _BaseTransitionTestCase(unittest.TestCase):
                    return_value=(checklist_instances if checklist_instances is not None else [])) as mock_checklist_instances, \
              patch("business_core.checklist_manager.list_checklist_instance_items",
                    return_value=(checklist_items if checklist_items is not None else [])) as mock_checklist_items, \
+             patch("business_core.roadmap_manager.resolve_template_stage_for_stage",
+                   return_value=(_resolve_template_stage_not_found(stage_id) if resolve_template_stage_result is _UNSET
+                                 else resolve_template_stage_result)) as mock_resolve_template_stage, \
+             patch("business_core.stage_entity_relations.get_relations_for_template_stage",
+                   return_value=(output_relations if output_relations is not None else ())) as mock_output_relations, \
+             patch("business_core.stage_output_manager.list_output_instances_for_stage",
+                   return_value=(output_instances if output_instances is not None else ())) as mock_output_instances, \
+             patch("business_core.stage_output_manager.find_output_template_by_id",
+                   side_effect=(output_template_lookup if output_template_lookup is not None else (lambda otid: None))) as mock_output_template_lookup, \
              patch("business_core.roadmap_manager.record_stage_completion_override",
                    return_value=(record_override_result if record_override_result is not None
                                  else _override_write_result())) as mock_record_override:
@@ -178,6 +197,10 @@ class _BaseTransitionTestCase(unittest.TestCase):
             self._last_mock_progress = mock_progress
             self._last_mock_checklist_instances = mock_checklist_instances
             self._last_mock_checklist_items = mock_checklist_items
+            self._last_mock_resolve_template_stage = mock_resolve_template_stage
+            self._last_mock_output_relations = mock_output_relations
+            self._last_mock_output_instances = mock_output_instances
+            self._last_mock_output_template_lookup = mock_output_template_lookup
             return result
 
 
@@ -638,6 +661,8 @@ class TestDocumentCompletionGate(_BaseTransitionTestCase):
             previous_status="in_progress", target_status="done",
             override_type="missing_blocking_documents", configuration_error_details="",
             missing_checklist_instance_ids=(), missing_checklist_item_ids=(), missing_checklist_item_titles=(),
+            missing_blocking_output_instance_ids=(), missing_blocking_output_template_ids=(),
+            missing_blocking_output_titles=(), missing_blocking_output_statuses=(),
         )
 
     def test_force_with_reason_and_blocking_zero_completes_without_audit(self):
@@ -849,6 +874,8 @@ class TestChecklistCompletionGate(_BaseTransitionTestCase):
             override_type="missing_checklist_items", configuration_error_details="",
             missing_checklist_instance_ids=("CLIN-001",), missing_checklist_item_ids=("CLII-001",),
             missing_checklist_item_titles=("Проверить",),
+            missing_blocking_output_instance_ids=(), missing_blocking_output_template_ids=(),
+            missing_blocking_output_titles=(), missing_blocking_output_statuses=(),
         )
 
     def test_force_with_reason_and_checklist_complete_completes_without_audit(self):

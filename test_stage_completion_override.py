@@ -36,6 +36,9 @@ EXPECTED_HEADERS = [
     "Override Type", "Configuration Error Details",
     "Missing Checklist Instance IDs", "Missing Checklist Item IDs",
     "Missing Checklist Item Titles",
+    # Phase B (Required Output Completion Gate): additive, columns 15-18.
+    "Missing Blocking Output Instance IDs", "Missing Blocking Output Template IDs",
+    "Missing Blocking Output Titles", "Missing Blocking Output Statuses",
 ]
 
 # Pre-Phase-44 header shape — the exact row shape SCO-001 was written

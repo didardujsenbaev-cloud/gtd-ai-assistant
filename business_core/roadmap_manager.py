@@ -2368,12 +2368,14 @@ def record_stage_completion_override(
     override_type: str = "missing_blocking_documents", configuration_error_details: str = "",
     missing_checklist_instance_ids: tuple = (), missing_checklist_item_ids: tuple = (),
     missing_checklist_item_titles: tuple = (),
+    missing_blocking_output_instance_ids: tuple = (), missing_blocking_output_template_ids: tuple = (),
+    missing_blocking_output_titles: tuple = (), missing_blocking_output_statuses: tuple = (),
     timestamp: str | None = None,
 ) -> dict:
     """
-    Phase 43/44 (Document + Checklist Completion Gates): sole write
-    primitive for the STAGE_COMPLETION_OVERRIDES audit trail —
-    append-only, one row per successful force=yes bypass of
+    Phase 43/44/B (Document + Checklist + Required Output Completion
+    Gates): sole write primitive for the STAGE_COMPLETION_OVERRIDES audit
+    trail — append-only, one row per successful force=yes bypass of
     business_builder.transition_stage_status()'s completion gates.
     Never called for a Stage transition the gate(s) would have allowed
     anyway (the caller decides that; this function only ever appends
@@ -2384,12 +2386,20 @@ def record_stage_completion_override(
 
     Args:
         override_type: one of "missing_blocking_documents",
-            "configuration_error", "missing_checklist_items", or a
-            "+"-joined composite of more than one (e.g.
-            "missing_blocking_documents+missing_checklist_items") when
-            a single force=yes call bypassed more than one gate at
-            once — the caller (transition_stage_status()) decides this
-            string; this function never inspects or validates it.
+            "configuration_error", "missing_checklist_items",
+            "missing_blocking_outputs", or a "+"-joined composite of more
+            than one (e.g. "missing_blocking_documents+missing_checklist_
+            items+missing_blocking_outputs") when a single force=yes call
+            bypassed more than one gate at once — the caller
+            (transition_stage_status()) decides this string; this
+            function never inspects or validates it.
+        missing_blocking_output_instance_ids/_template_ids/_titles/
+            _statuses: Phase B additive — same tuple-default,
+            "; joined to empty string when absent" contract as the
+            pre-existing Checklist fields (never a bare str="" default,
+            for consistency with every other composite field here).
+            Any pre-existing caller omitting these four continues to
+            write "" for all of them, unchanged.
 
     Returns:
         {"ok": bool, "override_id": str, "error": str | None}
@@ -2425,6 +2435,10 @@ def record_stage_completion_override(
             "Missing Checklist Instance IDs": ", ".join(missing_checklist_instance_ids),
             "Missing Checklist Item IDs": ", ".join(missing_checklist_item_ids),
             "Missing Checklist Item Titles": ", ".join(missing_checklist_item_titles),
+            "Missing Blocking Output Instance IDs": ", ".join(missing_blocking_output_instance_ids),
+            "Missing Blocking Output Template IDs": ", ".join(missing_blocking_output_template_ids),
+            "Missing Blocking Output Titles": ", ".join(missing_blocking_output_titles),
+            "Missing Blocking Output Statuses": ", ".join(missing_blocking_output_statuses),
         }
         row = row_from_header_map(headers, values)
         append_business_row("stage_completion_overrides", row)

@@ -2182,6 +2182,8 @@ def _stage_transition_result(
     override_applied: bool = False, override_type: str = "", override_id: str = "",
     missing_checklist_instance_ids: tuple = (), missing_checklist_item_ids: tuple = (),
     missing_checklist_item_titles: tuple = (),
+    missing_blocking_output_instance_ids: tuple = (), missing_blocking_output_template_ids: tuple = (),
+    missing_blocking_output_titles: tuple = (), missing_blocking_output_statuses: tuple = (),
 ) -> dict:
     """
     Shared result-builder for transition_stage_status() and
@@ -2198,6 +2200,14 @@ def _stage_transition_result(
     Phase 44 (Checklist Completion Gate) additive fields:
     missing_checklist_instance_ids/missing_checklist_item_ids/
     missing_checklist_item_titles — same empty-default contract.
+
+    Phase B (Required Output Completion Gate) additive fields:
+    missing_blocking_output_instance_ids/_template_ids/_titles/_statuses —
+    same empty-default contract. A missing instance ("instance_missing")
+    is represented as an empty string at the corresponding position in
+    missing_blocking_output_instance_ids, never by omitting it from the
+    other three tuples — all four always stay the same length and index-
+    aligned.
     """
     return {
         "ok": ok,
@@ -2226,6 +2236,10 @@ def _stage_transition_result(
         "missing_checklist_instance_ids": tuple(missing_checklist_instance_ids),
         "missing_checklist_item_ids": tuple(missing_checklist_item_ids),
         "missing_checklist_item_titles": tuple(missing_checklist_item_titles),
+        "missing_blocking_output_instance_ids": tuple(missing_blocking_output_instance_ids),
+        "missing_blocking_output_template_ids": tuple(missing_blocking_output_template_ids),
+        "missing_blocking_output_titles": tuple(missing_blocking_output_titles),
+        "missing_blocking_output_statuses": tuple(missing_blocking_output_statuses),
     }
 
 
@@ -2255,6 +2269,13 @@ class _StageCompletionGateResult:
     missing_checklist_instance_ids: tuple = ()
     missing_checklist_item_ids: tuple = ()
     missing_checklist_item_titles: tuple = ()
+    # Phase B (Required Output Completion Gate) — always the same length,
+    # index-aligned; missing_blocking_output_instance_ids holds "" at any
+    # position where no instance was ever created ("instance_missing").
+    missing_blocking_output_instance_ids: tuple = ()
+    missing_blocking_output_template_ids: tuple = ()
+    missing_blocking_output_titles: tuple = ()
+    missing_blocking_output_statuses: tuple = ()
 
 
 def _evaluate_document_completion_gate(stage_id: str) -> _StageCompletionGateResult:
@@ -2406,6 +2427,132 @@ def _evaluate_checklist_completion_gate(stage_id: str) -> _StageCompletionGateRe
                 f"У этапа {stage_id} не хватает {total_optional_missing} "
                 f"необязательных (optional) пунктов чек-листа — завершение разрешено."
             ),
+        )
+
+    return _StageCompletionGateResult()
+
+
+def _evaluate_output_completion_gate(stage_id: str) -> _StageCompletionGateResult:
+    """
+    Phase B: Required Output Completion Gate. Mirrors
+    _evaluate_document_completion_gate()/_evaluate_checklist_completion_
+    gate()'s shape (blocked=False is "nothing to report", never an
+    error), but — approved architectural correction over the original
+    audit's "instances-only" recommendation — checks BOTH of two sources,
+    not just existing instances:
+
+      Source A: active STAGE_ENTITY_RELATIONS rows of Entity Type
+      "required_output" on this Stage's Template Stage, filtered to
+      Blocking=="true". If the resolution to a Template Stage fails for
+      any reason, Source A is simply empty (not an error) — Source B
+      below is completely independent of this resolution and still
+      fully protects against a Stage closing with an unresolved blocking
+      instance.
+
+      Source B: every existing STAGE_OUTPUT_INSTANCES row for this Stage
+      with its OWN Blocking=="true", regardless of whether its
+      originating relation is still active or was ever active at all.
+      An already-created blocking instance's own Blocking field is the
+      permanent source of truth — deactivating/deleting its relation or
+      its Output Template afterward never retroactively exempts it.
+
+    For each blocking relation (Source A) with no corresponding instance
+    yet, this reports a "instance_missing" entry (Instance ID = "",
+    Template ID = the relation's Entity ID, Title = the Output
+    Template's own Title, Status = the literal string
+    "instance_missing") — an active blocking relation can never be
+    silently bypassed just because /syncoutputs was never run.
+
+    Every instance (from either source) whose Status is NOT in
+    stage_output_manager.TERMINAL_OUTPUT_STATUSES ({"accepted", "waived",
+    "not_applicable"}) is blocking — pending/produced/submitted/rejected
+    all block equally. Required is never consulted (Blocking alone
+    governs, exactly like the Document Gate's own Blocking-only
+    semantics).
+
+    Deduplicated by (Output Template ID, Output Instance ID) so the same
+    output is never counted twice when it appears via both sources at
+    once (the common case: an active relation whose instance already
+    exists and is still non-terminal).
+    """
+    from business_core.roadmap_manager import resolve_template_stage_for_stage
+    from business_core.stage_entity_relations import get_relations_for_template_stage
+    from business_core.stage_output_manager import (
+        find_output_template_by_id, list_output_instances_for_stage, TERMINAL_OUTPUT_STATUSES,
+    )
+
+    resolved = resolve_template_stage_for_stage(stage_id)
+    template_stage_id = resolved.get("template_stage_id", "") if resolved.get("ok") else ""
+
+    blocking_relations = ()
+    if template_stage_id:
+        relations = get_relations_for_template_stage(template_stage_id, entity_type="required_output")
+        blocking_relations = tuple(
+            r for r in relations if (r.get("Blocking", "") or "").strip().lower() == "true"
+        )
+
+    all_instances = list_output_instances_for_stage(stage_id)
+    blocking_instances = [
+        i for i in all_instances if (i.get("Blocking", "") or "").strip().lower() == "true"
+    ]
+    instance_by_template_id: dict[str, dict] = {}
+    for inst in blocking_instances:
+        otid = inst.get("Output Template ID", "")
+        if otid not in instance_by_template_id:
+            instance_by_template_id[otid] = inst
+
+    seen_pairs: set = set()
+    missing_instance_ids: list[str] = []
+    missing_template_ids: list[str] = []
+    missing_titles: list[str] = []
+    missing_statuses: list[str] = []
+
+    def _add_missing(template_id: str, instance_id: str, title: str, status: str) -> None:
+        key = (template_id, instance_id)
+        if key in seen_pairs:
+            return
+        seen_pairs.add(key)
+        missing_template_ids.append(template_id)
+        missing_instance_ids.append(instance_id)
+        missing_titles.append(title)
+        missing_statuses.append(status)
+
+    # Source A: relation-driven requirements.
+    for rel in blocking_relations:
+        output_template_id = rel.get("Entity ID", "")
+        inst = instance_by_template_id.get(output_template_id)
+        if inst is None:
+            template = find_output_template_by_id(output_template_id)
+            title = template.get("Title", "") if template else ""
+            _add_missing(output_template_id, "", title, "instance_missing")
+        elif inst.get("Status", "") not in TERMINAL_OUTPUT_STATUSES:
+            _add_missing(
+                output_template_id, inst.get("Output Instance ID", ""),
+                inst.get("Title Snapshot", ""), inst.get("Status", ""),
+            )
+
+    # Source B: instance-driven requirements — a blocking instance always
+    # blocks on its own terms, even with an inactive/deleted relation.
+    for inst in blocking_instances:
+        status = inst.get("Status", "")
+        if status not in TERMINAL_OUTPUT_STATUSES:
+            _add_missing(
+                inst.get("Output Template ID", ""), inst.get("Output Instance ID", ""),
+                inst.get("Title Snapshot", ""), status,
+            )
+
+    if missing_template_ids:
+        return _StageCompletionGateResult(
+            blocked=True, error_code="STAGE_OUTPUT_GATE_BLOCKED",
+            error=(
+                f"У этапа {stage_id} есть непринятые обязательные результаты (Required Output): "
+                f"{', '.join(t for t in missing_titles if t) or ', '.join(missing_template_ids)}"
+            ),
+            override_type="missing_blocking_outputs",
+            missing_blocking_output_instance_ids=tuple(missing_instance_ids),
+            missing_blocking_output_template_ids=tuple(missing_template_ids),
+            missing_blocking_output_titles=tuple(missing_titles),
+            missing_blocking_output_statuses=tuple(missing_statuses),
         )
 
     return _StageCompletionGateResult()
@@ -2671,6 +2818,10 @@ def transition_stage_status(
     gate_missing_checklist_instance_ids: tuple = ()
     gate_missing_checklist_item_ids: tuple = ()
     gate_missing_checklist_item_titles: tuple = ()
+    gate_missing_blocking_output_instance_ids: tuple = ()
+    gate_missing_blocking_output_template_ids: tuple = ()
+    gate_missing_blocking_output_titles: tuple = ()
+    gate_missing_blocking_output_statuses: tuple = ()
     gate_override_types: list[str] = []
     gate_optional_missing_warnings: list[str] = []
 
@@ -2687,17 +2838,21 @@ def transition_stage_status(
                 retry_safe=True,
             )
 
-        # Both gates are always evaluated together — never short-circuited
-        # after the first one blocks — so a Stage missing both documents
-        # and checklist items is reported in full, in one response.
+        # All three gates are always evaluated together — never short-
+        # circuited after the first one blocks — so a Stage missing
+        # documents, checklist items, and Required Output all at once is
+        # reported in full, in one response.
         document_gate = _evaluate_document_completion_gate(stage_id)
         checklist_gate = _evaluate_checklist_completion_gate(stage_id)
-        blocked_gates = [g for g in (document_gate, checklist_gate) if g.blocked]
+        output_gate = _evaluate_output_completion_gate(stage_id)
+        blocked_gates = [g for g in (document_gate, checklist_gate, output_gate) if g.blocked]
 
         if document_gate.warning:
             gate_optional_missing_warnings.append(document_gate.warning)
         if checklist_gate.warning:
             gate_optional_missing_warnings.append(checklist_gate.warning)
+        if output_gate.warning:
+            gate_optional_missing_warnings.append(output_gate.warning)
 
         if blocked_gates:
             gate_missing_blocking_doc_ids = document_gate.missing_blocking_doc_ids
@@ -2705,6 +2860,10 @@ def transition_stage_status(
             gate_missing_checklist_instance_ids = checklist_gate.missing_checklist_instance_ids
             gate_missing_checklist_item_ids = checklist_gate.missing_checklist_item_ids
             gate_missing_checklist_item_titles = checklist_gate.missing_checklist_item_titles
+            gate_missing_blocking_output_instance_ids = output_gate.missing_blocking_output_instance_ids
+            gate_missing_blocking_output_template_ids = output_gate.missing_blocking_output_template_ids
+            gate_missing_blocking_output_titles = output_gate.missing_blocking_output_titles
+            gate_missing_blocking_output_statuses = output_gate.missing_blocking_output_statuses
             gate_override_types = [g.override_type for g in blocked_gates]
 
             if not force:
@@ -2723,6 +2882,10 @@ def transition_stage_status(
                         missing_checklist_instance_ids=gate_missing_checklist_instance_ids,
                         missing_checklist_item_ids=gate_missing_checklist_item_ids,
                         missing_checklist_item_titles=gate_missing_checklist_item_titles,
+                        missing_blocking_output_instance_ids=gate_missing_blocking_output_instance_ids,
+                        missing_blocking_output_template_ids=gate_missing_blocking_output_template_ids,
+                        missing_blocking_output_titles=gate_missing_blocking_output_titles,
+                        missing_blocking_output_statuses=gate_missing_blocking_output_statuses,
                     )
                 single = blocked_gates[0]
                 return _stage_transition_result(
@@ -2738,6 +2901,10 @@ def transition_stage_status(
                     missing_checklist_instance_ids=gate_missing_checklist_instance_ids,
                     missing_checklist_item_ids=gate_missing_checklist_item_ids,
                     missing_checklist_item_titles=gate_missing_checklist_item_titles,
+                    missing_blocking_output_instance_ids=gate_missing_blocking_output_instance_ids,
+                    missing_blocking_output_template_ids=gate_missing_blocking_output_template_ids,
+                    missing_blocking_output_titles=gate_missing_blocking_output_titles,
+                    missing_blocking_output_statuses=gate_missing_blocking_output_statuses,
                 )
 
     gate_override_type = "+".join(gate_override_types)
@@ -2805,6 +2972,10 @@ def transition_stage_status(
             missing_checklist_instance_ids=gate_missing_checklist_instance_ids,
             missing_checklist_item_ids=gate_missing_checklist_item_ids,
             missing_checklist_item_titles=gate_missing_checklist_item_titles,
+            missing_blocking_output_instance_ids=gate_missing_blocking_output_instance_ids,
+            missing_blocking_output_template_ids=gate_missing_blocking_output_template_ids,
+            missing_blocking_output_titles=gate_missing_blocking_output_titles,
+            missing_blocking_output_statuses=gate_missing_blocking_output_statuses,
         )
         if override_result["ok"]:
             override_id = override_result["override_id"]
@@ -2860,6 +3031,10 @@ def transition_stage_status(
         missing_checklist_instance_ids=gate_missing_checklist_instance_ids,
         missing_checklist_item_ids=gate_missing_checklist_item_ids,
         missing_checklist_item_titles=gate_missing_checklist_item_titles,
+        missing_blocking_output_instance_ids=gate_missing_blocking_output_instance_ids,
+        missing_blocking_output_template_ids=gate_missing_blocking_output_template_ids,
+        missing_blocking_output_titles=gate_missing_blocking_output_titles,
+        missing_blocking_output_statuses=gate_missing_blocking_output_statuses,
     )
 
 

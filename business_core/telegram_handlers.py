@@ -2722,6 +2722,21 @@ _STAGE_TRANSITION_ERROR_MESSAGES: dict[str, str] = {
 }
 
 
+def _render_output_gate_missing_lines(instance_ids, template_ids, titles, statuses) -> list[str]:
+    """Phase B: shared per-item renderer for the Required Output
+    Completion Gate — used by both the output-only and the combined
+    (Document+Checklist+Output) blocking messages so the two never
+    duplicate this formatting. An empty Instance ID (the
+    "instance_missing" case — an active blocking relation whose instance
+    was never created via /syncoutputs) is shown as
+    "[instance отсутствует]" instead of a blank."""
+    lines = []
+    for instance_id, template_id, title, status in zip(instance_ids, template_ids, titles, statuses):
+        instance_label = instance_id if instance_id else "[instance отсутствует]"
+        lines.append(f"- {instance_label} / {template_id} — {title or '—'} — {status}")
+    return lines
+
+
 def _stage_transition_failure_message(result: dict, stage_id: str, status: str) -> str:
     """
     Render a failed transition_stage_status() result (ok=False) into a
@@ -2856,11 +2871,34 @@ def _stage_transition_failure_message(result: dict, stage_id: str, status: str) 
             f"`/updatestage stage_id={stage_id} status=done force=yes reason=\"...\"`",
         ])
 
+    if code == "STAGE_OUTPUT_GATE_BLOCKED":
+        instance_ids = result.get("missing_blocking_output_instance_ids", ())
+        template_ids = result.get("missing_blocking_output_template_ids", ())
+        titles = result.get("missing_blocking_output_titles", ())
+        statuses = result.get("missing_blocking_output_statuses", ())
+        lines = [
+            "🔒 Завершение заблокировано — не приняты обязательные результаты",
+            f"Этап: `{stage_id}`",
+            f"Roadmap: `{roadmap_id}`",
+            "",
+            "── Required Outputs ──",
+            "Не приняты результаты:",
+        ]
+        lines.extend(_render_output_gate_missing_lines(instance_ids, template_ids, titles, statuses))
+        lines.append("")
+        lines.append("Чтобы всё же завершить этап, используй явный override:")
+        lines.append(f"`/updatestage stage_id={stage_id} status=done force=yes reason=\"...\"`")
+        return "\n".join(lines)
+
     if code == "STAGE_COMPLETION_GATE_BLOCKED":
         missing_docs = result.get("missing_blocking_doc_ids", ())
         instance_ids = result.get("missing_checklist_instance_ids", ())
         item_ids = result.get("missing_checklist_item_ids", ())
         titles = result.get("missing_checklist_item_titles", ())
+        output_instance_ids = result.get("missing_blocking_output_instance_ids", ())
+        output_template_ids = result.get("missing_blocking_output_template_ids", ())
+        output_titles = result.get("missing_blocking_output_titles", ())
+        output_statuses = result.get("missing_blocking_output_statuses", ())
         lines = [
             "🔒 Завершение заблокировано сразу по нескольким причинам",
             f"Этап: `{stage_id}`",
@@ -2876,6 +2914,13 @@ def _stage_transition_failure_message(result: dict, stage_id: str, status: str) 
             lines.append(f"Missing Checklist Item IDs: {', '.join(item_ids)}")
         if titles:
             lines.append(f"Невыполненные пункты чек-листа: {', '.join(titles)}")
+        if output_template_ids:
+            lines.append("")
+            lines.append("── Required Outputs ──")
+            lines.append("Не приняты результаты:")
+            lines.extend(_render_output_gate_missing_lines(
+                output_instance_ids, output_template_ids, output_titles, output_statuses,
+            ))
         lines.append("")
         lines.append("Чтобы всё же завершить этап, используй явный override:")
         lines.append(f"`/updatestage stage_id={stage_id} status=done force=yes reason=\"...\"`")
@@ -2987,6 +3032,9 @@ def _stage_transition_success_lines(result: dict, stage_id: str, notes: Optional
         titles = result.get("missing_checklist_item_titles", ())
         if titles:
             lines.append(f"Обойдённые пункты чек-листа: {', '.join(titles)}")
+        output_titles = result.get("missing_blocking_output_titles", ())
+        if output_titles:
+            lines.append(f"Обойдённые Required Output: {', '.join(output_titles)}")
 
     if notes is not None:
         lines.append(f"Notes обновлены: {notes}")

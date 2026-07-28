@@ -511,6 +511,19 @@ BUSINESS_HEADERS: dict[str, list[str]] = {
         # business_builder.transition_stage_status().
         "Missing Checklist Instance IDs", "Missing Checklist Item IDs",
         "Missing Checklist Item Titles",
+        # Phase B (Required Output Completion Gate): additive, appended at
+        # the end so every pre-existing row (including SCO-001 written
+        # before this phase) reads back as "" for all four — never
+        # breaking. Columns 15-18; order of the first 14 columns is
+        # unchanged. Unlike Checklist's 3-field shape (Instance/Item/
+        # Title — two tiers), Required Output has no sub-item tier, so
+        # this is 4 flat fields: Instance ID (blank when the instance was
+        # never created — "instance_missing" case), Output Template ID,
+        # Title (from the instance's own Title Snapshot, or from the
+        # Output Template when no instance exists), and Status (actual
+        # instance Status, or the literal string "instance_missing").
+        "Missing Blocking Output Instance IDs", "Missing Blocking Output Template IDs",
+        "Missing Blocking Output Titles", "Missing Blocking Output Statuses",
     ],
     # Phase A (Stage Output Foundation): Required Output. Template layer
     # (reference/config, mirrors sop_registry/checklist_registry) +

@@ -623,30 +623,84 @@ class TestSyncStageOutputRequirements(unittest.TestCase):
 # 61-63: Completion Gate isolation guards + regression marker
 # ────────────────────────────────────────────────────────────
 
-class TestCompletionGateIsolation(unittest.TestCase):
-    def test_transition_stage_status_never_calls_output_sync_or_gate(self):
+class TestCompletionGateWiring(unittest.TestCase):
+    """Phase B deliberately changes what Phase A's isolation guards
+    asserted — this class replaces TestCompletionGateIsolation, which
+    asserted the OPPOSITE (no gate wiring at all). Explicitly rewritten,
+    not just extended, per the Phase B instruction."""
+
+    def test_transition_stage_status_now_calls_output_gate(self):
+        import inspect
+        import business_core.business_builder as bb
+
+        source = inspect.getsource(bb.transition_stage_status)
+        self.assertIn("_evaluate_output_completion_gate", source)
+
+    def test_transition_stage_status_still_never_calls_sync(self):
+        """sync_stage_output_requirements() remains a separate, manually
+        triggered (/syncoutputs) retroactive tool — the gate reads
+        existing instances/relations directly, it never invokes sync."""
         import inspect
         import business_core.business_builder as bb
 
         source = inspect.getsource(bb.transition_stage_status)
         self.assertNotIn("sync_stage_output_requirements", source)
-        self.assertNotIn("stage_output_manager", source)
-        self.assertNotIn("_evaluate_output_completion_gate", source)
 
-    def test_no_output_completion_gate_function_exists(self):
+    def test_output_completion_gate_function_exists(self):
         import business_core.business_builder as bb
-        self.assertFalse(hasattr(bb, "_evaluate_output_completion_gate"))
+        self.assertTrue(hasattr(bb, "_evaluate_output_completion_gate"))
 
     def test_document_and_checklist_gate_functions_unchanged_by_name(self):
         import business_core.business_builder as bb
         self.assertTrue(hasattr(bb, "_evaluate_document_completion_gate"))
         self.assertTrue(hasattr(bb, "_evaluate_checklist_completion_gate"))
 
-    def test_stage_completion_overrides_schema_unchanged(self):
+    def test_stage_completion_overrides_schema_now_includes_output_fields(self):
         from business_core.sheets import BUSINESS_HEADERS
         headers = BUSINESS_HEADERS["stage_completion_overrides"]
-        self.assertNotIn("Missing Required Output IDs", headers)
-        self.assertNotIn("Missing Output Instance IDs", headers)
+        self.assertIn("Missing Blocking Output Instance IDs", headers)
+        self.assertIn("Missing Blocking Output Template IDs", headers)
+        self.assertIn("Missing Blocking Output Titles", headers)
+        self.assertIn("Missing Blocking Output Statuses", headers)
+
+    def test_stage_completion_overrides_first_14_columns_unchanged(self):
+        """п.27 support: the pre-Phase-B column order must be preserved
+        exactly — new fields only ever append at positions 15-18."""
+        from business_core.sheets import BUSINESS_HEADERS
+        headers = BUSINESS_HEADERS["stage_completion_overrides"]
+        self.assertEqual(headers[:14], [
+            "Override ID", "Stage ID", "Roadmap ID", "User", "Overridden At",
+            "Reason", "Missing Blocking Doc IDs", "Previous Status", "Target Status",
+            "Override Type", "Configuration Error Details",
+            "Missing Checklist Instance IDs", "Missing Checklist Item IDs",
+            "Missing Checklist Item Titles",
+        ])
+        self.assertEqual(headers[14:18], [
+            "Missing Blocking Output Instance IDs", "Missing Blocking Output Template IDs",
+            "Missing Blocking Output Titles", "Missing Blocking Output Statuses",
+        ])
+
+    def test_stage_output_templates_and_instances_schema_unchanged(self):
+        """Phase A schema (Часть 6 isolation requirement) must remain
+        byte-for-byte untouched by Phase B."""
+        from business_core.sheets import BUSINESS_HEADERS
+        self.assertEqual(BUSINESS_HEADERS["stage_output_templates"], OUTPUT_TEMPLATE_HEADERS)
+        self.assertEqual(BUSINESS_HEADERS["stage_output_instances"], OUTPUT_INSTANCE_HEADERS)
+
+    def test_lifecycle_functions_never_reference_the_gate(self):
+        """Phase A lifecycle functions must stay one-directional: the
+        gate reads them, they never call back into the gate."""
+        import inspect
+        import business_core.stage_output_manager as som
+
+        for fn in (
+            som.submit_output_evidence, som.accept_output_instance,
+            som.reject_output_instance, som.waive_output_instance,
+            som.update_output_instance_status, som.create_output_instance,
+        ):
+            source = inspect.getsource(fn)
+            self.assertNotIn("_evaluate_output_completion_gate", source)
+            self.assertNotIn("transition_stage_status", source)
 
 
 if __name__ == "__main__":
