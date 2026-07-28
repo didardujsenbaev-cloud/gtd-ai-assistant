@@ -5344,6 +5344,31 @@ async def analyzedoc_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             )
 
     except Exception as e:
+        # Phase 16B.1: a 429/5xx/network failure on the read()s above
+        # (find_row_by_id/get_content_status, both quota-safe at the
+        # sheets.py level) must never render as the generic "не удалось
+        # запустить анализ" — upload/registration already succeeded
+        # earlier and is completely unaffected; only this read-triggering
+        # check couldn't complete.
+        from business_core.sheets import SheetsQuotaExceededError, TransientSheetsReadError
+        if isinstance(e, SheetsQuotaExceededError):
+            log.warning(f"analyzedoc_cmd quota error: {e}")
+            await _reply(update, "\n".join([
+                "⚠️ Google Sheets временно перегружен",
+                "",
+                "Анализ документа не завершён.",
+                "Повторите /analyzedoc немного позже.",
+            ]), parse_mode=None)
+            return
+        if isinstance(e, TransientSheetsReadError):
+            log.warning(f"analyzedoc_cmd transient read error: {e}")
+            await _reply(update, "\n".join([
+                "⚠️ Не удалось временно прочитать данные Google Sheets",
+                "",
+                "Документ сохранён.",
+                "Анализ можно повторить позже.",
+            ]), parse_mode=None)
+            return
         log.error(f"analyzedoc_cmd error: {e}")
         await _reply(update, "❌ Не удалось запустить анализ документа.", parse_mode=None)
 
@@ -5454,6 +5479,27 @@ def _render_document_analysis(result) -> str:
         return "⏳ Документ сейчас анализируется."
 
     if result.status == "failed":
+        # Phase 16B.1: a Sheets 429/5xx during analysis is never rendered
+        # like a generic AI/analysis failure — Content Status is still
+        # "failed" (no new enum value), but is_quota_error/
+        # is_transient_read_error (set by document_query from the fixed
+        # error-text markers) route to a safe, retry-encouraging message
+        # instead, without ever showing the raw error/APIError/
+        # project_number text.
+        if result.is_quota_error:
+            return "\n".join([
+                "⚠️ Google Sheets временно перегружен",
+                "",
+                "Анализ документа не завершён.",
+                f"Повторите /analyzedoc document_id={result.document_id} немного позже.",
+            ])
+        if result.is_transient_read_error:
+            return "\n".join([
+                "⚠️ Не удалось временно прочитать данные Google Sheets",
+                "",
+                "Документ сохранён.",
+                f"Анализ можно повторить позже: /analyzedoc document_id={result.document_id}",
+            ])
         lines = [
             "❌ Анализ завершился с ошибкой",
             "",
@@ -5511,6 +5557,21 @@ def _render_document_analysis(result) -> str:
             card_lines.append("Извлечённые поля:")
             card_lines.append(fields_block)
 
+    # Phase 16B.1: exact-duplicate detection — informational only. Never
+    # shows the full SHA-256 hash, raw AI JSON, or any automatic-relation
+    # claim; explicitly states no automatic replacement happened.
+    card_lines.append("")
+    if result.duplicate_status == "EXACT_DUPLICATE":
+        card_lines.append("⚠️ Обнаружен точный дубликат")
+        card_lines.append("")
+        card_lines.append(f"Совпадает с: {result.duplicate_of_document_id}")
+        card_lines.append(f"Название: {result.duplicate_document_name or '—'}")
+        card_lines.append(f"Статус: {result.duplicate_document_status or '—'}")
+        card_lines.append("Файл сохранён отдельно.")
+        card_lines.append("Автоматическая замена не выполнялась.")
+    else:
+        card_lines.append("Дубликат: не обнаружен")
+
     return "\n".join(card_lines)
 
 
@@ -5548,6 +5609,25 @@ async def docanalysis_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await update.message.reply_text(part, parse_mode=None)
 
     except Exception as e:
+        # Phase 16B.1: same rationale as analyzedoc_cmd — a 429/5xx here
+        # is a read-only viewer failing to read, never "анализ сломан".
+        from business_core.sheets import SheetsQuotaExceededError, TransientSheetsReadError
+        if isinstance(e, SheetsQuotaExceededError):
+            log.warning(f"docanalysis_cmd quota error: {e}")
+            await _reply(update, "\n".join([
+                "⚠️ Google Sheets временно перегружен",
+                "",
+                "Повторите запрос немного позже.",
+            ]), parse_mode=None)
+            return
+        if isinstance(e, TransientSheetsReadError):
+            log.warning(f"docanalysis_cmd transient read error: {e}")
+            await _reply(update, "\n".join([
+                "⚠️ Не удалось временно прочитать данные Google Sheets",
+                "",
+                "Попробуйте повторить запрос позже.",
+            ]), parse_mode=None)
+            return
         log.error(f"docanalysis_cmd error: {e}")
         await _reply(update, "❌ Не удалось получить результат анализа.", parse_mode=None)
 

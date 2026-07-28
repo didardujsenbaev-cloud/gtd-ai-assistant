@@ -456,6 +456,14 @@ BUSINESS_HEADERS: dict[str, list[str]] = {
         "Model", "Prompt Version", "Content Hash",
         "Analysis Started At", "Analysis Completed At", "Analysis Error",
         "Created At", "Updated At",
+        # Phase 16B.1 (2026-07-28): exact-duplicate detection, purely
+        # additive at the end of the header list. "Duplicate Status" is
+        # "" (not yet computed — e.g. a pre-16B.1 row that was never
+        # re-analyzed) | "EXACT_DUPLICATE" | "NEW_DOCUMENT". See
+        # business_core.document_intelligence.find_exact_duplicate() for
+        # the canonical-selection algorithm. Never touches Document
+        # Family/Version, Document Template ID, relations, or Status.
+        "Duplicate Status", "Duplicate Of Document ID", "Duplicate Checked At",
     ],
     # Phase 18C-1: Stage-to-Entity Relation Foundation.
     # One row = one stage<->entity relationship. Exactly one of

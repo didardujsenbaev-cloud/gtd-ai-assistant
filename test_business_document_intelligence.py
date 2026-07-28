@@ -46,6 +46,8 @@ CONTENT_HEADERS = [
     "Model", "Prompt Version", "Content Hash",
     "Analysis Started At", "Analysis Completed At", "Analysis Error",
     "Created At", "Updated At",
+    # Phase 16B.1 (2026-07-28): exact-duplicate detection, purely additive.
+    "Duplicate Status", "Duplicate Of Document ID", "Duplicate Checked At",
 ]
 
 DOC_REGISTRY_HEADERS = [
@@ -492,7 +494,9 @@ class TestSizeSafeguards(unittest.TestCase):
         self.assertEqual(result["action"], "completed")
         idx = {h: i for i, h in enumerate(CONTENT_HEADERS)}
         col_to_header = {chr(ord("A") + i): h for h, i in idx.items()}
-        final_write = sheet._batch_calls[-1]
+        # [-2]: the main "completed" write — [-1] is the separate Phase
+        # 16B.1 exact-duplicate-fields follow-up write.
+        final_write = sheet._batch_calls[-2]
         written = {col_to_header[e["range"][0]]: e["values"][0][0] for e in final_write}
         self.assertLessEqual(len(written["Detected Document Type"]), di.DETECTED_TYPE_MAX_CHARS)
         self.assertLessEqual(len(written["Language"]), di.LANGUAGE_MAX_CHARS)
@@ -524,6 +528,8 @@ class TestUpdateBusinessRow(unittest.TestCase):
             "claude-sonnet-4-5", "v1", "abc123hash",
             "2026-01-01 00:00:00 UTC", "2026-01-01 00:05:00 UTC", "",
             "2026-01-01 00:00:00 UTC", "2026-01-01 00:05:00 UTC",
+            # Phase 16B.1: exact-duplicate columns, unset in this pre-existing row.
+            "", "", "",
         ]
         self.assertEqual(len(row), len(CONTENT_HEADERS))
         sheet = _make_sheet(CONTENT_HEADERS, existing_rows=[row])
@@ -733,11 +739,16 @@ class TestAnalyzeDocument(unittest.TestCase):
         self.assertTrue(result["ok"])
         # No prior row -> the claim step is the row's own creation
         # (append_business_row, i.e. sheet.update(), not batch_update);
-        # only the final "completed" write goes through batch_update.
-        # Field-level correctness is asserted separately in
-        # test_completed_row_fields_are_correct().
+        # the "completed" write goes through batch_update, followed by a
+        # SEPARATE best-effort batch_update for the Phase 16B.1 exact-
+        # duplicate fields (Duplicate Status/Of Document ID/Checked At) —
+        # deliberately its own call so a not-yet-migrated production
+        # sheet (missing those 3 columns) degrades to "duplicate fields
+        # simply not written" rather than reverting the whole completed
+        # analysis to failed. Field-level correctness is asserted
+        # separately in test_completed_row_fields_are_correct().
         self.assertEqual(len(sheet._appended), 1)
-        self.assertEqual(len(sheet._batch_calls), 1)
+        self.assertEqual(len(sheet._batch_calls), 2)
 
     def test_completed_row_fields_are_correct(self):
         di = _fresh_di()
@@ -756,7 +767,9 @@ class TestAnalyzeDocument(unittest.TestCase):
             col_letter = chr(ord("A") + i)
             col_to_header[col_letter] = h
 
-        final_write = sheet._batch_calls[-1]
+        # [-2]: the main "completed" write — [-1] is the separate Phase
+        # 16B.1 exact-duplicate-fields follow-up write.
+        final_write = sheet._batch_calls[-2]
         written = {}
         for entry in final_write:
             col_letter = entry["range"][0]
@@ -890,7 +903,9 @@ class TestAnalyzeDocument(unittest.TestCase):
         self.assertEqual(result["action"], "completed")
         idx = {h: i for i, h in enumerate(CONTENT_HEADERS)}
         col_to_header = {chr(ord("A") + i): h for h, i in idx.items()}
-        final_write = sheet._batch_calls[-1]
+        # [-2]: the main "completed" write — [-1] is the separate Phase
+        # 16B.1 exact-duplicate-fields follow-up write.
+        final_write = sheet._batch_calls[-2]
         written = {col_to_header[e["range"][0]]: e["values"][0][0] for e in final_write}
         self.assertNotIn("Document Template ID", written)  # not even a DOCUMENT_CONTENT field
         self.assertEqual(written["Suggested Document Template ID"], "DOC-IZH-KP-001")

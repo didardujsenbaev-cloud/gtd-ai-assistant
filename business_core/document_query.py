@@ -33,6 +33,23 @@ class DocumentAnalysisResult:
         "no_content"  — registered, but no DOCUMENT_CONTENT row yet
         "pending" | "processing" | "failed" | "unsupported" | "completed"
                       — DOCUMENT_CONTENT's own Content Status, verbatim
+
+    Phase 16B.1 additions (all additive, default-safe for any
+    pre-16B.1 row that has never been re-analyzed):
+      is_quota_error / is_transient_read_error — True only when `error`
+        carries business_core.document_intelligence's
+        QUOTA_ERROR_PREFIX/TRANSIENT_ERROR_PREFIX marker (status is still
+        "failed" — CONTENT_STATUS_VALUES is unchanged) — lets a renderer
+        show a safe, retry-encouraging message instead of a generic
+        analysis-failure one, without ever exposing the raw error text.
+      duplicate_status — "" (never checked) | "EXACT_DUPLICATE" | "NEW_DOCUMENT"
+      duplicate_of_document_id / duplicate_checked_at — verbatim from
+        DOCUMENT_CONTENT's own additive columns.
+      duplicate_document_name / duplicate_document_status — looked up
+        fresh from DOCUMENT_REGISTRY (not cached/stored) ONLY when
+        duplicate_status == "EXACT_DUPLICATE", so the shown Status always
+        reflects the found document's CURRENT state, never a stale
+        snapshot from whenever the duplicate check last ran.
     """
     status: str
     document_id: str = ""
@@ -51,6 +68,13 @@ class DocumentAnalysisResult:
     completed_at: str = ""
     updated_at: str = ""
     error: str = ""
+    is_quota_error: bool = False
+    is_transient_read_error: bool = False
+    duplicate_status: str = ""
+    duplicate_of_document_id: str = ""
+    duplicate_checked_at: str = ""
+    duplicate_document_name: str = ""
+    duplicate_document_status: str = ""
 
 
 def _parse_fields_json(raw: str) -> tuple[dict, bool]:
@@ -120,6 +144,27 @@ def get_document_analysis(document_id: str) -> DocumentAnalysisResult:
     status = (content.get("Content Status") or "").strip() or "pending"
     fields_dict, fields_valid = _parse_fields_json(content.get("Extracted Fields JSON", ""))
     keywords = _parse_keywords_json(content.get("Keywords JSON", ""))
+    error = content.get("Analysis Error", "") or ""
+
+    # Phase 16B.1: recognize document_intelligence's fixed error-text
+    # markers — Content Status is still "failed" either way (unchanged
+    # enum), only the renderer's choice of message differs. A pre-16B.1
+    # row (or any ordinary AI/Drive failure) simply has neither prefix —
+    # both flags default to False.
+    from business_core.document_intelligence import QUOTA_ERROR_PREFIX, TRANSIENT_ERROR_PREFIX
+    is_quota_error = error.startswith(QUOTA_ERROR_PREFIX)
+    is_transient_read_error = error.startswith(TRANSIENT_ERROR_PREFIX)
+
+    duplicate_status = content.get("Duplicate Status", "") or ""
+    duplicate_of_document_id = content.get("Duplicate Of Document ID", "") or ""
+    duplicate_document_name = ""
+    duplicate_document_status = ""
+    if duplicate_status == "EXACT_DUPLICATE" and duplicate_of_document_id:
+        dup_found = find_row_by_id("document_registry", duplicate_of_document_id)
+        if dup_found:
+            _, dup_row = dup_found
+            duplicate_document_name = dup_row.get("Document Name", "")
+            duplicate_document_status = dup_row.get("Status", "")
 
     return DocumentAnalysisResult(
         status=status,
@@ -138,7 +183,14 @@ def get_document_analysis(document_id: str) -> DocumentAnalysisResult:
         template_match_confidence=content.get("Template Match Confidence", ""),
         completed_at=content.get("Analysis Completed At", ""),
         updated_at=content.get("Updated At", ""),
-        error=content.get("Analysis Error", ""),
+        error=error,
+        is_quota_error=is_quota_error,
+        is_transient_read_error=is_transient_read_error,
+        duplicate_status=duplicate_status,
+        duplicate_of_document_id=duplicate_of_document_id,
+        duplicate_checked_at=content.get("Duplicate Checked At", "") or "",
+        duplicate_document_name=duplicate_document_name,
+        duplicate_document_status=duplicate_document_status,
     )
 
 
