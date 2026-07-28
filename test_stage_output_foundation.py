@@ -602,6 +602,110 @@ class TestSyncStageOutputRequirements(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertEqual(result["code"], "NO_REQUIRED_OUTPUT_RELATIONS")
 
+    def test_preview_has_empty_errors_and_partial_success_false(self):
+        import business_core.business_builder as bb
+        with patch("business_core.roadmap_manager.resolve_template_stage_for_stage", return_value=_RESOLVED_OK), \
+             patch("business_core.stage_entity_relations.get_relations_for_template_stage",
+                   return_value=(_RELATION_SOUT_001,)), \
+             patch("business_core.stage_output_manager.find_output_template_by_id", return_value=_ACTIVE_TEMPLATE), \
+             patch("business_core.stage_output_manager.list_output_instances_for_stage", return_value=()):
+            result = bb.sync_stage_output_requirements("STAGE-013", confirm=False)
+        self.assertEqual(result["errors"], ())
+        self.assertFalse(result["partial_success"])
+
+    def test_confirm_all_created_has_empty_errors(self):
+        """Old success shape preserved — STAGE_OUTPUT_SYNCED, plus the
+        two new additive fields both at their inert defaults."""
+        import business_core.business_builder as bb
+        with patch("business_core.roadmap_manager.resolve_template_stage_for_stage", return_value=_RESOLVED_OK), \
+             patch("business_core.stage_entity_relations.get_relations_for_template_stage",
+                   return_value=(_RELATION_SOUT_001,)), \
+             patch("business_core.stage_output_manager.find_output_template_by_id", return_value=_ACTIVE_TEMPLATE), \
+             patch("business_core.stage_output_manager.list_output_instances_for_stage", return_value=()), \
+             patch("business_core.stage_output_manager.create_output_instance",
+                   return_value={"ok": True, "output_instance_id": "SOUTI-001", "code": "OUTPUT_INSTANCE_CREATED", "error": None}):
+            result = bb.sync_stage_output_requirements("STAGE-013", confirm=True)
+        self.assertEqual(result["code"], "STAGE_OUTPUT_SYNCED")
+        self.assertEqual(result["errors"], ())
+        self.assertFalse(result["partial_success"])
+
+    def test_one_error_itemized_with_template_id_code_message(self):
+        import business_core.business_builder as bb
+        relations = (_RELATION_SOUT_001,)
+        with patch("business_core.roadmap_manager.resolve_template_stage_for_stage", return_value=_RESOLVED_OK), \
+             patch("business_core.stage_entity_relations.get_relations_for_template_stage", return_value=relations), \
+             patch("business_core.stage_output_manager.find_output_template_by_id", return_value=_ACTIVE_TEMPLATE), \
+             patch("business_core.stage_output_manager.list_output_instances_for_stage", return_value=()), \
+             patch("business_core.stage_output_manager.create_output_instance",
+                   return_value={"ok": False, "output_instance_id": "", "code": "OUTPUT_TEMPLATE_NOT_FOUND",
+                                 "error": "Output Template SOUT-001 не найден"}):
+            result = bb.sync_stage_output_requirements("STAGE-013", confirm=True)
+        self.assertEqual(result["errors"], (("SOUT-001", "OUTPUT_TEMPLATE_NOT_FOUND", "Output Template SOUT-001 не найден"),))
+
+    def test_partial_success_continues_creating_remaining_outputs(self):
+        """One failure never stops the loop — the second (valid) Output
+        Template is still attempted and created."""
+        import business_core.business_builder as bb
+        relation_2 = {**_RELATION_SOUT_001, "Relation ID": "REL-101", "Entity ID": "SOUT-002"}
+        template_2 = {"Output Template ID": "SOUT-002", "Status": "active"}
+
+        def _find_template(otid):
+            return {"SOUT-001": _ACTIVE_TEMPLATE, "SOUT-002": template_2}.get(otid)
+
+        def _create_side_effect(output_template_id, stage_id, **kwargs):
+            if output_template_id == "SOUT-001":
+                return {"ok": False, "output_instance_id": "", "code": "WRITE_FAILURE", "error": "boom"}
+            return {"ok": True, "output_instance_id": "SOUTI-002", "code": "OUTPUT_INSTANCE_CREATED", "error": None}
+
+        with patch("business_core.roadmap_manager.resolve_template_stage_for_stage", return_value=_RESOLVED_OK), \
+             patch("business_core.stage_entity_relations.get_relations_for_template_stage",
+                   return_value=(_RELATION_SOUT_001, relation_2)), \
+             patch("business_core.stage_output_manager.find_output_template_by_id", side_effect=_find_template), \
+             patch("business_core.stage_output_manager.list_output_instances_for_stage", return_value=()), \
+             patch("business_core.stage_output_manager.create_output_instance",
+                   side_effect=_create_side_effect) as mock_create:
+            result = bb.sync_stage_output_requirements("STAGE-013", confirm=True)
+
+        self.assertEqual(mock_create.call_count, 2)  # both attempted, no short-circuit
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["code"], "STAGE_OUTPUT_SYNC_PARTIAL")
+        self.assertEqual(result["created"], ("SOUT-002",))
+        self.assertEqual(len(result["errors"]), 1)
+        self.assertEqual(result["errors"][0][0], "SOUT-001")
+        self.assertTrue(result["partial_success"])
+
+    def test_full_failure_no_successful_creates(self):
+        import business_core.business_builder as bb
+        with patch("business_core.roadmap_manager.resolve_template_stage_for_stage", return_value=_RESOLVED_OK), \
+             patch("business_core.stage_entity_relations.get_relations_for_template_stage",
+                   return_value=(_RELATION_SOUT_001,)), \
+             patch("business_core.stage_output_manager.find_output_template_by_id", return_value=_ACTIVE_TEMPLATE), \
+             patch("business_core.stage_output_manager.list_output_instances_for_stage", return_value=()), \
+             patch("business_core.stage_output_manager.create_output_instance",
+                   return_value={"ok": False, "output_instance_id": "", "code": "WRITE_FAILURE", "error": "boom"}):
+            result = bb.sync_stage_output_requirements("STAGE-013", confirm=True)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "STAGE_OUTPUT_SYNC_FAILED")
+        self.assertEqual(result["created"], ())
+        self.assertEqual(len(result["errors"]), 1)
+        self.assertFalse(result["partial_success"])
+
+    def test_already_present_without_errors_stays_synced(self):
+        import business_core.business_builder as bb
+        existing = {"Output Template ID": "SOUT-001", "Output Instance ID": "SOUTI-001"}
+        with patch("business_core.roadmap_manager.resolve_template_stage_for_stage", return_value=_RESOLVED_OK), \
+             patch("business_core.stage_entity_relations.get_relations_for_template_stage",
+                   return_value=(_RELATION_SOUT_001,)), \
+             patch("business_core.stage_output_manager.find_output_template_by_id", return_value=_ACTIVE_TEMPLATE), \
+             patch("business_core.stage_output_manager.list_output_instances_for_stage", return_value=(existing,)), \
+             patch("business_core.stage_output_manager.create_output_instance") as mock_create:
+            result = bb.sync_stage_output_requirements("STAGE-013", confirm=True)
+        mock_create.assert_not_called()
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["code"], "STAGE_OUTPUT_SYNCED")
+        self.assertEqual(result["errors"], ())
+        self.assertFalse(result["partial_success"])
+
     def test_never_touches_roadmap_stages_writer(self):
         """Architectural guard: sync_stage_output_requirements() must
         never call any ROADMAP_STAGES writer — it only ever calls

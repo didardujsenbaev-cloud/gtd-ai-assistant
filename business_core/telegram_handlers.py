@@ -7130,10 +7130,42 @@ def _stage_output_sync_message(result: dict) -> str:
         lines.append(_STAGE_OUTPUT_SYNC_NOTE)
         return "\n".join(lines)
 
+    if code == "STAGE_OUTPUT_SYNC_PARTIAL":
+        # Additive (Phase Unified Provisioning): partial confirm outcome —
+        # some Output Instances created, some failed. Errors are itemized
+        # (output_template_id, error_code, error_message), never inferred.
+        created = result.get("created", ())
+        already_present = result.get("already_present", ())
+        skipped = result.get("skipped_inactive_templates", ())
+        errors = result.get("errors", ())
+        lines = [
+            "⚠️ Синхронизация Required Output выполнена частично",
+            f"Stage ID: {stage_id}",
+            f"Template Stage ID: {template_stage_id}",
+        ]
+        if created:
+            lines.append(f"Добавлено: {', '.join(created)}")
+        if already_present:
+            lines.append(f"Уже было: {', '.join(already_present)}")
+        if skipped:
+            lines.append(f"Пропущено (неактивный Output Template): {', '.join(skipped)}")
+        if errors:
+            lines.append("Ошибки:")
+            for output_template_id, error_code, error_message in errors:
+                lines.append(f"- {output_template_id} [{error_code}]: {error_message}")
+        lines.append(_STAGE_OUTPUT_SYNC_NOTE)
+        return "\n".join(lines)
+
     if code == "NO_REQUIRED_OUTPUT_RELATIONS":
         return f"❌ {result.get('error') or 'У Template Stage нет активных required_output relations.'}"
 
     if code == "STAGE_OUTPUT_SYNC_FAILED":
+        errors = result.get("errors", ())
+        if errors:
+            lines = [f"❌ Не удалось синхронизировать Required Output (Stage ID: {stage_id}):"]
+            for output_template_id, error_code, error_message in errors:
+                lines.append(f"- {output_template_id} [{error_code}]: {error_message}")
+            return "\n".join(lines)
         return f"❌ {result.get('error') or 'Не удалось синхронизировать Required Output.'}"
 
     # Shared resolution-failure codes (STAGE_NOT_FOUND/ROADMAP_NOT_FOUND/
@@ -8047,6 +8079,138 @@ async def syncchecklists_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
     except Exception as e:
         log.error(f"syncchecklists_cmd error: {e}")
         await _reply(update, "❌ Не удалось синхронизировать Checklist.")
+
+
+# ─────────────────────────────────────────────────────────────
+# Unified Stage Provisioning — thin wrapper over
+# business_builder.provision_stage_operational_instances(). /syncchecklists
+# and /syncoutputs remain unchanged, narrow diagnostic commands — this is
+# additive, not a replacement. No auto-trigger, no /provisionroadmap.
+# ─────────────────────────────────────────────────────────────
+
+def _provisioning_preview_message(result: dict) -> str:
+    stage_id = result.get("stage_id", "")
+    roadmap_id = result.get("roadmap_id", "") or "—"
+    template_stage_id = result.get("template_stage_id", "") or "—"
+
+    if result.get("code") == "STAGE_PROVISIONING_NOT_ALLOWED_FOR_STATUS":
+        return f"❌ {'; '.join(result.get('errors', ())) or 'Provisioning не разрешён для текущего статуса этапа.'}"
+    if not result.get("checklists") and not result.get("outputs"):
+        return f"❌ {'; '.join(result.get('errors', ())) or 'Не удалось выполнить provisioning.'}"
+
+    checklists = result.get("checklists", {})
+    outputs = result.get("outputs", {})
+    totals = result.get("totals", {})
+
+    lines = [
+        "📋 Подтверди provisioning этапа:",
+        "",
+        f"Stage ID: {stage_id}",
+        f"Roadmap ID: {roadmap_id}",
+        f"Template Stage ID: {template_stage_id}",
+        "",
+        "── Checklist ──",
+        f"К созданию: {', '.join(checklists.get('to_create', ())) or '—'}",
+        f"Уже существует: {', '.join(checklists.get('already_existing', ())) or '—'}",
+        f"Пропущено: {', '.join(checklists.get('skipped_inactive', ())) or '—'}",
+        f"Ошибок: {len(checklists.get('errors', ()))}",
+        "",
+        "── Required Outputs ──",
+        f"К созданию: {', '.join(outputs.get('to_add', ())) or '—'}",
+        f"Уже существует: {', '.join(outputs.get('already_present', ())) or '—'}",
+        f"Пропущено: {', '.join(outputs.get('skipped_inactive_templates', ())) or '—'}",
+        f"Ошибок: {len(outputs.get('errors', ()))}",
+        "",
+        f"Итого: к созданию {totals.get('to_create', 0)}, уже существует {totals.get('already_existing', 0)}, "
+        f"пропущено {totals.get('skipped', 0)}, ошибок {totals.get('errors', 0)}.",
+        "",
+        "Чтобы применить, повтори команду с confirm=yes.",
+    ]
+    return "\n".join(lines)
+
+
+def _provisioning_confirm_message(result: dict) -> str:
+    if result.get("code") == "STAGE_PROVISIONING_NOT_ALLOWED_FOR_STATUS":
+        return f"❌ {'; '.join(result.get('errors', ())) or 'Provisioning не разрешён для текущего статуса этапа.'}"
+
+    checklists = result.get("checklists", {})
+    outputs = result.get("outputs", {})
+    totals = result.get("totals", {})
+    code = result.get("code", "")
+
+    header = {
+        "NOTHING_TO_PROVISION": "ℹ️ Provisioning: нечего создавать",
+        "STAGE_PROVISIONED": "✅ Provisioning выполнен",
+        "STAGE_PROVISION_PARTIAL": "⚠️ Provisioning выполнен частично",
+        "STAGE_PROVISION_FAILED": "❌ Provisioning не выполнен",
+    }.get(code, "ℹ️ Provisioning выполнен")
+
+    lines = [
+        header,
+        f"Stage ID: {result.get('stage_id', '')}",
+        f"Roadmap ID: {result.get('roadmap_id', '') or '—'}",
+        f"Template Stage ID: {result.get('template_stage_id', '') or '—'}",
+        "",
+        f"Создано Checklist Instances: {len(checklists.get('created', ()))}",
+        f"Создано Output Instances: {len(outputs.get('created', ()))}",
+        f"Уже существовало: {totals.get('already_existing', 0)}",
+        f"Пропущено: {totals.get('skipped', 0)}",
+        f"Ошибок: {totals.get('errors', 0)}",
+    ]
+
+    checklist_errors = checklists.get("errors", ())
+    if checklist_errors:
+        lines.append("Ошибки Checklist:")
+        for checklist_template_id, error_message in checklist_errors:
+            lines.append(f"- {checklist_template_id}: {error_message}")
+
+    output_errors = outputs.get("errors", ())
+    if output_errors:
+        lines.append("Ошибки Output:")
+        for output_template_id, error_code, error_message in output_errors:
+            lines.append(f"- {output_template_id} [{error_code}]: {error_message}")
+
+    return "\n".join(lines)
+
+
+async def provisionstage_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /provisionstage stage_id=STAGE-013
+    /provisionstage stage_id=STAGE-013 confirm=yes
+
+    Тонкая обёртка над business_builder.provision_stage_operational_
+    instances() — единым вызовом создаёт недостающие Checklist Instances
+    и Output Instances для живого Stage. /syncchecklists и /syncoutputs
+    остаются доступны отдельно, без изменений. Никакого auto-trigger:
+    только явный ручной вызов этой команды.
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg())
+        return
+    raw = " ".join(context.args or [])
+    args = _parse_kv_args(raw)
+    stage_id = args.get("stage_id") or args.get("_pos0", "")
+    if not stage_id:
+        await _reply(update, "❌ Укажи stage_id.\n\nПример: `/provisionstage stage_id=STAGE-013`")
+        return
+
+    confirmed = args.get("confirm", "").strip().lower() == "yes"
+
+    try:
+        from business_core.business_builder import provision_stage_operational_instances
+
+        actor = str(update.effective_user.id) if update.effective_user else ""
+        result = provision_stage_operational_instances(
+            stage_id, confirm=confirmed, trigger="manual_telegram", actor=actor,
+        )
+        text = (
+            _provisioning_confirm_message(result) if confirmed
+            else _provisioning_preview_message(result)
+        )
+        await _reply(update, text)
+    except Exception as e:
+        log.error(f"provisionstage_cmd error: {e}")
+        await _reply(update, "❌ Не удалось выполнить provisioning этапа.")
 
 
 async def checklists_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -13049,6 +13213,8 @@ def register_business_handlers(app: Application) -> None:
     # Phase 1: Checklist Relation Foundation.
     app.add_handler(CommandHandler("linkchecklist",    linkchecklist_cmd))
     app.add_handler(CommandHandler("syncchecklists",   syncchecklists_cmd))
+    # Unified Stage Provisioning.
+    app.add_handler(CommandHandler("provisionstage",   provisionstage_cmd))
     app.add_handler(CommandHandler("startchecklist",   startchecklist_cmd))
     app.add_handler(CommandHandler("checklists",       checklists_cmd))
     app.add_handler(CommandHandler("checklist",        checklist_cmd))

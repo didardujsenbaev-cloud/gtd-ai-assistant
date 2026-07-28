@@ -4873,7 +4873,18 @@ def sync_stage_output_requirements(stage_id: str, confirm: bool = False) -> dict
             "already_present": tuple[str, ...],            # Output Template IDs with an instance already
             "created": tuple[str, ...],                    # actually created (confirm=True only)
             "skipped_inactive_templates": tuple[str, ...], # active relation, but Output Template itself inactive
+            "errors": tuple,        # (output_template_id, error_code, error_message) per create failure — additive
+            "partial_success": bool, # True only when SOME (not all) requested instances were created — additive
         }
+
+    Additive contract note: `errors`/`partial_success` were added after
+    this function's original shipping shape — every pre-existing field
+    above is unchanged in name and meaning; every pre-existing caller
+    that ignores these two new fields continues to work exactly as
+    before. `errors` is itemized per Output Template (never an inferred
+    count) — a create_output_instance() failure never stops the loop,
+    every remaining to_add entry is still attempted, and no already-
+    created instance is ever rolled back because a later one failed.
     """
     from business_core.roadmap_manager import resolve_template_stage_for_stage
     from business_core.stage_entity_relations import get_relations_for_template_stage
@@ -4884,6 +4895,7 @@ def sync_stage_output_requirements(stage_id: str, confirm: bool = False) -> dict
     empty = {
         "stage_id": stage_id, "template_stage_id": "",
         "to_add": (), "already_present": (), "created": (), "skipped_inactive_templates": (),
+        "errors": (), "partial_success": False,
     }
 
     resolved = resolve_template_stage_for_stage(stage_id)
@@ -4904,6 +4916,7 @@ def sync_stage_output_requirements(stage_id: str, confirm: bool = False) -> dict
             "error": f"У Template Stage {template_stage_id} нет активных required_output relations",
             "stage_id": stage_id, "template_stage_id": template_stage_id,
             "to_add": (), "already_present": (), "created": (), "skipped_inactive_templates": (),
+            "errors": (), "partial_success": False,
         }
 
     relations_by_output_template_id = {r.get("Entity ID", ""): r for r in relations}
@@ -4929,10 +4942,12 @@ def sync_stage_output_requirements(stage_id: str, confirm: bool = False) -> dict
             "stage_id": stage_id, "template_stage_id": template_stage_id,
             "to_add": to_add, "already_present": already_present, "created": (),
             "skipped_inactive_templates": tuple(skipped_inactive_templates),
+            "errors": (), "partial_success": False,
         }
 
     roadmap = resolved.get("roadmap") or {}
     created = []
+    errors = []
     for output_template_id in to_add:
         relation = relations_by_output_template_id[output_template_id]
         result = create_output_instance(
@@ -4946,12 +4961,27 @@ def sync_stage_output_requirements(stage_id: str, confirm: bool = False) -> dict
         )
         if result["ok"]:
             created.append(output_template_id)
+        else:
+            errors.append((
+                output_template_id,
+                result.get("code") or "OUTPUT_INSTANCE_CREATE_FAILED",
+                result.get("error") or "unknown error",
+            ))
+
+    if not errors:
+        ok, code = True, "STAGE_OUTPUT_SYNCED"
+    elif created:
+        ok, code = True, "STAGE_OUTPUT_SYNC_PARTIAL"
+    else:
+        ok, code = False, "STAGE_OUTPUT_SYNC_FAILED"
 
     return {
-        "ok": True, "code": "STAGE_OUTPUT_SYNCED", "error": None,
+        "ok": ok, "code": code,
+        "error": None if not errors else "; ".join(f"{otid}: {msg}" for otid, _, msg in errors),
         "stage_id": stage_id, "template_stage_id": template_stage_id,
         "to_add": to_add, "already_present": already_present, "created": tuple(created),
         "skipped_inactive_templates": tuple(skipped_inactive_templates),
+        "errors": tuple(errors), "partial_success": bool(errors) and bool(created),
     }
 
 
@@ -5197,6 +5227,204 @@ def provision_checklists_for_stage(stage_id: str, confirm: bool = False) -> dict
         "to_create": to_create, "created": tuple(created), "already_existing": already_existing,
         "skipped_inactive": tuple(skipped_inactive), "errors": tuple(errors),
         "partial_success": bool(errors) and bool(created),
+    }
+
+
+_STAGE_PROVISIONING_CONFIRM_DENIED_STATUSES = frozenset({"done", "cancelled"})
+
+
+def provision_stage_operational_instances(
+    stage_id: str,
+    confirm: bool = False,
+    include_checklists: bool = True,
+    include_outputs: bool = True,
+    trigger: str = "manual",
+    actor: str = "",
+) -> dict:
+    """
+    Unified Stage Provisioning: a single call orchestrating both
+    provision_checklists_for_stage() and sync_stage_output_requirements()
+    for one Stage. Deliberately additive/wrapping only — neither child
+    function's own contract, the Checklist/Output Completion Gates, or
+    transition_stage_status() are touched by this function or by adding
+    it. No Update/context/Telegram dependency: /provisionstage is a thin
+    wrapper over this function, and a future automatic pending->
+    in_progress trigger (NOT wired in this phase) could call it directly,
+    unchanged.
+
+    Resolution happens exactly ONCE here (via
+    roadmap_manager.resolve_template_stage_for_stage()) — stage_id,
+    roadmap_id, and template_stage_id are derived once and returned at
+    the top level, rather than relying on comparing each child's own
+    (otherwise redundant) resolution outcome. Each child function still
+    performs its own internal resolve — this duplication is accepted
+    (see the architecture audit) rather than changing either child's
+    signature to accept a pre-resolved template_stage_id, which would be
+    a child-contract change outside this phase's scope.
+
+    Status policy: `confirm=True` is refused (with
+    STAGE_PROVISIONING_NOT_ALLOWED_FOR_STATUS) when the Stage's current
+    Status is "done" or "cancelled" — `confirm=False` (preview) is always
+    allowed regardless of Status, since it never writes anything. No
+    `force=` override exists in this phase.
+
+    Both included subsystems are ALWAYS attempted (no short-circuit) —
+    each wrapped in its own try/except so an unexpected exception in one
+    never prevents the other from running and never propagates out of
+    this function (a caller, including a future automatic trigger, must
+    never see a raised exception here — only a structured error entry).
+    A disabled subsystem (`include_checklists=False`/
+    `include_outputs=False`) returns an explicit `SUBSYSTEM_DISABLED`
+    code in its own raw result — never `None`, never silently omitted.
+
+    `checklists`/`outputs` in the returned dict are each child's FULL,
+    UNMODIFIED return dict — field names are never renamed or dropped.
+    `totals` is computed ONLY by summing each child's own explicit
+    tuple-length fields (`to_create`/`to_add`, `created`, `already_
+    existing`/`already_present`, `skipped_inactive`/
+    `skipped_inactive_templates`, `errors`) — no inferred/estimated
+    count of any kind, now that sync_stage_output_requirements() itemizes
+    its own errors additively.
+
+    `trigger`/`actor` are returned in the structured result for a future
+    caller's/log's use — neither is written to any sheet or table in
+    this phase (no STAGE_PROVISIONING_LOG exists or is created here).
+
+    Top-level `ok`/`code`/`partial_success` policy:
+      A. Stage/Roadmap/Template Stage resolution itself fails -> ok=False,
+         code=<the shared resolution code>, partial_success=False.
+      B. Both INCLUDED subsystems have nothing configured (or are
+         disabled) -> ok=True, code="NOTHING_TO_PROVISION",
+         partial_success=False.
+      C. totals["errors"] == 0 -> ok=True, code="STAGE_PROVISIONED",
+         partial_success=False.
+      D. totals["errors"] > 0 and (totals["created"] > 0 or
+         totals["already_existing"] > 0) -> ok=True,
+         code="STAGE_PROVISION_PARTIAL", partial_success=True.
+      E. totals["errors"] > 0 and totals["created"] == 0 and
+         totals["already_existing"] == 0 -> ok=False,
+         code="STAGE_PROVISION_FAILED", partial_success=False.
+    `skipped` never counts as an error for this policy.
+
+    Returns:
+        {
+            "ok": bool, "code": str,
+            "stage_id": str, "roadmap_id": str, "template_stage_id": str,
+            "confirm": bool, "trigger": str, "actor": str,
+            "checklists": dict,  # raw provision_checklists_for_stage() result (or SUBSYSTEM_DISABLED shape)
+            "outputs": dict,     # raw sync_stage_output_requirements() result (or SUBSYSTEM_DISABLED shape)
+            "totals": {"to_create": int, "created": int, "already_existing": int, "skipped": int, "errors": int},
+            "partial_success": bool,
+            "warnings": tuple,  # e.g. an unexpected subsystem exception, caught here
+            "errors": tuple,    # populated only for policy A / B (resolution failure / status denial)
+        }
+    """
+    from business_core.roadmap_manager import resolve_template_stage_for_stage
+
+    def _empty_result(ok: bool, code: str, roadmap_id: str = "", template_stage_id: str = "",
+                       errors: tuple = ()) -> dict:
+        return {
+            "ok": ok, "code": code,
+            "stage_id": stage_id, "roadmap_id": roadmap_id, "template_stage_id": template_stage_id,
+            "confirm": confirm, "trigger": trigger, "actor": actor,
+            "checklists": {}, "outputs": {},
+            "totals": {"to_create": 0, "created": 0, "already_existing": 0, "skipped": 0, "errors": 0},
+            "partial_success": False,
+            "warnings": (), "errors": errors,
+        }
+
+    resolved = resolve_template_stage_for_stage(stage_id)
+    if not resolved["ok"]:
+        return _empty_result(False, resolved["code"], errors=(resolved.get("error") or resolved["code"],))
+
+    roadmap = resolved.get("roadmap") or {}
+    roadmap_id = roadmap.get("roadmap_id", "")
+    template_stage_id = resolved["template_stage_id"]
+    stage = resolved.get("stage") or {}
+    stage_status = stage.get("status", "")
+
+    if confirm and stage_status in _STAGE_PROVISIONING_CONFIRM_DENIED_STATUSES:
+        return _empty_result(
+            False, "STAGE_PROVISIONING_NOT_ALLOWED_FOR_STATUS", roadmap_id, template_stage_id,
+            errors=(f"Provisioning с confirm=yes запрещён для Stage со статусом {stage_status!r}.",),
+        )
+
+    disabled_checklists_result = {
+        "ok": True, "code": "SUBSYSTEM_DISABLED", "error": None,
+        "stage_id": stage_id, "template_stage_id": template_stage_id, "source": "",
+        "to_create": (), "created": (), "already_existing": (), "skipped_inactive": (),
+        "errors": (), "partial_success": False,
+    }
+    disabled_outputs_result = {
+        "ok": True, "code": "SUBSYSTEM_DISABLED", "error": None,
+        "stage_id": stage_id, "template_stage_id": template_stage_id,
+        "to_add": (), "already_present": (), "created": (), "skipped_inactive_templates": (),
+        "errors": (), "partial_success": False,
+    }
+
+    warnings: list[str] = []
+
+    if include_checklists:
+        try:
+            checklists_result = provision_checklists_for_stage(stage_id, confirm=confirm)
+        except Exception as exc:
+            log.error(f"provision_stage_operational_instances({stage_id}): checklist subsystem exception: {exc}")
+            warnings.append(f"Checklist subsystem raised an exception: {exc}")
+            checklists_result = {
+                "ok": False, "code": "CHECKLIST_SUBSYSTEM_EXCEPTION", "error": str(exc),
+                "stage_id": stage_id, "template_stage_id": template_stage_id, "source": "",
+                "to_create": (), "created": (), "already_existing": (), "skipped_inactive": (),
+                "errors": (("", "CHECKLIST_SUBSYSTEM_EXCEPTION", str(exc)),), "partial_success": False,
+            }
+    else:
+        checklists_result = disabled_checklists_result
+
+    if include_outputs:
+        try:
+            outputs_result = sync_stage_output_requirements(stage_id, confirm=confirm)
+        except Exception as exc:
+            log.error(f"provision_stage_operational_instances({stage_id}): output subsystem exception: {exc}")
+            warnings.append(f"Output subsystem raised an exception: {exc}")
+            outputs_result = {
+                "ok": False, "code": "OUTPUT_SUBSYSTEM_EXCEPTION", "error": str(exc),
+                "stage_id": stage_id, "template_stage_id": template_stage_id,
+                "to_add": (), "already_present": (), "created": (), "skipped_inactive_templates": (),
+                "errors": (("", "OUTPUT_SUBSYSTEM_EXCEPTION", str(exc)),), "partial_success": False,
+            }
+    else:
+        outputs_result = disabled_outputs_result
+
+    totals = {
+        "to_create": len(checklists_result.get("to_create", ())) + len(outputs_result.get("to_add", ())),
+        "created": len(checklists_result.get("created", ())) + len(outputs_result.get("created", ())),
+        "already_existing": (
+            len(checklists_result.get("already_existing", ())) + len(outputs_result.get("already_present", ()))
+        ),
+        "skipped": (
+            len(checklists_result.get("skipped_inactive", ())) + len(outputs_result.get("skipped_inactive_templates", ()))
+        ),
+        "errors": len(checklists_result.get("errors", ())) + len(outputs_result.get("errors", ())),
+    }
+
+    checklists_configured = checklists_result.get("code") not in ("SUBSYSTEM_DISABLED", "NO_CHECKLIST_TEMPLATES")
+    outputs_configured = outputs_result.get("code") not in ("SUBSYSTEM_DISABLED", "NO_REQUIRED_OUTPUT_RELATIONS")
+
+    if not checklists_configured and not outputs_configured:
+        ok, code, partial_success = True, "NOTHING_TO_PROVISION", False
+    elif totals["errors"] == 0:
+        ok, code, partial_success = True, "STAGE_PROVISIONED", False
+    elif totals["created"] > 0 or totals["already_existing"] > 0:
+        ok, code, partial_success = True, "STAGE_PROVISION_PARTIAL", True
+    else:
+        ok, code, partial_success = False, "STAGE_PROVISION_FAILED", False
+
+    return {
+        "ok": ok, "code": code,
+        "stage_id": stage_id, "roadmap_id": roadmap_id, "template_stage_id": template_stage_id,
+        "confirm": confirm, "trigger": trigger, "actor": actor,
+        "checklists": checklists_result, "outputs": outputs_result,
+        "totals": totals, "partial_success": partial_success,
+        "warnings": tuple(warnings), "errors": (),
     }
 
 
