@@ -87,10 +87,10 @@ def _dfs_find_cycle(adjacency: dict, start: str, node_limit: int) -> dict:
     return {"cycle_found": False, "cycle_path": (), "limit_exceeded": False}
 
 
-def _build_active_adjacency(roadmap_template_id: str) -> dict:
-    from business_core.sheets import read_business_sheet
+def _build_active_adjacency(roadmap_template_id: str, read_context=None) -> dict:
+    from business_core.sheets import read_business_sheet_cached
 
-    rows = read_business_sheet("template_stage_dependencies")
+    rows = read_business_sheet_cached("template_stage_dependencies", read_context=read_context)
     adjacency: dict[str, list[str]] = {}
     for r in rows:
         if r.get("Roadmap Template ID", "") != roadmap_template_id:
@@ -122,19 +122,25 @@ def generate_dependency_id() -> str:
 # ═══════════════════════════════════════════════════════════════
 
 def list_dependencies_for_template_stage(
-    template_stage_id: str, active_only: bool = True,
+    template_stage_id: str, active_only: bool = True, read_context=None,
 ) -> tuple[dict, ...]:
     """All TEMPLATE_STAGE_DEPENDENCIES rows where Template Stage ID
-    (the dependent side) matches — active-only by default. Read-only."""
+    (the dependent side) matches — active-only by default. Read-only.
+
+    `read_context`: optional transaction-local cache — see
+    business_core.sheets.read_business_sheet_cached()."""
     if not template_stage_id:
         return ()
     try:
-        from business_core.sheets import read_business_sheet
-        rows = read_business_sheet("template_stage_dependencies")
+        from business_core.sheets import read_business_sheet_cached, SheetsReadError
+        rows = read_business_sheet_cached("template_stage_dependencies", read_context=read_context)
         rows = [r for r in rows if r.get("Template Stage ID", "") == template_stage_id]
         if active_only:
             rows = [r for r in rows if (r.get("Status", "") or "") == "active"]
         return tuple(rows)
+    except SheetsReadError:
+        # Never mask a 429/5xx/network failure as "no dependencies".
+        raise
     except Exception as exc:
         log.error(f"list_dependencies_for_template_stage({template_stage_id}) error: {exc}")
         return ()
@@ -144,9 +150,11 @@ def find_dependency_by_id(dependency_id: str) -> Optional[dict]:
     if not dependency_id:
         return None
     try:
-        from business_core.sheets import find_row_by_id
+        from business_core.sheets import find_row_by_id, SheetsReadError
         found = find_row_by_id("template_stage_dependencies", dependency_id)
         return found[1] if found else None
+    except SheetsReadError:
+        raise
     except Exception as exc:
         log.error(f"find_dependency_by_id({dependency_id}) error: {exc}")
         return None
@@ -208,6 +216,7 @@ def detect_dependency_cycle(
 
 def detect_reachable_cycle_from_template_stage(
     roadmap_template_id: str, template_stage_id: str, node_limit: int = _GATE_TIME_CYCLE_NODE_LIMIT,
+    read_context=None,
 ) -> dict:
     """
     Read-time corrupted-data defense — used ONLY inside the Dependency
@@ -219,6 +228,12 @@ def detect_reachable_cycle_from_template_stage(
     corrupted graph (e.g. from a manually edited Sheet row that bypassed
     create-time validation) can never cause an unbounded traversal.
 
+    `read_context`: optional transaction-local cache — see
+    business_core.sheets.read_business_sheet_cached(). When the caller
+    (the Dependency Gate) already read TEMPLATE_STAGE_DEPENDENCIES once
+    in this same transition, this reuses that data instead of a second
+    full-table read.
+
     Returns:
         {"ok": bool, "cycle_found": bool, "cycle_path": tuple, "limit_exceeded": bool, "error": str | None}
     """
@@ -226,13 +241,20 @@ def detect_reachable_cycle_from_template_stage(
         return {"ok": False, "cycle_found": False, "cycle_path": (), "limit_exceeded": False,
                 "error": "roadmap_template_id/template_stage_id обязательны"}
     try:
-        adjacency = _build_active_adjacency(roadmap_template_id)
+        adjacency = _build_active_adjacency(roadmap_template_id, read_context=read_context)
         result = _dfs_find_cycle(adjacency, template_stage_id, node_limit=node_limit)
         return {
             "ok": True, "cycle_found": result["cycle_found"], "cycle_path": result["cycle_path"],
             "limit_exceeded": result["limit_exceeded"], "error": None,
         }
     except Exception as exc:
+        from business_core.sheets import SheetsReadError
+        if isinstance(exc, SheetsReadError):
+            # Never mask a 429/5xx/network failure as a corrupted-graph
+            # DEPENDENCY_CONFIGURATION_ERROR (the Dependency Gate's own
+            # meaning for this "not ok") — the Gate must see this as a
+            # distinct read failure, not "the data is broken".
+            raise
         log.error(f"detect_reachable_cycle_from_template_stage error: {exc}")
         return {"ok": False, "cycle_found": False, "cycle_path": (), "limit_exceeded": False, "error": str(exc)}
 
@@ -411,7 +433,7 @@ def create_template_stage_dependency(
 # Live resolver
 # ═══════════════════════════════════════════════════════════════
 
-def resolve_live_stage_dependencies(stage_id: str) -> dict:
+def resolve_live_stage_dependencies(stage_id: str, read_context=None) -> dict:
     """
     Resolves the active Template-Stage-level dependencies of `stage_id`
     into their live-Stage prerequisites, within the SAME Roadmap.
@@ -444,16 +466,23 @@ def resolve_live_stage_dependencies(stage_id: str) -> dict:
             "missing_live_stages": tuple,   # (dependency_id, depends_on_template_stage_id)
             "configuration_errors": tuple,  # (dependency_id, reason)
         }
+
+    `read_context` (Sheets quota mitigation, 2026-07-28): optional,
+    duck-typed transaction-local cache threaded down from
+    transition_stage_status() — see business_core.sheets.
+    read_business_sheet_cached() and business_builder._TransitionReadContext.
+    Default None preserves the exact prior behavior (always fresh reads)
+    for every existing direct caller (e.g. /dependencies).
     """
     from business_core.roadmap_manager import resolve_template_stage_for_stage, get_stages_for_roadmap
-    from business_core.sheets import read_business_sheet
+    from business_core.sheets import read_business_sheet_cached
 
     empty = {
         "stage_id": stage_id, "roadmap_id": "", "roadmap_template_id": "", "template_stage_id": "",
         "dependencies": (), "resolved": (), "missing_live_stages": (), "configuration_errors": (),
     }
 
-    resolved = resolve_template_stage_for_stage(stage_id)
+    resolved = resolve_template_stage_for_stage(stage_id, read_context=read_context)
     if not resolved["ok"]:
         return {"ok": False, "code": resolved["code"], "error": resolved["error"], **empty}
 
@@ -462,7 +491,9 @@ def resolve_live_stage_dependencies(stage_id: str) -> dict:
     roadmap_template_id = resolved.get("template_id", "")
     template_stage_id = resolved["template_stage_id"]
 
-    dependencies = list_dependencies_for_template_stage(template_stage_id, active_only=True)
+    dependencies = list_dependencies_for_template_stage(
+        template_stage_id, active_only=True, read_context=read_context,
+    )
 
     if not dependencies:
         return {
@@ -472,8 +503,8 @@ def resolve_live_stage_dependencies(stage_id: str) -> dict:
             "dependencies": (), "resolved": (), "missing_live_stages": (), "configuration_errors": (),
         }
 
-    all_template_stage_rows = read_business_sheet("roadmap_template_stages")
-    all_live_stage_rows = get_stages_for_roadmap(roadmap_id)
+    all_template_stage_rows = read_business_sheet_cached("roadmap_template_stages", read_context=read_context)
+    all_live_stage_rows = get_stages_for_roadmap(roadmap_id, read_context=read_context)
 
     resolved_items = []
     missing_live: list[tuple] = []

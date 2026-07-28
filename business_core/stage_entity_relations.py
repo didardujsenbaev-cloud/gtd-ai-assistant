@@ -130,17 +130,23 @@ def _parse_legacy_id_list(raw: str) -> list[str]:
 # Read-only listing
 # ─────────────────────────────────────────────────────────────
 
-def list_relations(include_inactive: bool = False) -> tuple[dict, ...]:
+def list_relations(include_inactive: bool = False, read_context=None) -> tuple[dict, ...]:
     """
     All STAGE_ENTITY_RELATIONS rows, in deterministic sheet order.
     Inactive rows are excluded by default (include_inactive=True to
     see them). Never filters out a structurally invalid or dangling
     row — that judgment belongs to validate_relation_record()/
     validate_relation_references(), not to this listing function.
-    """
-    from business_core.sheets import read_business_sheet
 
-    rows = read_business_sheet("stage_entity_relations")
+    `read_context` (Sheets quota mitigation, 2026-07-28): optional,
+    duck-typed transaction-local cache — see
+    business_core.sheets.read_business_sheet_cached()'s docstring.
+    Default None preserves the exact prior behavior (always a fresh
+    read) for every existing caller.
+    """
+    from business_core.sheets import read_business_sheet_cached
+
+    rows = read_business_sheet_cached("stage_entity_relations", read_context=read_context)
     if include_inactive:
         return tuple(rows)
     return tuple(r for r in rows if (r.get("Status", "") or "").strip() == "active")
@@ -158,14 +164,17 @@ def get_relation_by_id(relation_id: str) -> dict | None:
 
 
 def get_relations_for_template_stage(
-    template_stage_id: str, entity_type: str | None = None, include_inactive: bool = False
+    template_stage_id: str, entity_type: str | None = None, include_inactive: bool = False,
+    read_context=None,
 ) -> tuple[dict, ...]:
     """All relations whose Template Stage ID matches, in sheet order.
     Does not require Stage ID to be blank on the matched row — this is
-    a read helper reflecting actual data, not a validity enforcer."""
+    a read helper reflecting actual data, not a validity enforcer.
+
+    `read_context`: see list_relations()."""
     if not template_stage_id:
         return ()
-    rows = list_relations(include_inactive=include_inactive)
+    rows = list_relations(include_inactive=include_inactive, read_context=read_context)
     rows = tuple(r for r in rows if r.get("Template Stage ID", "") == template_stage_id)
     if entity_type is not None:
         rows = tuple(r for r in rows if r.get("Entity Type", "") == entity_type)
@@ -173,13 +182,16 @@ def get_relations_for_template_stage(
 
 
 def get_relations_for_stage(
-    stage_id: str, entity_type: str | None = None, include_inactive: bool = False
+    stage_id: str, entity_type: str | None = None, include_inactive: bool = False,
+    read_context=None,
 ) -> tuple[dict, ...]:
     """All relations whose (instantiated) Stage ID matches, in sheet
-    order."""
+    order.
+
+    `read_context`: see list_relations()."""
     if not stage_id:
         return ()
-    rows = list_relations(include_inactive=include_inactive)
+    rows = list_relations(include_inactive=include_inactive, read_context=read_context)
     rows = tuple(r for r in rows if r.get("Stage ID", "") == stage_id)
     if entity_type is not None:
         rows = tuple(r for r in rows if r.get("Entity Type", "") == entity_type)

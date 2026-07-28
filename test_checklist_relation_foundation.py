@@ -18,7 +18,7 @@ from __future__ import annotations
 import sys
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 WORKSPACE = Path(__file__).parent
 sys.path.insert(0, str(WORKSPACE))
@@ -240,6 +240,9 @@ _RESOLVED_OK = {
 _RESOLUTION_OK = {
     "ok": True, "error": None, "template_stage_id": "TSTG-001", "source": "relations",
     "checklist_template_ids": ("CHK-001",), "skipped_inactive_templates": (), "invalid_legacy_checklist_ids": (),
+    # Additive field (Sheets quota mitigation, 2026-07-28): provision_checklists_for_stage()
+    # now reuses this instead of a second get_relations_for_template_stage() call.
+    "relations": (_RELATION_CHK_001,),
 }
 
 
@@ -289,7 +292,7 @@ class TestProvisionChecklistsForStage(unittest.TestCase):
             result = bb.provision_checklists_for_stage("STAGE-013", confirm=True)
         mock_instantiate.assert_called_once_with(
             "BIZ-001", "CHK-001", service_id="SVC-001", object_id="OBJ-001",
-            roadmap_id="RM-003", stage_id="STAGE-013",
+            roadmap_id="RM-003", stage_id="STAGE-013", read_context=ANY,
         )
         self.assertTrue(result["ok"])
         self.assertEqual(result["code"], "CHECKLIST_PROVISIONED")
@@ -336,11 +339,11 @@ class TestProvisionChecklistsForStage(unittest.TestCase):
     def test_partial_failure_creates_remaining_valid_instances(self):
         """п.40."""
         bb = _fresh_bb()
-        resolution = {**_RESOLUTION_OK, "checklist_template_ids": ("CHK-001", "CHK-002")}
         relations = (
             _RELATION_CHK_001,
             {**_RELATION_CHK_001, "Relation ID": "REL-101", "Entity ID": "CHK-002"},
         )
+        resolution = {**_RESOLUTION_OK, "checklist_template_ids": ("CHK-001", "CHK-002"), "relations": relations}
 
         def _instantiate_side_effect(business_id, checklist_template_id, **kwargs):
             if checklist_template_id == "CHK-001":
@@ -368,10 +371,9 @@ class TestProvisionChecklistsForStage(unittest.TestCase):
         configured, just not with anything in blocking scope)."""
         bb = _fresh_bb()
         non_blocking_relation = {**_RELATION_CHK_001, "Blocking": "false"}
+        resolution = {**_RESOLUTION_OK, "relations": (non_blocking_relation,)}
         with patch("business_core.roadmap_manager.resolve_template_stage_for_stage", return_value=_RESOLVED_OK), \
-             patch.object(bb, "resolve_checklist_templates_for_template_stage", return_value=_RESOLUTION_OK), \
-             patch("business_core.stage_entity_relations.get_relations_for_template_stage",
-                   return_value=(non_blocking_relation,)), \
+             patch.object(bb, "resolve_checklist_templates_for_template_stage", return_value=resolution), \
              patch("business_core.checklist_manager.list_checklist_instances", return_value=()):
             result = bb.provision_checklists_for_stage("STAGE-013", confirm=False)
         self.assertTrue(result["ok"])

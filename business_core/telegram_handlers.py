@@ -2755,6 +2755,31 @@ def _stage_transition_failure_message(result: dict, stage_id: str, status: str) 
             f"Этап: `{stage_id}`",
         ])
 
+    # Sheets quota mitigation (2026-07-28, RM-003 incident post-mortem):
+    # a 429/5xx/network failure is never the same thing as "не найден" —
+    # these two codes are ONLY ever returned before any Status write
+    # (transition_stage_status() maps SheetsQuotaExceededError/
+    # TransientSheetsReadError raised during Stage/Roadmap/Dependency-Gate
+    # resolution or the pre-write re-read inside update_stage_status_in_
+    # sheet() to these codes) — "Этап не изменён" always holds for both.
+    # Never surface the raw APIError text (project_number, consumer ID,
+    # quota metric name, traceback) to the user.
+    if code == "SHEETS_QUOTA_EXCEEDED":
+        return "\n".join([
+            "⚠️ Google Sheets временно перегружен",
+            "",
+            "Этап не изменён.",
+            "Повторите команду через 1–2 минуты.",
+        ])
+
+    if code == "TRANSIENT_SHEETS_READ_ERROR":
+        return "\n".join([
+            "⚠️ Не удалось временно прочитать данные Google Sheets",
+            "",
+            "Этап не изменён.",
+            "Попробуйте повторить команду немного позже.",
+        ])
+
     if code == "ROADMAP_NOT_FOUND":
         return "\n".join([
             "❌ Не удалось найти Roadmap для этого этапа",
@@ -3019,6 +3044,7 @@ def _stage_transition_success_lines(result: dict, stage_id: str, notes: Optional
             lines.append("Не удалось обновить:")
             for item in downstream_failures:
                 lines.append(f"- {item}")
+            lines.append(f"Проверить: /stage stage_id={stage_id}")
         if retry_safe:
             lines.append("Повтор команды безопасен.")
     elif changed:

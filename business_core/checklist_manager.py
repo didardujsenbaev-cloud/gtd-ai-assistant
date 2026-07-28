@@ -106,29 +106,57 @@ def find_checklist_instance_item_by_id(item_id: str) -> Optional[dict]:
     return {f: v.get(f, "") for f in _ITEM_FIELDS}
 
 
-def _list_instances_raw() -> list[dict]:
-    from business_core.sheets import get_business_sheet, get_header_index_map
+_CTX_CACHE_KEY_CHECKLIST_INSTANCES = "checklist_instances"
+
+
+def _list_instances_raw(read_context=None) -> list[dict]:
+    """
+    `read_context` (Sheets quota mitigation, 2026-07-28): optional,
+    duck-typed transaction-local cache — see business_core.sheets.
+    read_business_sheet_cached() / business_builder._TransitionReadContext.
+    Reused across every checklist created within the SAME provisioning
+    call (business_builder.provision_checklists_for_stage() appends each
+    newly-created instance to this same cached list instead of forcing a
+    fresh full-table re-read before the next idempotency check). Default
+    None preserves the exact prior behavior (always a fresh read) for
+    every existing caller.
+    """
+    if read_context is not None:
+        cached = read_context.sheet_rows.get(_CTX_CACHE_KEY_CHECKLIST_INSTANCES)
+        if cached is not None:
+            return cached
+
+    from business_core.sheets import get_business_sheet, get_header_index_map, read_with_retry, SheetsReadError
 
     try:
         sheet = get_business_sheet("checklist_instances")
-        all_values = sheet.get_all_values()
+        all_values = read_with_retry(sheet.get_all_values)
+    except SheetsReadError:
+        # Never mask a 429/5xx/network failure as "no instances" —
+        # callers on the auto-provisioning path must see this distinctly
+        # (RM-003 incident, 2026-07-28).
+        raise
     except Exception as exc:
         log.warning(f"_list_instances_raw() error: {exc}")
         return []
     if len(all_values) < 2:
-        return []
+        result: list[dict] = []
+    else:
+        idx = get_header_index_map(all_values[0])
 
-    idx = get_header_index_map(all_values[0])
+        def _g(row, h):
+            i = idx.get(h)
+            return row[i].strip() if (i is not None and i < len(row)) else ""
 
-    def _g(row, h):
-        i = idx.get(h)
-        return row[i].strip() if (i is not None and i < len(row)) else ""
+        result = [
+            {f: _g(row, f) for f in _INSTANCE_FIELDS}
+            for row in all_values[1:]
+            if row and row[0].strip()
+        ]
 
-    return [
-        {f: _g(row, f) for f in _INSTANCE_FIELDS}
-        for row in all_values[1:]
-        if row and row[0].strip()
-    ]
+    if read_context is not None:
+        read_context.sheet_rows[_CTX_CACHE_KEY_CHECKLIST_INSTANCES] = result
+    return result
 
 
 def _list_items_raw() -> list[dict]:
@@ -156,9 +184,11 @@ def _list_items_raw() -> list[dict]:
     ]
 
 
-def list_checklist_instances(business_id: str = "", status: str = "") -> list[dict]:
-    """Read-only, simple filter. No business policy hidden here."""
-    rows = _list_instances_raw()
+def list_checklist_instances(business_id: str = "", status: str = "", read_context=None) -> list[dict]:
+    """Read-only, simple filter. No business policy hidden here.
+
+    `read_context`: see _list_instances_raw()."""
+    rows = _list_instances_raw(read_context=read_context)
     if business_id:
         rows = [r for r in rows if r["Business ID"] == business_id]
     if status:
@@ -178,6 +208,7 @@ def list_checklist_instance_items(instance_id: str = "", status: str = "") -> li
 
 def find_instances_by_idempotency_key(
     business_id: str, template_id: str, roadmap_id: str = "", stage_id: str = "",
+    read_context=None,
 ) -> list[dict]:
     """
     Exact-match idempotency lookup: Business ID + Checklist Template ID
@@ -185,10 +216,13 @@ def find_instances_by_idempotency_key(
     compared as given). Never fuzzy, never first-pick — the caller
     (business_builder.instantiate_checklist) decides zero/one/multiple
     policy from this full list.
+
+    `read_context`: see _list_instances_raw() — reused across every
+    checklist created within the same provisioning call.
     """
     if not business_id or not template_id:
         return []
-    rows = _list_instances_raw()
+    rows = _list_instances_raw(read_context=read_context)
     return [
         r for r in rows
         if r["Business ID"] == business_id

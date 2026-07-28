@@ -363,7 +363,7 @@ def _increment_template_stages_count(template_id: str) -> None:
         log.warning(f"_increment_template_stages_count({template_id}) error: {exc}")
 
 
-def find_template_stages(template_id: str) -> list[dict]:
+def find_template_stages(template_id: str, read_context=None) -> list[dict]:
     """
     Получить все этапы шаблона, отсортированные по Order.
 
@@ -376,13 +376,23 @@ def find_template_stages(template_id: str) -> list[dict]:
     was a Core -> Extension read dependency for data that physically
     lives in a registry this module already owns; no Extension import
     is needed to read a column of your own sheet.
+
+    `read_context` (Sheets quota mitigation, 2026-07-28): optional,
+    duck-typed transaction-local cache exposing a `.template_stages`
+    tuple attribute — see business_builder._TransitionReadContext. A
+    transition only ever touches one Roadmap Template, so this cache is
+    keyed implicitly by "the one template this transition is about", not
+    by template_id. Default None preserves the exact prior behavior
+    (always a fresh read) for every existing caller.
     """
+    if read_context is not None and read_context.template_stages:
+        return list(read_context.template_stages)
     if not template_id:
         return []
     try:
-        from business_core.sheets import get_business_sheet
+        from business_core.sheets import get_business_sheet, read_with_retry, SheetsReadError
         sheet      = get_business_sheet("roadmap_template_stages")
-        all_values = sheet.get_all_values()
+        all_values = read_with_retry(sheet.get_all_values)
         if len(all_values) < 2:
             return []
         headers = all_values[0]
@@ -420,7 +430,12 @@ def find_template_stages(template_id: str) -> list[dict]:
                     "faq_ids":               _ids(row, "FAQ IDs"),
                 })
         results.sort(key=lambda x: int(x["order"]) if x["order"].isdigit() else 0)
+        if read_context is not None:
+            read_context.template_stages = tuple(results)
         return results
+    except SheetsReadError:
+        # Never mask a 429/5xx/network failure as "no template stages".
+        raise
     except Exception as exc:
         log.warning(f"find_template_stages({template_id}) error: {exc}")
         return []

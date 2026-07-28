@@ -362,14 +362,18 @@ class TestGatesAndOverrideUnaffected(unittest.TestCase):
         self.assertNotIn("provision_stage_operational_instances", source)
 
     def test_provision_stage_operational_instances_unchanged_signature(self):
+        """Sheets quota mitigation (2026-07-28) added one new, optional,
+        default-None `read_context` param at the end — additive only,
+        every pre-existing positional/keyword usage is unaffected."""
         import inspect
         from test_stage_transition_foundation import _fresh_bb
         bb = _fresh_bb()
         sig = inspect.signature(bb.provision_stage_operational_instances)
         self.assertEqual(
             list(sig.parameters.keys()),
-            ["stage_id", "confirm", "include_checklists", "include_outputs", "trigger", "actor"],
+            ["stage_id", "confirm", "include_checklists", "include_outputs", "trigger", "actor", "read_context"],
         )
+        self.assertIsNone(sig.parameters["read_context"].default)
 
 
 class TestForceCompletionGatePathUnaffected(_BaseTransitionTestCase):

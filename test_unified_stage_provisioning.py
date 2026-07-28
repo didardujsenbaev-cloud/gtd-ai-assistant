@@ -20,7 +20,7 @@ from __future__ import annotations
 import sys
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 WORKSPACE = Path(__file__).parent
 sys.path.insert(0, str(WORKSPACE))
@@ -105,7 +105,7 @@ class TestResolutionAndStatusPolicy(unittest.TestCase):
              patch.object(bb, "provision_checklists_for_stage", return_value=_CHECKLISTS_NOTHING), \
              patch.object(bb, "sync_stage_output_requirements", return_value=_OUTPUTS_NOTHING):
             bb.provision_stage_operational_instances("STAGE-016", confirm=False)
-        mock_resolve.assert_called_once_with("STAGE-016")
+        mock_resolve.assert_called_once_with("STAGE-016", read_context=ANY)
 
     def test_resolution_failure_propagates(self):
         bb = _fresh_bb()
@@ -163,8 +163,8 @@ class TestSubsystemInvocation(unittest.TestCase):
              patch.object(bb, "sync_stage_output_requirements",
                           return_value=_outputs_preview(to_add=("SOUT-001",))) as mock_out:
             result = bb.provision_stage_operational_instances("STAGE-016", confirm=False)
-        mock_chk.assert_called_once_with("STAGE-016", confirm=False)
-        mock_out.assert_called_once_with("STAGE-016", confirm=False)
+        mock_chk.assert_called_once_with("STAGE-016", confirm=False, read_context=ANY)
+        mock_out.assert_called_once_with("STAGE-016", confirm=False, read_context=ANY)
         self.assertEqual(result["checklists"]["to_create"], ("CHK-001",))
         self.assertEqual(result["outputs"]["to_add"], ("SOUT-001",))
 
@@ -176,8 +176,8 @@ class TestSubsystemInvocation(unittest.TestCase):
              patch.object(bb, "sync_stage_output_requirements",
                           return_value=_outputs_confirmed(created=("SOUT-001",))) as mock_out:
             result = bb.provision_stage_operational_instances("STAGE-016", confirm=True)
-        mock_chk.assert_called_once_with("STAGE-016", confirm=True)
-        mock_out.assert_called_once_with("STAGE-016", confirm=True)
+        mock_chk.assert_called_once_with("STAGE-016", confirm=True, read_context=ANY)
+        mock_out.assert_called_once_with("STAGE-016", confirm=True, read_context=ANY)
         self.assertEqual(result["totals"]["created"], 2)
 
     def test_checklist_only_output_disabled(self):
@@ -242,11 +242,17 @@ class TestSubsystemInvocation(unittest.TestCase):
         self.assertEqual(result["checklists"]["created"], ("CHK-001",))
 
     def test_no_telegram_dependency(self):
-        """п. no Telegram dependency: signature has only primitives."""
+        """п. no Telegram dependency: signature has only primitives (+ the
+        internal, non-Telegram `read_context` cache added by Sheets quota
+        mitigation, 2026-07-28 — explicitly exempted below, distinct from
+        python-telegram-bot's own `update`/`context: ContextTypes...`
+        params, which must still never appear)."""
         import inspect
         bb = _fresh_bb()
         sig = inspect.signature(bb.provision_stage_operational_instances)
         for name, param in sig.parameters.items():
+            if name == "read_context":
+                continue
             self.assertNotIn("update", name.lower())
             self.assertNotIn("context", name.lower())
 

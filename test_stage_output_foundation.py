@@ -649,7 +649,7 @@ class TestSyncStageOutputRequirements(unittest.TestCase):
         relation_2 = {**_RELATION_SOUT_001, "Relation ID": "REL-101", "Entity ID": "SOUT-002"}
         template_2 = {"Output Template ID": "SOUT-002", "Status": "active"}
 
-        def _find_template(otid):
+        def _find_template(otid, **kwargs):
             return {"SOUT-001": _ACTIVE_TEMPLATE, "SOUT-002": template_2}.get(otid)
 
         def _create_side_effect(output_template_id, stage_id, **kwargs):

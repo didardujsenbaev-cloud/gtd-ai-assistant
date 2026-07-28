@@ -1119,14 +1119,26 @@ def get_commercial_milestones_for_roadmap(roadmap_id: str) -> dict:
     }
 
 
-def get_stages_for_roadmap(roadmap_id: str) -> list[dict]:
-    """Получить все этапы roadmap из ROADMAP_STAGES."""
+def get_stages_for_roadmap(roadmap_id: str, read_context=None) -> list[dict]:
+    """
+    Получить все этапы roadmap из ROADMAP_STAGES.
+
+    `read_context` (Sheets quota mitigation, 2026-07-28): optional,
+    duck-typed transaction-local cache exposing a `.roadmap_stages`
+    tuple attribute — see business_builder._TransitionReadContext. A
+    transition only ever touches one Roadmap, so this cache is keyed
+    implicitly by "the one roadmap this transition is about", not by
+    roadmap_id. Default None preserves the exact prior behavior (always
+    a fresh read) for every existing caller.
+    """
+    if read_context is not None and read_context.roadmap_stages:
+        return list(read_context.roadmap_stages)
     if not roadmap_id:
         return []
     try:
-        from business_core.sheets import get_business_sheet
+        from business_core.sheets import get_business_sheet, read_with_retry, SheetsReadError
         sheet      = get_business_sheet("roadmap_stages")
-        all_values = sheet.get_all_values()
+        all_values = read_with_retry(sheet.get_all_values)
         if len(all_values) < 2:
             return []
         headers = all_values[0]
@@ -1156,7 +1168,13 @@ def get_stages_for_roadmap(roadmap_id: str) -> list[dict]:
                     "notes":      _get(row, "Notes"),
                 })
         results.sort(key=lambda x: int(x["order"]) if x["order"].isdigit() else 0)
+        if read_context is not None:
+            read_context.roadmap_stages = tuple(results)
         return results
+    except SheetsReadError:
+        # Never mask a 429/5xx/network failure as "no stages" — see
+        # find_stage_by_id()'s identical rationale.
+        raise
     except Exception as exc:
         log.warning(f"get_stages_for_roadmap({roadmap_id}) error: {exc}")
         return []
@@ -1190,15 +1208,17 @@ def find_stage_by_id(stage_id: str) -> Optional[dict]:
         return None
 
     try:
-        from business_core.sheets import get_business_sheet, read_row_by_headers
+        from business_core.sheets import (
+            get_business_sheet, read_row_by_headers, read_with_retry, SheetsReadError,
+        )
 
         sheet = get_business_sheet("roadmap_stages")
-        cell = sheet.find(stage_id, in_column=1)
+        cell = read_with_retry(sheet.find, stage_id, in_column=1)
         if not cell:
             return None
 
-        headers = sheet.row_values(1)
-        row = sheet.row_values(cell.row)
+        headers = read_with_retry(sheet.row_values, 1)
+        row = read_with_retry(sheet.row_values, cell.row)
 
         wanted = [
             "Stage ID", "Roadmap ID", "Order", "Name", "Status",
@@ -1230,16 +1250,36 @@ def find_stage_by_id(stage_id: str) -> Optional[dict]:
             "status_before_block":  v["Status Before Block"],
         }
 
+    except SheetsReadError:
+        # A Google Sheets API failure (429/5xx/network) did NOT complete
+        # this read — never mask it as "Stage not found" (RM-003
+        # incident, 2026-07-28). The caller must see this distinctly.
+        raise
     except Exception as exc:
         log.warning(f"find_stage_by_id({stage_id}) error: {exc}")
         return None
 
 
-def resolve_template_stage_for_stage(stage_id: str) -> dict:
+def resolve_template_stage_for_stage(stage_id: str, read_context=None) -> dict:
     """
     Read-only: derive which ROADMAP_TEMPLATE_STAGES row an already-
     created ROADMAP_STAGES row was (or would have been) created from,
     by joining Stage -> Roadmap -> Template ID -> Order.
+
+    `read_context` (Sheets quota mitigation, 2026-07-28): optional,
+    duck-typed transaction-local cache — see business_builder.
+    _TransitionReadContext. If `read_context.template_stage_resolution`
+    already holds a resolution for this exact `stage_id`, it is reused
+    verbatim (no read at all) — this function is otherwise called fresh,
+    from scratch, up to 5 times within a single transition_stage_status()
+    transaction (F.7, auto-provisioning top-level, checklist/output
+    provisioning), each costing 7 read requests; this cache collapses
+    that to one. If `read_context.stage`/`.roadmap` are already
+    populated for this stage_id (from transition_stage_status()'s own
+    A/B/C validation), those are reused instead of a fresh
+    find_stage_by_id()/find_roadmap_by_id() call. Default None preserves
+    the exact prior behavior (always fresh reads) for every existing
+    direct caller (e.g. /provisionstage, /syncchecklists, /syncoutputs).
 
     This is the exact same join business_builder.create_roadmap_for_object()
     already performs at Stage-creation time (its local
@@ -1276,11 +1316,29 @@ def resolve_template_stage_for_stage(stage_id: str) -> dict:
     if not stage_id:
         return {"ok": False, "code": "STAGE_NOT_FOUND", "error": "stage_id обязателен", **empty}
 
-    stage = find_stage_by_id(stage_id)
-    if stage is None:
-        return {"ok": False, "code": "STAGE_NOT_FOUND", "error": f"Stage {stage_id} не найден", **empty}
+    if (
+        read_context is not None
+        and read_context.template_stage_resolution is not None
+        and read_context.stage is not None
+        and read_context.stage.get("stage_id") == stage_id
+    ):
+        return read_context.template_stage_resolution
 
-    roadmap = find_roadmap_by_id(stage["roadmap_id"])
+    stage = (
+        read_context.stage
+        if (read_context is not None and read_context.stage is not None and read_context.stage.get("stage_id") == stage_id)
+        else find_stage_by_id(stage_id)
+    )
+    if stage is None:
+        result = {"ok": False, "code": "STAGE_NOT_FOUND", "error": f"Stage {stage_id} не найден", **empty}
+        return result
+
+    roadmap = (
+        read_context.roadmap
+        if (read_context is not None and read_context.roadmap is not None
+            and read_context.roadmap.get("roadmap_id") == stage["roadmap_id"])
+        else find_roadmap_by_id(stage["roadmap_id"])
+    )
     if roadmap is None:
         return {
             "ok": False, "code": "ROADMAP_NOT_FOUND",
@@ -1307,7 +1365,7 @@ def resolve_template_stage_for_stage(stage_id: str) -> dict:
     order = int(order_raw)
 
     from business_core.roadmap_template_manager import find_template_stages
-    template_stage_rows = find_template_stages(template_id)
+    template_stage_rows = find_template_stages(template_id, read_context=read_context)
     match = next(
         (r for r in template_stage_rows
          if str(r.get("order", "")).strip().isdigit() and int(r["order"]) == order),
@@ -1321,11 +1379,18 @@ def resolve_template_stage_for_stage(stage_id: str) -> dict:
             "template_stage_row": None,
         }
 
-    return {
+    result = {
         "ok": True, "code": "", "error": None,
         "stage": stage, "roadmap": roadmap, "template_id": template_id,
         "template_stage_id": match["stage_id"], "template_stage_row": match,
     }
+    if read_context is not None:
+        read_context.template_stage_resolution = result
+        if read_context.stage is None:
+            read_context.stage = stage
+        if read_context.roadmap is None:
+            read_context.roadmap = roadmap
+    return result
 
 
 def _stage_update_result(
@@ -1575,7 +1640,7 @@ def calculate_progress(stages: list[dict]) -> int:
     return math.floor(done / total * 100 + 0.5)
 
 
-def recalculate_roadmap_progress(roadmap_id: str) -> dict:
+def recalculate_roadmap_progress(roadmap_id: str, read_context=None) -> dict:
     """
     Phase 9C: пересчитать и записать Progress % для roadmap.
 
@@ -1587,6 +1652,18 @@ def recalculate_roadmap_progress(roadmap_id: str) -> dict:
     Не меняет Status roadmap, не меняет строки ROADMAP_STAGES, не пишет
     историю. Идемпотентна: повторный вызов при неизменном состоянии
     этапов даёт тот же процент и не является ошибкой.
+
+    `read_context` (Sheets quota mitigation, 2026-07-28): optional,
+    duck-typed transaction-local cache — see business_builder.
+    _TransitionReadContext. `get_stages_for_roadmap()` reuses
+    `read_context.roadmap_stages` if already populated (e.g. by the
+    Dependency Gate) instead of a second full ROADMAP_STAGES read. If
+    `read_context.roadmap` already holds this exact roadmap (from
+    transition_stage_status()'s own earlier find_roadmap_by_id() call),
+    its row_num/progress are reused instead of a second `.find()` +
+    `.row_values()` round-trip on ROADMAPS — only the write (`update_cell`)
+    still happens. Default None preserves the exact prior behavior
+    (always fresh reads) for every existing caller.
 
     Returns:
         {
@@ -1605,34 +1682,54 @@ def recalculate_roadmap_progress(roadmap_id: str) -> dict:
                 "old_progress": "", "new_progress": 0, "done_count": 0,
                 "total_count": 0, "changed": False}
 
-    stages = get_stages_for_roadmap(roadmap_id)
+    stages = get_stages_for_roadmap(roadmap_id, read_context=read_context)
     total_count = len(stages)
     done_count = sum(1 for s in stages if s.get("status", "") in DONE_SET)
     new_progress = calculate_progress(stages)
+
+    cached_roadmap = (
+        read_context.roadmap
+        if (read_context is not None and read_context.roadmap is not None
+            and read_context.roadmap.get("roadmap_id") == roadmap_id)
+        else None
+    )
 
     try:
         from business_core.sheets import get_business_sheet, get_header_index_map
 
         sheet = get_business_sheet("roadmaps")
-        cell = sheet.find(roadmap_id, in_column=1)
-        if not cell:
-            return {"ok": False, "error": f"Roadmap '{roadmap_id}' не найден",
-                    "roadmap_id": roadmap_id, "old_progress": "", "new_progress": new_progress,
-                    "done_count": done_count, "total_count": total_count, "changed": False}
 
-        headers = sheet.row_values(1)
-        idx = get_header_index_map(headers)
+        if cached_roadmap is not None:
+            row_num = cached_roadmap["row_num"]
+            headers = sheet.row_values(1)
+            idx = get_header_index_map(headers)
+            if "Progress %" not in idx:
+                return {"ok": False, "error": "В листе ROADMAPS отсутствует колонка 'Progress %'",
+                        "roadmap_id": roadmap_id, "old_progress": "", "new_progress": new_progress,
+                        "done_count": done_count, "total_count": total_count, "changed": False}
+            col = idx["Progress %"]
+            old_progress = (cached_roadmap.get("progress", "") or "").strip()
+        else:
+            cell = sheet.find(roadmap_id, in_column=1)
+            if not cell:
+                return {"ok": False, "error": f"Roadmap '{roadmap_id}' не найден",
+                        "roadmap_id": roadmap_id, "old_progress": "", "new_progress": new_progress,
+                        "done_count": done_count, "total_count": total_count, "changed": False}
 
-        if "Progress %" not in idx:
-            return {"ok": False, "error": "В листе ROADMAPS отсутствует колонка 'Progress %'",
-                    "roadmap_id": roadmap_id, "old_progress": "", "new_progress": new_progress,
-                    "done_count": done_count, "total_count": total_count, "changed": False}
+            headers = sheet.row_values(1)
+            idx = get_header_index_map(headers)
 
-        row = sheet.row_values(cell.row)
-        col = idx["Progress %"]
-        old_progress = row[col].strip() if col < len(row) else ""
+            if "Progress %" not in idx:
+                return {"ok": False, "error": "В листе ROADMAPS отсутствует колонка 'Progress %'",
+                        "roadmap_id": roadmap_id, "old_progress": "", "new_progress": new_progress,
+                        "done_count": done_count, "total_count": total_count, "changed": False}
 
-        sheet.update_cell(cell.row, col + 1, str(new_progress))
+            row_num = cell.row
+            row = sheet.row_values(row_num)
+            col = idx["Progress %"]
+            old_progress = row[col].strip() if col < len(row) else ""
+
+        sheet.update_cell(row_num, col + 1, str(new_progress))
 
         return {
             "ok": True, "error": None,
@@ -1684,6 +1781,7 @@ def maybe_complete_roadmap(
     roadmap_id: str,
     stages: Optional[list[dict]] = None,
     progress_pct: Optional[int] = None,
+    read_context=None,
 ) -> dict:
     """
     Phase 9E.2: автоматически перевести Roadmap active -> completed,
@@ -1704,6 +1802,18 @@ def maybe_complete_roadmap(
     Никогда не переводит completed обратно в active. Не трогает Progress %,
     не трогает ROADMAP_STAGES, не трогает другие roadmap, не пишет историю.
 
+    `read_context` (Sheets quota mitigation, 2026-07-28): optional,
+    duck-typed transaction-local cache — see business_builder.
+    _TransitionReadContext. If `read_context.roadmap` already holds this
+    exact roadmap, its row_num/status are reused instead of a second
+    `.find()` + `.row_values()` round-trip on ROADMAPS (transition_
+    stage_status() already did this lookup in its own A/B/C validation).
+    If `stages` is not given and `read_context.roadmap_stages` is
+    already populated (e.g. by recalculate_roadmap_progress() moments
+    earlier in the same transition), that is reused instead of a second
+    get_stages_for_roadmap() call. Default None preserves the exact
+    prior behavior (always fresh reads) for every existing caller.
+
     Returns:
         {
             "ok":         bool,
@@ -1718,24 +1828,42 @@ def maybe_complete_roadmap(
         return {"ok": False, "error": "roadmap_id не указан", "roadmap_id": "",
                 "old_status": "", "new_status": "", "changed": False}
 
+    cached_roadmap = (
+        read_context.roadmap
+        if (read_context is not None and read_context.roadmap is not None
+            and read_context.roadmap.get("roadmap_id") == roadmap_id)
+        else None
+    )
+
     try:
         from business_core.sheets import get_business_sheet, get_header_index_map
 
         sheet = get_business_sheet("roadmaps")
-        cell = sheet.find(roadmap_id, in_column=1)
-        if not cell:
-            return {"ok": False, "error": f"Roadmap '{roadmap_id}' не найден",
-                    "roadmap_id": roadmap_id, "old_status": "", "new_status": "", "changed": False}
 
-        headers = sheet.row_values(1)
-        idx = get_header_index_map(headers)
+        if cached_roadmap is not None:
+            row_num = cached_roadmap["row_num"]
+            headers = sheet.row_values(1)
+            idx = get_header_index_map(headers)
+            if "Status" not in idx:
+                return {"ok": False, "error": "В листе ROADMAPS отсутствует колонка 'Status'",
+                        "roadmap_id": roadmap_id, "old_status": "", "new_status": "", "changed": False}
+            current_status = (cached_roadmap.get("raw_status") or cached_roadmap.get("status") or "").strip()
+        else:
+            cell = sheet.find(roadmap_id, in_column=1)
+            if not cell:
+                return {"ok": False, "error": f"Roadmap '{roadmap_id}' не найден",
+                        "roadmap_id": roadmap_id, "old_status": "", "new_status": "", "changed": False}
 
-        if "Status" not in idx:
-            return {"ok": False, "error": "В листе ROADMAPS отсутствует колонка 'Status'",
-                    "roadmap_id": roadmap_id, "old_status": "", "new_status": "", "changed": False}
+            headers = sheet.row_values(1)
+            idx = get_header_index_map(headers)
 
-        row = sheet.row_values(cell.row)
-        current_status = row[idx["Status"]].strip() if idx["Status"] < len(row) else ""
+            if "Status" not in idx:
+                return {"ok": False, "error": "В листе ROADMAPS отсутствует колонка 'Status'",
+                        "roadmap_id": roadmap_id, "old_status": "", "new_status": "", "changed": False}
+
+            row_num = cell.row
+            row = sheet.row_values(row_num)
+            current_status = row[idx["Status"]].strip() if idx["Status"] < len(row) else ""
 
         if current_status == "completed":
             return {"ok": True, "error": None, "roadmap_id": roadmap_id,
@@ -1746,7 +1874,10 @@ def maybe_complete_roadmap(
                     "old_status": current_status, "new_status": current_status, "changed": False}
 
         if stages is None:
-            stages = get_stages_for_roadmap(roadmap_id)
+            if read_context is not None and read_context.roadmap_stages:
+                stages = list(read_context.roadmap_stages)
+            else:
+                stages = get_stages_for_roadmap(roadmap_id, read_context=read_context)
         if progress_pct is None:
             progress_pct = calculate_progress(stages)
 
@@ -1754,7 +1885,7 @@ def maybe_complete_roadmap(
             return {"ok": True, "error": None, "roadmap_id": roadmap_id,
                     "old_status": "active", "new_status": "active", "changed": False}
 
-        sheet.update_cell(cell.row, idx["Status"] + 1, "completed")
+        sheet.update_cell(row_num, idx["Status"] + 1, "completed")
 
         return {"ok": True, "error": None, "roadmap_id": roadmap_id,
                 "old_status": "active", "new_status": "completed", "changed": True}
@@ -1807,15 +1938,17 @@ def find_roadmap_by_id(roadmap_id: str) -> Optional[dict]:
         return None
 
     try:
-        from business_core.sheets import get_business_sheet, read_row_by_headers
+        from business_core.sheets import (
+            get_business_sheet, read_row_by_headers, read_with_retry, SheetsReadError,
+        )
 
         sheet = get_business_sheet("roadmaps")
-        cell = sheet.find(roadmap_id, in_column=1)
+        cell = read_with_retry(sheet.find, roadmap_id, in_column=1)
         if not cell:
             return None
 
-        headers = sheet.row_values(1)
-        row = sheet.row_values(cell.row)
+        headers = read_with_retry(sheet.row_values, 1)
+        row = read_with_retry(sheet.row_values, cell.row)
 
         stage_status_headers = [f"Stage {i} Status" for i in range(1, 11)]
         wanted = [
@@ -1845,6 +1978,10 @@ def find_roadmap_by_id(roadmap_id: str) -> Optional[dict]:
             "legacy_stage_statuses": [v[h] for h in stage_status_headers],
         }
 
+    except SheetsReadError:
+        # See find_stage_by_id()'s identical comment — never mask a
+        # 429/5xx/network failure as "Roadmap not found".
+        raise
     except Exception as exc:
         log.warning(f"find_roadmap_by_id({roadmap_id}) error: {exc}")
         return None

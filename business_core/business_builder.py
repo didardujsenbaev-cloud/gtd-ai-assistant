@@ -12,7 +12,7 @@ from __future__ import annotations
 import logging
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional
 
@@ -2609,7 +2609,7 @@ class _StageDependencyGateResult:
     configuration_errors: tuple = ()
 
 
-def _evaluate_stage_dependency_gate(stage_id: str) -> _StageDependencyGateResult:
+def _evaluate_stage_dependency_gate(stage_id: str, read_context=None) -> _StageDependencyGateResult:
     """
     Dependencies Foundation: evaluates whether `stage_id` may transition
     pending->in_progress given its Template Stage's active prerequisite
@@ -2649,12 +2649,25 @@ def _evaluate_stage_dependency_gate(stage_id: str) -> _StageDependencyGateResult
 
     Returns _StageDependencyGateResult — blocked=False + empty defaults
     is "nothing to report" (no active dependencies, or all satisfied).
+
+    `read_context` (Sheets quota mitigation, 2026-07-28): optional,
+    duck-typed transaction-local cache — see _TransitionReadContext.
+    Threaded through resolve_live_stage_dependencies()/
+    detect_reachable_cycle_from_template_stage() so ROADMAP_STAGES/
+    ROADMAPS/ROADMAP_TEMPLATE_STAGES/TEMPLATE_STAGE_DEPENDENCIES are
+    each read at most once per transition. A SheetsReadError raised by
+    either call is never caught here — it propagates to
+    transition_stage_status(), which maps it to SHEETS_QUOTA_EXCEEDED/
+    TRANSIENT_SHEETS_READ_ERROR instead of this function's own
+    DEPENDENCY_CONFIGURATION_ERROR (a 429/5xx is not "the dependency
+    data is broken"). Default None preserves the exact prior behavior
+    for every existing direct caller.
     """
     from business_core.stage_dependency_manager import (
         resolve_live_stage_dependencies, detect_reachable_cycle_from_template_stage,
     )
 
-    resolution = resolve_live_stage_dependencies(stage_id)
+    resolution = resolve_live_stage_dependencies(stage_id, read_context=read_context)
     if not resolution["ok"]:
         # Same shared resolution-failure codes as every other Gate
         # (STAGE_NOT_FOUND/ROADMAP_NOT_FOUND/ROADMAP_HAS_NO_TEMPLATE/
@@ -2675,7 +2688,9 @@ def _evaluate_stage_dependency_gate(stage_id: str) -> _StageDependencyGateResult
 
     # Read-time corrupted-cycle defense (bounded, reachable-only) — never
     # the primary prevention mechanism.
-    cycle_check = detect_reachable_cycle_from_template_stage(roadmap_template_id, template_stage_id)
+    cycle_check = detect_reachable_cycle_from_template_stage(
+        roadmap_template_id, template_stage_id, read_context=read_context,
+    )
     if not cycle_check["ok"] or cycle_check.get("limit_exceeded") or cycle_check.get("cycle_found"):
         reason = (
             cycle_check.get("error")
@@ -2750,6 +2765,59 @@ def _roadmap_eligibility_code_for_stage_update(roadmap_status: str) -> str | Non
     if roadmap_status == "cancelled":
         return "ROADMAP_CANCELLED"
     return "ROADMAP_CANCELLED"
+
+
+@dataclass
+class _TransitionReadContext:
+    """
+    Sheets quota mitigation (2026-07-28, RM-003 incident post-mortem):
+    a private, mutable, transaction-local read cache — created fresh
+    inside transition_stage_status() at the start of one call, threaded
+    down (as the optional `read_context` kwarg) into every reader on the
+    F.7/K path that would otherwise re-derive the same Stage/Roadmap/
+    Template Stage/relations/instances from scratch, and discarded when
+    transition_stage_status() returns.
+
+    NOT frozen — fields are filled in progressively as the transition
+    proceeds (Stage/Roadmap known after A/B/C, template_stage_resolution
+    only once F.7 or auto-provisioning first resolves it, etc). NOT
+    global, NOT cached across Telegram updates, NOT TTL'd — it lives and
+    dies with exactly one transition_stage_status() call.
+
+    Fields:
+      stage/roadmap: the exact dicts find_stage_by_id()/find_roadmap_by_id()
+        already returned in this transition's own A/B/C validation —
+        reused by resolve_template_stage_for_stage() instead of a second
+        lookup.
+      template_stage_resolution: the full resolve_template_stage_for_stage()
+        result — this function is otherwise called fresh, from scratch,
+        up to 5 times in one transition (F.7, auto-provisioning
+        top-level, checklist provisioning, output provisioning), each
+        costing 7 Sheets read requests; this collapses that to one.
+      roadmap_stages: get_stages_for_roadmap()'s result for THIS
+        transition's one Roadmap (a transition only ever touches one).
+      template_stages: find_template_stages()'s result for THIS
+        transition's one Roadmap Template (likewise only one per
+        transition).
+      sheet_rows: generic full-table cache keyed by BUSINESS_SHEET_NAMES
+        key (e.g. "template_stage_dependencies", "stage_entity_relations",
+        "checklist_instances", "stage_output_instances",
+        "stage_output_templates") — see business_core.sheets.
+        read_business_sheet_cached().
+      relations_by_entity_type: reserved for a future per-entity-type
+        STAGE_ENTITY_RELATIONS cache split; not populated in this phase
+        (the generic `sheet_rows["stage_entity_relations"]` cache
+        already collapses all STAGE_ENTITY_RELATIONS reads to one full-
+        table read per transition, filtered by entity_type in memory —
+        see stage_entity_relations.list_relations()).
+    """
+    stage: dict | None = None
+    roadmap: dict | None = None
+    template_stage_resolution: dict | None = None
+    roadmap_stages: tuple = ()
+    template_stages: tuple = ()
+    sheet_rows: dict = field(default_factory=dict)
+    relations_by_entity_type: dict = field(default_factory=dict)
 
 
 def transition_stage_status(
@@ -2884,6 +2952,7 @@ def transition_stage_status(
         recalculate_roadmap_progress, maybe_complete_roadmap,
         normalize_roadmap_status,
     )
+    from business_core.sheets import SheetsQuotaExceededError, TransientSheetsReadError
 
     # A. Required identifier.
     if not stage_id:
@@ -2892,19 +2961,38 @@ def transition_stage_status(
             stage_id=stage_id, retry_safe=True,
         )
 
-    # B. Stage existence.
-    stage = find_stage_by_id(stage_id)
-    if stage is None:
+    # Sheets quota mitigation (2026-07-28, RM-003 incident post-mortem):
+    # a 429/5xx/network failure during the Stage/Roadmap lookup below
+    # must never be reported as STAGE_NOT_FOUND/ROADMAP_NOT_FOUND (that
+    # exact masking turned a transient quota exhaustion into a false
+    # "not found" during the incident). Nothing has been written yet at
+    # this point, so `final_status` is unknown/empty ("Этап не изменён"
+    # holds trivially — there is no confirmed previous state to report).
+    try:
+        # B. Stage existence.
+        stage = find_stage_by_id(stage_id)
+        if stage is None:
+            return _stage_transition_result(
+                ok=False, code="STAGE_NOT_FOUND", error=f"Этап {stage_id} не найден",
+                stage_id=stage_id, retry_safe=True,
+            )
+
+        roadmap_id = stage.get("roadmap_id", "")
+        previous_status = stage.get("status", "")
+
+        # C. Parent Roadmap existence.
+        roadmap = find_roadmap_by_id(roadmap_id) if roadmap_id else None
+    except SheetsQuotaExceededError as exc:
         return _stage_transition_result(
-            ok=False, code="STAGE_NOT_FOUND", error=f"Этап {stage_id} не найден",
+            ok=False, code="SHEETS_QUOTA_EXCEEDED", error=str(exc),
+            stage_id=stage_id, retry_safe=True,
+        )
+    except TransientSheetsReadError as exc:
+        return _stage_transition_result(
+            ok=False, code="TRANSIENT_SHEETS_READ_ERROR", error=str(exc),
             stage_id=stage_id, retry_safe=True,
         )
 
-    roadmap_id = stage.get("roadmap_id", "")
-    previous_status = stage.get("status", "")
-
-    # C. Parent Roadmap existence.
-    roadmap = find_roadmap_by_id(roadmap_id) if roadmap_id else None
     if roadmap is None:
         return _stage_transition_result(
             ok=False, code="ROADMAP_NOT_FOUND",
@@ -2913,6 +3001,8 @@ def transition_stage_status(
             previous_status=previous_status, requested_status=target_status,
             final_status=previous_status, retry_safe=True,
         )
+
+    read_ctx = _TransitionReadContext(stage=stage, roadmap=roadmap)
 
     roadmap_status_before = normalize_roadmap_status(roadmap.get("status", ""))
 
@@ -3091,7 +3181,33 @@ def transition_stage_status(
     # Progress/Roadmap-completion/K (auto-provisioning) are never
     # reached.
     if previous_status == "pending" and target_status == "in_progress":
-        dep_gate = _evaluate_stage_dependency_gate(stage_id)
+        # Sheets quota mitigation (2026-07-28): a 429/5xx/network failure
+        # while evaluating the Dependency Gate must never be reported as
+        # DEPENDENCY_CONFIGURATION_ERROR (that implies corrupted DATA,
+        # not a transient infra failure) — nothing has been written yet
+        # at this point, so "Этап не изменён" holds.
+        try:
+            dep_gate = _evaluate_stage_dependency_gate(stage_id, read_context=read_ctx)
+        except SheetsQuotaExceededError as exc:
+            return _stage_transition_result(
+                ok=False, code="SHEETS_QUOTA_EXCEEDED", error=str(exc),
+                stage_id=stage_id, roadmap_id=roadmap_id,
+                previous_status=previous_status, requested_status=target_status,
+                final_status=previous_status,
+                roadmap_status_before=roadmap_status_before,
+                roadmap_status_after=roadmap_status_before,
+                retry_safe=True,
+            )
+        except TransientSheetsReadError as exc:
+            return _stage_transition_result(
+                ok=False, code="TRANSIENT_SHEETS_READ_ERROR", error=str(exc),
+                stage_id=stage_id, roadmap_id=roadmap_id,
+                previous_status=previous_status, requested_status=target_status,
+                final_status=previous_status,
+                roadmap_status_before=roadmap_status_before,
+                roadmap_status_after=roadmap_status_before,
+                retry_safe=True,
+            )
         if dep_gate.blocked:
             return _stage_transition_result(
                 ok=False, code=dep_gate.error_code, error=dep_gate.error,
@@ -3108,7 +3224,35 @@ def transition_stage_status(
             )
 
     # G. Persist Stage status (+ any coupled admin_fields).
-    write_result = update_stage_status_in_sheet(stage_id, target_status, notes=notes)
+    #
+    # Sheets quota mitigation (2026-07-28): update_stage_status_in_sheet()
+    # itself re-reads the Stage (find_stage_by_id()) BEFORE its own write
+    # attempt — if THAT re-read hits a 429/5xx/network failure, it raises
+    # here, before any cell has been touched. This is still a pre-write
+    # failure (final_status=previous_status, "Этап не изменён" holds) —
+    # never a corrupted-data STAGE_WRITE_PARTIAL_FAILURE.
+    try:
+        write_result = update_stage_status_in_sheet(stage_id, target_status, notes=notes)
+    except SheetsQuotaExceededError as exc:
+        return _stage_transition_result(
+            ok=False, code="SHEETS_QUOTA_EXCEEDED", error=str(exc),
+            stage_id=stage_id, roadmap_id=roadmap_id,
+            previous_status=previous_status, requested_status=target_status,
+            final_status=previous_status,
+            roadmap_status_before=roadmap_status_before,
+            roadmap_status_after=roadmap_status_before,
+            retry_safe=True,
+        )
+    except TransientSheetsReadError as exc:
+        return _stage_transition_result(
+            ok=False, code="TRANSIENT_SHEETS_READ_ERROR", error=str(exc),
+            stage_id=stage_id, roadmap_id=roadmap_id,
+            previous_status=previous_status, requested_status=target_status,
+            final_status=previous_status,
+            roadmap_status_before=roadmap_status_before,
+            roadmap_status_after=roadmap_status_before,
+            retry_safe=True,
+        )
     if not write_result["ok"]:
         return _stage_transition_result(
             ok=False, code="STAGE_WRITE_PARTIAL_FAILURE",
@@ -3191,7 +3335,7 @@ def transition_stage_status(
 
     # H. Progress recalculation — only if Status actually changed.
     if changed:
-        progress_result = recalculate_roadmap_progress(roadmap_id)
+        progress_result = recalculate_roadmap_progress(roadmap_id, read_context=read_ctx)
         if progress_result["ok"]:
             progress_after = progress_result["new_progress"]
             try:
@@ -3200,8 +3344,10 @@ def transition_stage_status(
                 progress_before = None
 
             # I. Maybe auto-complete Roadmap — only after a successful
-            # recalculation.
-            completion_result = maybe_complete_roadmap(roadmap_id, progress_pct=progress_after)
+            # recalculation. read_context reuses the exact ROADMAP_STAGES
+            # list H just read (via get_stages_for_roadmap()) instead of
+            # a second full-table re-read — see _TransitionReadContext.
+            completion_result = maybe_complete_roadmap(roadmap_id, progress_pct=progress_after, read_context=read_ctx)
             if completion_result["ok"]:
                 roadmap_status_after = normalize_roadmap_status(completion_result.get("new_status", roadmap_status_before))
             else:
@@ -3245,6 +3391,7 @@ def transition_stage_status(
         try:
             provisioning_result = provision_stage_operational_instances(
                 stage_id=stage_id, confirm=True, trigger="stage_started", actor=actor,
+                read_context=read_ctx,
             )
             prov_code = provisioning_result.get("code", "")
             if prov_code == "STAGE_PROVISION_PARTIAL":
@@ -5095,7 +5242,7 @@ def sync_stage_sop_knowledge(stage_id: str, dry_run: bool = True) -> dict:
     }
 
 
-def sync_stage_output_requirements(stage_id: str, confirm: bool = False) -> dict:
+def sync_stage_output_requirements(stage_id: str, confirm: bool = False, read_context=None) -> dict:
     """
     Phase A (Stage Output Foundation): resolves the Template Stage for
     `stage_id`, reads its active required_output relations, and creates
@@ -5151,6 +5298,20 @@ def sync_stage_output_requirements(stage_id: str, confirm: bool = False) -> dict
     count) — a create_output_instance() failure never stops the loop,
     every remaining to_add entry is still attempted, and no already-
     created instance is ever rolled back because a later one failed.
+
+    `read_context` (Sheets quota mitigation, 2026-07-28): optional,
+    duck-typed transaction-local cache — see _TransitionReadContext.
+    Threaded through resolve_template_stage_for_stage()/
+    get_relations_for_template_stage()/find_output_template_by_id()/
+    list_output_instances_for_stage() so ROADMAP_STAGES/ROADMAPS/
+    ROADMAP_TEMPLATE_STAGES/STAGE_ENTITY_RELATIONS/STAGE_OUTPUT_TEMPLATES/
+    STAGE_OUTPUT_INSTANCES are each read at most once per transition —
+    find_output_template_by_id() in particular previously cost one
+    find_row_by_id() API call per configured Output Template relation
+    (M calls); with a context it reads the whole STAGE_OUTPUT_TEMPLATES
+    table once and looks up all M in memory. Default None preserves the
+    exact prior behavior (always fresh reads) for every existing direct
+    caller (e.g. /syncoutputs).
     """
     from business_core.roadmap_manager import resolve_template_stage_for_stage
     from business_core.stage_entity_relations import get_relations_for_template_stage
@@ -5164,7 +5325,7 @@ def sync_stage_output_requirements(stage_id: str, confirm: bool = False) -> dict
         "errors": (), "partial_success": False,
     }
 
-    resolved = resolve_template_stage_for_stage(stage_id)
+    resolved = resolve_template_stage_for_stage(stage_id, read_context=read_context)
     if not resolved["ok"]:
         return {"ok": False, "code": resolved["code"], "error": resolved["error"], **empty}
 
@@ -5175,7 +5336,9 @@ def sync_stage_output_requirements(stage_id: str, confirm: bool = False) -> dict
     # reaches `to_add`/creation and is not separately reported (only an
     # ACTIVE relation pointing at an INACTIVE Output Template is —
     # see skipped_inactive_templates below).
-    relations = get_relations_for_template_stage(template_stage_id, entity_type="required_output")
+    relations = get_relations_for_template_stage(
+        template_stage_id, entity_type="required_output", read_context=read_context,
+    )
     if not relations:
         return {
             "ok": False, "code": "NO_REQUIRED_OUTPUT_RELATIONS",
@@ -5190,13 +5353,13 @@ def sync_stage_output_requirements(stage_id: str, confirm: bool = False) -> dict
     skipped_inactive_templates = []
     active_template_ids = []
     for output_template_id in relations_by_output_template_id:
-        template = find_output_template_by_id(output_template_id)
+        template = find_output_template_by_id(output_template_id, read_context=read_context)
         if template is None or (template.get("Status", "") or "") != "active":
             skipped_inactive_templates.append(output_template_id)
         else:
             active_template_ids.append(output_template_id)
 
-    existing_instances = list_output_instances_for_stage(stage_id)
+    existing_instances = list_output_instances_for_stage(stage_id, read_context=read_context)
     existing_template_ids = {i.get("Output Template ID", "") for i in existing_instances}
 
     to_add = tuple(otid for otid in active_template_ids if otid not in existing_template_ids)
@@ -5251,7 +5414,7 @@ def sync_stage_output_requirements(stage_id: str, confirm: bool = False) -> dict
     }
 
 
-def resolve_checklist_templates_for_template_stage(template_stage_id: str) -> dict:
+def resolve_checklist_templates_for_template_stage(template_stage_id: str, read_context=None) -> dict:
     """
     Phase 1 (Checklist Relation Foundation): read-only resolver — same
     dual-source precedence already established for document_template/
@@ -5263,6 +5426,12 @@ def resolve_checklist_templates_for_template_stage(template_stage_id: str) -> di
 
     Never writes anything.
 
+    `read_context` (Sheets quota mitigation, 2026-07-28): optional,
+    duck-typed transaction-local cache — see _TransitionReadContext.
+    Threaded to get_relations_for_template_stage() so STAGE_ENTITY_
+    RELATIONS is read at most once per transition. Default None
+    preserves the exact prior behavior for every existing caller.
+
     Returns:
         {
             "ok": bool, "error": str | None,
@@ -5270,6 +5439,9 @@ def resolve_checklist_templates_for_template_stage(template_stage_id: str) -> di
             "checklist_template_ids": tuple[str, ...],       # valid, active-template, de-duplicated (order preserved)
             "skipped_inactive_templates": tuple[str, ...],   # found but Checklist Template Status != "active"
             "invalid_legacy_checklist_ids": tuple[str, ...], # legacy source only: ID not found in checklist_registry
+            "relations": tuple,  # additive — the raw active "checklist" relations read above (source=="relations"
+                                 # only, else ()); lets a caller reuse them instead of a second
+                                 # get_relations_for_template_stage() call for the same entity_type.
         }
     """
     from business_core.sheets import find_row_by_id
@@ -5279,7 +5451,7 @@ def resolve_checklist_templates_for_template_stage(template_stage_id: str) -> di
     empty = {
         "template_stage_id": template_stage_id, "source": "",
         "checklist_template_ids": (), "skipped_inactive_templates": (),
-        "invalid_legacy_checklist_ids": (),
+        "invalid_legacy_checklist_ids": (), "relations": (),
     }
 
     if not template_stage_id:
@@ -5289,7 +5461,9 @@ def resolve_checklist_templates_for_template_stage(template_stage_id: str) -> di
     if found is None:
         return {"ok": False, "error": f"Template Stage {template_stage_id!r} не найден", **empty}
 
-    relations = get_relations_for_template_stage(template_stage_id, entity_type="checklist")
+    relations = get_relations_for_template_stage(
+        template_stage_id, entity_type="checklist", read_context=read_context,
+    )
 
     if relations:
         checklist_ids: list[str] = []
@@ -5307,6 +5481,7 @@ def resolve_checklist_templates_for_template_stage(template_stage_id: str) -> di
             "checklist_template_ids": tuple(checklist_ids),
             "skipped_inactive_templates": tuple(skipped_inactive),
             "invalid_legacy_checklist_ids": (),
+            "relations": tuple(relations),
         }
 
     _, row = found
@@ -5323,7 +5498,7 @@ def resolve_checklist_templates_for_template_stage(template_stage_id: str) -> di
             "ok": True, "error": None,
             "template_stage_id": template_stage_id, "source": "",
             "checklist_template_ids": (), "skipped_inactive_templates": (),
-            "invalid_legacy_checklist_ids": (),
+            "invalid_legacy_checklist_ids": (), "relations": (),
         }
 
     checklist_ids = []
@@ -5344,10 +5519,11 @@ def resolve_checklist_templates_for_template_stage(template_stage_id: str) -> di
         "checklist_template_ids": tuple(checklist_ids),
         "skipped_inactive_templates": tuple(skipped_inactive),
         "invalid_legacy_checklist_ids": tuple(invalid_ids),
+        "relations": (),
     }
 
 
-def provision_checklists_for_stage(stage_id: str, confirm: bool = False) -> dict:
+def provision_checklists_for_stage(stage_id: str, confirm: bool = False, read_context=None) -> dict:
     """
     Phase 1 (Checklist Relation Foundation): resolves the Template Stage
     for `stage_id`, determines which Checklist Templates apply via
@@ -5403,9 +5579,21 @@ def provision_checklists_for_stage(stage_id: str, confirm: bool = False) -> dict
             "errors": tuple,                     # (checklist_template_id, error string) per create failure
             "partial_success": bool,             # True only if SOME (not all) requested instances were created
         }
+
+    `read_context` (Sheets quota mitigation, 2026-07-28): optional,
+    duck-typed transaction-local cache — see _TransitionReadContext.
+    Threaded through resolve_template_stage_for_stage()/
+    resolve_checklist_templates_for_template_stage()/
+    list_checklist_instances() so ROADMAP_STAGES/ROADMAPS/
+    ROADMAP_TEMPLATE_STAGES/STAGE_ENTITY_RELATIONS/CHECKLIST_INSTANCES
+    are each read at most once per transition instead of once per
+    subsystem call. The Blocking-filter below reuses `resolution
+    ["relations"]` (additive field) instead of a second
+    get_relations_for_template_stage() call for the same entity_type.
+    Default None preserves the exact prior behavior (always fresh
+    reads) for every existing direct caller (e.g. /syncchecklists).
     """
     from business_core.roadmap_manager import resolve_template_stage_for_stage
-    from business_core.stage_entity_relations import get_relations_for_template_stage
     from business_core.checklist_manager import list_checklist_instances
 
     empty = {
@@ -5414,14 +5602,14 @@ def provision_checklists_for_stage(stage_id: str, confirm: bool = False) -> dict
         "skipped_inactive": (), "errors": (), "partial_success": False,
     }
 
-    resolved = resolve_template_stage_for_stage(stage_id)
+    resolved = resolve_template_stage_for_stage(stage_id, read_context=read_context)
     if not resolved["ok"]:
         return {"ok": False, "code": resolved["code"], "error": resolved["error"], **empty}
 
     template_stage_id = resolved["template_stage_id"]
     roadmap = resolved.get("roadmap") or {}
 
-    resolution = resolve_checklist_templates_for_template_stage(template_stage_id)
+    resolution = resolve_checklist_templates_for_template_stage(template_stage_id, read_context=read_context)
     if not resolution["ok"]:
         return {"ok": False, "code": "TEMPLATE_STAGE_NOT_FOUND", "error": resolution["error"], **empty}
 
@@ -5439,7 +5627,7 @@ def provision_checklists_for_stage(stage_id: str, confirm: bool = False) -> dict
 
     blocking_checklist_ids = list(resolution["checklist_template_ids"])
     if source == "relations":
-        relations = get_relations_for_template_stage(template_stage_id, entity_type="checklist")
+        relations = resolution.get("relations") or ()
         blocking_by_id = {
             r.get("Entity ID", ""): (r.get("Blocking", "") or "").strip().lower() == "true" for r in relations
         }
@@ -5451,7 +5639,7 @@ def provision_checklists_for_stage(stage_id: str, confirm: bool = False) -> dict
     roadmap_id = roadmap.get("roadmap_id", "")
 
     existing_instances = [
-        inst for inst in list_checklist_instances(business_id=business_id)
+        inst for inst in list_checklist_instances(business_id=business_id, read_context=read_context)
         if inst.get("Stage ID", "") == stage_id and inst.get("Status", "") not in ("cancelled", "archived")
     ]
     existing_template_ids = {inst.get("Checklist Template ID", "") for inst in existing_instances}
@@ -5473,6 +5661,7 @@ def provision_checklists_for_stage(stage_id: str, confirm: bool = False) -> dict
         result = instantiate_checklist(
             business_id, checklist_template_id,
             service_id=service_id, object_id=object_id, roadmap_id=roadmap_id, stage_id=stage_id,
+            read_context=read_context,
         )
         if result["ok"]:
             created.append(checklist_template_id)
@@ -5506,6 +5695,7 @@ def provision_stage_operational_instances(
     include_outputs: bool = True,
     trigger: str = "manual",
     actor: str = "",
+    read_context=None,
 ) -> dict:
     """
     Unified Stage Provisioning: a single call orchestrating both
@@ -5523,10 +5713,17 @@ def provision_stage_operational_instances(
     roadmap_id, and template_stage_id are derived once and returned at
     the top level, rather than relying on comparing each child's own
     (otherwise redundant) resolution outcome. Each child function still
-    performs its own internal resolve — this duplication is accepted
-    (see the architecture audit) rather than changing either child's
-    signature to accept a pre-resolved template_stage_id, which would be
-    a child-contract change outside this phase's scope.
+    performs its own internal resolve() *call* — but as of Sheets quota
+    mitigation (2026-07-28), `read_context` (optional, see
+    _TransitionReadContext) is threaded through to both children, so
+    that repeated resolve() call is answered from cache (zero extra
+    Sheets reads) rather than re-deriving Stage/Roadmap/Template Stage
+    from scratch a 2nd/3rd/4th/5th time within one transition_stage_
+    status() transaction — the RM-003 incident (2026-07-28, Google
+    Sheets 429 quota exhaustion) traced a meaningful share of one
+    transition's ~48-70 read requests to exactly this repeated
+    resolution. `read_context=None` (the default) preserves the exact
+    prior behavior for /provisionstage and every other direct caller.
 
     Status policy: `confirm=True` is refused (with
     STAGE_PROVISIONING_NOT_ALLOWED_FOR_STATUS) when the Stage's current
@@ -5599,7 +5796,7 @@ def provision_stage_operational_instances(
             "warnings": (), "errors": errors,
         }
 
-    resolved = resolve_template_stage_for_stage(stage_id)
+    resolved = resolve_template_stage_for_stage(stage_id, read_context=read_context)
     if not resolved["ok"]:
         return _empty_result(False, resolved["code"], errors=(resolved.get("error") or resolved["code"],))
 
@@ -5632,7 +5829,7 @@ def provision_stage_operational_instances(
 
     if include_checklists:
         try:
-            checklists_result = provision_checklists_for_stage(stage_id, confirm=confirm)
+            checklists_result = provision_checklists_for_stage(stage_id, confirm=confirm, read_context=read_context)
         except Exception as exc:
             log.error(f"provision_stage_operational_instances({stage_id}): checklist subsystem exception: {exc}")
             warnings.append(f"Checklist subsystem raised an exception: {exc}")
@@ -5647,7 +5844,7 @@ def provision_stage_operational_instances(
 
     if include_outputs:
         try:
-            outputs_result = sync_stage_output_requirements(stage_id, confirm=confirm)
+            outputs_result = sync_stage_output_requirements(stage_id, confirm=confirm, read_context=read_context)
         except Exception as exc:
             log.error(f"provision_stage_operational_instances({stage_id}): output subsystem exception: {exc}")
             warnings.append(f"Output subsystem raised an exception: {exc}")
@@ -6118,7 +6315,7 @@ def _validate_checklist_relations(
 def instantiate_checklist(
     business_id: str, checklist_template_id: str,
     *, service_id: str = "", object_id: str = "", roadmap_id: str = "", stage_id: str = "",
-    created_by: str = "", notes: str = "",
+    created_by: str = "", notes: str = "", read_context=None,
 ) -> dict:
     """
     Phase 38C (ADR-021 §10/§11): the sole canonical Checklist
@@ -6134,6 +6331,15 @@ def instantiate_checklist(
       G. low-level parent + item persistence
       H. post-write verification
       I. structured result
+
+    `read_context` (Sheets quota mitigation, 2026-07-28): optional,
+    duck-typed transaction-local cache — see _TransitionReadContext.
+    Threaded to find_instances_by_idempotency_key() (step E) so
+    CHECKLIST_INSTANCES is read at most once across every checklist
+    provision_checklists_for_stage() creates in the same to_create loop,
+    instead of once per checklist. Default None preserves the exact
+    prior behavior (always a fresh read) for every existing direct
+    caller.
     """
     from business_core.checklist_manager import (
         find_instances_by_idempotency_key, create_checklist_instance, create_checklist_instance_items,
@@ -6193,6 +6399,7 @@ def instantiate_checklist(
 
     matches = find_instances_by_idempotency_key(
         business_id, checklist_template_id, resolved["roadmap_id"], resolved["stage_id"],
+        read_context=read_context,
     )
     if len(matches) > 1:
         conflicting_ids = tuple(m["Checklist Instance ID"] for m in matches)

@@ -9,7 +9,9 @@ Business Core — Google Sheets layer.
 from __future__ import annotations
 
 import os
+import random
 import sys
+import time
 import logging
 
 import gspread
@@ -17,6 +19,128 @@ from google.oauth2.service_account import Credentials
 from dotenv import load_dotenv
 
 load_dotenv()
+
+
+# ═══════════════════════════════════════════════════════════════
+# Sheets quota mitigation (2026-07-28): typed read-failure contract.
+#
+# A Google Sheets API failure (429 quota / 5xx / network) must never be
+# silently swallowed and reported to a caller as "row not found" — that
+# masking is exactly what turned a transient quota exhaustion into a
+# false "STAGE_NOT_FOUND" during the RM-003 incident. These typed
+# exceptions let every read function distinguish "read succeeded, no
+# match" (returns None/[]/(), unchanged) from "read did not complete"
+# (raises, never masked).
+# ═══════════════════════════════════════════════════════════════
+
+class SheetsReadError(RuntimeError):
+    """Base class: a Google Sheets read did not complete. Never treat
+    this as an empty/"not found" result — the caller must surface it
+    distinctly."""
+
+
+class SheetsQuotaExceededError(SheetsReadError):
+    """Google Sheets API returned 429 (quota exceeded). `retry_after`
+    is the server-supplied Retry-After delay in seconds, if any."""
+
+    def __init__(self, message: str, retry_after: float | None = None):
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+class TransientSheetsReadError(SheetsReadError):
+    """Google Sheets API returned 5xx, or the read failed on a
+    network/timeout error, and bounded retries were exhausted."""
+
+
+# 5xx/timeout/connection: bounded retry, exponential backoff + jitter.
+_READ_5XX_MAX_ATTEMPTS = 3
+_READ_5XX_BASE_DELAY_SECONDS = 0.4
+
+# 429: never a blind retry loop against an already-exhausted per-minute
+# quota. A single controlled retry is allowed ONLY when the server gives
+# an explicit Retry-After short enough not to make one Telegram command
+# hang unacceptably long.
+_READ_429_MAX_ACCEPTABLE_RETRY_AFTER_SECONDS = 5.0
+
+
+def _api_error_status_code(exc) -> int | None:
+    code = getattr(exc, "code", None)
+    return code if isinstance(code, int) else None
+
+
+def _api_error_retry_after(exc) -> float | None:
+    try:
+        raw = exc.response.headers.get("Retry-After")
+    except Exception:
+        return None
+    if not raw:
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def read_with_retry(fn, *args, **kwargs):
+    """
+    Execute a read-only gspread call (e.g. `sheet.get_all_values`,
+    `sheet.find`, `sheet.row_values`), translating Google Sheets API
+    failures into the typed exceptions above instead of letting them
+    propagate as a raw gspread.exceptions.APIError (or, worse, be caught
+    by a broad `except Exception: return None` upstream and silently
+    turned into "not found").
+
+    - 429 (quota exceeded): no blind retry against an already-exhausted
+      per-minute quota. If the response carries a Retry-After header
+      that is short enough (<= _READ_429_MAX_ACCEPTABLE_RETRY_AFTER_SECONDS)
+      not to make a single Telegram command hang unacceptably long, ONE
+      controlled retry is attempted after sleeping that long; otherwise
+      raises SheetsQuotaExceededError immediately, no retry at all.
+    - 5xx / network timeout / connection error: up to
+      _READ_5XX_MAX_ATTEMPTS attempts total, exponential backoff +
+      small jitter. Exhausted -> TransientSheetsReadError.
+    - Any other exception (e.g. gspread.exceptions.WorksheetNotFound) is
+      never touched here — it propagates unchanged.
+    """
+    import requests.exceptions as requests_exceptions
+
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            return fn(*args, **kwargs)
+        except gspread.exceptions.APIError as exc:
+            status = _api_error_status_code(exc)
+            if status == 429:
+                retry_after = _api_error_retry_after(exc)
+                if (
+                    attempt == 1
+                    and retry_after is not None
+                    and retry_after <= _READ_429_MAX_ACCEPTABLE_RETRY_AFTER_SECONDS
+                ):
+                    time.sleep(retry_after)
+                    continue
+                raise SheetsQuotaExceededError(
+                    f"Google Sheets API quota exceeded: {exc}", retry_after=retry_after,
+                ) from exc
+            if status is not None and 500 <= status < 600:
+                if attempt < _READ_5XX_MAX_ATTEMPTS:
+                    delay = _READ_5XX_BASE_DELAY_SECONDS * (2 ** (attempt - 1)) + random.uniform(0, 0.2)
+                    time.sleep(delay)
+                    continue
+                raise TransientSheetsReadError(
+                    f"Google Sheets API error after {attempt} attempts: {exc}"
+                ) from exc
+            raise
+        except (requests_exceptions.Timeout, requests_exceptions.ConnectionError) as exc:
+            if attempt < _READ_5XX_MAX_ATTEMPTS:
+                delay = _READ_5XX_BASE_DELAY_SECONDS * (2 ** (attempt - 1)) + random.uniform(0, 0.2)
+                time.sleep(delay)
+                continue
+            raise TransientSheetsReadError(
+                f"Sheets network error after {attempt} attempts: {exc}"
+            ) from exc
 
 log = logging.getLogger(__name__)
 
@@ -1111,7 +1235,34 @@ def read_business_sheet(sheet_key: str) -> list[dict]:
         list[dict] — каждый словарь = одна строка (ключи = заголовки)
     """
     sheet = get_business_sheet(sheet_key)
-    return _values_to_records(sheet.get_all_values())
+    return _values_to_records(read_with_retry(sheet.get_all_values))
+
+
+def read_business_sheet_cached(sheet_key: str, read_context=None) -> list[dict]:
+    """
+    Sheets quota mitigation (2026-07-28): same as read_business_sheet(),
+    but if `read_context` is given and already has this sheet_key cached
+    on its `.sheet_rows` dict, reuses it instead of hitting the API
+    again — the raw, unfiltered full-table rows are cached, so callers
+    that need different filters (active-only vs all, entity_type=X vs
+    Y) all share the same one read within a single transition.
+
+    `read_context` is duck-typed (any object exposing a mutable
+    `sheet_rows: dict` attribute) — this module never imports
+    business_core.business_builder's _TransitionReadContext, keeping
+    the existing Core -> Orchestration layering direction unchanged.
+    `read_context=None` (the default) is byte-for-byte the same as
+    calling read_business_sheet() directly — every existing caller that
+    doesn't pass a context is unaffected.
+    """
+    if read_context is not None:
+        cached = read_context.sheet_rows.get(sheet_key)
+        if cached is not None:
+            return cached
+    rows = read_business_sheet(sheet_key)
+    if read_context is not None:
+        read_context.sheet_rows[sheet_key] = rows
+    return rows
 
 
 def update_business_cell(sheet_key: str, row: int, col: int, value) -> None:
@@ -1180,7 +1331,7 @@ def find_row_by_id(sheet_key: str, record_id: str) -> tuple[int, dict] | None:
         (row_number, row_dict) или None если не найдено
     """
     sheet = get_business_sheet(sheet_key)
-    all_values = sheet.get_all_values()
+    all_values = read_with_retry(sheet.get_all_values)
     if len(all_values) < 2:
         return None
 

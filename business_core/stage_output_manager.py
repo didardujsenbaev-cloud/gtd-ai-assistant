@@ -207,15 +207,34 @@ def create_output_template(
         return {"ok": False, "output_template_id": "", "code": "", "error": str(exc)}
 
 
-def find_output_template_by_id(output_template_id: str) -> Optional[dict]:
-    """Header-mapped single-row read of STAGE_OUTPUT_TEMPLATES by Output
-    Template ID, or None if not found."""
+def find_output_template_by_id(output_template_id: str, read_context=None) -> Optional[dict]:
+    """
+    Header-mapped single-row read of STAGE_OUTPUT_TEMPLATES by Output
+    Template ID, or None if not found.
+
+    `read_context` (Sheets quota mitigation, 2026-07-28): optional,
+    duck-typed transaction-local cache — see business_core.sheets.
+    read_business_sheet_cached(). When given, the WHOLE table is read
+    once and looked up in memory — sync_stage_output_requirements()
+    calls this once per configured Output Template relation (M times),
+    which previously meant M separate find_row_by_id() API calls.
+    Default None preserves the exact prior single-row find_row_by_id()
+    behavior for every existing caller.
+    """
     if not output_template_id:
         return None
     try:
-        from business_core.sheets import find_row_by_id
+        from business_core.sheets import find_row_by_id, read_business_sheet_cached, SheetsReadError
+        if read_context is not None:
+            rows = read_business_sheet_cached("stage_output_templates", read_context=read_context)
+            for r in rows:
+                if r.get("Output Template ID", "") == output_template_id:
+                    return r
+            return None
         found = find_row_by_id("stage_output_templates", output_template_id)
         return found[1] if found else None
+    except SheetsReadError:
+        raise
     except Exception as exc:
         log.error(f"find_output_template_by_id({output_template_id}) error: {exc}")
         return None
@@ -349,15 +368,20 @@ def find_output_instance_by_id(output_instance_id: str) -> Optional[dict]:
         return None
 
 
-def list_output_instances_for_stage(stage_id: str) -> list[dict]:
+def list_output_instances_for_stage(stage_id: str, read_context=None) -> list[dict]:
     """All STAGE_OUTPUT_INSTANCES rows whose Stage ID matches, in sheet
-    order."""
+    order.
+
+    `read_context`: optional transaction-local cache — see
+    business_core.sheets.read_business_sheet_cached()."""
     if not stage_id:
         return []
     try:
-        from business_core.sheets import read_business_sheet
-        rows = read_business_sheet("stage_output_instances")
+        from business_core.sheets import read_business_sheet_cached, SheetsReadError
+        rows = read_business_sheet_cached("stage_output_instances", read_context=read_context)
         return [r for r in rows if r.get("Stage ID", "") == stage_id]
+    except SheetsReadError:
+        raise
     except Exception as exc:
         log.error(f"list_output_instances_for_stage({stage_id}) error: {exc}")
         return []
