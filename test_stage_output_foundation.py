@@ -443,11 +443,15 @@ class TestRequiredOutputEntityType(unittest.TestCase):
         self.assertEqual(ser.ENTITY_TYPE_DISPATCH["required_output"]["sheet_key"], "stage_output_templates")
         self.assertEqual(ser.ENTITY_TYPE_DISPATCH["required_output"]["id_column"], "Output Template ID")
 
-    def test_dispatch_now_has_four_entries(self):
+    def test_dispatch_now_has_five_entries(self):
+        """Phase 1 (Checklist Relation Foundation) added a fifth entry,
+        "checklist" — this count is updated here rather than treated as a
+        durable invariant, same precedent as every prior phase's version
+        of this guard."""
         import business_core.stage_entity_relations as ser
         self.assertEqual(
             set(ser.ENTITY_TYPE_DISPATCH.keys()),
-            {"document_template", "role", "sop", "required_output"},
+            {"document_template", "role", "sop", "required_output", "checklist"},
         )
 
 

@@ -83,6 +83,26 @@ ENTITY_TYPE_DISPATCH: dict[str, dict[str, str]] = {
         "sheet_key": "stage_output_templates",
         "id_column": "Output Template ID",
     },
+    # Phase 1 (Checklist Relation Foundation): links a Template Stage to a
+    # Checklist Template (business_core.knowledge_manager). Mirrors
+    # required_output's scope exactly — Template-Stage-scoped only, NEVER
+    # copied down into a Stage-scoped relation row; the "instance" is a
+    # full CHECKLIST_INSTANCES row created by
+    # business_builder.provision_checklists_for_stage(), not a relation
+    # copy. Blocking=true is the sole signal provisioning uses to decide
+    # whether to auto-create an instance — the Checklist Completion Gate
+    # itself has no concept of relation-level Blocking and is
+    # deliberately NOT changed by this phase (see
+    # business_builder._evaluate_checklist_completion_gate()'s docstring,
+    # unchanged): once an instance exists, ALL of its live required items
+    # block, unconditionally, regardless of this relation's Blocking
+    # value. Blocking=false relations are therefore stored (visible via
+    # /checklists template_stage_id=...) but never auto-instantiated by
+    # provisioning in this phase.
+    "checklist": {
+        "sheet_key": "checklist_registry",
+        "id_column": "Checklist ID",
+    },
 }
 
 
@@ -888,6 +908,99 @@ def create_required_output_relation_for_template_stage(
         template_stage_id=template_stage_id, stage_id="",
         created=tuple(created_records),
         skipped_duplicates=tuple(skipped_duplicates),
+    )
+
+
+def create_checklist_relation_for_template_stage(
+    template_stage_id: str, checklist_id: str,
+    required: bool = True, blocking: bool = True, status: str = "active",
+    timestamp: str | None = None,
+) -> CopyRelationsResult:
+    """
+    Phase 1 (Checklist Relation Foundation): the /linkchecklist write
+    path — creates a single TEMPLATE-scoped checklist relation linking
+    `template_stage_id` to one Checklist Template. Mirrors
+    create_required_output_relation_for_template_stage()'s exact scope
+    and contract: Template-Stage-scoped only, NEVER copied down into a
+    Stage-scoped relation row (the "instance" is a full
+    CHECKLIST_INSTANCES row created by
+    business_builder.provision_checklists_for_stage(), not a relation
+    copy).
+
+    `required`/`blocking` are accepted as Python bools (matching the
+    signature approved for Phase 1) and converted to the concrete
+    "true"/"false" strings validate_relation_record() requires — never
+    written blank, same as every other entity type in this table.
+
+    Idempotent per (Template Stage ID, Entity Type="checklist", Entity ID)
+    via the same find_active_duplicate_relation() check used everywhere
+    else in this module.
+    """
+    from business_core.sheets import (
+        find_row_by_id, generate_next_ids, batch_append_business_rows,
+        get_business_sheet, row_from_header_map,
+    )
+    from datetime import datetime
+
+    if not template_stage_id or not checklist_id:
+        return CopyRelationsResult(
+            template_stage_id=template_stage_id, stage_id="",
+            errors=(("__precondition__", ("template_stage_id and checklist_id are both required.",)),),
+            ok=False,
+        )
+
+    if find_row_by_id("roadmap_template_stages", template_stage_id) is None:
+        return CopyRelationsResult(
+            template_stage_id=template_stage_id, stage_id="",
+            errors=((
+                "__precondition__",
+                (f"Template Stage ID {template_stage_id!r} does not exist in ROADMAP_TEMPLATE_STAGES.",),
+            ),),
+            ok=False,
+        )
+
+    candidate = {
+        "Template Stage ID": template_stage_id, "Stage ID": "",
+        "Entity Type": "checklist", "Entity ID": checklist_id,
+        "Required": "true" if required else "false",
+        "Blocking": "true" if blocking else "false",
+        "Minimum Count": "1", "Status": status,
+    }
+
+    rel_errors = tuple(validate_relation_record(candidate)) + tuple(validate_relation_references(candidate))
+    if rel_errors:
+        return CopyRelationsResult(
+            template_stage_id=template_stage_id, stage_id="",
+            errors=((checklist_id, rel_errors),), ok=False,
+        )
+
+    existing = find_active_duplicate_relation(candidate)
+    if existing is not None:
+        return CopyRelationsResult(
+            template_stage_id=template_stage_id, stage_id="",
+            skipped_duplicates=((checklist_id, existing.get("Relation ID", "")),),
+        )
+
+    ts = timestamp or datetime.now().strftime("%Y-%m-%d")
+    sheet = get_business_sheet("stage_entity_relations")
+    headers = sheet.row_values(1)
+    new_relation_id = generate_next_ids("stage_entity_relations", 1)[0]
+
+    values = {**candidate, "Relation ID": new_relation_id, "Created At": ts, "Updated At": ts}
+    row = row_from_header_map(headers, values)
+
+    try:
+        batch_append_business_rows("stage_entity_relations", [row])
+    except Exception as exc:
+        return CopyRelationsResult(
+            template_stage_id=template_stage_id, stage_id="",
+            errors=(("__write_failure__", (str(exc),)),),
+            ok=False,
+        )
+
+    return CopyRelationsResult(
+        template_stage_id=template_stage_id, stage_id="",
+        created=(values,),
     )
 
 

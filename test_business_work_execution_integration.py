@@ -525,7 +525,7 @@ class TestArchitectureGuards(unittest.TestCase):
         self.assertNotIn("contractor_person", ser.ENTITY_TYPE_DISPATCH)
         self.assertEqual(
             set(ser.ENTITY_TYPE_DISPATCH.keys()),
-            {"document_template", "role", "sop", "required_output"},
+            {"document_template", "role", "sop", "required_output", "checklist"},
         )
 
     def test_no_automatic_hierarchy_escalation_reference(self):

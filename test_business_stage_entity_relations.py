@@ -411,17 +411,18 @@ class TestEntityTypeDispatcher(unittest.TestCase):
         self.assertEqual(entry["sheet_key"], "document_template_registry")
         self.assertEqual(entry["id_column"], "Document Template ID")
 
-    def test_only_document_template_role_sop_and_required_output_supported_today(self):
+    def test_only_document_template_role_sop_output_and_checklist_supported_today(self):
         """Phase 22B added "role" (Work Execution Foundation), Phase 45
         added "sop" (SOP Foundation UX), Phase A added "required_output"
-        (Stage Output Foundation) — the dispatch table is exactly four
+        (Stage Output Foundation), Phase 1 added "checklist" (Checklist
+        Relation Foundation) — the dispatch table is exactly five
         entries, all additive, none a schema change to
         STAGE_ENTITY_RELATIONS itself. "contractor_person" remains
         explicitly deferred (Phase 22A/22B)."""
         ser = _fresh_ser()
         self.assertEqual(
             set(ser.ENTITY_TYPE_DISPATCH.keys()),
-            {"document_template", "role", "sop", "required_output"},
+            {"document_template", "role", "sop", "required_output", "checklist"},
         )
 
     def test_role_entity_type_dispatch_target(self):
@@ -1044,10 +1045,11 @@ class TestCopyTemplateRelationsToStage(_CopyCase):
         self.assertEqual(appended, [])
 
     def test_unsupported_entity_type_visible(self):
-        """"sop" is now a supported Entity Type (Phase 45) — use
-        "checklist" instead as an example of a still-unsupported type."""
+        """"sop"/"checklist" are now supported Entity Types (Phase 45,
+        Phase 1) — use "faq" instead as an example of a still-unsupported
+        type."""
         result, appended = self._run(relations=[_rel_row(**{
-            "Relation ID": "REL-001", "Entity Type": "checklist", "Entity ID": "CHK-001",
+            "Relation ID": "REL-001", "Entity Type": "faq", "Entity ID": "FAQ-001",
         })])
         self.assertFalse(result.ok)
         self.assertTrue(any("Unsupported Entity Type" in str(e) for _, errs in result.errors for e in errs))

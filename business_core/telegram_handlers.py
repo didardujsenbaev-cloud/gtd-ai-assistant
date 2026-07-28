@@ -7861,6 +7861,194 @@ async def startchecklist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
 _CHECKLISTS_LIST_MAX_SHOWN = 20
 
 
+# ─────────────────────────────────────────────────────────────
+# Phase 1: Checklist Relation Foundation — Template Stage -> Checklist
+# Template linkage (STAGE_ENTITY_RELATIONS Entity Type="checklist") and
+# provisioning. Does NOT change /startchecklist, /updatecheckitem,
+# /updatechecklist, or the Checklist Completion Gate — see
+# business_builder.provision_checklists_for_stage()'s docstring for the
+# Blocking=false design decision.
+# ─────────────────────────────────────────────────────────────
+
+async def linkchecklist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /linkchecklist template_stage_id=TSTG-001 checklist_ids=CHK-001,CHK-002 [required=true] [blocking=true]
+
+    Связывает Checklist Template(ы) с Template Stage через
+    STAGE_ENTITY_RELATIONS (Entity Type="checklist") — relation остаётся
+    на уровне Template Stage, никогда не копируется на живой Stage (для
+    этого есть /syncchecklists). Отдельная команда, НЕ расширение
+    /linkknowledge — та остаётся legacy-командой, пишущей только в
+    comma-list колонки ROADMAP_TEMPLATE_STAGES.
+
+    Если required=/blocking= не переданы — применяется true/true к
+    каждому checklist_id (у checklist_registry нет per-template Default
+    Required/Blocking колонок, в отличие от Output Template). Если
+    переданы явно — применяются одинаково ко ВСЕМ перечисленным ID.
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg())
+        return
+    raw = " ".join(context.args or [])
+    args = _parse_kv_args(raw)
+    template_stage_id = args.get("template_stage_id") or args.get("_pos0", "")
+    if not template_stage_id:
+        await _reply(update,
+            "❌ Укажи template_stage_id.\n\nПример:\n"
+            "`/linkchecklist template_stage_id=TSTG-001 checklist_ids=CHK-001`"
+        )
+        return
+
+    checklist_ids = [x.strip() for x in (args.get("checklist_ids", "") or "").replace(";", ",").split(",") if x.strip()]
+    if not checklist_ids:
+        await _reply(update,
+            "❌ Укажи checklist_ids.\n\nПример:\n"
+            "`/linkchecklist template_stage_id=TSTG-001 checklist_ids=CHK-001,CHK-002`"
+        )
+        return
+
+    required = (args.get("required", "").strip().lower() != "false") if "required" in args else True
+    blocking = (args.get("blocking", "").strip().lower() != "false") if "blocking" in args else True
+
+    try:
+        from business_core.stage_entity_relations import create_checklist_relation_for_template_stage
+
+        created_ids: list[str] = []
+        error_texts: list[str] = []
+        for checklist_id in checklist_ids:
+            result = create_checklist_relation_for_template_stage(
+                template_stage_id, checklist_id, required=required, blocking=blocking,
+            )
+            if not result.ok:
+                error_texts.append("; ".join(str(errs) for _, errs in result.errors))
+            elif result.created:
+                created_ids.append(checklist_id)
+
+        if error_texts:
+            await _reply(update, f"❌ Ошибка: {'; '.join(error_texts)}")
+            return
+
+        lines = ["✅ *Checklist привязан к Template Stage*\n", f"Template Stage: `{template_stage_id}`"]
+        if created_ids:
+            lines.append(f"Добавлено: {', '.join(created_ids)}")
+        else:
+            lines.append("Добавлено: ничего (уже было привязано).")
+        lines.append("\nСинхронизировать в live Stage: `/syncchecklists stage_id=... confirm=yes`")
+        await _reply(update, "\n".join(lines))
+    except Exception as e:
+        log.error(f"linkchecklist_cmd error: {e}")
+        await _reply(update, "❌ Не удалось привязать Checklist.")
+
+
+_CHECKLIST_PROVISION_NOTE = (
+    "Статус, ответственный, сроки, приоритет и прогресс этапа не изменятся. "
+    "ROADMAP_STAGES меняться не будет. Checklist Completion Gate не изменён."
+)
+
+
+def _checklist_provision_message(result: dict) -> str:
+    code = result.get("code", "")
+    stage_id = result.get("stage_id", "")
+    template_stage_id = result.get("template_stage_id", "")
+
+    if code in ("CHECKLIST_PROVISIONED", "CHECKLIST_PROVISION_PARTIAL"):
+        created = result.get("created", ())
+        already_existing = result.get("already_existing", ())
+        skipped = result.get("skipped_inactive", ())
+        errors = result.get("errors", ())
+        lines = [
+            "✅ Синхронизация Checklist выполнена" if code == "CHECKLIST_PROVISIONED"
+            else "⚠️ Синхронизация Checklist выполнена частично",
+            f"Stage ID: {stage_id}",
+            f"Template Stage ID: {template_stage_id}",
+        ]
+        if created:
+            lines.append(f"Добавлено: {', '.join(created)}")
+        else:
+            lines.append("Добавлено: ничего (уже было синхронизировано).")
+        if already_existing:
+            lines.append(f"Уже было: {', '.join(already_existing)}")
+        if skipped:
+            lines.append(f"Пропущено (неактивный Checklist Template): {', '.join(skipped)}")
+        if errors:
+            lines.append("Ошибки: " + "; ".join(f"{cid}: {err}" for cid, err in errors))
+        lines.append(_CHECKLIST_PROVISION_NOTE)
+        return "\n".join(lines)
+
+    if code == "NO_CHECKLIST_TEMPLATES":
+        return f"❌ {result.get('error') or 'У Template Stage нет активных checklist relations, ни legacy-значений.'}"
+
+    if code == "CHECKLIST_PROVISION_FAILED":
+        return f"❌ {result.get('error') or 'Не удалось синхронизировать Checklist.'}"
+
+    return _stage_knowledge_sync_message(result)
+
+
+def _checklist_provision_preview_message(result: dict) -> str:
+    if result.get("code") == "CHECKLIST_PROVISION_PREVIEW":
+        to_create = result.get("to_create", ())
+        already_existing = result.get("already_existing", ())
+        skipped = result.get("skipped_inactive", ())
+        lines = [
+            "📋 Подтверди синхронизацию Checklist:",
+            "",
+            f"Stage ID: {result.get('stage_id', '')}",
+            f"Template Stage ID: {result.get('template_stage_id', '')}",
+            "",
+        ]
+        if to_create:
+            lines.append(f"Будет добавлено: {', '.join(to_create)}")
+        else:
+            lines.append("Будет добавлено: ничего — уже полностью синхронизировано.")
+        if already_existing:
+            lines.append(f"Уже привязано: {', '.join(already_existing)}")
+        if skipped:
+            lines.append(f"Пропущено (неактивный Checklist Template): {', '.join(skipped)}")
+        lines.append("")
+        lines.append(_CHECKLIST_PROVISION_NOTE)
+        lines.append("")
+        lines.append("Чтобы применить, повтори команду с confirm=yes.")
+        return "\n".join(lines)
+    return _checklist_provision_message(result)
+
+
+async def syncchecklists_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /syncchecklists stage_id=STAGE-013
+    /syncchecklists stage_id=STAGE-013 confirm=yes
+
+    Тонкая обёртка над business_builder.provision_checklists_for_stage()
+    — создаёт недостающие Checklist Instances для живого Stage из
+    активных checklist relations (или legacy fallback) Template Stage.
+    Не вызывается автоматически ни из /updatestage, ни откуда-либо ещё
+    в этой фазе.
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg())
+        return
+    raw = " ".join(context.args or [])
+    args = _parse_kv_args(raw)
+    stage_id = args.get("stage_id") or args.get("_pos0", "")
+    if not stage_id:
+        await _reply(update, "❌ Укажи stage_id.\n\nПример: `/syncchecklists stage_id=STAGE-013`")
+        return
+
+    confirmed = args.get("confirm", "").strip().lower() == "yes"
+
+    try:
+        from business_core.business_builder import provision_checklists_for_stage
+
+        result = provision_checklists_for_stage(stage_id, confirm=confirmed)
+        text = (
+            _checklist_provision_message(result) if confirmed
+            else _checklist_provision_preview_message(result)
+        )
+        await _reply(update, text)
+    except Exception as e:
+        log.error(f"syncchecklists_cmd error: {e}")
+        await _reply(update, "❌ Не удалось синхронизировать Checklist.")
+
+
 async def checklists_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     /checklists [business_id=BIZ-001] [checklist_template_id=CHK-001]
@@ -7868,6 +8056,11 @@ async def checklists_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 [stage_id=...] [status=in_progress]
 
     Read-only, bounded, filtered list of Checklist Instances.
+
+    /checklists template_stage_id=TSTG-001 — отдельный, Template-level
+    режим (Phase 1): показывает Checklist Template ID/название/relation
+    Required/Blocking/Status/источник (relations или legacy), не
+    инстансы.
     """
     if not _is_bc_enabled():
         await _reply(update, _bc_disabled_msg(), parse_mode=None)
@@ -7875,6 +8068,54 @@ async def checklists_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     raw = " ".join(context.args or [])
     args = _parse_kv_args(raw)
+
+    template_stage_id = args.get("template_stage_id", "")
+    if template_stage_id:
+        try:
+            from business_core.business_builder import resolve_checklist_templates_for_template_stage
+            from business_core.knowledge_manager import find_checklist_by_id
+            from business_core.stage_entity_relations import get_relations_for_template_stage
+
+            resolution = resolve_checklist_templates_for_template_stage(template_stage_id)
+            if not resolution["ok"]:
+                await _reply(update, f"❌ {resolution['error']}", parse_mode=None)
+                return
+
+            checklist_ids = resolution["checklist_template_ids"]
+            skipped = resolution["skipped_inactive_templates"]
+            source = resolution["source"]
+            if not checklist_ids and not skipped:
+                await _reply(
+                    update,
+                    f"У Template Stage {template_stage_id} нет привязанных Checklist Template.",
+                    parse_mode=None,
+                )
+                return
+
+            relations_by_id = {}
+            if source == "relations":
+                relations_by_id = {
+                    r.get("Entity ID", ""): r
+                    for r in get_relations_for_template_stage(template_stage_id, entity_type="checklist")
+                }
+
+            source_label = {"relations": "STAGE_ENTITY_RELATIONS", "legacy": "legacy Checklist IDs", "": "—"}.get(source, source)
+            lines = [f"📋 Checklist Templates для Template Stage {template_stage_id} (источник: {source_label}):", ""]
+            for checklist_id in checklist_ids:
+                template = find_checklist_by_id(checklist_id) or {}
+                rel = relations_by_id.get(checklist_id)
+                line = f"- {checklist_id} — {template.get('Title', '') or '—'}"
+                if rel:
+                    line += f" | Required: {rel.get('Required', '')} | Blocking: {rel.get('Blocking', '')} | Status: {rel.get('Status', '')}"
+                lines.append(line)
+            for checklist_id in skipped:
+                lines.append(f"- {checklist_id} — ⚠️ пропущен (неактивный Checklist Template)")
+
+            await _reply(update, "\n".join(lines), parse_mode=None)
+        except Exception as e:
+            log.error(f"checklists_cmd (template_stage_id) error: {e}")
+            await _reply(update, "❌ Не удалось получить Checklist Templates.", parse_mode=None)
+        return
 
     try:
         from business_core.checklist_manager import list_checklist_instances
@@ -7894,9 +8135,11 @@ async def checklists_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         lines = [f"📋 Checklist Instances ({len(instances)})", ""]
         for inst in instances[:_CHECKLISTS_LIST_MAX_SHOWN]:
             lines.append(
-                f"{inst.get('Checklist Instance ID', '')} — {inst.get('Checklist Title Snapshot', '')} "
+                f"{inst.get('Checklist Instance ID', '')} [{inst.get('Checklist Template ID', '')}] — "
+                f"{inst.get('Checklist Title Snapshot', '')} "
                 f"[{_checklist_status_ru(inst.get('Status', ''))}] "
-                f"{inst.get('Completed Items', '0')}/{inst.get('Total Items', '0')}"
+                f"{inst.get('Completed Items', '0')}/{inst.get('Total Items', '0')} "
+                f"(обязательных осталось: {inst.get('Required Remaining', '0')})"
             )
         if len(instances) > _CHECKLISTS_LIST_MAX_SHOWN:
             lines.append(f"\n… показаны первые {_CHECKLISTS_LIST_MAX_SHOWN} из {len(instances)}.")
@@ -12803,6 +13046,9 @@ def register_business_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("rejectoutput",     rejectoutput_cmd))
     app.add_handler(CommandHandler("waiveoutput",      waiveoutput_cmd))
     # Phase 38D (ADR-021): Checklist Domain — operational commands.
+    # Phase 1: Checklist Relation Foundation.
+    app.add_handler(CommandHandler("linkchecklist",    linkchecklist_cmd))
+    app.add_handler(CommandHandler("syncchecklists",   syncchecklists_cmd))
     app.add_handler(CommandHandler("startchecklist",   startchecklist_cmd))
     app.add_handler(CommandHandler("checklists",       checklists_cmd))
     app.add_handler(CommandHandler("checklist",        checklist_cmd))

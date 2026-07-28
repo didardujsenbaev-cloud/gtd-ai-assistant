@@ -4955,6 +4955,251 @@ def sync_stage_output_requirements(stage_id: str, confirm: bool = False) -> dict
     }
 
 
+def resolve_checklist_templates_for_template_stage(template_stage_id: str) -> dict:
+    """
+    Phase 1 (Checklist Relation Foundation): read-only resolver — same
+    dual-source precedence already established for document_template/
+    sop/required_output: active "checklist" STAGE_ENTITY_RELATIONS rows
+    on the Template Stage, else the legacy ROADMAP_TEMPLATE_STAGES.
+    "Checklist IDs" comma-list. Relations, when present, are the SOLE
+    source — never merged with legacy, same no-merge rule as every
+    sibling resolver in this codebase.
+
+    Never writes anything.
+
+    Returns:
+        {
+            "ok": bool, "error": str | None,
+            "template_stage_id": str, "source": str,  # "relations" | "legacy" | ""
+            "checklist_template_ids": tuple[str, ...],       # valid, active-template, de-duplicated (order preserved)
+            "skipped_inactive_templates": tuple[str, ...],   # found but Checklist Template Status != "active"
+            "invalid_legacy_checklist_ids": tuple[str, ...], # legacy source only: ID not found in checklist_registry
+        }
+    """
+    from business_core.sheets import find_row_by_id
+    from business_core.stage_entity_relations import get_relations_for_template_stage
+    from business_core.knowledge_manager import find_checklist_by_id
+
+    empty = {
+        "template_stage_id": template_stage_id, "source": "",
+        "checklist_template_ids": (), "skipped_inactive_templates": (),
+        "invalid_legacy_checklist_ids": (),
+    }
+
+    if not template_stage_id:
+        return {"ok": False, "error": "template_stage_id обязателен", **empty}
+
+    found = find_row_by_id("roadmap_template_stages", template_stage_id)
+    if found is None:
+        return {"ok": False, "error": f"Template Stage {template_stage_id!r} не найден", **empty}
+
+    relations = get_relations_for_template_stage(template_stage_id, entity_type="checklist")
+
+    if relations:
+        checklist_ids: list[str] = []
+        skipped_inactive: list[str] = []
+        for rel in relations:
+            checklist_id = rel.get("Entity ID", "")
+            template = find_checklist_by_id(checklist_id)
+            if template is None or template.get("Status", "") != "active":
+                skipped_inactive.append(checklist_id)
+            elif checklist_id not in checklist_ids:
+                checklist_ids.append(checklist_id)
+        return {
+            "ok": True, "error": None,
+            "template_stage_id": template_stage_id, "source": "relations",
+            "checklist_template_ids": tuple(checklist_ids),
+            "skipped_inactive_templates": tuple(skipped_inactive),
+            "invalid_legacy_checklist_ids": (),
+        }
+
+    _, row = found
+    raw_legacy = row.get("Checklist IDs", "") or ""
+    seen: dict[str, None] = {}
+    for token in raw_legacy.split(","):
+        token = token.strip()
+        if token and token not in seen:
+            seen[token] = None
+    legacy_ids = list(seen.keys())
+
+    if not legacy_ids:
+        return {
+            "ok": True, "error": None,
+            "template_stage_id": template_stage_id, "source": "",
+            "checklist_template_ids": (), "skipped_inactive_templates": (),
+            "invalid_legacy_checklist_ids": (),
+        }
+
+    checklist_ids = []
+    skipped_inactive = []
+    invalid_ids: list[str] = []
+    for checklist_id in legacy_ids:
+        template = find_checklist_by_id(checklist_id)
+        if template is None:
+            invalid_ids.append(checklist_id)
+        elif template.get("Status", "") != "active":
+            skipped_inactive.append(checklist_id)
+        else:
+            checklist_ids.append(checklist_id)
+
+    return {
+        "ok": True, "error": None,
+        "template_stage_id": template_stage_id, "source": "legacy",
+        "checklist_template_ids": tuple(checklist_ids),
+        "skipped_inactive_templates": tuple(skipped_inactive),
+        "invalid_legacy_checklist_ids": tuple(invalid_ids),
+    }
+
+
+def provision_checklists_for_stage(stage_id: str, confirm: bool = False) -> dict:
+    """
+    Phase 1 (Checklist Relation Foundation): resolves the Template Stage
+    for `stage_id`, determines which Checklist Templates apply via
+    resolve_checklist_templates_for_template_stage() (relations first,
+    legacy fallback, no merge), and creates the missing Checklist
+    Instances for the live Stage via instantiate_checklist() — idempotent
+    per instantiate_checklist()'s own 4-field key (business_id/
+    checklist_template_id/roadmap_id/stage_id): a repeat call never
+    creates a duplicate instance, it is recognized as already_existing.
+
+    Only Blocking=true relations are within automatic-provisioning scope
+    (see stage_entity_relations.ENTITY_TYPE_DISPATCH["checklist"]'s
+    docstring for why — the Checklist Completion Gate itself has no
+    concept of relation-level Blocking and is unconditionally applied to
+    every live instance's required items once created, so a
+    Blocking=false relation is deliberately never auto-instantiated in
+    this phase — it remains visible via /checklists
+    template_stage_id=... only). The legacy fallback carries no per-item
+    Blocking data at all and is always treated as blocking (mirrors the
+    established _DOCUMENT_TEMPLATE_RELATION_DEFAULTS precedent already
+    used for legacy-sourced document_template/sop relations).
+
+    Deliberately named neutrally (not "sync_...") and takes no Update/
+    context/Telegram dependency — /syncchecklists is a thin wrapper over
+    this function, and a future automatic pending->in_progress trigger
+    (NOT built in this phase) could call it directly, unchanged. This
+    phase does not wire any such trigger — transition_stage_status() is
+    untouched.
+
+    Never writes ROADMAP_STAGES, never touches Status/Responsible/Due
+    Date/Priority/Progress, never evaluates or affects the Checklist
+    Completion Gate (a created instance defaults to Status="draft", the
+    exact same default a manual /startchecklist call produces, and is
+    treated identically by the unchanged gate).
+
+    confirm=False (default, used for /syncchecklists' preview step):
+    every read/resolution step runs and the result reports what WOULD be
+    created, without writing anything.
+
+    A per-item create failure never stops the loop — every other
+    requested instance is still attempted, matching the
+    all-non-blocking-items-attempted principle already used elsewhere in
+    this codebase.
+
+    Returns:
+        {
+            "ok": bool, "code": str, "error": str | None,
+            "stage_id": str, "template_stage_id": str, "source": str,
+            "to_create": tuple[str, ...],        # Checklist Template IDs to instantiate
+            "created": tuple[str, ...],          # actually created (confirm=True only)
+            "already_existing": tuple[str, ...], # Checklist Template IDs with a live instance already
+            "skipped_inactive": tuple[str, ...], # relation/legacy pointed at an inactive Checklist Template
+            "errors": tuple,                     # (checklist_template_id, error string) per create failure
+            "partial_success": bool,             # True only if SOME (not all) requested instances were created
+        }
+    """
+    from business_core.roadmap_manager import resolve_template_stage_for_stage
+    from business_core.stage_entity_relations import get_relations_for_template_stage
+    from business_core.checklist_manager import list_checklist_instances
+
+    empty = {
+        "stage_id": stage_id, "template_stage_id": "", "source": "",
+        "to_create": (), "created": (), "already_existing": (),
+        "skipped_inactive": (), "errors": (), "partial_success": False,
+    }
+
+    resolved = resolve_template_stage_for_stage(stage_id)
+    if not resolved["ok"]:
+        return {"ok": False, "code": resolved["code"], "error": resolved["error"], **empty}
+
+    template_stage_id = resolved["template_stage_id"]
+    roadmap = resolved.get("roadmap") or {}
+
+    resolution = resolve_checklist_templates_for_template_stage(template_stage_id)
+    if not resolution["ok"]:
+        return {"ok": False, "code": "TEMPLATE_STAGE_NOT_FOUND", "error": resolution["error"], **empty}
+
+    source = resolution["source"]
+    skipped_inactive = list(resolution["skipped_inactive_templates"])
+
+    if not resolution["checklist_template_ids"]:
+        return {
+            "ok": False, "code": "NO_CHECKLIST_TEMPLATES",
+            "error": f"У Template Stage {template_stage_id} нет активных checklist relations, ни legacy-значений",
+            "stage_id": stage_id, "template_stage_id": template_stage_id, "source": source,
+            "to_create": (), "created": (), "already_existing": (),
+            "skipped_inactive": tuple(skipped_inactive), "errors": (), "partial_success": False,
+        }
+
+    blocking_checklist_ids = list(resolution["checklist_template_ids"])
+    if source == "relations":
+        relations = get_relations_for_template_stage(template_stage_id, entity_type="checklist")
+        blocking_by_id = {
+            r.get("Entity ID", ""): (r.get("Blocking", "") or "").strip().lower() == "true" for r in relations
+        }
+        blocking_checklist_ids = [cid for cid in blocking_checklist_ids if blocking_by_id.get(cid, False)]
+
+    business_id = roadmap.get("business_id", "")
+    service_id = roadmap.get("service_id", "")
+    object_id = roadmap.get("object_id", "")
+    roadmap_id = roadmap.get("roadmap_id", "")
+
+    existing_instances = [
+        inst for inst in list_checklist_instances(business_id=business_id)
+        if inst.get("Stage ID", "") == stage_id and inst.get("Status", "") not in ("cancelled", "archived")
+    ]
+    existing_template_ids = {inst.get("Checklist Template ID", "") for inst in existing_instances}
+
+    to_create = tuple(cid for cid in blocking_checklist_ids if cid not in existing_template_ids)
+    already_existing = tuple(cid for cid in blocking_checklist_ids if cid in existing_template_ids)
+
+    if not confirm:
+        return {
+            "ok": True, "code": "CHECKLIST_PROVISION_PREVIEW", "error": None,
+            "stage_id": stage_id, "template_stage_id": template_stage_id, "source": source,
+            "to_create": to_create, "created": (), "already_existing": already_existing,
+            "skipped_inactive": tuple(skipped_inactive), "errors": (), "partial_success": False,
+        }
+
+    created: list[str] = []
+    errors: list[tuple] = []
+    for checklist_template_id in to_create:
+        result = instantiate_checklist(
+            business_id, checklist_template_id,
+            service_id=service_id, object_id=object_id, roadmap_id=roadmap_id, stage_id=stage_id,
+        )
+        if result["ok"]:
+            created.append(checklist_template_id)
+        else:
+            errors.append((checklist_template_id, result.get("error") or result.get("code") or "unknown"))
+
+    if not errors:
+        ok, code = True, "CHECKLIST_PROVISIONED"
+    elif created:
+        ok, code = True, "CHECKLIST_PROVISION_PARTIAL"
+    else:
+        ok, code = False, "CHECKLIST_PROVISION_FAILED"
+
+    return {
+        "ok": ok, "code": code,
+        "error": None if not errors else "; ".join(f"{cid}: {err}" for cid, err in errors),
+        "stage_id": stage_id, "template_stage_id": template_stage_id, "source": source,
+        "to_create": to_create, "created": tuple(created), "already_existing": already_existing,
+        "skipped_inactive": tuple(skipped_inactive), "errors": tuple(errors),
+        "partial_success": bool(errors) and bool(created),
+    }
+
+
 def transition_document_status(document_id: str, target_status: str) -> dict:
     """
     Phase 37D (ADR-020 §15/§11/§12): the sole canonical Document-
