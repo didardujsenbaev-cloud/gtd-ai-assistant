@@ -431,13 +431,21 @@ class TestGatesAndTransitionUnchanged(unittest.TestCase):
         source = inspect.getsource(bb._evaluate_output_completion_gate)
         self.assertNotIn("provision_stage_operational_instances", source)
 
-    def test_transition_stage_status_does_not_call_unified_provisioning(self):
+    def test_transition_stage_status_now_calls_unified_provisioning(self):
+        """Superseded by the auto-trigger phase — explicitly inverted
+        (not just extended), same precedent as every prior "isolation
+        guard later flipped by design" case in this codebase (e.g. the
+        Output Gate wiring into transition_stage_status() itself). See
+        test_stage_auto_provisioning.py for the full behavioral test
+        suite covering exactly what/when/how this call happens."""
         import inspect
         bb = _fresh_bb()
         source = inspect.getsource(bb.transition_stage_status)
-        self.assertNotIn("provision_stage_operational_instances", source)
-        self.assertNotIn("provision_checklists_for_stage", source)
-        self.assertNotIn("sync_stage_output_requirements", source)
+        self.assertIn("provision_stage_operational_instances", source)
+        # Still never calls the two child subsystems directly — only the
+        # unified wrapper.
+        self.assertNotIn("provision_checklists_for_stage(", source)
+        self.assertNotIn("sync_stage_output_requirements(", source)
 
     def test_no_provisionroadmap_command(self):
         import business_core.telegram_handlers as th

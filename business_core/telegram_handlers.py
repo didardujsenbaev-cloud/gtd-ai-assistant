@@ -3036,6 +3036,42 @@ def _stage_transition_success_lines(result: dict, stage_id: str, notes: Optional
         if output_titles:
             lines.append(f"Обойдённые Required Output: {', '.join(output_titles)}")
 
+    # Auto-provisioning (pending->in_progress auto-trigger) — additive,
+    # only ever shown when transition_stage_status() actually attempted
+    # it. Never shown for any other transition.
+    if result.get("provisioning_attempted"):
+        provisioning = result.get("provisioning") or {}
+        prov_code = provisioning.get("code", "")
+        prov_warning = result.get("provisioning_warning", "")
+        prov_stage_id = result.get("stage_id", "") or stage_id
+
+        if prov_code == "NOTHING_TO_PROVISION":
+            lines.append("📦 Operational provisioning: нечего создавать.")
+        elif prov_code == "STAGE_PROVISION_PARTIAL":
+            lines.append("⚠️ Provisioning выполнен частично.")
+            lines.append("Статус этапа сохранён.")
+            lines.append("Повтори:")
+            lines.append(f" /provisionstage stage_id={prov_stage_id} confirm=yes")
+        elif prov_code == "STAGE_PROVISION_FAILED":
+            lines.append("⚠️ Этап переведён в работу, но operational instances не созданы.")
+            lines.append("Повтори:")
+            lines.append(f" /provisionstage stage_id={prov_stage_id} confirm=yes")
+        elif prov_code == "STAGE_PROVISIONED":
+            checklists = provisioning.get("checklists", {})
+            outputs = provisioning.get("outputs", {})
+            totals = provisioning.get("totals", {})
+            lines.append("📦 Operational provisioning:")
+            lines.append(f"- Checklist created: {len(checklists.get('created', ()))}")
+            lines.append(f"- Outputs created: {len(outputs.get('created', ()))}")
+            lines.append(f"- Already existing: {totals.get('already_existing', 0)}")
+            lines.append(f"- Skipped: {totals.get('skipped', 0)}")
+            lines.append(f"- Errors: {totals.get('errors', 0)}")
+        elif prov_warning:
+            # Unexpected-exception path (provisioning dict may be empty)
+            # or any other not-explicitly-handled code — never silently
+            # dropped, always surfaced via the generic warning string.
+            lines.append(f"⚠️ {prov_warning}")
+
     if notes is not None:
         lines.append(f"Notes обновлены: {notes}")
 

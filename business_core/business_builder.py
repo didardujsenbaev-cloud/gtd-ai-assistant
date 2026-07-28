@@ -2184,6 +2184,8 @@ def _stage_transition_result(
     missing_checklist_item_titles: tuple = (),
     missing_blocking_output_instance_ids: tuple = (), missing_blocking_output_template_ids: tuple = (),
     missing_blocking_output_titles: tuple = (), missing_blocking_output_statuses: tuple = (),
+    provisioning_attempted: bool = False, provisioning: dict | None = None,
+    provisioning_warning: str = "",
 ) -> dict:
     """
     Shared result-builder for transition_stage_status() and
@@ -2208,6 +2210,16 @@ def _stage_transition_result(
     missing_blocking_output_instance_ids, never by omitting it from the
     other three tuples — all four always stay the same length and index-
     aligned.
+
+    Auto-provisioning (pending->in_progress) additive fields:
+    provisioning_attempted/provisioning/provisioning_warning — same
+    empty-default contract; every result built for any transition other
+    than a successful pending->in_progress is unaffected
+    (provisioning_attempted stays False, provisioning stays {}).
+    `provisioning` defaults to None here (never a mutable {} default) and
+    is normalized to {} in the returned dict, never left as None, so
+    every caller can safely do `result["provisioning"].get(...)` without
+    a None-check.
     """
     return {
         "ok": ok,
@@ -2240,6 +2252,9 @@ def _stage_transition_result(
         "missing_blocking_output_template_ids": tuple(missing_blocking_output_template_ids),
         "missing_blocking_output_titles": tuple(missing_blocking_output_titles),
         "missing_blocking_output_statuses": tuple(missing_blocking_output_statuses),
+        "provisioning_attempted": provisioning_attempted,
+        "provisioning": provisioning if provisioning is not None else {},
+        "provisioning_warning": provisioning_warning,
     }
 
 
@@ -3015,6 +3030,70 @@ def transition_stage_status(
             downstream_failures.append(f"Не удалось пересчитать прогресс: {progress_result.get('error')}")
             code = "PROGRESS_RECALCULATION_FAILED"
 
+    # K. Auto-provisioning (Unified Stage Provisioning auto-trigger):
+    # strictly pending->in_progress, and only when the write in G actually
+    # changed the Stage's status — never for a repeat in_progress call,
+    # never for blocked->in_progress/in_progress->blocked/in_progress->done/
+    # force completion/admin-field-only updates (all excluded by this exact
+    # condition on previous_status/target_status/changed, captured before
+    # any write above). Runs strictly after G (Status persisted), H
+    # (Progress recalculated), and I (Roadmap auto-completion checked) —
+    # the Stage's core state is fully settled before this best-effort
+    # downstream step runs.
+    #
+    # provision_stage_operational_instances() already never raises on its
+    # own (both of ITS child subsystems are individually try/except'ed
+    # internally) — this try/except here is defense-in-depth on top of
+    # that, not a substitute for it: if anything here still raises
+    # unexpectedly, it is caught and folded into downstream_failures/
+    # provisioning_warning, exactly like every other downstream step above
+    # (progress recalculation, roadmap auto-completion) — it NEVER rolls
+    # back the Status write already confirmed in G, and it NEVER changes
+    # `code` away from "STAGE_STATUS_UPDATED" (unlike the progress/
+    # completion downstream failures above, which do override `code` —
+    # deliberately different here: provisioning is auxiliary staff
+    # tooling, not Roadmap data-integrity-critical, per the approved
+    # design).
+    provisioning_attempted = False
+    provisioning_result: dict | None = None
+    provisioning_warning = ""
+    if previous_status == "pending" and target_status == "in_progress" and changed:
+        provisioning_attempted = True
+        try:
+            provisioning_result = provision_stage_operational_instances(
+                stage_id=stage_id, confirm=True, trigger="stage_started", actor=actor,
+            )
+            prov_code = provisioning_result.get("code", "")
+            if prov_code == "STAGE_PROVISION_PARTIAL":
+                partial_success = True
+                downstream_failures.append(
+                    f"Provisioning выполнен частично: {provisioning_result.get('totals', {})}"
+                )
+                provisioning_warning = "Provisioning выполнен частично"
+            elif prov_code == "STAGE_PROVISION_FAILED":
+                partial_success = True
+                downstream_failures.append(
+                    f"Provisioning не создал ни одного operational instance: {provisioning_result.get('totals', {})}"
+                )
+                provisioning_warning = "Этап переведён в работу, но operational instances не созданы"
+            # STAGE_PROVISIONED / NOTHING_TO_PROVISION / a resolution-
+            # failure code all leave provisioning_warning empty — the
+            # first two are success states, and a resolution failure here
+            # (extremely unlikely, since resolve_template_stage_for_stage()
+            # already succeeded moments ago for this same stage_id inside
+            # this very function) is surfaced via downstream_failures only.
+            elif not provisioning_result.get("ok"):
+                partial_success = True
+                downstream_failures.append(
+                    f"Provisioning не выполнен: {provisioning_result.get('code')}"
+                )
+        except Exception as exc:
+            log.error(f"transition_stage_status({stage_id}): auto-provisioning exception: {exc}")
+            partial_success = True
+            downstream_failures.append(f"Provisioning вызвал непредвиденную ошибку: {exc}")
+            provisioning_warning = "Provisioning вызвал непредвиденную ошибку"
+            provisioning_result = provisioning_result or {}
+
     return _stage_transition_result(
         ok=True, code=code, error=None,
         stage_id=stage_id, roadmap_id=roadmap_id,
@@ -3035,6 +3114,9 @@ def transition_stage_status(
         missing_blocking_output_template_ids=gate_missing_blocking_output_template_ids,
         missing_blocking_output_titles=gate_missing_blocking_output_titles,
         missing_blocking_output_statuses=gate_missing_blocking_output_statuses,
+        provisioning_attempted=provisioning_attempted,
+        provisioning=provisioning_result,
+        provisioning_warning=provisioning_warning,
     )
 
 

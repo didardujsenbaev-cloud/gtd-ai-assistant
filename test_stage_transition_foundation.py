@@ -145,6 +145,26 @@ def _resolve_template_stage_not_found(stage_id="STAGE-001"):
     return {"ok": False, "code": "STAGE_NOT_FOUND", "error": "", "template_stage_id": "", "roadmap": None}
 
 
+def _default_provisioning_nothing(stage_id="STAGE-001"):
+    """Auto-provisioning default: a safe, inert NOTHING_TO_PROVISION
+    result — mocked at the business_builder.provision_stage_operational_
+    instances() boundary itself (never its internals), matching every
+    other cross-module boundary already mocked in this harness. Almost
+    every existing test in this file goes through pending->in_progress
+    by default (both _call()'s own target_status default and _stage()'s
+    own status default), so without this default mock every one of them
+    would suddenly attempt a live call the moment the auto-trigger was
+    wired in."""
+    return {
+        "ok": True, "code": "NOTHING_TO_PROVISION",
+        "stage_id": stage_id, "roadmap_id": "RM-001", "template_stage_id": "",
+        "confirm": True, "trigger": "stage_started", "actor": "",
+        "checklists": {}, "outputs": {},
+        "totals": {"to_create": 0, "created": 0, "already_existing": 0, "skipped": 0, "errors": 0},
+        "partial_success": False, "warnings": (), "errors": (),
+    }
+
+
 _UNSET = object()
 
 
@@ -156,7 +176,8 @@ class _BaseTransitionTestCase(unittest.TestCase):
               evaluate_scope_result=_UNSET, record_override_result=None,
               checklist_instances=None, checklist_items=None,
               resolve_template_stage_result=_UNSET, output_relations=None,
-              output_instances=None, output_template_lookup=None):
+              output_instances=None, output_template_lookup=None,
+              provisioning_result=_UNSET, provisioning_side_effect=None):
         bb = _fresh_bb()
         with patch("business_core.roadmap_manager.find_stage_by_id",
                    return_value=_stage() if stage is _UNSET else stage), \
@@ -186,7 +207,13 @@ class _BaseTransitionTestCase(unittest.TestCase):
                    side_effect=(output_template_lookup if output_template_lookup is not None else (lambda otid: None))) as mock_output_template_lookup, \
              patch("business_core.roadmap_manager.record_stage_completion_override",
                    return_value=(record_override_result if record_override_result is not None
-                                 else _override_write_result())) as mock_record_override:
+                                 else _override_write_result())) as mock_record_override, \
+             patch(
+                 "business_core.business_builder.provision_stage_operational_instances",
+                 side_effect=provisioning_side_effect,
+                 return_value=(_default_provisioning_nothing(stage_id) if provisioning_result is _UNSET
+                               else provisioning_result),
+             ) as mock_provisioning:
             result = bb.transition_stage_status(
                 stage_id, target_status, notes=notes, admin_fields=admin_fields,
                 force=force, reason=reason, actor=actor,
@@ -201,6 +228,7 @@ class _BaseTransitionTestCase(unittest.TestCase):
             self._last_mock_output_relations = mock_output_relations
             self._last_mock_output_instances = mock_output_instances
             self._last_mock_output_template_lookup = mock_output_template_lookup
+            self._last_mock_provisioning = mock_provisioning
             return result
 
 
