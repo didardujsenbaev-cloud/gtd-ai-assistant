@@ -172,6 +172,71 @@ def resize_grid_if_needed(sheet, plan: dict) -> dict:
     }
 
 
+def _compare_data_preservation(data_rows_before: list, data_rows_after: list, preserved_width: int) -> dict:
+    """
+    Compare only the column range that existed BEFORE this migration —
+    columns 1..preserved_width (preserved_width = len(headers_before)).
+    Newly appended columns to the right (the ones this migration itself
+    just added) must NEVER affect this comparison: a resize/append pass
+    legitimately widens every existing data row with empty trailing
+    cells, and that is not data loss.
+
+    Each row is padded with "" up to preserved_width (a short row is not
+    itself corruption — a genuinely empty trailing cell is still data
+    and must compare equal, not be treated as "missing"), then truncated
+    to preserved_width, before comparing. Rows are compared strictly by
+    position — never sorted — so a reordering of existing rows is
+    detected as a mismatch.
+
+    Returns:
+        {
+            "data_preserved": bool,
+            "appended_columns_clean": bool,  # True iff every row's
+                newly-appended columns (index >= preserved_width) are
+                all empty in data_rows_after
+            "preserved_column_count": int,
+            "rows_before_count": int,
+            "rows_after_count": int,
+            "first_mismatch_row": int | None,  # 1-indexed position
+                within the data rows (NOT the sheet row number) of the
+                first mismatch — never the row content itself.
+        }
+    """
+    def _normalize(row):
+        padded = list(row) + [""] * max(0, preserved_width - len(row))
+        return padded[:preserved_width]
+
+    rows_before_count = len(data_rows_before)
+    rows_after_count = len(data_rows_after)
+
+    first_mismatch_row = None
+    data_preserved = True
+    for i in range(max(rows_before_count, rows_after_count)):
+        if i >= rows_before_count or i >= rows_after_count:
+            data_preserved = False
+            first_mismatch_row = i + 1
+            break
+        if _normalize(data_rows_before[i]) != _normalize(data_rows_after[i]):
+            data_preserved = False
+            first_mismatch_row = i + 1
+            break
+
+    appended_columns_clean = True
+    for row in data_rows_after:
+        if any(v != "" for v in list(row)[preserved_width:]):
+            appended_columns_clean = False
+            break
+
+    return {
+        "data_preserved": data_preserved,
+        "appended_columns_clean": appended_columns_clean,
+        "preserved_column_count": preserved_width,
+        "rows_before_count": rows_before_count,
+        "rows_after_count": rows_after_count,
+        "first_mismatch_row": first_mismatch_row,
+    }
+
+
 def apply_migration_plan(sheet, plan: dict, data_rows_before: list | None = None) -> dict:
     """
     Full controlled live migration — steps 8-13 of the approved order:
@@ -200,6 +265,11 @@ def apply_migration_plan(sheet, plan: dict, data_rows_before: list | None = None
             "added_headers": list[str],
             "already_present_headers": list[str],
             "data_preserved": bool | None, # None if data_rows_before not given
+            "appended_columns_clean": bool | None,
+            "preserved_column_count": int | None,
+            "rows_before_count": int | None,
+            "rows_after_count": int | None,
+            "first_mismatch_row": int | None,
             "error": str | None,
         }
 
@@ -234,8 +304,14 @@ def apply_migration_plan(sheet, plan: dict, data_rows_before: list | None = None
         "added_headers": [],
         "already_present_headers": list(plan["already_present"]),
         "data_preserved": None,
+        "appended_columns_clean": None,
+        "preserved_column_count": None,
+        "rows_before_count": None,
+        "rows_after_count": None,
+        "first_mismatch_row": None,
         "error": None,
     }
+    preserved_width = len(plan["existing_headers"])
 
     if not plan["has_changes"]:
         result["status"] = STATUS_ALREADY_PRESENT
@@ -270,9 +346,9 @@ def apply_migration_plan(sheet, plan: dict, data_rows_before: list | None = None
         if data_rows_before is not None:
             try:
                 data_after = sheet.get_all_values()[1:]
-                result["data_preserved"] = (data_rows_before == data_after)
+                result.update(_compare_data_preservation(data_rows_before, data_after, preserved_width))
             except Exception:
-                pass
+                pass  # best-effort only — status already reflects the failure
         return result
 
     result["added_headers"] = added
@@ -281,10 +357,13 @@ def apply_migration_plan(sheet, plan: dict, data_rows_before: list | None = None
     after_headers = sheet.row_values(1)
     result["headers_after"] = after_headers
 
-    # Step 13: verify existing data rows unchanged, if requested.
+    # Step 13: verify existing data rows unchanged, if requested. Only
+    # the column range that existed BEFORE this migration is compared —
+    # newly appended columns legitimately widen every row and must
+    # never be mistaken for data loss.
     if data_rows_before is not None:
         data_after = sheet.get_all_values()[1:]
-        result["data_preserved"] = (data_rows_before == data_after)
+        result.update(_compare_data_preservation(data_rows_before, data_after, preserved_width))
 
     if after_headers != plan["canonical_headers"]:
         result["status"] = STATUS_VERIFICATION_FAILED
@@ -383,7 +462,11 @@ def main() -> int:
     print(f"Headers после: {result['headers_after']}")
     print(f"Добавлено: {result['added_headers']}")
     print(f"Уже было:  {result['already_present_headers']}")
-    print(f"Данные не изменились: {result['data_preserved']}")
+    print(f"Данные не изменились (первые {result['preserved_column_count']} колонок): {result['data_preserved']}")
+    print(f"Новые колонки справа пустые: {result['appended_columns_clean']}")
+    print(f"Строк данных: до={result['rows_before_count']}, после={result['rows_after_count']}")
+    if result["first_mismatch_row"] is not None:
+        print(f"Первое несовпадение в строке данных №{result['first_mismatch_row']}")
     if result["error"]:
         print(f"Ошибка: {result['error']}")
 

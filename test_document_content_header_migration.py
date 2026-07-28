@@ -80,7 +80,18 @@ class _FakeSheet:
         self._headers[col - 1] = value
 
     def get_all_values(self):
-        return [list(self._headers)] + [list(r) for r in self._data_rows]
+        # Mirrors real Google Sheets/gspread behavior discovered against
+        # production: get_all_values() pads every row (including
+        # existing data rows) out to the sheet's current col_count —
+        # widening the grid legitimately widens already-written rows
+        # with trailing empty cells, without touching their real values.
+        def _padded(row):
+            row = list(row)
+            if len(row) < self.col_count:
+                row = row + [""] * (self.col_count - len(row))
+            return row
+
+        return [_padded(self._headers)] + [_padded(r) for r in self._data_rows]
 
     def resize(self, rows=None, cols=None):
         self.resize_calls.append((rows, cols))
@@ -241,15 +252,23 @@ class TestApplyMigrationPlan(unittest.TestCase):
         self.assertEqual(sheet.col_count, first_col_count)
 
     def test_existing_row_data_untouched_after_resize_and_append(self):
-        """п.9: Existing row data preserved after resize and header append."""
+        """п.9: Existing row data preserved after resize and header
+        append — even though the raw rows widen from 20 to 23 columns
+        (real Sheets/gspread behavior), the normalized comparison must
+        still report data_preserved=True, and the 3 new trailing cells
+        must be clean."""
         data_row = ["DREG-001", "FILE1", "completed"] + [""] * (len(PHASE_16A_HEADERS) - 3)
         m, plan = _plan(PHASE_16A_HEADERS, current_col_count=20)
         sheet = _FakeSheet(PHASE_16A_HEADERS, data_rows=[data_row], col_count=20, row_count=999)
         before = sheet.get_all_values()[1:]
+        self.assertEqual(len(before[0]), 20)  # sanity: raw width before is 20
         result = m.apply_migration_plan(sheet, plan, data_rows_before=before)
         after = sheet.get_all_values()[1:]
-        self.assertEqual(before, after)
+        self.assertEqual(len(after[0]), 23)  # raw width after legitimately grew
         self.assertTrue(result["data_preserved"])
+        self.assertTrue(result["appended_columns_clean"])
+        self.assertEqual(result["preserved_column_count"], 20)
+        self.assertIsNone(result["first_mismatch_row"])
 
     def test_conflict_plan_raises_never_writes(self):
         tampered = list(PHASE_16A_HEADERS)
@@ -318,6 +337,116 @@ class TestApplyMigrationPlan(unittest.TestCase):
         with patch.object(sheet, "row_values", side_effect=_tampered_row_values):
             result = m.apply_migration_plan(sheet, plan)
         self.assertEqual(result["status"], "VERIFICATION_FAILED")
+
+
+class TestDataPreservationComparison(unittest.TestCase):
+    """
+    Direct unit tests for _compare_data_preservation() — the normalized
+    comparison contract fixing the false-negative discovered on the
+    real production migration (rows legitimately widen from 20 to 23
+    columns after a resize+append pass; that must never be reported as
+    data loss). Only the column range that existed BEFORE migration
+    (preserved_width = len(headers_before)) is compared; newly appended
+    columns are checked separately via appended_columns_clean.
+    """
+
+    def _row20(self, doc_id="DREG-001", val3="v"):
+        return [doc_id, "FILE", "completed", val3] + [""] * 16  # width 20
+
+    def setUp(self):
+        self.m = _fresh_migration()
+
+    # 1. Before width=20, after width=23 with empty cells on the right.
+    def test_widened_rows_with_empty_tail_preserved(self):
+        before = [self._row20()]
+        after = [self._row20() + ["", "", ""]]
+        result = self.m._compare_data_preservation(before, after, preserved_width=20)
+        self.assertTrue(result["data_preserved"])
+        self.assertTrue(result["appended_columns_clean"])
+        self.assertIsNone(result["first_mismatch_row"])
+
+    # 2. Existing value in column 1 changed.
+    def test_column_1_change_detected(self):
+        before = [self._row20(doc_id="DREG-001")]
+        after = [self._row20(doc_id="DREG-999") + ["", "", ""]]
+        result = self.m._compare_data_preservation(before, after, preserved_width=20)
+        self.assertFalse(result["data_preserved"])
+        self.assertEqual(result["first_mismatch_row"], 1)
+
+    # 3. Existing value in column 20 (last preserved column) changed.
+    def test_column_20_change_detected(self):
+        before_row = self._row20()
+        after_row = self._row20()
+        after_row[19] = "CHANGED"
+        result = self.m._compare_data_preservation([before_row], [after_row + ["", "", ""]], preserved_width=20)
+        self.assertFalse(result["data_preserved"])
+        self.assertEqual(result["first_mismatch_row"], 1)
+
+    # 4. Empty values inside the first 20 columns must still compare
+    #    equal (an empty cell within the preserved range is data, not
+    #    "missing").
+    def test_empty_values_within_preserved_range_are_preserved(self):
+        before = [self._row20(val3="")]
+        after = [self._row20(val3="") + ["", "", ""]]
+        result = self.m._compare_data_preservation(before, after, preserved_width=20)
+        self.assertTrue(result["data_preserved"])
+
+    # 5. A row was deleted.
+    def test_deleted_row_detected(self):
+        before = [self._row20("DREG-001"), self._row20("DREG-002")]
+        after = [self._row20("DREG-001") + ["", "", ""]]
+        result = self.m._compare_data_preservation(before, after, preserved_width=20)
+        self.assertFalse(result["data_preserved"])
+        self.assertEqual(result["first_mismatch_row"], 2)
+
+    # 6. A row was added (unexpected). Policy: strict — False.
+    def test_added_row_detected_as_not_preserved(self):
+        before = [self._row20("DREG-001")]
+        after = [self._row20("DREG-001") + ["", "", ""], self._row20("DREG-002") + ["", "", ""]]
+        result = self.m._compare_data_preservation(before, after, preserved_width=20)
+        self.assertFalse(result["data_preserved"])
+        self.assertEqual(result["first_mismatch_row"], 2)
+
+    # 7. Existing row order changed — never resorted before comparing.
+    def test_reordered_rows_detected(self):
+        before = [self._row20("DREG-001"), self._row20("DREG-002")]
+        after = [self._row20("DREG-002") + ["", "", ""], self._row20("DREG-001") + ["", "", ""]]
+        result = self.m._compare_data_preservation(before, after, preserved_width=20)
+        self.assertFalse(result["data_preserved"])
+        self.assertEqual(result["first_mismatch_row"], 1)
+
+    # 8. New columns 21-23 contain only empty values.
+    def test_appended_columns_all_empty_is_clean(self):
+        before = [self._row20()]
+        after = [self._row20() + ["", "", ""]]
+        result = self.m._compare_data_preservation(before, after, preserved_width=20)
+        self.assertTrue(result["appended_columns_clean"])
+
+    # 9. New columns 21-23 unexpectedly contain values — existing-data
+    #    preservation must remain True, but appended_columns_clean must
+    #    flag it separately (chosen policy: appended_columns_clean=False,
+    #    NOT a VERIFICATION_FAILED — this migration never intentionally
+    #    writes into those cells itself, but an external actor could).
+    def test_appended_columns_with_unexpected_values_flagged_separately(self):
+        before = [self._row20()]
+        after = [self._row20() + ["SOMETHING", "", ""]]
+        result = self.m._compare_data_preservation(before, after, preserved_width=20)
+        self.assertTrue(result["data_preserved"])  # the existing 1..20 range is untouched
+        self.assertFalse(result["appended_columns_clean"])
+
+    # 10. Full realistic resize 20→23 scenario via apply_migration_plan:
+    #     status=ADDED, data_preserved=True, appended_columns_clean=True.
+    def test_full_resize_scenario_end_to_end(self):
+        data_row = ["DREG-001", "FILE1", "completed"] + [""] * (len(PHASE_16A_HEADERS) - 3)
+        m, plan = _plan(PHASE_16A_HEADERS, current_col_count=20)
+        sheet = _FakeSheet(PHASE_16A_HEADERS, data_rows=[data_row], col_count=20, row_count=999)
+        data_before = sheet.get_all_values()[1:]
+        result = m.apply_migration_plan(sheet, plan, data_rows_before=data_before)
+        self.assertEqual(result["status"], "ADDED")
+        self.assertTrue(result["data_preserved"])
+        self.assertTrue(result["appended_columns_clean"])
+        self.assertEqual(result["rows_before_count"], 1)
+        self.assertEqual(result["rows_after_count"], 1)
 
 
 class TestMainDryRunVsLive(unittest.TestCase):
