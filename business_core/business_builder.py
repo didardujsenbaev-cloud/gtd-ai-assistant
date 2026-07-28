@@ -2186,6 +2186,8 @@ def _stage_transition_result(
     missing_blocking_output_titles: tuple = (), missing_blocking_output_statuses: tuple = (),
     provisioning_attempted: bool = False, provisioning: dict | None = None,
     provisioning_warning: str = "",
+    dependencies_checked: bool = False, unsatisfied_dependencies: tuple = (),
+    missing_live_dependency_stages: tuple = (), dependency_configuration_errors: tuple = (),
 ) -> dict:
     """
     Shared result-builder for transition_stage_status() and
@@ -2220,6 +2222,13 @@ def _stage_transition_result(
     is normalized to {} in the returned dict, never left as None, so
     every caller can safely do `result["provisioning"].get(...)` without
     a None-check.
+
+    Dependencies Foundation (2026-07-28, DECISIONS.md §14a) additive
+    fields: dependencies_checked/unsatisfied_dependencies/missing_live_
+    dependency_stages/dependency_configuration_errors — same empty-
+    default contract; every result built for any transition other than
+    a pending->in_progress attempt is unaffected
+    (dependencies_checked stays False).
     """
     return {
         "ok": ok,
@@ -2255,6 +2264,10 @@ def _stage_transition_result(
         "provisioning_attempted": provisioning_attempted,
         "provisioning": provisioning if provisioning is not None else {},
         "provisioning_warning": provisioning_warning,
+        "dependencies_checked": dependencies_checked,
+        "unsatisfied_dependencies": tuple(unsatisfied_dependencies),
+        "missing_live_dependency_stages": tuple(missing_live_dependency_stages),
+        "dependency_configuration_errors": tuple(dependency_configuration_errors),
     }
 
 
@@ -2571,6 +2584,149 @@ def _evaluate_output_completion_gate(stage_id: str) -> _StageCompletionGateResul
         )
 
     return _StageCompletionGateResult()
+
+
+@dataclass(frozen=True)
+class _StageDependencyGateResult:
+    """
+    Dependencies Foundation (2026-07-28, DECISIONS.md §14a): shared,
+    minimal result contract for _evaluate_stage_dependency_gate() —
+    mirrors _StageCompletionGateResult's own shape/spirit (blocked=False
+    is the "nothing to report" default), but is a SEPARATE dataclass,
+    never merged with it — the Dependency Gate governs Stage START
+    (pending->in_progress only) while _StageCompletionGateResult's
+    family governs Stage FINISH (in_progress->done only); the two never
+    fire on the same transition and are kept structurally distinct.
+    """
+    blocked: bool = False
+    error_code: str = ""
+    error: str = ""
+    dependencies: tuple = ()
+    blocking_dependencies: tuple = ()
+    satisfied: tuple = ()
+    unsatisfied: tuple = ()
+    missing_live_stages: tuple = ()
+    configuration_errors: tuple = ()
+
+
+def _evaluate_stage_dependency_gate(stage_id: str) -> _StageDependencyGateResult:
+    """
+    Dependencies Foundation: evaluates whether `stage_id` may transition
+    pending->in_progress given its Template Stage's active prerequisite
+    dependencies (business_core.stage_dependency_manager,
+    TEMPLATE_STAGE_DEPENDENCIES — a completely separate table from
+    STAGE_ENTITY_RELATIONS, never touched here).
+
+    Uses resolve_live_stage_dependencies() to map each active dependency
+    to its live prerequisite Stage (Order-join, the same existing
+    mechanism resolve_template_stage_for_stage() itself uses — Order
+    remains a technical join-key only, never a dependency signal, per
+    DECISIONS.md §14/§14a).
+
+    Satisfying prerequisite statuses: "done" and "skipped" (both are
+    legitimate terminal outcomes for a Stage — blocking downstream
+    progress on a correctly-skipped prerequisite would contradict the
+    reason skip exists at all). Unsatisfying: "pending", "in_progress",
+    "blocked". Stage-level "cancelled" does not exist as a status
+    (STAGE_STATUS_CANONICAL confirms this) — not applicable.
+
+    Non-blocking dependencies (Blocking="false") are included in
+    `dependencies` for visibility but never in `blocking_dependencies`/
+    `unsatisfied` — they never block the transition. Inactive
+    dependencies are never read at all (list_dependencies_for_template_
+    stage() defaults to active-only).
+
+    Read-time corrupted-cycle defense: detect_reachable_cycle_from_
+    template_stage() — bounded (200 nodes), scoped to one Roadmap
+    Template ID, reachable from THIS Template Stage only. This is
+    defense-in-depth against data corrupted after creation (e.g. a
+    manually edited Sheet row) — the actual cycle-prevention mechanism
+    is create_template_stage_dependency()'s own create-time DFS. This
+    function never re-validates the WHOLE template graph on every
+    transition (that would be validate_dependency_graph_for_template()'s
+    job — a separate, manually-invoked diagnostic tool, never called
+    automatically here).
+
+    Returns _StageDependencyGateResult — blocked=False + empty defaults
+    is "nothing to report" (no active dependencies, or all satisfied).
+    """
+    from business_core.stage_dependency_manager import (
+        resolve_live_stage_dependencies, detect_reachable_cycle_from_template_stage,
+    )
+
+    resolution = resolve_live_stage_dependencies(stage_id)
+    if not resolution["ok"]:
+        # Same shared resolution-failure codes as every other Gate
+        # (STAGE_NOT_FOUND/ROADMAP_NOT_FOUND/ROADMAP_HAS_NO_TEMPLATE/
+        # TEMPLATE_STAGE_NOT_FOUND) — surfaced as a configuration error
+        # here since the Dependency Gate cannot evaluate anything without
+        # a resolved Template Stage.
+        return _StageDependencyGateResult(
+            blocked=True, error_code="DEPENDENCY_CONFIGURATION_ERROR",
+            error=resolution.get("error") or f"Не удалось резолвить зависимости этапа {stage_id}",
+            configuration_errors=((None, resolution.get("error") or resolution.get("code", "")),),
+        )
+
+    if resolution["code"] == "NO_STAGE_DEPENDENCIES":
+        return _StageDependencyGateResult(blocked=False, error_code="NO_STAGE_DEPENDENCIES")
+
+    template_stage_id = resolution["template_stage_id"]
+    roadmap_template_id = resolution["roadmap_template_id"]
+
+    # Read-time corrupted-cycle defense (bounded, reachable-only) — never
+    # the primary prevention mechanism.
+    cycle_check = detect_reachable_cycle_from_template_stage(roadmap_template_id, template_stage_id)
+    if not cycle_check["ok"] or cycle_check.get("limit_exceeded") or cycle_check.get("cycle_found"):
+        reason = (
+            cycle_check.get("error")
+            or ("превышен лимит обхода графа зависимостей" if cycle_check.get("limit_exceeded") else None)
+            or (f"обнаружен цикл в графе зависимостей: {' -> '.join(cycle_check.get('cycle_path', ()))}"
+                if cycle_check.get("cycle_found") else "неизвестная ошибка проверки цикла")
+        )
+        return _StageDependencyGateResult(
+            blocked=True, error_code="DEPENDENCY_CONFIGURATION_ERROR",
+            error=f"Настройка зависимостей этапа {stage_id} повреждена: {reason}",
+            configuration_errors=((None, reason),),
+        )
+
+    configuration_errors = resolution.get("configuration_errors", ())
+    if configuration_errors:
+        details = "; ".join(f"{dep_id or '—'}: {reason}" for dep_id, reason in configuration_errors)
+        return _StageDependencyGateResult(
+            blocked=True, error_code="DEPENDENCY_CONFIGURATION_ERROR",
+            error=f"Настройка зависимостей этапа {stage_id} повреждена: {details}",
+            configuration_errors=tuple(configuration_errors),
+        )
+
+    missing_live_stages = resolution.get("missing_live_stages", ())
+    if missing_live_stages:
+        details = "; ".join(f"{dep_id}: {tstg_id}" for dep_id, tstg_id in missing_live_stages)
+        return _StageDependencyGateResult(
+            blocked=True, error_code="PREREQUISITE_LIVE_STAGE_NOT_FOUND",
+            error=f"Обязательный предыдущий этап не найден в этом Roadmap: {details}",
+            missing_live_stages=tuple(missing_live_stages),
+        )
+
+    resolved_items = resolution.get("resolved", ())
+    dependencies = tuple(resolved_items)
+    blocking_dependencies = tuple(d for d in resolved_items if d["blocking"])
+    satisfied = tuple(d for d in blocking_dependencies if d["satisfied"])
+    unsatisfied = tuple(d for d in blocking_dependencies if not d["satisfied"])
+
+    if unsatisfied:
+        titles = ", ".join(f"{d['prerequisite_stage_id']} — {d['prerequisite_stage_name']}" for d in unsatisfied)
+        return _StageDependencyGateResult(
+            blocked=True, error_code="STAGE_DEPENDENCIES_NOT_SATISFIED",
+            error=f"У этапа {stage_id} есть незавершённые обязательные зависимости: {titles}",
+            dependencies=dependencies, blocking_dependencies=blocking_dependencies,
+            satisfied=satisfied, unsatisfied=unsatisfied,
+        )
+
+    return _StageDependencyGateResult(
+        blocked=False, error_code="STAGE_DEPENDENCIES_SATISFIED",
+        dependencies=dependencies, blocking_dependencies=blocking_dependencies,
+        satisfied=satisfied, unsatisfied=(),
+    )
 
 
 def _roadmap_eligibility_code_for_stage_update(roadmap_status: str) -> str | None:
@@ -2924,6 +3080,33 @@ def transition_stage_status(
 
     gate_override_type = "+".join(gate_override_types)
 
+    # F.7. Dependency Gate (Dependencies Foundation, 2026-07-28,
+    # DECISIONS.md §14a) — strictly pending->in_progress only, strictly
+    # before G (no Status write below this point may execute if this
+    # gate blocks). Functionally disjoint from F.5 (which only fires for
+    # in_progress->done) — the two gates never evaluate on the same
+    # transition. No force/override exists for this gate in this phase;
+    # a blocked dependency gate always returns early here, exactly like
+    # every other pre-G validation failure above — Status/Start Date/
+    # Progress/Roadmap-completion/K (auto-provisioning) are never
+    # reached.
+    if previous_status == "pending" and target_status == "in_progress":
+        dep_gate = _evaluate_stage_dependency_gate(stage_id)
+        if dep_gate.blocked:
+            return _stage_transition_result(
+                ok=False, code=dep_gate.error_code, error=dep_gate.error,
+                stage_id=stage_id, roadmap_id=roadmap_id,
+                previous_status=previous_status, requested_status=target_status,
+                final_status=previous_status,
+                roadmap_status_before=roadmap_status_before,
+                roadmap_status_after=roadmap_status_before,
+                retry_safe=True,
+                dependencies_checked=True,
+                unsatisfied_dependencies=dep_gate.unsatisfied,
+                missing_live_dependency_stages=dep_gate.missing_live_stages,
+                dependency_configuration_errors=dep_gate.configuration_errors,
+            )
+
     # G. Persist Stage status (+ any coupled admin_fields).
     write_result = update_stage_status_in_sheet(stage_id, target_status, notes=notes)
     if not write_result["ok"]:
@@ -3117,6 +3300,7 @@ def transition_stage_status(
         provisioning_attempted=provisioning_attempted,
         provisioning=provisioning_result,
         provisioning_warning=provisioning_warning,
+        dependencies_checked=(previous_status == "pending" and target_status == "in_progress"),
     )
 
 

@@ -2103,6 +2103,38 @@ active/8 pending, RM-002 cancelled/0 stages) — находка носит
     (вне scope Stage Domain и этого ADR). Зависимости НЕ выводятся из
     числового Order неявно ни в этом ADR, ни в Phase 34C.
 
+14a. Dependencies Foundation — пересмотр deferral (2026-07-28).
+
+    Решение 14 (выше) не удаляется и не переписывается — оно остаётся
+    в силе буквально: Order по-прежнему НЕ является зависимостью ни
+    явно, ни неявно, нигде в коде.
+
+    Отдельно и добавочно к решению 14: Stage Domain к 2026-07-28 стал
+    владельцем полного lifecycle этапов — transition_stage_status()
+    как единственная точка перехода статусов, три Completion Gates
+    (Document/Checklist/Required Output) и Unified Stage Provisioning
+    с auto-trigger на pending→in_progress. Поскольку Stage Domain уже
+    управляет тем, ЧТО происходит при переходе (гейты завершения,
+    provisioning), логично и минимально рискованно добавить сюда же
+    контроль того, КОГДА разрешён старт этапа (prerequisite-граф) — как
+    симметричную пару к уже существующим Completion Gates, а не как
+    отдельный домен.
+
+    Решение: Dependencies Foundation вводится в Stage Domain как
+    отдельная, явно ограниченная фаза (Template Stage → Template Stage
+    prerequisite-граф, finish_to_start, гейт только на
+    pending→in_progress). Это НЕ отменяет и не предвосхищает будущий
+    Workflow/Task Domain — если/когда он появится, он может иметь
+    собственную, более общую task-level dependency-модель (произвольные
+    задачи, не только Stage-уровня, возможно другие типы связей).
+    Stage-level prerequisite-граф, вводимый здесь, — узкий,
+    специализированный механизм именно для последовательности этапов
+    Roadmap, не претендующий на универсальность будущего Workflow
+    Domain.
+
+    Order по-прежнему остаётся исключительно display/identity-полем —
+    решение 14 этим дополнением не пересматривается и не размывается.
+
 15. Конкурентность материализации.
 
     TOCTOU-риск в ensure_roadmap_stages, найденный в Phase 34A,

@@ -2871,6 +2871,40 @@ def _stage_transition_failure_message(result: dict, stage_id: str, status: str) 
             f"`/updatestage stage_id={stage_id} status=done force=yes reason=\"...\"`",
         ])
 
+    if code == "STAGE_DEPENDENCIES_NOT_SATISFIED":
+        # Dependencies Foundation (2026-07-28, DECISIONS.md §14a) — Stage
+        # START gate (pending->in_progress), never involved in Completion
+        # Gates (in_progress->done), no force/override in this phase.
+        unsatisfied = result.get("unsatisfied_dependencies", ())
+        lines = [
+            "⛔ Этап нельзя начать",
+            "",
+            f"Stage: {stage_id}",
+            "Причина: не завершены обязательные зависимости",
+            "",
+            "Ожидается:",
+        ]
+        for dep in unsatisfied:
+            lines.append(f"- {dep['prerequisite_stage_id']} — {dep['prerequisite_stage_name']} [{dep['prerequisite_status']}]")
+        lines.append("")
+        lines.append("Сначала завершите обязательные зависимые этапы.")
+        lines.append(f"Проверить: /dependencies stage_id={stage_id}")
+        return "\n".join(lines)
+
+    if code == "PREREQUISITE_LIVE_STAGE_NOT_FOUND":
+        return "\n".join([
+            "⚠️ Этап нельзя начать — обязательный предыдущий этап не найден в этом Roadmap",
+            f"Stage: {stage_id}",
+            "Требуется проверка администратора настроек этапа.",
+        ])
+
+    if code == "DEPENDENCY_CONFIGURATION_ERROR":
+        return "\n".join([
+            "⚠️ Этап нельзя начать — повреждена настройка зависимостей",
+            f"Stage: {stage_id}",
+            "Требуется проверка администратора настроек этапа.",
+        ])
+
     if code == "STAGE_OUTPUT_GATE_BLOCKED":
         instance_ids = result.get("missing_blocking_output_instance_ids", ())
         template_ids = result.get("missing_blocking_output_template_ids", ())
@@ -8249,6 +8283,152 @@ async def provisionstage_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await _reply(update, "❌ Не удалось выполнить provisioning этапа.")
 
 
+# ─────────────────────────────────────────────────────────────
+# Dependencies Foundation (2026-07-28, DECISIONS.md §14a): Template
+# Stage -> Template Stage prerequisite graph. NOT stored in
+# STAGE_ENTITY_RELATIONS (separate table, separate manager module) — no
+# live dependency instances, resolved dynamically at gate-check time.
+# No /unlinkdependency, /syncdependencies, /provisionroadmap, or
+# override/force in this phase.
+# ─────────────────────────────────────────────────────────────
+
+async def linkdependency_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /linkdependency template_stage_id=TSTG-035 depends_on=TSTG-034 [blocking=true] [notes="..."]
+
+    Создаёт (или реактивирует, если ранее была inactive) зависимость
+    Template Stage от другого Template Stage в том же Roadmap Template —
+    finish_to_start, читается Dependency Gate'ом при pending→in_progress.
+    Live dependency instances не создаются — резолв всегда динамический.
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg())
+        return
+    raw = " ".join(context.args or [])
+    args = _parse_kv_args(raw)
+    template_stage_id = args.get("template_stage_id") or args.get("_pos0", "")
+    depends_on = args.get("depends_on", "")
+
+    if not template_stage_id or not depends_on:
+        await _reply(update,
+            "❌ Укажи template_stage_id и depends_on.\n\nПример:\n"
+            "`/linkdependency template_stage_id=TSTG-035 depends_on=TSTG-034`"
+        )
+        return
+
+    blocking = args.get("blocking", "").strip().lower() != "false"
+    notes = args.get("notes", "")
+
+    try:
+        from business_core.stage_dependency_manager import create_template_stage_dependency
+
+        result = create_template_stage_dependency(
+            template_stage_id, depends_on, blocking=blocking, notes=notes,
+        )
+        if not result["ok"]:
+            await _reply(update, f"❌ Ошибка: {result['error']}")
+            return
+
+        if result["code"] == "DEPENDENCY_ALREADY_EXISTS":
+            await _reply(update, "ℹ️ Зависимость уже существует")
+            return
+        if result["code"] == "DEPENDENCY_REACTIVATED":
+            await _reply(update,
+                "✅ Зависимость этапа реактивирована\n\n"
+                f"Этап: `{template_stage_id}`\nЗависит от: `{depends_on}`"
+            )
+            return
+
+        lines = [
+            "✅ Зависимость этапа создана\n",
+            f"Этап: `{template_stage_id}`",
+            f"Зависит от: `{depends_on}`",
+            "Тип: finish_to_start",
+            f"Blocking: {'true' if blocking else 'false'}",
+        ]
+        await _reply(update, "\n".join(lines))
+    except Exception as e:
+        log.error(f"linkdependency_cmd error: {e}")
+        await _reply(update, "❌ Не удалось создать зависимость.")
+
+
+async def dependencies_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /dependencies template_stage_id=TSTG-035 — read-only, Template-level:
+    показывает, от каких Template Stage зависит этот, тип, blocking, статус relation.
+
+    /dependencies stage_id=STAGE-019 — read-only, live-level: резолвит
+    зависимости динамически (никаких live instances), показывает
+    prerequisite live Stage, название, текущий статус, satisfied/not.
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg(), parse_mode=None)
+        return
+    raw = " ".join(context.args or [])
+    args = _parse_kv_args(raw)
+    template_stage_id = args.get("template_stage_id", "")
+    stage_id = args.get("stage_id", "")
+
+    if not template_stage_id and not stage_id:
+        await _reply(update,
+            "❌ Укажи template_stage_id или stage_id.\n\nПримеры:\n"
+            "/dependencies template_stage_id=TSTG-035\n"
+            "/dependencies stage_id=STAGE-019",
+            parse_mode=None,
+        )
+        return
+
+    try:
+        if template_stage_id:
+            from business_core.stage_dependency_manager import list_dependencies_for_template_stage
+
+            deps = list_dependencies_for_template_stage(template_stage_id, active_only=True)
+            if not deps:
+                await _reply(
+                    update, f"У Template Stage {template_stage_id} нет активных зависимостей.",
+                    parse_mode=None,
+                )
+                return
+            lines = [f"📎 Зависимости Template Stage {template_stage_id}:", ""]
+            for dep in deps:
+                lines.append(
+                    f"- {dep.get('Depends On Template Stage ID', '')} "
+                    f"| Тип: {dep.get('Dependency Type', '')} "
+                    f"| Blocking: {dep.get('Blocking', '')} "
+                    f"| Status: {dep.get('Status', '')}"
+                )
+            await _reply(update, "\n".join(lines), parse_mode=None)
+            return
+
+        from business_core.stage_dependency_manager import resolve_live_stage_dependencies
+
+        resolution = resolve_live_stage_dependencies(stage_id)
+        if not resolution["ok"]:
+            await _reply(update, f"❌ {resolution['error']}", parse_mode=None)
+            return
+        if resolution["code"] == "NO_STAGE_DEPENDENCIES":
+            await _reply(update, f"У этапа {stage_id} нет активных зависимостей.", parse_mode=None)
+            return
+
+        lines = [f"📎 Зависимости этапа {stage_id}:", ""]
+        for item in resolution["resolved"]:
+            satisfied_label = "выполнено" if item["satisfied"] else "не выполнено"
+            lines.append(
+                f"- {item['prerequisite_stage_id']} — {item['prerequisite_stage_name']} "
+                f"[{item['prerequisite_status']}] — {satisfied_label} "
+                f"(blocking={'true' if item['blocking'] else 'false'})"
+            )
+        for dep_id, tstg_id in resolution.get("missing_live_stages", ()):
+            lines.append(f"⚠️ {dep_id}: обязательный предыдущий этап {tstg_id} не найден в этом Roadmap")
+        for dep_id, reason in resolution.get("configuration_errors", ()):
+            lines.append(f"⚠️ {dep_id or '—'}: {reason}")
+
+        await _reply(update, "\n".join(lines), parse_mode=None)
+    except Exception as e:
+        log.error(f"dependencies_cmd error: {e}")
+        await _reply(update, "❌ Не удалось получить зависимости.", parse_mode=None)
+
+
 async def checklists_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     /checklists [business_id=BIZ-001] [checklist_template_id=CHK-001]
@@ -13251,6 +13431,9 @@ def register_business_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("syncchecklists",   syncchecklists_cmd))
     # Unified Stage Provisioning.
     app.add_handler(CommandHandler("provisionstage",   provisionstage_cmd))
+    # Dependencies Foundation.
+    app.add_handler(CommandHandler("linkdependency",   linkdependency_cmd))
+    app.add_handler(CommandHandler("dependencies",     dependencies_cmd))
     app.add_handler(CommandHandler("startchecklist",   startchecklist_cmd))
     app.add_handler(CommandHandler("checklists",       checklists_cmd))
     app.add_handler(CommandHandler("checklist",        checklist_cmd))

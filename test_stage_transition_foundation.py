@@ -165,6 +165,20 @@ def _default_provisioning_nothing(stage_id="STAGE-001"):
     }
 
 
+def _default_dependency_gate_pass():
+    """Dependency Gate default (F.7, Dependencies Foundation, 2026-07-28,
+    DECISIONS.md §14a): a safe, inert non-blocking result — mocked at the
+    business_builder._evaluate_stage_dependency_gate() boundary itself
+    (never its internals: stage_dependency_manager is never touched),
+    matching every other cross-module boundary already mocked in this
+    harness. Almost every existing test in this file goes through
+    pending->in_progress by default, so without this default mock every
+    one of them would suddenly attempt a live resolution the moment the
+    F.7 gate was wired in."""
+    from business_core.business_builder import _StageDependencyGateResult
+    return _StageDependencyGateResult(blocked=False, error_code="NO_STAGE_DEPENDENCIES")
+
+
 _UNSET = object()
 
 
@@ -177,7 +191,8 @@ class _BaseTransitionTestCase(unittest.TestCase):
               checklist_instances=None, checklist_items=None,
               resolve_template_stage_result=_UNSET, output_relations=None,
               output_instances=None, output_template_lookup=None,
-              provisioning_result=_UNSET, provisioning_side_effect=None):
+              provisioning_result=_UNSET, provisioning_side_effect=None,
+              dependency_gate_result=_UNSET):
         bb = _fresh_bb()
         with patch("business_core.roadmap_manager.find_stage_by_id",
                    return_value=_stage() if stage is _UNSET else stage), \
@@ -213,7 +228,12 @@ class _BaseTransitionTestCase(unittest.TestCase):
                  side_effect=provisioning_side_effect,
                  return_value=(_default_provisioning_nothing(stage_id) if provisioning_result is _UNSET
                                else provisioning_result),
-             ) as mock_provisioning:
+             ) as mock_provisioning, \
+             patch(
+                 "business_core.business_builder._evaluate_stage_dependency_gate",
+                 return_value=(_default_dependency_gate_pass() if dependency_gate_result is _UNSET
+                               else dependency_gate_result),
+             ) as mock_dependency_gate:
             result = bb.transition_stage_status(
                 stage_id, target_status, notes=notes, admin_fields=admin_fields,
                 force=force, reason=reason, actor=actor,
@@ -229,6 +249,7 @@ class _BaseTransitionTestCase(unittest.TestCase):
             self._last_mock_output_instances = mock_output_instances
             self._last_mock_output_template_lookup = mock_output_template_lookup
             self._last_mock_provisioning = mock_provisioning
+            self._last_mock_dependency_gate = mock_dependency_gate
             return result
 
 

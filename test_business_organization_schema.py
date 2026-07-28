@@ -218,12 +218,15 @@ class TestExistingRegistriesUntouched(unittest.TestCase):
         # (Document Completion Gate) legitimately added 1 more
         # (stage_completion_overrides) = 35. Phase A (Stage Output
         # Foundation) legitimately added 2 more (stage_output_templates,
-        # stage_output_instances) = 37 — this point-in-time closeout
-        # check is updated here rather than treated as a durable count
-        # invariant (same precedent as the removed git-diff-based
-        # TestAdditiveOnly guard in test_business_organization_commands.py).
-        self.assertEqual(len(s.BUSINESS_SHEET_NAMES), 37)
-        self.assertEqual(len(s.BUSINESS_HEADERS), 37)
+        # stage_output_instances) = 37. Dependencies Foundation
+        # (2026-07-28, DECISIONS.md §14a) legitimately added 1 more
+        # (template_stage_dependencies) = 38 — this point-in-time
+        # closeout check is updated here rather than treated as a
+        # durable count invariant (same precedent as the removed
+        # git-diff-based TestAdditiveOnly guard in
+        # test_business_organization_commands.py).
+        self.assertEqual(len(s.BUSINESS_SHEET_NAMES), 38)
+        self.assertEqual(len(s.BUSINESS_HEADERS), 38)
 
 
 class TestGTDAndEnvUntouched(unittest.TestCase):

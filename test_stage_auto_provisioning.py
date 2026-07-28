@@ -203,6 +203,8 @@ class TestCallOrdering(_BaseTransitionTestCase):
              patch("business_core.stage_output_manager.find_output_template_by_id", return_value=None), \
              patch("business_core.roadmap_manager.record_stage_completion_override",
                    return_value={"ok": True, "override_id": "SCO-001", "error": None}), \
+             patch("business_core.business_builder._evaluate_stage_dependency_gate",
+                   return_value=bb._StageDependencyGateResult(blocked=False, error_code="NO_STAGE_DEPENDENCIES")), \
              patch("business_core.business_builder.provision_stage_operational_instances",
                    side_effect=_provisioning_side_effect):
             from business_core.document_requirements_query import ScopeEvaluationResult

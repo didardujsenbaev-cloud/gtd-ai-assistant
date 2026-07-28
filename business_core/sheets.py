@@ -92,6 +92,17 @@ BUSINESS_SHEET_NAMES: dict[str, str] = {
     # Stage Completion Gate in this phase — see business_builder.py.
     "stage_output_templates":         "STAGE_OUTPUT_TEMPLATES",
     "stage_output_instances":         "STAGE_OUTPUT_INSTANCES",
+    # Dependencies Foundation (2026-07-28, DECISIONS.md §14a): Template
+    # Stage -> Template Stage prerequisite graph. Deliberately its own
+    # table, NOT an ENTITY_TYPE_DISPATCH entry in stage_entity_relations.py
+    # — that module's own docstring states relation direction is "always
+    # stage -> entity, never a generic source-to-target graph"; a
+    # Stage-to-Stage dependency IS exactly such a graph. No live
+    # dependency instances exist or are created — resolved dynamically at
+    # transition time via the existing Template Stage <-> live Stage
+    # Order-join mechanism (see business_core.roadmap_manager.
+    # resolve_template_stage_for_stage()).
+    "template_stage_dependencies":    "TEMPLATE_STAGE_DEPENDENCIES",
 }
 
 BUSINESS_HEADERS: dict[str, list[str]] = {
@@ -554,6 +565,18 @@ BUSINESS_HEADERS: dict[str, list[str]] = {
         "Waived By", "Waived At", "Waiver Reason",
         "Created At", "Last Updated", "Notes",
     ],
+    # Dependencies Foundation (2026-07-28, DECISIONS.md §14a). Template
+    # Stage -> Template Stage prerequisite graph only — no live dependency
+    # instances. "Required" is deliberately NOT a column here (unlike
+    # STAGE_ENTITY_RELATIONS) — dependencies have no completion-counting
+    # concept, only Blocking (gates the transition) or not (informational
+    # only). Dependency Type is a single-value enum in this phase
+    # ("finish_to_start" only).
+    "template_stage_dependencies": [
+        "Dependency ID", "Roadmap Template ID", "Template Stage ID",
+        "Depends On Template Stage ID", "Dependency Type", "Blocking", "Status",
+        "Created At", "Updated At", "Notes",
+    ],
 }
 
 # ID-префиксы для generate_next_id
@@ -620,6 +643,9 @@ _ID_PREFIXES: dict[str, str] = {
     # prefix above — no collisions.
     "stage_output_templates":         "SOUT",
     "stage_output_instances":         "SOUTI",
+    # Dependencies Foundation: checked against every existing prefix
+    # above — no collisions.
+    "template_stage_dependencies":    "TDEP",
 }
 
 
