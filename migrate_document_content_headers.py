@@ -2,21 +2,23 @@
 Идемпотентная миграция заголовков листа DOCUMENT_CONTENT (Phase 16B.1).
 
 Контекст: production DOCUMENT_CONTENT физически содержит только первые
-20 колонок (Phase 16A shape). business_core/sheets.py's
-BUSINESS_HEADERS["document_content"] уже аддитивно расширен на 3 новые
-колонки в конце (Duplicate Status / Duplicate Of Document ID /
+20 колонок (Phase 16A shape), И его grid (физическая сетка листа) выделен
+ровно под 20 колонок (`worksheet.col_count == 20`). business_core/
+sheets.py's BUSINESS_HEADERS["document_content"] уже аддитивно расширен
+на 3 новые колонки в конце (Duplicate Status / Duplicate Of Document ID /
 Duplicate Checked At — Phase 16B.1), но код никогда не переписывает
 заголовки существующего листа сам по себе (ensure_headers() в
 business_core/sheets.py явно отказывается действовать при
-расхождении — логирует предупреждение и не трогает лист). Это —
-контролируемый, одноразовый admin-скрипт для закрытия именно этого
-разрыва, а не общая Telegram-команда.
+расхождении). Это — контролируемый, одноразовый admin-скрипт для
+закрытия именно этого разрыва, а не общая Telegram-команда.
 
-Значительно проще прецедента migrate_roadmap_stages_headers.py: там
-требовалось распознавать/переставлять уже существующие, но неверно
-подписанные колонки по данным. Здесь такой проблемы нет — все текущие
-20 колонок DOCUMENT_CONTENT уже правильно подписаны с Phase 16A; нужно
-только ДОПИСАТЬ 3 новые колонки строго в конец, если их ещё нет.
+Первая живая попытка миграции (без grid-resize) упала с:
+    gspread.exceptions.APIError: [400]: Range (DOCUMENT_CONTENT!U1)
+    exceeds grid limits. Max rows: 999, max columns: 20
+— `update_cell()` не расширяет grid сам; сетку нужно явно расширить
+(`worksheet.resize(...)`) ДО записи заголовков за пределы текущего
+`col_count`. Эта версия скрипта делает это безопасно, отдельным,
+явно проверяемым шагом.
 
 Использование:
     python migrate_document_content_headers.py              # dry-run (по умолчанию)
@@ -27,19 +29,24 @@ business_core/sheets.py явно отказывается действовать
 - Работает ТОЛЬКО с листом DOCUMENT_CONTENT — ни один другой Business
   Core лист не читается и не пишется.
 - НИКОГДА не трогает строки данных (row >= 2) — только строку
-  заголовков (row 1), и только ячейки СПРАВА от уже существующих
-  заголовков.
+  заголовков (row 1) и grid-размер, и только справа/сверх уже
+  существующих заголовков/колонок.
 - НИКОГДА не переименовывает и не переставляет уже существующие
   заголовки. Если существующие заголовки НЕ являются точным префиксом
-  канонического списка (т.е. что-то в первых 20 колонках уже
-  расходится с ожиданием) — миграция отказывается действовать и требует
+  канонического списка — миграция отказывается действовать и требует
   ручной проверки, а не угадывает.
+- НИКОГДА не уменьшает grid (`worksheet.resize(cols=...)` вызывается
+  только когда col_count МЕНЬШЕ требуемого; если col_count уже больше
+  или равен требуемому — resize не вызывается вовсе).
 - Идемпотентна: повторный запуск на уже смигрированном листе не меняет
-  ничего (has_changes=False, ноль write-запросов).
-- Dry-run (по умолчанию) не выполняет ни одной записи — только читает
-  текущие заголовки и печатает план.
+  ничего (has_changes=False, ноль write-запросов, ноль resize-вызовов).
+- Dry-run (по умолчанию) не выполняет ни одной записи и ни одного
+  resize — только читает текущие заголовки/grid и печатает план.
 - Live-запуск сверяет строки данных (row >= 2) до и после миграции на
   побайтовую идентичность.
+- resize()/update_cell() — write-операции, НИКОГДА не оборачиваются в
+  read_with_retry и никогда не повторяются автоматически при ошибке
+  (см. Sheets quota mitigation write-policy: no retry around writes).
 """
 
 from __future__ import annotations
@@ -48,16 +55,24 @@ import sys
 
 SHEET_KEY = "document_content"
 
+# Structured result statuses (Phase 16B.1 grid-resize hardening).
+STATUS_DRY_RUN = "DRY_RUN"
+STATUS_ADDED = "ADDED"
+STATUS_ALREADY_PRESENT = "ALREADY_PRESENT"
+STATUS_GRID_RESIZE_FAILED = "GRID_RESIZE_FAILED"
+STATUS_HEADER_WRITE_FAILED = "HEADER_WRITE_FAILED"
+STATUS_VERIFICATION_FAILED = "VERIFICATION_FAILED"
+
 
 def _canonical_headers() -> list[str]:
     from business_core.sheets import BUSINESS_HEADERS
     return list(BUSINESS_HEADERS[SHEET_KEY])
 
 
-def analyze_document_content_headers(existing_headers: list[str]) -> dict:
+def analyze_document_content_headers(existing_headers: list[str], current_col_count: int | None = None) -> dict:
     """
-    Read-only анализ фактического состояния листа DOCUMENT_CONTENT.
-    Ничего не пишет в Sheets.
+    Read-only анализ фактического состояния листа DOCUMENT_CONTENT —
+    и заголовков, и grid-размера. Ничего не пишет в Sheets.
 
     Returns:
         {
@@ -71,6 +86,9 @@ def analyze_document_content_headers(existing_headers: list[str]) -> dict:
             "conflicts": list[tuple],         # (col, existing, expected) if prefix_ok is False
             "after_preview": list[str] | None,
             "has_changes": bool,
+            "current_col_count": int | None,  # worksheet.col_count, if known
+            "required_col_count": int,        # len(canonical_headers)
+            "grid_resize_required": bool,     # current_col_count is known AND < required
         }
     """
     canonical = _canonical_headers()
@@ -85,6 +103,8 @@ def analyze_document_content_headers(existing_headers: list[str]) -> dict:
     prefix_ok = not conflicts
     already_present = [h for h in canonical if h in existing]
     to_append = [h for h in canonical if h not in existing]
+    required_col_count = len(canonical)
+    grid_resize_required = current_col_count is not None and current_col_count < required_col_count
 
     return {
         "existing_headers": existing,
@@ -95,24 +115,106 @@ def analyze_document_content_headers(existing_headers: list[str]) -> dict:
         "conflicts": conflicts,
         "after_preview": (existing + to_append) if prefix_ok else None,
         "has_changes": bool(to_append) and prefix_ok,
+        "current_col_count": current_col_count,
+        "required_col_count": required_col_count,
+        "grid_resize_required": grid_resize_required,
     }
 
 
-def apply_migration_plan(sheet, plan: dict) -> list[tuple[str, str]]:
+def resize_grid_if_needed(sheet, plan: dict) -> dict:
     """
-    Применить план на реальный Worksheet. Пишет ТОЛЬКО ячейки строки 1,
-    строго справа от уже существующих заголовков — никогда не трогает
-    row >= 2.
+    Grow the worksheet's grid to plan["required_col_count"] columns, ONLY
+    if plan["grid_resize_required"] is True. NEVER shrinks — if
+    col_count is already >= required, this is a pure no-op (no API call
+    at all, not even a read).
 
-    Raises:
-        ValueError: если plan["prefix_ok"] is False — этот скрипт
-            никогда не пытается угадать/переставить существующие
-            заголовки, только дописывает отсутствующие в конец.
+    Uses worksheet.resize(rows=sheet.row_count, cols=required_col_count)
+    — rows explicitly preserved (never implicitly reset), per the
+    approved preference over add_cols().
+
+    A single attempt, no retry (this is a write operation — see the
+    module docstring's write-policy note).
 
     Returns:
-        [(header_name, "ADDED" | "ALREADY_PRESENT"), ...] — по одному
-        элементу на каждый канонический заголовок, в каноническом
-        порядке.
+        {
+            "attempted": bool,
+            "succeeded": bool,
+            "error": str | None,
+            "col_count_before": int | None,
+            "col_count_after": int | None,
+        }
+    """
+    col_count_before = plan["current_col_count"]
+
+    if not plan["grid_resize_required"]:
+        return {
+            "attempted": False, "succeeded": True, "error": None,
+            "col_count_before": col_count_before, "col_count_after": col_count_before,
+        }
+
+    try:
+        sheet.resize(rows=sheet.row_count, cols=plan["required_col_count"])
+    except Exception as exc:
+        return {
+            "attempted": True, "succeeded": False, "error": str(exc),
+            "col_count_before": col_count_before, "col_count_after": col_count_before,
+        }
+
+    col_count_after = sheet.col_count
+    succeeded = col_count_after >= plan["required_col_count"]
+    return {
+        "attempted": True, "succeeded": succeeded,
+        "error": None if succeeded else (
+            f"col_count after resize ({col_count_after}) still below required "
+            f"({plan['required_col_count']})"
+        ),
+        "col_count_before": col_count_before, "col_count_after": col_count_after,
+    }
+
+
+def apply_migration_plan(sheet, plan: dict, data_rows_before: list | None = None) -> dict:
+    """
+    Full controlled live migration — steps 8-13 of the approved order:
+      8.  resize grid, если требуется (never shrinks, never retried);
+      9.  verify col_count >= required after resize;
+      10. write missing headers (only after 8-9 succeed);
+      11. re-read headers;
+      12. verify exact canonical header match;
+      13. verify existing data rows unchanged (if data_rows_before given).
+
+    Raises:
+        ValueError: если plan["prefix_ok"] is False — never guesses/
+            reorders existing headers, refuses outright.
+
+    Returns a structured result:
+        {
+            "status": one of ADDED/ALREADY_PRESENT/GRID_RESIZE_FAILED/
+                      HEADER_WRITE_FAILED/VERIFICATION_FAILED,
+            "grid_before": int | None,
+            "grid_after": int | None,
+            "grid_resize_required": bool,
+            "grid_resized": bool,          # True only if resize was
+                                            # attempted AND succeeded
+            "headers_before": list[str],
+            "headers_after": list[str],
+            "added_headers": list[str],
+            "already_present_headers": list[str],
+            "data_preserved": bool | None, # None if data_rows_before not given
+            "error": str | None,
+        }
+
+    Guarantees on failure:
+      - GRID_RESIZE_FAILED: headers are NEVER written (grid still at
+        col_count_before, or whatever partial state resize() itself left
+        it in — never assumed corrupted, just not migrated).
+      - HEADER_WRITE_FAILED: grid may already be resized (never rolled
+        back automatically) — data rows are NOT considered damaged,
+        only some headers may be missing; headers_after reflects the
+        actual current state via a fresh re-read.
+      - VERIFICATION_FAILED: the write calls all returned without
+        raising, but the final re-read doesn't exactly match the
+        canonical header list — surfaced distinctly rather than
+        silently reported as ADDED.
     """
     if not plan["prefix_ok"]:
         raise ValueError(
@@ -121,25 +223,91 @@ def apply_migration_plan(sheet, plan: dict) -> list[tuple[str, str]]:
             f"Conflicts: {plan['conflicts']}"
         )
 
-    results: list[tuple[str, str]] = []
+    result: dict = {
+        "status": "",
+        "grid_before": plan["current_col_count"],
+        "grid_after": plan["current_col_count"],
+        "grid_resize_required": plan["grid_resize_required"],
+        "grid_resized": False,
+        "headers_before": list(plan["existing_headers"]),
+        "headers_after": list(plan["existing_headers"]),
+        "added_headers": [],
+        "already_present_headers": list(plan["already_present"]),
+        "data_preserved": None,
+        "error": None,
+    }
+
+    if not plan["has_changes"]:
+        result["status"] = STATUS_ALREADY_PRESENT
+        return result
+
+    # Step 8-9: resize grid if required, verify it actually grew enough.
+    resize_outcome = resize_grid_if_needed(sheet, plan)
+    result["grid_resized"] = resize_outcome["attempted"] and resize_outcome["succeeded"]
+    result["grid_after"] = resize_outcome["col_count_after"]
+
+    if plan["grid_resize_required"] and not resize_outcome["succeeded"]:
+        result["status"] = STATUS_GRID_RESIZE_FAILED
+        result["error"] = resize_outcome["error"]
+        return result  # headers deliberately never written
+
+    # Step 10: write missing headers, strictly to the right of existing ones.
     next_col = len(plan["existing_headers"]) + 1
-    for h in plan["to_append"]:
-        sheet.update_cell(1, next_col, h)
-        results.append((h, "ADDED"))
-        next_col += 1
+    added: list[str] = []
+    try:
+        for h in plan["to_append"]:
+            sheet.update_cell(1, next_col, h)
+            added.append(h)
+            next_col += 1
+    except Exception as exc:
+        result["added_headers"] = added
+        result["status"] = STATUS_HEADER_WRITE_FAILED
+        result["error"] = str(exc)
+        try:
+            result["headers_after"] = sheet.row_values(1)
+        except Exception:
+            pass  # best-effort only — status already reflects the failure
+        if data_rows_before is not None:
+            try:
+                data_after = sheet.get_all_values()[1:]
+                result["data_preserved"] = (data_rows_before == data_after)
+            except Exception:
+                pass
+        return result
 
-    for h in plan["already_present"]:
-        results.append((h, "ALREADY_PRESENT"))
+    result["added_headers"] = added
 
-    # Re-order results into canonical order for a stable, predictable report.
-    by_name = dict(results)
-    return [(h, by_name[h]) for h in plan["canonical_headers"]]
+    # Step 11-12: re-read headers, verify exact canonical match.
+    after_headers = sheet.row_values(1)
+    result["headers_after"] = after_headers
+
+    # Step 13: verify existing data rows unchanged, if requested.
+    if data_rows_before is not None:
+        data_after = sheet.get_all_values()[1:]
+        result["data_preserved"] = (data_rows_before == data_after)
+
+    if after_headers != plan["canonical_headers"]:
+        result["status"] = STATUS_VERIFICATION_FAILED
+        return result
+
+    result["status"] = STATUS_ADDED
+    return result
 
 
 def _print_plan(plan: dict) -> None:
     print("=== ДО миграции (фактические заголовки DOCUMENT_CONTENT) ===")
     for i, h in enumerate(plan["existing_headers"], start=1):
         print(f"{i}: {h!r}")
+
+    print()
+    print("=== Grid ===")
+    print(f"Текущий col_count:   {plan['current_col_count']}")
+    print(f"Требуемый col_count: {plan['required_col_count']}")
+    if plan["grid_resize_required"]:
+        print(f"Grid resize required: {plan['current_col_count']} → {plan['required_col_count']}")
+        print(f"Add grid columns: {plan['required_col_count'] - plan['current_col_count']}")
+    else:
+        print("Grid resize required: нет")
 
     print()
     print("=== План миграции ===")
@@ -174,8 +342,9 @@ def main() -> int:
 
     sheet = get_business_sheet(SHEET_KEY)
     existing_headers = sheet.row_values(1)
+    current_col_count = sheet.col_count
 
-    plan = analyze_document_content_headers(existing_headers)
+    plan = analyze_document_content_headers(existing_headers, current_col_count=current_col_count)
     _print_plan(plan)
 
     if not plan["prefix_ok"]:
@@ -183,7 +352,7 @@ def main() -> int:
         return 1
 
     if not args.live:
-        print("\n[DRY-RUN] Изменения НЕ применены. Запустите с --live для применения.")
+        print("\n[DRY-RUN] Изменения (заголовки и grid) НЕ применены. Запустите с --live для применения.")
         return 0
 
     if not plan["has_changes"]:
@@ -192,42 +361,37 @@ def main() -> int:
 
     data_before = sheet.get_all_values()[1:]
 
-    print(f"\n⚠️  Это добавит {len(plan['to_append'])} колонок(и) СПРАВА в строку заголовков "
-          f"(row 1) листа DOCUMENT_CONTENT в проде: {plan['to_append']}")
+    print(f"\n⚠️  Это выполнит в проде на листе DOCUMENT_CONTENT:")
+    if plan["grid_resize_required"]:
+        print(f"   - расширение grid: {plan['current_col_count']} → {plan['required_col_count']} колонок "
+              f"(rows сохраняются: {sheet.row_count})")
+    print(f"   - добавление {len(plan['to_append'])} колонок(и) СПРАВА в строку заголовков (row 1): "
+          f"{plan['to_append']}")
     print(f"Строк данных сейчас: {len(data_before)}. Они изменены НЕ будут.")
     confirm = input("Введите YES для применения: ").strip()
     if confirm != "YES":
         print("Отменено.")
         return 0
 
-    results = apply_migration_plan(sheet, plan)
+    result = apply_migration_plan(sheet, plan, data_rows_before=data_before)
 
-    print("\nВыполнено:")
-    for name, outcome in results:
-        print(f" - {name}: {outcome}")
-
-    # Verification: re-read headers, confirm exact match with canonical.
-    after_headers = sheet.row_values(1)
-    headers_match = after_headers == plan["canonical_headers"]
     print()
-    print("=== Проверка после записи ===")
-    print(f"Заголовки совпадают с канонической схемой: {headers_match}")
-    if not headers_match:
-        print("‼️  ВНИМАНИЕ: заголовки после записи НЕ совпадают с ожиданием! Проверьте лист вручную.")
-        return 1
+    print("=== Результат миграции ===")
+    print(f"Status: {result['status']}")
+    print(f"Grid: {result['grid_before']} → {result['grid_after']} (resized: {result['grid_resized']})")
+    print(f"Headers до:    {result['headers_before']}")
+    print(f"Headers после: {result['headers_after']}")
+    print(f"Добавлено: {result['added_headers']}")
+    print(f"Уже было:  {result['already_present_headers']}")
+    print(f"Данные не изменились: {result['data_preserved']}")
+    if result["error"]:
+        print(f"Ошибка: {result['error']}")
 
-    data_after = sheet.get_all_values()[1:]
-    rows_match = len(data_before) == len(data_after) and all(
-        a == b for a, b in zip(data_before, data_after)
-    )
-    print(f"Строк данных до:    {len(data_before)}")
-    print(f"Строк данных после: {len(data_after)}")
-    print(f"Данные не изменились (row >= 2): {rows_match}")
-    if not rows_match:
-        print("‼️  ВНИМАНИЕ: данные изменились! Немедленно проверьте лист вручную.")
-        return 1
+    if result["status"] == STATUS_ADDED:
+        return 0
 
-    return 0
+    print("\n‼️  Миграция НЕ завершена полностью — см. status выше. Проверьте лист вручную.")
+    return 1
 
 
 if __name__ == "__main__":
