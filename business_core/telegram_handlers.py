@@ -8355,24 +8355,44 @@ async def linkdependency_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await _reply(update, f"❌ Ошибка: {result['error']}")
             return
 
+        # Sheets quota mitigation UX-fix (2026-07-28): all three replies
+        # below render the canonical Dependency Type ("finish_to_start")
+        # as bare text. Under the default parse_mode="Markdown" (legacy),
+        # an even count of "_" is parsed as an italic delimiter pair —
+        # "finish_to_start" silently becomes "finishtostart" (Telegram
+        # consumes both underscores around "to", no parse error, so
+        # _reply()'s own except-fallback to parse_mode=None never fires).
+        # template_stage_id/depends_on are already safe (wrapped in
+        # backtick code spans, which legacy Markdown never re-parses) —
+        # only the bare "Тип: finish_to_start" line was exposed. Fixed by
+        # sending these three result messages with parse_mode=None
+        # (point fix, same pattern already used by dependencies_cmd()
+        # below — not a global Markdown-mode change).
         if result["code"] == "DEPENDENCY_ALREADY_EXISTS":
-            await _reply(update, "ℹ️ Зависимость уже существует")
+            await _reply(update,
+                "ℹ️ Зависимость уже существует\n\n"
+                f"Этап: {template_stage_id}\nЗависит от: {depends_on}\n"
+                "Тип: finish_to_start",
+                parse_mode=None,
+            )
             return
         if result["code"] == "DEPENDENCY_REACTIVATED":
             await _reply(update,
                 "✅ Зависимость этапа реактивирована\n\n"
-                f"Этап: `{template_stage_id}`\nЗависит от: `{depends_on}`"
+                f"Этап: {template_stage_id}\nЗависит от: {depends_on}\n"
+                "Тип: finish_to_start",
+                parse_mode=None,
             )
             return
 
         lines = [
             "✅ Зависимость этапа создана\n",
-            f"Этап: `{template_stage_id}`",
-            f"Зависит от: `{depends_on}`",
+            f"Этап: {template_stage_id}",
+            f"Зависит от: {depends_on}",
             "Тип: finish_to_start",
             f"Blocking: {'true' if blocking else 'false'}",
         ]
-        await _reply(update, "\n".join(lines))
+        await _reply(update, "\n".join(lines), parse_mode=None)
     except Exception as e:
         log.error(f"linkdependency_cmd error: {e}")
         await _reply(update, "❌ Не удалось создать зависимость.")
