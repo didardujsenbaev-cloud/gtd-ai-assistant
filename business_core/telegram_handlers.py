@@ -6012,6 +6012,35 @@ async def reviewdoc_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await _reply(update, "❌ Не удалось получить состояние проверки реквизитов.", parse_mode=None)
 
 
+def _sanitize_referenced_document_id(raw: str) -> str:
+    """Same bounded/control-character-stripped policy as
+    _sanitize_document_name() in business_core/document_search.py —
+    deliberately NOT a strict Document ID regex (no such contract
+    exists anywhere else in the project; not introduced here just for
+    this marker)."""
+    text = (raw or "").strip()
+    text = "".join(ch for ch in text if ord(ch) >= 32 or ch == "\t")
+    return text[:50]
+
+
+def _render_duplicate_marker(item) -> "str | None":
+    """Phase 16B.5.1: returns a single warning line, or None if no
+    marker should be shown. Only ever fires for
+    duplicate_status == "EXACT_DUPLICATE" (the canonical string from
+    business_core.document_intelligence.DUPLICATE_STATUS_VALUES) —
+    NEW_DOCUMENT / empty / unknown / legacy-row values never show
+    anything, and the canonical/original document of a duplicate pair
+    never gets a marker either (it is NOT the one whose Duplicate
+    Status is "EXACT_DUPLICATE"). Never shows hash, Drive URL,
+    filename, or internal duplicate-check timestamps."""
+    if item.duplicate_status != "EXACT_DUPLICATE":
+        return None
+    ref = _sanitize_referenced_document_id(item.duplicate_of_document_id)
+    if not ref:
+        return "⚠️ Точный дубликат: исходный документ не определён"
+    return f"⚠️ Точный дубликат: {ref}"
+
+
 def _render_document_search_item(item, index: int) -> list:
     """Pure per-item rendering — never shows file_name (may contain PII
     per the original upload filename), raw extracted_fields, Confirmed
@@ -6033,6 +6062,10 @@ def _render_document_search_item(item, index: int) -> list:
         lines.append("   ⚠️ Состояние подтверждений требует проверки")
     elif item.has_conflict:
         lines.append("   ⚠️ Есть конфликт AI и подтверждённых данных")
+
+    duplicate_marker = _render_duplicate_marker(item)
+    if duplicate_marker:
+        lines.append(f"   {duplicate_marker}")
 
     return lines
 

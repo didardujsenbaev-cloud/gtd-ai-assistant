@@ -42,14 +42,16 @@ def _item(document_id="DREG-004", document_name="Техпаспорт", file_nam
           effective_document_date="2026-07-22", document_date_source="human",
           effective_direction="internal", direction_source="human",
           effective_requires_action=None, review_status="partially_confirmed",
-          has_conflict=False, cache_warning=False):
+          has_conflict=False, cache_warning=False,
+          duplicate_status="", duplicate_of_document_id=""):
     return DocumentSearchItem(
         document_id=document_id, document_name=document_name, file_name=file_name,
         business_id="BIZ-001", effective_document_date=effective_document_date,
         document_date_source=document_date_source, effective_direction=effective_direction,
         direction_source=direction_source, effective_requires_action=effective_requires_action,
         effective_has_expiration=None, review_status=review_status, review_version=2,
-        has_conflict=has_conflict, duplicate_status="", duplicate_of_document_id="",
+        has_conflict=has_conflict, duplicate_status=duplicate_status,
+        duplicate_of_document_id=duplicate_of_document_id,
         cache_warning=cache_warning,
     )
 
@@ -197,6 +199,82 @@ class TestFinddocsCmd(unittest.TestCase):
         text = update.message.reply_text.call_args[0][0]
         for forbidden in ("Confirmed Fields JSON", "Review ID", "Mutation ID", "didar", "extracted_fields"):
             self.assertNotIn(forbidden, text)
+
+
+class TestFinddocsDuplicateMarker(unittest.TestCase):
+    """Phase 16B.5.1: Duplicate Marker in /finddocs."""
+
+    def _run(self, item):
+        update, context = _cmd("/finddocs business_id=BIZ-001")
+        result = _result(items=[item])
+        with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
+             patch("business_core.document_search.search_documents", return_value=result):
+            asyncio.run(th.finddocs_cmd(update, context))
+        return update.message.reply_text.call_args[0][0]
+
+    def test_exact_duplicate_with_duplicate_of_renders_marker(self):
+        """п.1/п.2."""
+        text = self._run(_item(document_id="DREG-005", duplicate_status="EXACT_DUPLICATE",
+                                duplicate_of_document_id="DREG-004"))
+        self.assertIn("⚠️ Точный дубликат: DREG-004", text)
+
+    def test_canonical_original_has_no_marker(self):
+        """п.3."""
+        text = self._run(_item(document_id="DREG-004", duplicate_status="NEW_DOCUMENT",
+                                duplicate_of_document_id=""))
+        self.assertNotIn("Точный дубликат", text)
+
+    def test_new_document_has_no_marker(self):
+        """п.4."""
+        text = self._run(_item(duplicate_status="NEW_DOCUMENT", duplicate_of_document_id=""))
+        self.assertNotIn("Точный дубликат", text)
+
+    def test_empty_duplicate_status_has_no_marker(self):
+        """п.5 — legacy row."""
+        text = self._run(_item(duplicate_status="", duplicate_of_document_id=""))
+        self.assertNotIn("Точный дубликат", text)
+
+    def test_unknown_duplicate_status_has_no_marker(self):
+        """п.6."""
+        text = self._run(_item(duplicate_status="SOMETHING_ELSE", duplicate_of_document_id="DREG-004"))
+        self.assertNotIn("Точный дубликат", text)
+
+    def test_exact_duplicate_without_duplicate_of_shows_safe_fallback(self):
+        """п.7."""
+        text = self._run(_item(duplicate_status="EXACT_DUPLICATE", duplicate_of_document_id=""))
+        self.assertIn("⚠️ Точный дубликат: исходный документ не определён", text)
+
+    def test_duplicate_of_control_characters_sanitized(self):
+        """п.8."""
+        text = self._run(_item(duplicate_status="EXACT_DUPLICATE",
+                                duplicate_of_document_id="DREG-004\x00\x01"))
+        self.assertIn("⚠️ Точный дубликат: DREG-004", text)
+        self.assertNotIn("\x00", text)
+
+    def test_hash_not_shown(self):
+        """п.9."""
+        text = self._run(_item(duplicate_status="EXACT_DUPLICATE", duplicate_of_document_id="DREG-004"))
+        self.assertNotIn("hash", text.lower())
+        self.assertNotIn("sha256", text.lower())
+
+    def test_file_name_not_shown_with_duplicate_marker(self):
+        """п.10."""
+        text = self._run(_item(duplicate_status="EXACT_DUPLICATE", duplicate_of_document_id="DREG-004",
+                                file_name="Иванов_паспорт.pdf"))
+        self.assertNotIn("Иванов_паспорт.pdf", text)
+
+    def test_drive_url_not_shown(self):
+        """п.11."""
+        text = self._run(_item(duplicate_status="EXACT_DUPLICATE", duplicate_of_document_id="DREG-004"))
+        self.assertNotIn("drive.google.com", text)
+
+    def test_zero_writes(self):
+        """п.15: rendering is pure — no write helper referenced."""
+        import inspect
+        source = inspect.getsource(th._render_duplicate_marker)
+        source += inspect.getsource(th._render_document_search_item)
+        self.assertNotIn("update_business_row", source)
+        self.assertNotIn("append_business_row", source)
 
 
 if __name__ == "__main__":
