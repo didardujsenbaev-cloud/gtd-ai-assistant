@@ -6967,14 +6967,19 @@ async def missingdocs_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             lines.append(f"Blocking missing: {summary.blocking_missing}")
             lines.append(f"Completion percentage: {summary.completion_percentage}")
             lines.append("")
-            for item in unsatisfied:
+            for index, item in enumerate(unsatisfied, start=1):
                 req = item.requirement
-                lines.append(f"- Document Template ID: {req.document_template_id}")
-                lines.append(f"  Name: {_requirement_display_name(req)}")
-                lines.append(f"  Stage ID: {req.stage_id or '—'}")
-                lines.append(f"  Matched count / Minimum count: {item.matched_count}/{req.minimum_count}")
-                lines.append(f"  Status: {_STATUS_LABELS_RU.get(item.status, item.status)}")
-                lines.append(f"  Blocking: {'yes' if item.is_blocking else 'no'}")
+                lines.append(f"{index}. {_requirement_display_name(req)}")
+                lines.append(f"   Requirement ID: {req.requirement_id}")
+                lines.append(f"   Document Template ID: {req.document_template_id}")
+                lines.append(f"   Stage ID: {req.stage_id or '—'}")
+                lines.append(f"   Matched count / Minimum count: {item.matched_count}/{req.minimum_count}")
+                lines.append(f"   Status: {_STATUS_LABELS_RU.get(item.status, item.status)}")
+                lines.append(f"   Blocking: {'yes' if item.is_blocking else 'no'}")
+                lines.append("")
+                lines.append("   Подробнее:")
+                lines.append(f"   /docgap roadmap_id={req.roadmap_id} requirement_id={req.requirement_id}")
+                lines.append("")
 
         if summary.has_configuration_errors:
             lines.append("")
