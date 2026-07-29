@@ -62,6 +62,9 @@ CONTENT_HEADERS = [
     "Analysis Started At", "Analysis Completed At", "Analysis Error",
     "Created At", "Updated At",
     "Duplicate Status", "Duplicate Of Document ID", "Duplicate Checked At",
+    "Document Number", "Document Date", "Issued By",
+    "Valid From", "Valid Until", "Has Expiration",
+    "Direction", "Requires Action",
 ]
 
 DOC_REGISTRY_HEADERS = [

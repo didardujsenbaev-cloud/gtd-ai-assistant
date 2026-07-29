@@ -48,6 +48,10 @@ CONTENT_HEADERS = [
     "Created At", "Updated At",
     # Phase 16B.1 (2026-07-28): exact-duplicate detection, purely additive.
     "Duplicate Status", "Duplicate Of Document ID", "Duplicate Checked At",
+    # Phase 16B.2 (2026-07-29): structured document fields, purely additive.
+    "Document Number", "Document Date", "Issued By",
+    "Valid From", "Valid Until", "Has Expiration",
+    "Direction", "Requires Action",
 ]
 
 DOC_REGISTRY_HEADERS = [
@@ -530,6 +534,8 @@ class TestUpdateBusinessRow(unittest.TestCase):
             "2026-01-01 00:00:00 UTC", "2026-01-01 00:05:00 UTC",
             # Phase 16B.1: exact-duplicate columns, unset in this pre-existing row.
             "", "", "",
+            # Phase 16B.2: structured document field columns, unset in this pre-existing row.
+            "", "", "", "", "", "", "", "",
         ]
         self.assertEqual(len(row), len(CONTENT_HEADERS))
         sheet = _make_sheet(CONTENT_HEADERS, existing_rows=[row])

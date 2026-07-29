@@ -50,6 +50,18 @@ class DocumentAnalysisResult:
         duplicate_status == "EXACT_DUPLICATE", so the shown Status always
         reflects the found document's CURRENT state, never a stale
         snapshot from whenever the duplicate check last ran.
+
+    Phase 16B.2 additions (all additive, default-safe "" /None for any
+    pre-16B.2 row or a not-yet-migrated Sheet — see
+    business_core.document_intelligence.StructuredDocumentFields):
+      document_number/document_date/issued_by/valid_from/valid_until —
+        verbatim strings from DOCUMENT_CONTENT's own additive columns.
+      has_expiration/requires_action — tri-state bool | None, decoded via
+        business_core.document_intelligence.cell_to_bool() from the
+        stored "true"/"false"/"" text (any other stored text safely
+        reads back as None, never raises).
+      direction — one of "incoming"/"outgoing"/"internal"/"unknown"
+        (falls back to "unknown" for an empty/pre-16B.2 cell too).
     """
     status: str
     document_id: str = ""
@@ -75,6 +87,14 @@ class DocumentAnalysisResult:
     duplicate_checked_at: str = ""
     duplicate_document_name: str = ""
     duplicate_document_status: str = ""
+    document_number: str = ""
+    document_date: str = ""
+    issued_by: str = ""
+    valid_from: str = ""
+    valid_until: str = ""
+    has_expiration: bool | None = None
+    direction: str = "unknown"
+    requires_action: bool | None = None
 
 
 def _parse_fields_json(raw: str) -> tuple[dict, bool]:
@@ -151,9 +171,16 @@ def get_document_analysis(document_id: str) -> DocumentAnalysisResult:
     # enum), only the renderer's choice of message differs. A pre-16B.1
     # row (or any ordinary AI/Drive failure) simply has neither prefix —
     # both flags default to False.
-    from business_core.document_intelligence import QUOTA_ERROR_PREFIX, TRANSIENT_ERROR_PREFIX
+    from business_core.document_intelligence import QUOTA_ERROR_PREFIX, TRANSIENT_ERROR_PREFIX, cell_to_bool
     is_quota_error = error.startswith(QUOTA_ERROR_PREFIX)
     is_transient_read_error = error.startswith(TRANSIENT_ERROR_PREFIX)
+
+    # Phase 16B.2: absent on a pre-16B.2 row or a not-yet-migrated Sheet
+    # (content.get returns "" via the default) — cell_to_bool("") is
+    # already None, direction already defaults to "unknown" below.
+    direction = (content.get("Direction", "") or "").strip() or "unknown"
+    if direction not in ("incoming", "outgoing", "internal", "unknown"):
+        direction = "unknown"
 
     duplicate_status = content.get("Duplicate Status", "") or ""
     duplicate_of_document_id = content.get("Duplicate Of Document ID", "") or ""
@@ -191,6 +218,14 @@ def get_document_analysis(document_id: str) -> DocumentAnalysisResult:
         duplicate_checked_at=content.get("Duplicate Checked At", "") or "",
         duplicate_document_name=duplicate_document_name,
         duplicate_document_status=duplicate_document_status,
+        document_number=content.get("Document Number", "") or "",
+        document_date=content.get("Document Date", "") or "",
+        issued_by=content.get("Issued By", "") or "",
+        valid_from=content.get("Valid From", "") or "",
+        valid_until=content.get("Valid Until", "") or "",
+        has_expiration=cell_to_bool(content.get("Has Expiration", "")),
+        direction=direction,
+        requires_action=cell_to_bool(content.get("Requires Action", "")),
     )
 
 

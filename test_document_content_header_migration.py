@@ -242,7 +242,8 @@ class TestApplyMigrationPlan(unittest.TestCase):
         first_headers = sheet.row_values(1)
         first_col_count = sheet.col_count
 
-        plan2 = m.analyze_document_content_headers(sheet.row_values(1), current_col_count=sheet.col_count)
+        with patch("business_core.sheets.BUSINESS_HEADERS", {"document_content": CANONICAL_HEADERS}):
+            plan2 = m.analyze_document_content_headers(sheet.row_values(1), current_col_count=sheet.col_count)
         self.assertFalse(plan2["has_changes"])
         self.assertFalse(plan2["grid_resize_required"])
         result2 = m.apply_migration_plan(sheet, plan2)

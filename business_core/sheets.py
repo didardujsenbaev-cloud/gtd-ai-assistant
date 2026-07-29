@@ -464,6 +464,18 @@ BUSINESS_HEADERS: dict[str, list[str]] = {
         # the canonical-selection algorithm. Never touches Document
         # Family/Version, Document Template ID, relations, or Status.
         "Duplicate Status", "Duplicate Of Document ID", "Duplicate Checked At",
+        # Phase 16B.2 (2026-07-29): AI-derived structured document fields
+        # (canonical, normalized) — purely additive. See
+        # business_core.document_intelligence.StructuredDocumentFields.
+        # These fields never change DOCUMENT_REGISTRY, Document Template
+        # ID, Document Status, Document Family/Version, relations, or the
+        # Completion Gate — enrichment data only. "Has Expiration"/
+        # "Requires Action" are stored as the literal strings "true"/
+        # "false"/"" (never "True"/"yes"/"да") — see
+        # document_intelligence.bool_to_cell()/cell_to_bool().
+        "Document Number", "Document Date", "Issued By",
+        "Valid From", "Valid Until", "Has Expiration",
+        "Direction", "Requires Action",
     ],
     # Phase 18C-1: Stage-to-Entity Relation Foundation.
     # One row = one stage<->entity relationship. Exactly one of

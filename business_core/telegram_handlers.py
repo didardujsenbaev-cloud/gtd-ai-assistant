@@ -5417,6 +5417,29 @@ def _render_fields_dict(fields: dict) -> str:
     return "\n".join(lines)
 
 
+_DIRECTION_LABELS = {
+    "incoming": "входящий",
+    "outgoing": "исходящий",
+    "internal": "внутренний",
+    "unknown": "не определено",
+}
+
+
+def _render_direction(direction: str) -> str:
+    """Phase 16B.2 §D: canonical Sheets value -> localized label, safe
+    fallback to "не определено" for anything unrecognized."""
+    return _DIRECTION_LABELS.get(direction, "не определено")
+
+
+def _render_tristate_bool(value) -> str:
+    """Phase 16B.2 §C: True/False/None -> "да"/"нет"/"не определено"."""
+    if value is True:
+        return "да"
+    if value is False:
+        return "нет"
+    return "не определено"
+
+
 def _split_message_by_lines(text: str, max_len: int = _DOCANALYSIS_MESSAGE_MAX_CHARS) -> list[str]:
     """Line-aware splitter: never cuts a line in half, so it can never
     cut a Unicode character or a "field: value" line's content midway —
@@ -5556,6 +5579,35 @@ def _render_document_analysis(result) -> str:
             card_lines.append("")
             card_lines.append("Извлечённые поля:")
             card_lines.append(fields_block)
+
+    # Phase 16B.2: structured fields ("Реквизиты") — only non-empty
+    # values, except direction/booleans which always render with a
+    # "не определено" fallback. Deliberately does NOT show: raw
+    # extracted_fields, confidence/alias/warning internals, prompt,
+    # hash, or any sensitive-document-number heuristics — Document
+    # Number here is ALWAYS the canonical structured field, never an
+    # arbitrary number pulled from extracted_fields at render time.
+    requisites_lines = []
+    if result.document_number:
+        requisites_lines.append(f"Номер: {result.document_number}")
+    if result.document_date:
+        requisites_lines.append(f"Дата: {result.document_date}")
+    if result.issued_by:
+        requisites_lines.append(f"Кем выдан: {result.issued_by}")
+    if result.valid_from:
+        requisites_lines.append(f"Действует с: {result.valid_from}")
+    if result.valid_until:
+        requisites_lines.append(f"Действует до: {result.valid_until}")
+    requisites_lines.append(
+        f"Есть срок действия: {_render_tristate_bool(result.has_expiration)}"
+    )
+    requisites_lines.append(f"Направление: {_render_direction(result.direction)}")
+    requisites_lines.append(
+        f"Требует действия: {_render_tristate_bool(result.requires_action)}"
+    )
+    card_lines.append("")
+    card_lines.append("Реквизиты:")
+    card_lines.extend(requisites_lines)
 
     # Phase 16B.1: exact-duplicate detection — informational only. Never
     # shows the full SHA-256 hash, raw AI JSON, or any automatic-relation
