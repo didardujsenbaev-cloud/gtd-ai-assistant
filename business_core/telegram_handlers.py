@@ -27,6 +27,7 @@ import io
 import json
 import logging
 import os
+import re
 import tempfile
 from datetime import datetime
 from typing import Optional
@@ -5403,6 +5404,69 @@ def _render_value(value, depth: int = 0) -> str:
     return str(value)
 
 
+# Phase 16B.2.1: Telegram Extracted Fields Privacy Hardening.
+# Deliberately narrow, multi-word-or-unambiguous tokens only — a bare
+# "account"/"number"/"id"/"license"/"bank" is NEVER listed alone (too
+# many false positives: "account_manager", "order_number", "object_id",
+# "driver_license", "bank" as part of an address). Matching happens
+# against the key only, never the value — this filters WHICH fields are
+# shown, it never inspects/redacts values themselves.
+_SENSITIVE_KEY_TOKENS = (
+    # Identity
+    "iin", "иин", "bin", "бин", "passport", "паспорт",
+    "удостоверение личности", "personal id", "taxpayer id",
+    # Contacts
+    "phone", "телефон", "mobile", "email", "e mail",
+    # Bank
+    "iban", "bank account", "банковский счет", "банковский счёт",
+    "расчетный счет", "расчетный счёт", "расчётный счет", "расчётный счёт",
+    "account number", "card number", "номер карты",
+    # Legal authority
+    "power of attorney", "доверенность", "notary license", "лицензия нотариуса",
+)
+
+
+def _normalize_field_key(key: str) -> str:
+    """casefold + treat _/-/./ as spaces + collapse repeated spaces —
+    "Owner_IIN", "owner-iin", "owner.iin" all normalize the same way."""
+    text = str(key).strip().casefold()
+    for ch in ("_", "-", ".", "/"):
+        text = text.replace(ch, " ")
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _is_sensitive_field_key(key: str) -> bool:
+    """True if `key` (after normalization) contains any denylist token —
+    checked both with spaces preserved (multi-word tokens like "power of
+    attorney") and with spaces removed (a slitno/concatenated form like
+    "poweroftattorney" or "bankaccount")."""
+    normalized = _normalize_field_key(key)
+    collapsed = normalized.replace(" ", "")
+    for token in _SENSITIVE_KEY_TOKENS:
+        token_normalized = _normalize_field_key(token)
+        token_collapsed = token_normalized.replace(" ", "")
+        if token_normalized and token_normalized in normalized:
+            return True
+        if token_collapsed and token_collapsed in collapsed:
+            return True
+    return False
+
+
+def _split_safe_and_sensitive_fields(fields: dict) -> tuple[dict, int]:
+    """Splits an extracted_fields dict into (safe_fields, hidden_count).
+    Values are never inspected/redacted here — bounds on value LENGTH
+    are already applied at write time (business_core.document_intelligence
+    .bounded_extracted_fields), before the value ever reaches Sheets."""
+    safe: dict = {}
+    hidden = 0
+    for key, value in (fields or {}).items():
+        if _is_sensitive_field_key(key):
+            hidden += 1
+        else:
+            safe[key] = value
+    return safe, hidden
+
+
 def _render_fields_dict(fields: dict) -> str:
     """
     Pure rendering: turns an ALREADY-PARSED dict (JSON parsing itself
@@ -5574,11 +5638,23 @@ def _render_document_analysis(result) -> str:
         card_lines.append("Извлечённые поля:")
         card_lines.append("⚠️ Структурированные поля сохранены в некорректном формате.")
     else:
-        fields_block = _render_fields_dict(result.fields)
-        if fields_block:
+        # Phase 16B.2.1: sensitive keys (ИИН/БИН/паспорт/телефон/email/
+        # банковские реквизиты/доверенность/лицензия нотариуса) are
+        # never shown — not even the key name, since the key name alone
+        # can reveal what kind of personal data the document contains.
+        # Raw values are NEVER touched here — this only decides which
+        # keys are shown; Sheets storage is completely unaffected.
+        safe_fields, hidden_count = _split_safe_and_sensitive_fields(result.fields)
+        fields_block = _render_fields_dict(safe_fields)
+        if fields_block or hidden_count:
             card_lines.append("")
             card_lines.append("Извлечённые поля:")
-            card_lines.append(fields_block)
+            if fields_block:
+                card_lines.append(fields_block)
+            elif hidden_count:
+                card_lines.append("🔒 Чувствительные данные скрыты.")
+            if hidden_count:
+                card_lines.append(f"🔒 Скрыто чувствительных полей: {hidden_count}")
 
     # Phase 16B.2: structured fields ("Реквизиты") — only non-empty
     # values, except direction/booleans which always render with a
