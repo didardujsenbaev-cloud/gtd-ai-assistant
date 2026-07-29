@@ -52,6 +52,9 @@ CONTENT_HEADERS = [
     "Document Number", "Document Date", "Issued By",
     "Valid From", "Valid Until", "Has Expiration",
     "Direction", "Requires Action",
+    # Phase 16B.3 (2026-07-29): human confirmation review cache, purely additive.
+    "Structured Review Status", "Confirmed Fields JSON",
+    "Structured Review Version", "Structured Review Updated At",
 ]
 
 DOC_REGISTRY_HEADERS = [
@@ -536,6 +539,8 @@ class TestUpdateBusinessRow(unittest.TestCase):
             "", "", "",
             # Phase 16B.2: structured document field columns, unset in this pre-existing row.
             "", "", "", "", "", "", "", "",
+            # Phase 16B.3: review-cache columns, unset in this pre-existing row.
+            "", "", "", "",
         ]
         self.assertEqual(len(row), len(CONTENT_HEADERS))
         sheet = _make_sheet(CONTENT_HEADERS, existing_rows=[row])

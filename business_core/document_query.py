@@ -62,6 +62,20 @@ class DocumentAnalysisResult:
         reads back as None, never raises).
       direction — one of "incoming"/"outgoing"/"internal"/"unknown"
         (falls back to "unknown" for an empty/pre-16B.2 cell too).
+
+    Phase 16B.3 additions (all additive, default-safe for any pre-16B.3
+    row or a not-yet-migrated Sheet — see
+    business_core.document_confirmation):
+      review_status — one of unreviewed|partially_confirmed|confirmed|
+        rejected (aggregate across the 8 structured fields).
+      review_version — document-level optimistic-concurrency counter;
+        0 for a pre-16B.3/never-reviewed row.
+      effective_fields — {field_name: {"effective_value", "source"
+        ("confirmed"|"ai"|"none"), "conflict", "ai_value",
+        "review_field_status"}} for each of the 8 canonical fields.
+        DISPLAY ONLY — never fed back into DOCUMENT_REGISTRY/Template
+        ID/Status/Stage/Completion Gate/relations, and never used to
+        skip/short-circuit exact-duplicate detection.
     """
     status: str
     document_id: str = ""
@@ -95,6 +109,9 @@ class DocumentAnalysisResult:
     has_expiration: bool | None = None
     direction: str = "unknown"
     requires_action: bool | None = None
+    review_status: str = "unreviewed"
+    review_version: int = 0
+    effective_fields: dict = field(default_factory=dict)
 
 
 def _parse_fields_json(raw: str) -> tuple[dict, bool]:
@@ -182,6 +199,19 @@ def get_document_analysis(document_id: str) -> DocumentAnalysisResult:
     if direction not in ("incoming", "outgoing", "internal", "unknown"):
         direction = "unknown"
 
+    # Phase 16B.3: review state is computed from THIS SAME already-read
+    # `content` row — no extra Sheets read. compute_effective_fields()
+    # is pure/read-only and recomputes "conflict" fresh every call by
+    # comparing against the CURRENT AI-derived columns above, so a
+    # reanalysis is reflected immediately without any extra write.
+    from business_core.document_confirmation import (
+        parse_confirmed_fields_json, parse_review_version, compute_effective_fields,
+    )
+    confirmed_fields = parse_confirmed_fields_json(content.get("Confirmed Fields JSON", ""))
+    review_status = content.get("Structured Review Status", "") or "unreviewed"
+    review_version = parse_review_version(content.get("Structured Review Version", ""))
+    effective_fields = compute_effective_fields(content, confirmed_fields)
+
     duplicate_status = content.get("Duplicate Status", "") or ""
     duplicate_of_document_id = content.get("Duplicate Of Document ID", "") or ""
     duplicate_document_name = ""
@@ -226,6 +256,9 @@ def get_document_analysis(document_id: str) -> DocumentAnalysisResult:
         has_expiration=cell_to_bool(content.get("Has Expiration", "")),
         direction=direction,
         requires_action=cell_to_bool(content.get("Requires Action", "")),
+        review_status=review_status,
+        review_version=review_version,
+        effective_fields=effective_fields,
     )
 
 

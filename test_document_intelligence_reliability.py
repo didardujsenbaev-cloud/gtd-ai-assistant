@@ -65,6 +65,8 @@ CONTENT_HEADERS = [
     "Document Number", "Document Date", "Issued By",
     "Valid From", "Valid Until", "Has Expiration",
     "Direction", "Requires Action",
+    "Structured Review Status", "Confirmed Fields JSON",
+    "Structured Review Version", "Structured Review Updated At",
 ]
 
 DOC_REGISTRY_HEADERS = [

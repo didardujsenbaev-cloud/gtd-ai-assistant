@@ -227,6 +227,8 @@ BUSINESS_SHEET_NAMES: dict[str, str] = {
     # Order-join mechanism (see business_core.roadmap_manager.
     # resolve_template_stage_for_stage()).
     "template_stage_dependencies":    "TEMPLATE_STAGE_DEPENDENCIES",
+    # Phase 16B.3: Human Confirmation of Structured Document Fields.
+    "document_field_reviews":        "DOCUMENT_FIELD_REVIEWS",
 }
 
 BUSINESS_HEADERS: dict[str, list[str]] = {
@@ -476,6 +478,37 @@ BUSINESS_HEADERS: dict[str, list[str]] = {
         "Document Number", "Document Date", "Issued By",
         "Valid From", "Valid Until", "Has Expiration",
         "Direction", "Requires Action",
+        # Phase 16B.3 (2026-07-29): Human Confirmation of Structured
+        # Document Fields — materialized current-state cache, purely
+        # additive. DOCUMENT_FIELD_REVIEWS (below) is the append-only
+        # source of truth; this cache exists only for fast Telegram
+        # reads without a join. "Structured Review Status" is one of
+        # unreviewed|partially_confirmed|confirmed|rejected (computed
+        # from Confirmed Fields JSON, never stored independently of
+        # it). "Confirmed Fields JSON" holds a dict keyed by the 8
+        # canonical structured field names, each value shaped like
+        # {"value":..., "status": "confirmed"|"rejected", "confirmed_by":...,
+        # "confirmed_at":..., "version":..., "source_analysis_completed_at":...}
+        # — an absent key means "unreviewed". "Structured Review
+        # Version" is a document-level optimistic-concurrency counter
+        # (starts unset/empty, treated as 0), incremented by exactly 1
+        # on every successful confirm/reject/clear mutation. See
+        # business_core/document_confirmation.py.
+        "Structured Review Status", "Confirmed Fields JSON",
+        "Structured Review Version", "Structured Review Updated At",
+    ],
+    # Phase 16B.3: append-only audit trail for every human confirm/
+    # reject/clear decision on a structured document field — the
+    # SOURCE OF TRUTH; DOCUMENT_CONTENT's "Confirmed Fields JSON" is
+    # only a materialized read cache derivable from this log. Mirrors
+    # the existing STAGE_COMPLETION_OVERRIDES append-only pattern.
+    # Never written to except by business_core/document_confirmation.py;
+    # never read by document_intelligence.py/duplicate detection/the
+    # Completion Gate.
+    "document_field_reviews": [
+        "Review ID", "Mutation ID", "Document ID", "Business ID", "Field Name",
+        "AI Value", "Confirmed Value", "Decision", "Actor", "Reviewed At",
+        "Review Version", "Source Analysis Completed At",
     ],
     # Phase 18C-1: Stage-to-Entity Relation Foundation.
     # One row = one stage<->entity relationship. Exactly one of
@@ -790,6 +823,8 @@ _ID_PREFIXES: dict[str, str] = {
     # Dependencies Foundation: checked against every existing prefix
     # above — no collisions.
     "template_stage_dependencies":    "TDEP",
+    # Phase 16B.3: checked against every existing prefix above — no collisions.
+    "document_field_reviews":         "DFR",
 }
 
 
@@ -893,6 +928,36 @@ def _invalidate_sheet_cache(name: str | None = None) -> None:
         _SHEET_CACHE = {}
     else:
         _SHEET_CACHE.pop(name, None)
+
+
+def business_sheet_exists(name: str) -> bool:
+    """
+    Phase 16B.3: read-only existence check that NEVER triggers
+    auto-creation — unlike get_business_sheet(), which creates a
+    missing worksheet (with canonical headers) as a side effect the
+    first time it's called for a not-yet-provisioned sheet_key.
+
+    Callers where a Telegram command must never silently become a
+    schema-migration mechanism (e.g. business_core/document_confirmation
+    .py's mutation functions, which require DOCUMENT_FIELD_REVIEWS to
+    already exist via a controlled admin migration) must check this
+    FIRST and fail closed if it returns False, rather than calling
+    get_business_sheet() and letting it auto-provision.
+
+    Raises:
+        KeyError: если ключ не найден в BUSINESS_SHEET_NAMES
+    """
+    if name not in BUSINESS_SHEET_NAMES:
+        valid = ", ".join(BUSINESS_SHEET_NAMES.keys())
+        raise KeyError(f"Неверный ключ листа: '{name}'\nДопустимые ключи: {valid}")
+
+    sheet_name = BUSINESS_SHEET_NAMES[name]
+    ss = get_business_spreadsheet()
+    try:
+        ss.worksheet(sheet_name)
+        return True
+    except gspread.exceptions.WorksheetNotFound:
+        return False
 
 
 def get_business_sheet(name: str) -> gspread.Worksheet:

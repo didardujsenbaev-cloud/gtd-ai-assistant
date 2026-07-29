@@ -5859,6 +5859,287 @@ async def docanalysis_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 # ─────────────────────────────────────────────────────────────
+# Phase 16B.3: Human Confirmation of Structured Document Fields
+# ─────────────────────────────────────────────────────────────
+
+_STRUCTURED_FIELD_LABELS = {
+    "document_number": "Номер документа",
+    "document_date": "Дата документа",
+    "issued_by": "Кем выдан",
+    "valid_from": "Действует с",
+    "valid_until": "Действует до",
+    "has_expiration": "Есть срок действия",
+    "direction": "Направление",
+    "requires_action": "Требует действия",
+}
+
+_REVIEW_STATUS_LABELS = {
+    "unreviewed": "не проверено",
+    "partially_confirmed": "частично подтверждено",
+    "confirmed": "подтверждено",
+    "rejected": "есть отклонённые поля",
+}
+
+_BOOLEAN_FIELDS = ("has_expiration", "requires_action")
+
+
+def _render_effective_field_value(field: str, raw_value: str) -> str:
+    """Renders an effective_fields[field]["effective_value"]/["ai_value"]
+    string (always the raw Sheets representation — "true"/"false"/""
+    for booleans, a canonical direction string, or a plain string/ISO
+    date) using the SAME localized labels as /docanalysis's Реквизиты
+    block, never a second, inconsistent rendering."""
+    from business_core.document_intelligence import cell_to_bool
+
+    if field == "direction":
+        return _render_direction(raw_value or "unknown")
+    if field in _BOOLEAN_FIELDS:
+        return _render_tristate_bool(cell_to_bool(raw_value))
+    return raw_value or "не определено"
+
+
+def _render_review_card(result) -> str:
+    """Pure rendering of a business_core.document_query
+    .DocumentAnalysisResult for /reviewdoc — never references a Sheets
+    column name directly."""
+    if result.status == "not_found":
+        return f"❌ Документ {result.document_id} не найден в DOCUMENT_REGISTRY."
+    if result.status == "no_content":
+        return (
+            f"ℹ️ Анализ для документа {result.document_id} ещё не запускался.\n\n"
+            f"Для запуска:\n/analyzedoc document_id={result.document_id}"
+        )
+    if result.status in ("pending", "processing"):
+        return "⏳ Анализ документа ещё не завершён — проверка реквизитов пока недоступна."
+    if result.status != "completed":
+        return f"ℹ️ Проверка реквизитов недоступна: статус анализа '{result.status}'."
+
+    lines = ["📄 Проверка реквизитов", "", f"Document ID: {result.document_id}", ""]
+    for i, field in enumerate(_document_confirmation_module().ALLOWED_STRUCTURED_FIELDS, start=1):
+        entry = result.effective_fields.get(field, {})
+        label = _STRUCTURED_FIELD_LABELS[field]
+        value_text = _render_effective_field_value(field, entry.get("effective_value", ""))
+        field_status = entry.get("review_field_status", "unreviewed")
+        if field_status == "confirmed":
+            indicator = "✅ подтверждено"
+            if entry.get("conflict"):
+                new_ai = _render_effective_field_value(field, entry.get("ai_value", ""))
+                indicator += f" (⚠️ новое AI-значение отличается: {new_ai})"
+        elif field_status == "rejected":
+            indicator = "❌ отклонено"
+        else:
+            indicator = "🤖 AI, не проверено"
+        lines.append(f"{i}. {label}: {value_text} {indicator}")
+
+    lines.append("")
+    lines.append(f"Статус проверки: {_REVIEW_STATUS_LABELS.get(result.review_status, result.review_status)}")
+    lines.append(f"Версия: {result.review_version}")
+    lines.append("")
+    lines.append("Подтвердить поле:")
+    lines.append(
+        f"/confirmdocfield document_id={result.document_id} field=<имя> value=<значение> "
+        f"expected_version={result.review_version}"
+    )
+    lines.append("Отклонить поле:")
+    lines.append(f"/rejectdocfield document_id={result.document_id} field=<имя> expected_version={result.review_version}")
+    lines.append("Снять подтверждение:")
+    lines.append(f"/cleardocfield document_id={result.document_id} field=<имя> expected_version={result.review_version}")
+    return "\n".join(lines)
+
+
+def _document_confirmation_module():
+    import business_core.document_confirmation as dc
+    return dc
+
+
+async def reviewdoc_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/reviewdoc document_id=DREG-004 — read-only просмотр реквизитов
+    и их review-статуса, ничего не пишет."""
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg())
+        return
+
+    raw = " ".join(context.args or [])
+    kv = _parse_kv_args(raw)
+    document_id = kv.get("document_id") or kv.get("_pos0", "")
+    if not document_id:
+        await _reply(update, "❌ Укажи document_id.\n\nПример: /reviewdoc document_id=DREG-004", parse_mode=None)
+        return
+
+    try:
+        from business_core.document_query import get_document_analysis
+        from business_core.sheets import SheetsQuotaExceededError, TransientSheetsReadError
+
+        result = get_document_analysis(document_id)
+        await _reply(update, _render_review_card(result), parse_mode=None)
+    except SheetsQuotaExceededError:
+        await _reply(update, "⚠️ Google Sheets временно перегружен. Повторите запрос немного позже.", parse_mode=None)
+    except TransientSheetsReadError:
+        await _reply(update, "⚠️ Не удалось временно прочитать данные Google Sheets. Попробуйте позже.", parse_mode=None)
+    except Exception as e:
+        log.error(f"reviewdoc_cmd error: {e}")
+        await _reply(update, "❌ Не удалось получить состояние проверки реквизитов.", parse_mode=None)
+
+
+def _render_confirmation_mutation_result(result: dict, document_id: str, field: str) -> str:
+    """Pure rendering of a business_core.document_confirmation mutation
+    result dict — never a raw exception/APIError/project_number."""
+    label = _STRUCTURED_FIELD_LABELS.get(field, field)
+    code = result.get("code", "")
+    if result["ok"]:
+        lines = [f"✅ {label}: решение сохранено.", f"Новая версия: {result['review_version']}"]
+        if code == "OK_IDEMPOTENT_REPLAY":
+            lines[0] = f"✅ {label}: это решение уже было применено ранее (повтор команды проигнорирован)."
+        entry = result["confirmed_fields"].get(field)
+        if entry:
+            value_text = _render_effective_field_value(field, entry.get("value", ""))
+            lines.append(f"Значение: {value_text}" if entry.get("value") else "Поле снято/отклонено.")
+        lines.append("")
+        lines.append(f"/reviewdoc document_id={document_id}")
+        return "\n".join(lines)
+
+    if code == "VERSION_CONFLICT":
+        return (
+            f"⚠️ Версия устарела (актуальная: {result.get('review_version')}).\n\n"
+            f"Проверьте текущее состояние:\n/reviewdoc document_id={document_id}"
+        )
+    if code == "FIELD_NOT_ALLOWED":
+        allowed = ", ".join(_document_confirmation_module().ALLOWED_STRUCTURED_FIELDS)
+        return f"❌ Поле '{field}' не разрешено для подтверждения.\n\nРазрешённые поля: {allowed}"
+    if code == "INVALID_VALUE":
+        return f"❌ {result.get('error', 'Некорректное значение.')}"
+    if code == "DOCUMENT_NOT_FOUND":
+        return f"❌ Документ {document_id} не найден."
+    if code == "REVIEWS_SHEET_NOT_READY":
+        return "❌ Проверка реквизитов временно недоступна (требуется техническая миграция). Обратитесь к администратору."
+    if code == "AUDIT_APPEND_FAILED":
+        return (
+            "❌ Решение НЕ сохранено — запись в аудит не удалась. Ничего не изменилось.\n\n"
+            "Попробуйте снова через некоторое время."
+        )
+    if code == "CACHE_SYNC_FAILED":
+        return (
+            "⚠️ Решение записано в аудит, но кэш для быстрого чтения не обновился.\n\n"
+            f"Аудит — источник истины; повторите /reviewdoc document_id={document_id} "
+            "— состояние пересчитается автоматически."
+        )
+    if code in ("TRANSIENT_READ_ERROR",):
+        return "⚠️ Не удалось временно прочитать данные Google Sheets. Попробуйте позже."
+    return "❌ Не удалось сохранить решение."
+
+
+async def confirmdocfield_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/confirmdocfield document_id=DREG-004 field=document_date value=2026-07-22 expected_version=0"""
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg())
+        return
+
+    raw = " ".join(context.args or [])
+    kv = _parse_kv_args(raw)
+    document_id = kv.get("document_id", "")
+    field = kv.get("field", "")
+    value = kv.get("value", "")
+    expected_version_raw = kv.get("expected_version", "")
+
+    if not document_id or not field or not value or expected_version_raw == "":
+        await _reply(
+            update,
+            "❌ Использование:\n"
+            "/confirmdocfield document_id=DREG-004 field=document_date "
+            "value=2026-07-22 expected_version=0\n\n"
+            "Сначала посмотрите текущую версию: /reviewdoc document_id=...",
+            parse_mode=None,
+        )
+        return
+    try:
+        expected_version = int(expected_version_raw)
+    except ValueError:
+        await _reply(update, "❌ expected_version должен быть целым числом.", parse_mode=None)
+        return
+
+    try:
+        from business_core.document_confirmation import confirm_field
+        actor = _telegram_username(update)
+        result = confirm_field(document_id, field, value, actor, expected_version)
+        await _reply(update, _render_confirmation_mutation_result(result, document_id, field), parse_mode=None)
+    except Exception as e:
+        log.error(f"confirmdocfield_cmd error: {e}")
+        await _reply(update, "❌ Не удалось сохранить решение.", parse_mode=None)
+
+
+async def rejectdocfield_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/rejectdocfield document_id=DREG-004 field=direction expected_version=1"""
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg())
+        return
+
+    raw = " ".join(context.args or [])
+    kv = _parse_kv_args(raw)
+    document_id = kv.get("document_id", "")
+    field = kv.get("field", "")
+    expected_version_raw = kv.get("expected_version", "")
+
+    if not document_id or not field or expected_version_raw == "":
+        await _reply(
+            update,
+            "❌ Использование:\n"
+            "/rejectdocfield document_id=DREG-004 field=direction expected_version=1",
+            parse_mode=None,
+        )
+        return
+    try:
+        expected_version = int(expected_version_raw)
+    except ValueError:
+        await _reply(update, "❌ expected_version должен быть целым числом.", parse_mode=None)
+        return
+
+    try:
+        from business_core.document_confirmation import reject_field
+        actor = _telegram_username(update)
+        result = reject_field(document_id, field, actor, expected_version)
+        await _reply(update, _render_confirmation_mutation_result(result, document_id, field), parse_mode=None)
+    except Exception as e:
+        log.error(f"rejectdocfield_cmd error: {e}")
+        await _reply(update, "❌ Не удалось сохранить решение.", parse_mode=None)
+
+
+async def cleardocfield_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/cleardocfield document_id=DREG-004 field=direction expected_version=2"""
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg())
+        return
+
+    raw = " ".join(context.args or [])
+    kv = _parse_kv_args(raw)
+    document_id = kv.get("document_id", "")
+    field = kv.get("field", "")
+    expected_version_raw = kv.get("expected_version", "")
+
+    if not document_id or not field or expected_version_raw == "":
+        await _reply(
+            update,
+            "❌ Использование:\n"
+            "/cleardocfield document_id=DREG-004 field=direction expected_version=2",
+            parse_mode=None,
+        )
+        return
+    try:
+        expected_version = int(expected_version_raw)
+    except ValueError:
+        await _reply(update, "❌ expected_version должен быть целым числом.", parse_mode=None)
+        return
+
+    try:
+        from business_core.document_confirmation import clear_field
+        actor = _telegram_username(update)
+        result = clear_field(document_id, field, actor, expected_version)
+        await _reply(update, _render_confirmation_mutation_result(result, document_id, field), parse_mode=None)
+    except Exception as e:
+        log.error(f"cleardocfield_cmd error: {e}")
+        await _reply(update, "❌ Не удалось сохранить решение.", parse_mode=None)
+
+
+# ─────────────────────────────────────────────────────────────
 # Telegram Document Requirements Interface (Phase 17B)
 # ─────────────────────────────────────────────────────────────
 #
@@ -13727,6 +14008,12 @@ def register_business_handlers(app: Application) -> None:
     # Phase 16A: Document Intelligence Foundation
     app.add_handler(CommandHandler("analyzedoc", analyzedoc_cmd))
     app.add_handler(CommandHandler("docanalysis", docanalysis_cmd))
+
+    # Phase 16B.3: Human Confirmation of Structured Document Fields
+    app.add_handler(CommandHandler("reviewdoc", reviewdoc_cmd))
+    app.add_handler(CommandHandler("confirmdocfield", confirmdocfield_cmd))
+    app.add_handler(CommandHandler("rejectdocfield", rejectdocfield_cmd))
+    app.add_handler(CommandHandler("cleardocfield", cleardocfield_cmd))
 
     # Phase 17B: Telegram Document Requirements Interface
     app.add_handler(CommandHandler("missingdocs", missingdocs_cmd))

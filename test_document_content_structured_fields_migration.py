@@ -260,7 +260,8 @@ class TestApplyMigrationPlan(unittest.TestCase):
         result1 = m.apply_migration_plan(sheet, plan)
         self.assertEqual(result1["status"], "ADDED")
 
-        plan2 = m.analyze_document_content_headers(sheet.row_values(1), current_col_count=sheet.col_count)
+        with patch("business_core.sheets.BUSINESS_HEADERS", {"document_content": CANONICAL_HEADERS}):
+            plan2 = m.analyze_document_content_headers(sheet.row_values(1), current_col_count=sheet.col_count)
         self.assertFalse(plan2["has_changes"])
         result2 = m.apply_migration_plan(sheet, plan2)
         self.assertEqual(result2["status"], "ALREADY_PRESENT")
