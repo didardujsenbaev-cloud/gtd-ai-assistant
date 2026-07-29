@@ -299,6 +299,124 @@ class TestDocgapPrivacy(unittest.TestCase):
         self.assertNotIn(".pdf", text)
 
 
+class TestDocgapNextStepNavigation(unittest.TestCase):
+    """Phase 16C.7: /docgap adds a ready-to-run /docgapnext command in
+    the success path, after the blocking/optional message and before
+    the return-to-summary block — never shown on any typed failure."""
+
+    def _run_success(self, base_status, roadmap_id="RM-003", requirement_id="STAGE-011:DOC-001", **detail_overrides):
+        update, context = _cmd(f"/docgap roadmap_id={roadmap_id} requirement_id={requirement_id}")
+        result = _result(
+            detail=_detail(base_status=base_status, **detail_overrides),
+            roadmap_id=roadmap_id, requirement_id=requirement_id,
+        )
+        with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
+             patch("business_core.document_gap_detail.generate_document_gap_detail", return_value=result):
+            asyncio.run(th.docgap_cmd(update, context))
+        return update.message.reply_text.call_args[0][0]
+
+    def test_missing_shows_docgapnext(self):
+        text = self._run_success("missing")
+        self.assertIn("/docgapnext roadmap_id=RM-003 requirement_id=STAGE-011:DOC-001", text)
+
+    def test_partial_shows_docgapnext(self):
+        text = self._run_success("partial", minimum_count=2, matched_document_count=1)
+        self.assertIn("/docgapnext roadmap_id=RM-003 requirement_id=STAGE-011:DOC-001", text)
+
+    def test_present_clean_shows_docgapnext(self):
+        text = self._run_success("present", matched_document_count=1, canonical_document_count=1)
+        self.assertIn("/docgapnext roadmap_id=RM-003 requirement_id=STAGE-011:DOC-001", text)
+
+    def test_present_with_quality_flags_shows_docgapnext(self):
+        text = self._run_success("present", matched_document_count=1, canonical_document_count=1,
+                                  quality_flags=("needs_review",))
+        self.assertIn("/docgapnext roadmap_id=RM-003 requirement_id=STAGE-011:DOC-001", text)
+
+    def test_optional_requirement_shows_docgapnext(self):
+        text = self._run_success("optional_missing", required=False, blocking=False)
+        self.assertIn("/docgapnext roadmap_id=RM-003 requirement_id=STAGE-011:DOC-001", text)
+
+    def test_exact_roadmap_id(self):
+        text = self._run_success("missing", roadmap_id="RM-777")
+        self.assertIn("/docgapnext roadmap_id=RM-777 requirement_id=STAGE-011:DOC-001", text)
+
+    def test_exact_requirement_id(self):
+        text = self._run_success("missing", requirement_id="STAGE-014:DOC-099")
+        self.assertIn("/docgapnext roadmap_id=RM-003 requirement_id=STAGE-014:DOC-099", text)
+
+    def test_docgapnext_appears_exactly_once(self):
+        text = self._run_success("missing")
+        self.assertEqual(text.count("/docgapnext"), 1)
+
+    def _run_error(self, error_code):
+        update, context = _cmd("/docgap roadmap_id=RM-003 requirement_id=STAGE-011:DOC-001")
+        result = _result(ok=False, error_code=error_code)
+        with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
+             patch("business_core.document_gap_detail.generate_document_gap_detail", return_value=result):
+            asyncio.run(th.docgap_cmd(update, context))
+        return update.message.reply_text.call_args[0][0]
+
+    def test_requirement_not_found_no_docgapnext(self):
+        text = self._run_error(ERROR_REQUIREMENT_NOT_FOUND)
+        self.assertNotIn("/docgapnext", text)
+
+    def test_ambiguous_requirement_id_no_docgapnext(self):
+        text = self._run_error(ERROR_AMBIGUOUS_REQUIREMENT_ID)
+        self.assertNotIn("/docgapnext", text)
+
+    def test_configuration_error_no_docgapnext(self):
+        text = self._run_error(ERROR_COVERAGE_CONFIGURATION_ERROR)
+        self.assertNotIn("/docgapnext", text)
+
+    def test_invariant_failure_no_docgapnext(self):
+        text = self._run_error(ERROR_COVERAGE_INVARIANT_FAILED)
+        self.assertNotIn("/docgapnext", text)
+
+    def test_unknown_engine_status_no_docgapnext(self):
+        text = self._run_error(ERROR_UNKNOWN_ENGINE_STATUS)
+        self.assertNotIn("/docgapnext", text)
+
+    def test_roadmap_not_found_no_docgapnext(self):
+        text = self._run_error(ERROR_ROADMAP_NOT_FOUND)
+        self.assertNotIn("/docgapnext", text)
+
+    def test_roadmap_missing_business_id_no_docgapnext(self):
+        text = self._run_error(ERROR_ROADMAP_MISSING_BUSINESS_ID)
+        self.assertNotIn("/docgapnext", text)
+
+    def test_privacy_no_document_ids(self):
+        text = self._run_success("missing")
+        self.assertNotIn("DREG-", text)
+        self.assertNotIn(".pdf", text)
+
+    def test_docgapnext_line_never_split_mid_line(self):
+        text = self._run_success("missing")
+        for line in text.splitlines():
+            if line.strip().startswith("/docgapnext"):
+                self.assertIn("requirement_id=", line)
+
+    def test_existing_return_to_summary_still_present(self):
+        text = self._run_success("missing")
+        self.assertIn("Вернуться к сводке:", text)
+        self.assertIn("/docgaps roadmap_id=RM-003", text)
+
+    def test_call_budget_unchanged(self):
+        update, context = _cmd("/docgap roadmap_id=RM-003 requirement_id=STAGE-011:DOC-001")
+        result = _result(detail=_detail(base_status="missing"))
+        with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
+             patch("business_core.document_gap_detail.generate_document_gap_detail",
+                   return_value=result) as mock_gen:
+            asyncio.run(th.docgap_cmd(update, context))
+            mock_gen.assert_called_once()
+
+    def test_zero_writes(self):
+        import inspect
+        source = inspect.getsource(th._render_document_gap_detail)
+        for forbidden in ("update_business_row", "append_business_row", "add_worksheet",
+                          "update_business_cell", "batch_append_business_rows"):
+            self.assertNotIn(forbidden, source)
+
+
 class TestDocgapCommandRegistration(unittest.TestCase):
     def test_docgap_registered_as_command_handler(self):
         import inspect

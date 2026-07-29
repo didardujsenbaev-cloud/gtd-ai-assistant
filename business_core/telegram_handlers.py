@@ -6535,6 +6535,10 @@ def _render_document_gap_detail(result) -> str:
         lines.append("Требование обязательное, но не помечено как блокирующее.")
 
     lines.append("")
+    lines.append("Следующий шаг:")
+    lines.append(f"/docgapnext roadmap_id={result.criteria.roadmap_id} requirement_id={result.criteria.requirement_id}")
+
+    lines.append("")
     lines.append("Вернуться к сводке:")
     lines.append(f"/docgaps roadmap_id={result.criteria.roadmap_id}")
 
@@ -7130,6 +7134,9 @@ async def missingdocs_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 lines.append("")
                 lines.append("   Подробнее:")
                 lines.append(f"   /docgap roadmap_id={req.roadmap_id} requirement_id={req.requirement_id}")
+                lines.append("")
+                lines.append("   Следующий шаг:")
+                lines.append(f"   /docgapnext roadmap_id={req.roadmap_id} requirement_id={req.requirement_id}")
                 lines.append("")
 
         if summary.has_configuration_errors:

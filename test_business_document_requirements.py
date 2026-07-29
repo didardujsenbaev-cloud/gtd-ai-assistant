@@ -1332,6 +1332,241 @@ class TestMissingDocsDrillDownAlignment(unittest.TestCase):
             self.assertNotIn(forbidden, source)
 
 
+class TestMissingDocsNextStepNavigation(unittest.TestCase):
+    """Phase 16C.7: /missingdocs adds a ready-to-run /docgapnext command
+    per unsatisfied item, alongside the existing /docgap command —
+    rendering-only, same requirement.roadmap_id/requirement_id source."""
+
+    def _run(self, cmdline, result):
+        th = _fresh_th()
+        update, context = _cmd17b(cmdline)
+
+        async def run():
+            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
+                 patch("business_core.document_requirements_query.evaluate_scope", return_value=result):
+                await th.missingdocs_cmd(update, context)
+
+        asyncio.run(run())
+        return update, context
+
+    def test_docgap_still_present(self):
+        status = _status17b(_req17b(roadmap_id="RM-001"), status="missing")
+        summary = _summary17b(items=(status,))
+        update, context = self._run("/missingdocs stage_id=STAGE-001", _scope_result17b(summary=summary))
+        reply = update.message.reply_text.call_args[0][0]
+        self.assertIn("/docgap roadmap_id=RM-001 requirement_id=STAGE-001:DOC-001", reply)
+
+    def test_docgapnext_added(self):
+        status = _status17b(_req17b(roadmap_id="RM-001"), status="missing")
+        summary = _summary17b(items=(status,))
+        update, context = self._run("/missingdocs stage_id=STAGE-001", _scope_result17b(summary=summary))
+        reply = update.message.reply_text.call_args[0][0]
+        self.assertIn("/docgapnext roadmap_id=RM-001 requirement_id=STAGE-001:DOC-001", reply)
+
+    def test_docgapnext_appears_exactly_once_per_item(self):
+        status = _status17b(_req17b(roadmap_id="RM-001"), status="missing")
+        summary = _summary17b(items=(status,))
+        update, context = self._run("/missingdocs stage_id=STAGE-001", _scope_result17b(summary=summary))
+        reply = update.message.reply_text.call_args[0][0]
+        self.assertEqual(reply.count("/docgapnext"), 1)
+
+    def test_docgapnext_exact_requirement_id(self):
+        req = _req17b(roadmap_id="RM-001", document_template_id="DOC-XYZ", requirement_id="STAGE-001:DOC-XYZ")
+        status = _status17b(req, status="missing")
+        summary = _summary17b(items=(status,))
+        update, context = self._run("/missingdocs stage_id=STAGE-001", _scope_result17b(summary=summary))
+        reply = update.message.reply_text.call_args[0][0]
+        self.assertIn("/docgapnext roadmap_id=RM-001 requirement_id=STAGE-001:DOC-XYZ", reply)
+
+    def test_docgapnext_uses_requirement_roadmap_id(self):
+        req = _req17b(roadmap_id="RM-999")
+        status = _status17b(req, status="missing")
+        summary = _summary17b(items=(status,))
+        update, context = self._run("/missingdocs stage_id=STAGE-001", _scope_result17b(summary=summary))
+        reply = update.message.reply_text.call_args[0][0]
+        self.assertIn("/docgapnext roadmap_id=RM-999", reply)
+
+    def test_roadmap_scope(self):
+        req = _req17b(roadmap_id="RM-001", scope_type="roadmap")
+        status = _status17b(req, status="missing")
+        summary = _summary17b(items=(status,), scope_type="roadmap", scope_id="RM-001")
+        update, context = self._run(
+            "/missingdocs roadmap_id=RM-001",
+            _scope_result17b(summary=summary, scope_type="roadmap", scope_id="RM-001"),
+        )
+        reply = update.message.reply_text.call_args[0][0]
+        self.assertIn("/docgapnext roadmap_id=RM-001 requirement_id=STAGE-001:DOC-001", reply)
+
+    def test_stage_scope(self):
+        req = _req17b(roadmap_id="RM-042")
+        status = _status17b(req, status="missing")
+        summary = _summary17b(items=(status,))
+        update, context = self._run("/missingdocs stage_id=STAGE-001", _scope_result17b(summary=summary))
+        reply = update.message.reply_text.call_args[0][0]
+        self.assertIn("/docgapnext roadmap_id=RM-042 requirement_id=STAGE-001:DOC-001", reply)
+
+    def test_object_scope(self):
+        req = _req17b(roadmap_id="RM-077")
+        status = _status17b(req, status="missing")
+        summary = _summary17b(items=(status,), scope_type="object", scope_id="OBJ-001")
+        update, context = self._run(
+            "/missingdocs object_id=OBJ-001",
+            _scope_result17b(summary=summary, scope_type="object", scope_id="OBJ-001"),
+        )
+        reply = update.message.reply_text.call_args[0][0]
+        self.assertIn("/docgapnext roadmap_id=RM-077 requirement_id=STAGE-001:DOC-001", reply)
+
+    def test_caller_stage_id_not_used_as_roadmap_id(self):
+        req = _req17b(roadmap_id="RM-042")
+        status = _status17b(req, status="missing")
+        summary = _summary17b(items=(status,))
+        update, context = self._run("/missingdocs stage_id=STAGE-001", _scope_result17b(summary=summary))
+        reply = update.message.reply_text.call_args[0][0]
+        self.assertNotIn("/docgapnext roadmap_id=STAGE-001", reply)
+
+    def test_caller_object_id_not_used_as_roadmap_id(self):
+        req = _req17b(roadmap_id="RM-077")
+        status = _status17b(req, status="missing")
+        summary = _summary17b(items=(status,), scope_type="object", scope_id="OBJ-001")
+        update, context = self._run(
+            "/missingdocs object_id=OBJ-001",
+            _scope_result17b(summary=summary, scope_type="object", scope_id="OBJ-001"),
+        )
+        reply = update.message.reply_text.call_args[0][0]
+        self.assertNotIn("/docgapnext roadmap_id=OBJ-001", reply)
+
+    def test_missing_item_has_docgapnext(self):
+        status = _status17b(_req17b(roadmap_id="RM-001"), status="missing")
+        summary = _summary17b(items=(status,))
+        update, context = self._run("/missingdocs stage_id=STAGE-001", _scope_result17b(summary=summary))
+        reply = update.message.reply_text.call_args[0][0]
+        self.assertIn("/docgapnext roadmap_id=RM-001 requirement_id=STAGE-001:DOC-001", reply)
+
+    def test_partial_item_has_docgapnext(self):
+        req = _req17b(roadmap_id="RM-001", minimum_count=2)
+        status = _status17b(req, status="partial", matched_document_ids=("DREG-001",), matched_count=1)
+        summary = _summary17b(items=(status,))
+        update, context = self._run("/missingdocs stage_id=STAGE-001", _scope_result17b(summary=summary))
+        reply = update.message.reply_text.call_args[0][0]
+        self.assertIn("/docgapnext roadmap_id=RM-001 requirement_id=STAGE-001:DOC-001", reply)
+
+    def test_optional_missing_item_has_docgapnext(self):
+        req = _req17b(roadmap_id="RM-001", required=False, blocking=False)
+        status = _status17b(req, status="optional_missing")
+        summary = _summary17b(items=(status,))
+        update, context = self._run("/missingdocs stage_id=STAGE-001", _scope_result17b(summary=summary))
+        reply = update.message.reply_text.call_args[0][0]
+        self.assertIn("/docgapnext roadmap_id=RM-001 requirement_id=STAGE-001:DOC-001", reply)
+
+    def test_ordering_unchanged(self):
+        first = _status17b(_req17b(document_template_id="DOC-A", requirement_id="STAGE-001:DOC-A"), status="missing")
+        second = _status17b(_req17b(document_template_id="DOC-B", requirement_id="STAGE-001:DOC-B"), status="present",
+                             matched_document_ids=("DREG-001",), matched_count=1)
+        third = _status17b(_req17b(document_template_id="DOC-C", requirement_id="STAGE-001:DOC-C"), status="partial",
+                            matched_document_ids=("DREG-002",), matched_count=1)
+        summary = _summary17b(items=(first, second, third))
+        update, context = self._run("/missingdocs stage_id=STAGE-001", _scope_result17b(summary=summary))
+        reply = update.message.reply_text.call_args[0][0]
+        self.assertLess(
+            reply.index("/docgapnext roadmap_id=RM-001 requirement_id=STAGE-001:DOC-A"),
+            reply.index("/docgapnext roadmap_id=RM-001 requirement_id=STAGE-001:DOC-C"),
+        )
+
+    def test_no_unsatisfied_path_has_no_docgapnext(self):
+        req = _req17b()
+        status = _status17b(req, status="present", matched_document_ids=("DREG-001",), matched_count=1)
+        summary = _summary17b(items=(status,))
+        update, context = self._run("/missingdocs stage_id=STAGE-001", _scope_result17b(summary=summary))
+        reply = update.message.reply_text.call_args[0][0]
+        self.assertNotIn("/docgapnext", reply)
+
+    def test_configuration_error_only_path_has_no_docgapnext(self):
+        req = _req17b()
+        status = _status17b(req, status="present", matched_document_ids=("DREG-001",), matched_count=1)
+        summary = _summary17b(
+            items=(status,),
+            configuration_errors=(("STAGE-001", "REL-100", "Minimum Count must be >= 1, got '0'."),),
+            has_configuration_errors=True,
+        )
+        update, context = self._run("/missingdocs stage_id=STAGE-001", _scope_result17b(summary=summary))
+        reply = update.message.reply_text.call_args[0][0]
+        self.assertNotIn("/docgapnext", reply)
+
+    def test_privacy_no_document_ids(self):
+        req = _req17b(roadmap_id="RM-001")
+        status = _status17b(req, status="missing", matched_document_ids=("DREG-001", "DREG-002"), matched_count=0)
+        summary = _summary17b(items=(status,))
+        update, context = self._run("/missingdocs stage_id=STAGE-001", _scope_result17b(summary=summary))
+        reply = update.message.reply_text.call_args[0][0]
+        self.assertNotIn("DREG-001", reply)
+        self.assertNotIn("DREG-002", reply)
+
+    def test_split_messages_preserve_docgapnext(self):
+        statuses = tuple(
+            _status17b(
+                _req17b(roadmap_id="RM-001", document_template_id=f"DOC-{i:03d}", requirement_id=f"STAGE-001:DOC-{i:03d}",
+                         name=f"Document number {i} with padding text to force a longer message"),
+                status="missing",
+            )
+            for i in range(200)
+        )
+        summary = _summary17b(items=statuses)
+        update, context = self._run("/missingdocs stage_id=STAGE-001", _scope_result17b(summary=summary))
+        self.assertGreater(update.message.reply_text.call_count, 1)
+        all_text = "\n".join(call[0][0] for call in update.message.reply_text.call_args_list)
+        self.assertEqual(all_text.count("/docgapnext"), 200)
+
+    def test_docgapnext_command_line_never_split_mid_line(self):
+        statuses = tuple(
+            _status17b(
+                _req17b(roadmap_id="RM-001", document_template_id=f"DOC-{i:03d}", requirement_id=f"STAGE-001:DOC-{i:03d}",
+                         name=f"Document number {i} with padding text to force a longer message"),
+                status="missing",
+            )
+            for i in range(200)
+        )
+        summary = _summary17b(items=statuses)
+        update, context = self._run("/missingdocs stage_id=STAGE-001", _scope_result17b(summary=summary))
+        for call in update.message.reply_text.call_args_list:
+            part = call[0][0]
+            for line in part.splitlines():
+                if line.strip().startswith("/docgapnext"):
+                    self.assertIn("requirement_id=", line)
+                    self.assertTrue(line.strip().count(" ") >= 2)
+
+    def test_evaluate_scope_called_exactly_once(self):
+        req = _req17b()
+        status = _status17b(req, status="missing")
+        summary = _summary17b(items=(status,))
+        th = _fresh_th()
+        update, context = _cmd17b("/missingdocs stage_id=STAGE-001")
+
+        async def run():
+            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
+                 patch("business_core.document_requirements_query.evaluate_scope",
+                       return_value=_scope_result17b(summary=summary)) as mock_eval:
+                await th.missingdocs_cmd(update, context)
+                mock_eval.assert_called_once()
+
+        asyncio.run(run())
+
+    def test_zero_writes(self):
+        import inspect
+        th = _fresh_th()
+        source = inspect.getsource(th.missingdocs_cmd)
+        for forbidden in ("update_business_row", "append_business_row", "add_worksheet",
+                          "update_business_cell", "batch_append_business_rows"):
+            self.assertNotIn(forbidden, source)
+
+    def test_docsrequired_tests_unaffected(self):
+        """/docgapnext must be added only to /missingdocs, not /docsrequired,
+        per Phase 16C.7 §4 — this phase deliberately excludes /docsrequired."""
+        import inspect
+        th = _fresh_th()
+        docsrequired_source = inspect.getsource(th.docsrequired_cmd)
+        self.assertNotIn("/docgapnext", docsrequired_source)
+
+
 class TestDocsRequiredCmd(unittest.TestCase):
     def _run(self, cmdline, result):
         th = _fresh_th()
