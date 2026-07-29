@@ -200,7 +200,7 @@ class TestScopeResolutionChain(_PatchedCase):
 
     def test_full_chain_resolves_via_registries(self):
         dr = self._dr()
-        chain = dr._resolve_scope_chain(stage_id="STAGE-001")
+        chain = dr._resolve_scope_chain(stage_id="STAGE-001", read_context=dr.RequirementsReadContext())
         self.assertEqual(chain["roadmap_id"], "RM-001")
         self.assertEqual(chain["object_id"], "OBJ-001")
         self.assertEqual(chain["service_id"], "SVC-001")
@@ -213,7 +213,7 @@ class TestScopeResolutionChain(_PatchedCase):
         dr = self._dr(stages=[
             {"Stage ID": "STAGE-ORPHAN", "Roadmap ID": "RM-DOES-NOT-EXIST", "Document Template IDs": "DOC-001"},
         ])
-        chain = dr._resolve_scope_chain(stage_id="STAGE-ORPHAN")
+        chain = dr._resolve_scope_chain(stage_id="STAGE-ORPHAN", read_context=dr.RequirementsReadContext())
         self.assertEqual(chain["roadmap_id"], "RM-DOES-NOT-EXIST")
         self.assertEqual(chain["business_id"], "")
         self.assertEqual(chain["service_id"], "")
@@ -322,7 +322,7 @@ class TestOptionalAndMinimumCount(_PatchedCase):
             requirement_id="STAGE-001:DOC-001", document_template_id="DOC-001",
             stage_id="STAGE-001", required=False,
         )
-        result = dr._evaluate_requirement(req)
+        result = dr._evaluate_requirement(req, read_context=dr.RequirementsReadContext())
         self.assertEqual(result.status, dr.STATUS_OPTIONAL_MISSING)
         self.assertFalse(result.is_blocking)  # optional requirements never block
 
@@ -332,7 +332,7 @@ class TestOptionalAndMinimumCount(_PatchedCase):
             requirement_id="STAGE-001:DOC-001", document_template_id="DOC-001",
             stage_id="STAGE-001", roadmap_id="RM-001", required=False,
         )
-        result = dr._evaluate_requirement(req)
+        result = dr._evaluate_requirement(req, read_context=dr.RequirementsReadContext())
         self.assertEqual(result.status, dr.STATUS_PRESENT)
 
     def test_optional_missing_excluded_from_required_completion_math(self):
@@ -344,7 +344,10 @@ class TestOptionalAndMinimumCount(_PatchedCase):
         optional_req = dr.DocumentRequirement(
             requirement_id="b", document_template_id="DOC-002", stage_id="STAGE-002", required=False,
         )
-        statuses = (dr._evaluate_requirement(required_req), dr._evaluate_requirement(optional_req))
+        statuses = (
+            dr._evaluate_requirement(required_req, read_context=dr.RequirementsReadContext()),
+            dr._evaluate_requirement(optional_req, read_context=dr.RequirementsReadContext()),
+        )
         summary = dr._summarize("stage", "STAGE-001", statuses)
         self.assertEqual(summary.total_required, 1)  # only the required one counts
         self.assertEqual(summary.optional_missing, 1)
@@ -356,7 +359,7 @@ class TestOptionalAndMinimumCount(_PatchedCase):
             requirement_id="STAGE-001:DOC-001", document_template_id="DOC-001",
             stage_id="STAGE-001", roadmap_id="RM-001", minimum_count=2,
         )
-        result = dr._evaluate_requirement(req)
+        result = dr._evaluate_requirement(req, read_context=dr.RequirementsReadContext())
         self.assertEqual(result.matched_count, 1)
         self.assertEqual(result.status, dr.STATUS_PARTIAL)
         self.assertFalse(result.is_satisfied)
@@ -370,7 +373,7 @@ class TestOptionalAndMinimumCount(_PatchedCase):
             requirement_id="STAGE-001:DOC-001", document_template_id="DOC-001",
             stage_id="STAGE-001", roadmap_id="RM-001", minimum_count=2,
         )
-        result = dr._evaluate_requirement(req)
+        result = dr._evaluate_requirement(req, read_context=dr.RequirementsReadContext())
         self.assertEqual(result.matched_count, 2)
         self.assertEqual(result.status, dr.STATUS_PRESENT)
         self.assertTrue(result.is_satisfied)

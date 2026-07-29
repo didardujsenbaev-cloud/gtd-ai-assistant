@@ -43,10 +43,39 @@ rule and get_requirements_for_stage() below for where it's consulted.
 Document matching/satisfaction (Phase 17D, above) is completely
 unaffected by which source produced the requirement.
 
+Phase 16C.1B1: bulk read context. Every public entrypoint below now
+accepts an optional keyword-only `read_context: RequirementsReadContext
+| None = None`. When omitted (every existing caller — Completion Gate,
+/missingdocs, /docsrequired — passes nothing), the entrypoint creates
+ONE throwaway RequirementsReadContext for the duration of that single
+call, so each distinct Sheet (roadmaps, roadmap_stages,
+stage_entity_relations, document_template_registry, document_registry)
+is read AT MOST ONCE per evaluation, regardless of how many stages/
+requirements/documents are involved — collapsing the prior O(Q) (Q =
+number of requirements) re-reads of document_registry and
+document_template_registry down to O(1) per evaluation. Passing an
+explicit context lets an external caller (e.g. a future coverage
+report) share one context across multiple calls, or share its cached
+DOCUMENT_REGISTRY rows with another module (see
+business_core.document_search.load_effective_document_records()'s own
+optional `registry_rows=` parameter, added separately).
+
+This changes nothing about the RESULT of any function — every
+DocumentRequirement/DocumentRequirementStatus/RequirementsSummary is
+byte-for-byte identical to before this phase (proven by the existing
+Phase 17A-18C-4 test suite, unmodified) — only the number of
+underlying Sheets reads changes.
+
 This module is strictly read-only: it makes no AI calls, no Drive
 calls, no Sheets writes, never modifies DOCUMENT_REGISTRY or any
 roadmap/stage row, and never enqueues a job. It only reads via
-business_core.sheets' existing read_business_sheet()/find_row_by_id().
+business_core.sheets' existing read_business_sheet_cached() (which
+itself wraps read_business_sheet()) — never find_row_by_id() or
+get_business_sheet() directly anymore (Phase 16C.1B1); the underlying
+auto-create-capable get_business_sheet() primitive is still reachable
+transitively (unchanged, latent, pre-existing — see the Phase 16C.1A
+audit), just called at most once per sheet per evaluation instead of
+once per requirement.
 """
 
 from __future__ import annotations
@@ -161,6 +190,110 @@ class RequirementsSummary:
     has_configuration_errors: bool = False
 
 
+class RequirementsReadContext:
+    """
+    Phase 16C.1B1: mutable, single-evaluation-lifetime Sheets read
+    cache — created fresh by a top-level public entrypoint (or by a
+    future external caller, e.g. a coverage report) at the start of one
+    evaluation, threaded down into every helper, and discarded when
+    that evaluation returns. NOT global, NOT shared across Telegram
+    updates, NOT TTL'd — mirrors business_core.business_builder.
+    _TransitionReadContext's own contract exactly.
+
+    `sheet_rows` is the SAME generic, duck-typed cache dict that
+    business_core.sheets.read_business_sheet_cached() and
+    business_core.stage_entity_relations.list_relations() already
+    expect (`read_context.sheet_rows[sheet_key] -> list[dict]`) — this
+    class IS that duck type, so it can be passed directly as the
+    `read_context=` argument to either of those existing functions with
+    no adapter needed.
+
+    The `*_by_*` index methods below are lazily built (memoized) on
+    first access, from whatever `sheet_rows` already holds (fetching it
+    via read_business_sheet_cached() if not yet cached) — a stage with
+    zero requirements never triggers a document_registry or
+    document_template_registry read at all, since neither index is
+    ever touched.
+
+    Index semantics (Phase 16C.1A/B design, unchanged from the
+    engine's prior direct find_row_by_id()/read_business_sheet() calls):
+    single-ID indexes (roadmap/stage/template lookup) keep the FIRST
+    matching row for a given ID — exactly matching find_row_by_id()'s
+    own top-to-bottom scan. Grouped indexes (by Roadmap ID/Object ID)
+    keep every row, in original sheet order — nothing is deduplicated
+    or reordered; the family/version reduction in
+    _current_valid_documents_for() still operates on the full,
+    unmodified group for its own roadmap.
+    """
+
+    def __init__(self):
+        self.sheet_rows: dict = {}
+        self._roadmaps_by_id: dict | None = None
+        self._roadmaps_by_object_id: dict | None = None
+        self._roadmap_stages_by_id: dict | None = None
+        self._roadmap_stages_by_roadmap_id: dict | None = None
+        self._document_template_registry_by_id: dict | None = None
+        self._document_registry_by_roadmap_id: dict | None = None
+
+    def _rows(self, sheet_key: str) -> list:
+        from business_core.sheets import read_business_sheet_cached
+        return read_business_sheet_cached(sheet_key, read_context=self)
+
+    def roadmap_by_id(self, roadmap_id: str) -> dict | None:
+        if self._roadmaps_by_id is None:
+            index: dict = {}
+            for row in self._rows("roadmaps"):
+                rid = row.get("Roadmap ID", "")
+                if rid and rid not in index:
+                    index[rid] = row
+            self._roadmaps_by_id = index
+        return self._roadmaps_by_id.get(roadmap_id)
+
+    def roadmap_ids_for_object(self, object_id: str) -> tuple:
+        if self._roadmaps_by_object_id is None:
+            grouped: dict = {}
+            for row in self._rows("roadmaps"):
+                grouped.setdefault(row.get("Object ID", ""), []).append(row)
+            self._roadmaps_by_object_id = grouped
+        return tuple(row.get("Roadmap ID", "") for row in self._roadmaps_by_object_id.get(object_id, ()))
+
+    def roadmap_stage_by_id(self, stage_id: str) -> dict | None:
+        if self._roadmap_stages_by_id is None:
+            index: dict = {}
+            for row in self._rows("roadmap_stages"):
+                sid = row.get("Stage ID", "")
+                if sid and sid not in index:
+                    index[sid] = row
+            self._roadmap_stages_by_id = index
+        return self._roadmap_stages_by_id.get(stage_id)
+
+    def stage_ids_for_roadmap(self, roadmap_id: str) -> tuple:
+        if self._roadmap_stages_by_roadmap_id is None:
+            grouped: dict = {}
+            for row in self._rows("roadmap_stages"):
+                grouped.setdefault(row.get("Roadmap ID", ""), []).append(row)
+            self._roadmap_stages_by_roadmap_id = grouped
+        return tuple(row.get("Stage ID", "") for row in self._roadmap_stages_by_roadmap_id.get(roadmap_id, ()))
+
+    def document_template(self, document_template_id: str) -> dict | None:
+        if self._document_template_registry_by_id is None:
+            index: dict = {}
+            for row in self._rows("document_template_registry"):
+                tid = row.get("Document Template ID", "")
+                if tid and tid not in index:
+                    index[tid] = row
+            self._document_template_registry_by_id = index
+        return self._document_template_registry_by_id.get(document_template_id)
+
+    def document_registry_rows_for_roadmap(self, roadmap_id: str) -> tuple:
+        if self._document_registry_by_roadmap_id is None:
+            grouped: dict = {}
+            for row in self._rows("document_registry"):
+                grouped.setdefault(row.get("Roadmap ID", ""), []).append(row)
+            self._document_registry_by_roadmap_id = grouped
+        return tuple(self._document_registry_by_roadmap_id.get(roadmap_id, ()))
+
+
 def _parse_id_list(raw: str) -> list[str]:
     """Comma-separated -> de-duplicated (order-preserving) list of IDs.
     The same Document Template ID appearing twice in the source list is
@@ -184,29 +317,36 @@ def _safe_version(raw: str) -> int:
         return 0
 
 
-def _resolve_scope_chain(stage_id: str = "", roadmap_id: str = "", object_id: str = "") -> dict:
+def _resolve_scope_chain(
+    stage_id: str = "", roadmap_id: str = "", object_id: str = "",
+    *, read_context: RequirementsReadContext,
+) -> dict:
     """
     Plain upward traversal (stage -> roadmap -> business/service/object),
-    read-only, via the existing find_row_by_id() primitive. Deliberately
-    NOT business_core.document_registry_manager.resolve_and_validate_links()
-    — that function validates a caller-supplied, possibly-contradictory
-    set of IDs for a WRITE gate; here we only ever walk upward from one
-    known-good leaf for read-only reporting, so there is nothing to
-    validate for contradictions.
-    """
-    from business_core.sheets import find_row_by_id
+    read-only, via the context's memoized indexes (Phase 16C.1B1 — was
+    find_row_by_id() directly before this phase; same first-row-wins
+    semantics, now sourced from an at-most-once-per-evaluation read).
+    Deliberately NOT business_core.document_registry_manager.
+    resolve_and_validate_links() — that function validates a
+    caller-supplied, possibly-contradictory set of IDs for a WRITE gate;
+    here we only ever walk upward from one known-good leaf for
+    read-only reporting, so there is nothing to validate for
+    contradictions.
 
+    Internal helper: always requires an existing read_context — never
+    creates its own (that would defeat the whole point of sharing one
+    context across a stage/roadmap/object evaluation).
+    """
     if stage_id and not roadmap_id:
-        found = find_row_by_id("roadmap_stages", stage_id)
+        found = read_context.roadmap_stage_by_id(stage_id)
         if found:
-            roadmap_id = found[1].get("Roadmap ID", "")
+            roadmap_id = found.get("Roadmap ID", "")
 
     business_id = ""
     service_id = ""
     if roadmap_id:
-        found = find_row_by_id("roadmaps", roadmap_id)
-        if found:
-            rm = found[1]
+        rm = read_context.roadmap_by_id(roadmap_id)
+        if rm:
             business_id = rm.get("Business ID", "")
             service_id = rm.get("Service ID", "")
             object_id = object_id or rm.get("Object ID", "")
@@ -220,7 +360,10 @@ def _resolve_scope_chain(stage_id: str = "", roadmap_id: str = "", object_id: st
     }
 
 
-def _current_valid_documents_for(roadmap_id: str, document_template_id: str, object_id: str = "") -> tuple:
+def _current_valid_documents_for(
+    roadmap_id: str, document_template_id: str, object_id: str = "",
+    *, read_context: RequirementsReadContext,
+) -> tuple:
     """
     Phase 17D: read-only match of one (roadmap_id, document_template_id)
     requirement against DOCUMENT_REGISTRY, ROADMAP-scoped rather than
@@ -258,16 +401,20 @@ def _current_valid_documents_for(roadmap_id: str, document_template_id: str, obj
     family) — this IS matched_count via len(), and duplicates across
     independent families both count normally (that's real evidence, not
     inflation — only same-family older versions are excluded).
-    """
-    from business_core.sheets import read_business_sheet
 
+    Phase 16C.1B1: DOCUMENT_REGISTRY is read at most once per
+    evaluation (via read_context.document_registry_rows_for_roadmap(),
+    memoized on the shared context) — the Roadmap ID filter that used
+    to run here is now applied once, up front, by that grouping index;
+    only the Document Template ID / Object ID filter still runs per
+    call, over the much smaller per-roadmap candidate set.
+    """
     if not roadmap_id or not document_template_id:
         return ()
 
     candidates = [
-        row for row in read_business_sheet("document_registry")
-        if row.get("Roadmap ID", "") == roadmap_id
-        and row.get("Document Template ID", "") == document_template_id
+        row for row in read_context.document_registry_rows_for_roadmap(roadmap_id)
+        if row.get("Document Template ID", "") == document_template_id
         and (
             not object_id
             or not row.get("Object ID", "")
@@ -289,7 +436,7 @@ def _current_valid_documents_for(roadmap_id: str, document_template_id: str, obj
     )
 
 
-def _lookup_template_catalog(document_template_id: str) -> tuple[str, str]:
+def _lookup_template_catalog(document_template_id: str, *, read_context: RequirementsReadContext) -> tuple[str, str]:
     """
     An unknown/dangling document_template_id (not present in
     document_template_registry) is NEVER silently discarded — the
@@ -299,25 +446,29 @@ def _lookup_template_catalog(document_template_id: str) -> tuple[str, str]:
     template reference. Shared by both the legacy comma-list path
     (_build_requirement) and the Phase 18C-4 relation-row path
     (_build_requirement_from_relation).
-    """
-    from business_core.sheets import find_row_by_id
 
+    Phase 16C.1B1: sourced from read_context.document_template()
+    (memoized index) instead of a fresh find_row_by_id() call each time
+    — DOCUMENT_TEMPLATE_REGISTRY is now read at most once per
+    evaluation, regardless of how many requirements reference it.
+    """
     document_type = ""
     name = document_template_id
-    template_found = find_row_by_id("document_template_registry", document_template_id)
-    if template_found:
-        tmpl = template_found[1]
+    tmpl = read_context.document_template(document_template_id)
+    if tmpl:
         document_type = tmpl.get("Document Type", "")
         name = tmpl.get("Title", "") or document_template_id
     return document_type, name
 
 
-def _build_requirement(stage_id: str, document_template_id: str, chain: dict) -> DocumentRequirement:
+def _build_requirement(
+    stage_id: str, document_template_id: str, chain: dict, *, read_context: RequirementsReadContext,
+) -> DocumentRequirement:
     """Legacy path: builds a requirement from one ROADMAP_STAGES.
     "Document Template IDs" comma-list entry — required/blocking/
     minimum_count are always the hardcoded engine defaults, since the
     legacy column has no per-item way to express anything else."""
-    document_type, name = _lookup_template_catalog(document_template_id)
+    document_type, name = _lookup_template_catalog(document_template_id, read_context=read_context)
 
     return DocumentRequirement(
         requirement_id=f"{stage_id}:{document_template_id}",
@@ -334,7 +485,9 @@ def _build_requirement(stage_id: str, document_template_id: str, chain: dict) ->
     )
 
 
-def _build_requirement_from_relation(stage_id: str, relation: dict, chain: dict) -> DocumentRequirement:
+def _build_requirement_from_relation(
+    stage_id: str, relation: dict, chain: dict, *, read_context: RequirementsReadContext,
+) -> DocumentRequirement:
     """
     Phase 18C-4: builds a requirement from one validated, active,
     instance-scoped STAGE_ENTITY_RELATIONS row — required/blocking/
@@ -346,7 +499,7 @@ def _build_requirement_from_relation(stage_id: str, relation: dict, chain: dict)
     does no validation of its own.
     """
     document_template_id = relation.get("Entity ID", "")
-    document_type, name = _lookup_template_catalog(document_template_id)
+    document_type, name = _lookup_template_catalog(document_template_id, read_context=read_context)
 
     required = (relation.get("Required", "") or "").strip().lower() == "true"
     blocking = (relation.get("Blocking", "") or "").strip().lower() == "true"
@@ -373,7 +526,7 @@ def _build_requirement_from_relation(stage_id: str, relation: dict, chain: dict)
     )
 
 
-def _evaluate_requirement(requirement: DocumentRequirement) -> DocumentRequirementStatus:
+def _evaluate_requirement(requirement: DocumentRequirement, *, read_context: RequirementsReadContext) -> DocumentRequirementStatus:
     """
     Matching by exact Document Template ID string works independently
     of whether that ID exists in document_template_registry — the
@@ -391,7 +544,8 @@ def _evaluate_requirement(requirement: DocumentRequirement) -> DocumentRequireme
     any) purely as provenance.
     """
     matched_ids = _current_valid_documents_for(
-        requirement.roadmap_id, requirement.document_template_id, requirement.object_id
+        requirement.roadmap_id, requirement.document_template_id, requirement.object_id,
+        read_context=read_context,
     )
     matched_count = len(matched_ids)
 
@@ -410,16 +564,17 @@ def _evaluate_requirement(requirement: DocumentRequirement) -> DocumentRequireme
     )
 
 
-def _resolve_stage_requirements_and_errors(stage_id: str) -> tuple:
+def _resolve_stage_requirements_and_errors(stage_id: str, *, read_context: RequirementsReadContext) -> tuple:
     """
     Read-only. Single point of truth for one stage's (requirements,
     configuration_errors) pair — calls
     business_core.stage_entity_relations.get_document_requirements_source_for_stage()
-    exactly ONCE (a real Sheets read), so callers that need both the
-    requirements and the configuration errors (evaluate_stage_requirements()
-    and its roadmap/object aggregates) never fetch the same relation
-    data twice. get_requirements_for_stage() and
-    _configuration_errors_for_stage() below are thin single-purpose
+    exactly ONCE (a real Sheets read the first time any stage needs it;
+    memoized on read_context thereafter — Phase 16C.1B1), so callers
+    that need both the requirements and the configuration errors
+    (evaluate_stage_requirements() and its roadmap/object aggregates)
+    never fetch the same relation data twice. get_requirements_for_stage()
+    and _configuration_errors_for_stage() below are thin single-purpose
     wrappers over this for callers that only need one side.
 
     Phase 18C-4 source precedence (see
@@ -440,16 +595,16 @@ def _resolve_stage_requirements_and_errors(stage_id: str) -> tuple:
     a non-document_template active relation (e.g. a future sop/checklist
     relation) is normal, expected data, not a document-engine
     configuration failure.
+
+    Internal helper: always requires an existing read_context.
     """
-    from business_core.sheets import find_row_by_id
     from business_core.stage_entity_relations import get_document_requirements_source_for_stage
 
-    found = find_row_by_id("roadmap_stages", stage_id)
-    if not found:
+    stage_row = read_context.roadmap_stage_by_id(stage_id)
+    if not stage_row:
         return (), ()
-    stage_row = found[1]
 
-    source = get_document_requirements_source_for_stage(stage_id)
+    source = get_document_requirements_source_for_stage(stage_id, read_context=read_context)
 
     configuration_errors = []
     for relation_id, reasons in source.validation_errors:
@@ -462,52 +617,60 @@ def _resolve_stage_requirements_and_errors(stage_id: str) -> tuple:
             )
     configuration_errors = tuple(configuration_errors)
 
-    chain = _resolve_scope_chain(stage_id=stage_id, roadmap_id=stage_row.get("Roadmap ID", ""))
+    chain = _resolve_scope_chain(
+        stage_id=stage_id, roadmap_id=stage_row.get("Roadmap ID", ""), read_context=read_context,
+    )
 
     if source.source == "instance_relations":
-        requirements = tuple(_build_requirement_from_relation(stage_id, rel, chain) for rel in source.requirements)
+        requirements = tuple(
+            _build_requirement_from_relation(stage_id, rel, chain, read_context=read_context)
+            for rel in source.requirements
+        )
         return requirements, configuration_errors
 
     template_ids = _parse_id_list(stage_row.get("Document Template IDs", ""))
     if not template_ids:
         return (), configuration_errors
-    return tuple(_build_requirement(stage_id, tid, chain) for tid in template_ids), configuration_errors
+    return (
+        tuple(_build_requirement(stage_id, tid, chain, read_context=read_context) for tid in template_ids),
+        configuration_errors,
+    )
 
 
-def get_requirements_for_stage(stage_id: str) -> tuple:
+def get_requirements_for_stage(stage_id: str, *, read_context: RequirementsReadContext | None = None) -> tuple:
     """Read-only: the DocumentRequirement tuple for one stage. Empty
     tuple if the stage doesn't exist or has no requirements — these
-    are treated the same (nothing to evaluate), never an exception."""
-    requirements, _ = _resolve_stage_requirements_and_errors(stage_id)
+    are treated the same (nothing to evaluate), never an exception.
+
+    Phase 16C.1B1: read_context is optional — when omitted, one
+    throwaway RequirementsReadContext is created for the duration of
+    this single call (existing callers are unaffected; results are
+    byte-for-byte identical, only the underlying read count improves).
+    """
+    context = read_context if read_context is not None else RequirementsReadContext()
+    requirements, _ = _resolve_stage_requirements_and_errors(stage_id, read_context=context)
     return requirements
 
 
-def _configuration_errors_for_stage(stage_id: str) -> tuple:
+def _configuration_errors_for_stage(stage_id: str, *, read_context: RequirementsReadContext | None = None) -> tuple:
     """Read-only: just the configuration-errors half of
     _resolve_stage_requirements_and_errors() — kept as its own function
     since it's still a meaningful, independently-testable unit, even
     though evaluate_stage_requirements() below calls the combined
     resolver directly to avoid a redundant second Sheets read."""
-    _, configuration_errors = _resolve_stage_requirements_and_errors(stage_id)
+    context = read_context if read_context is not None else RequirementsReadContext()
+    _, configuration_errors = _resolve_stage_requirements_and_errors(stage_id, read_context=context)
     return configuration_errors
 
 
-def _stage_ids_for_roadmap(roadmap_id: str) -> tuple:
-    from business_core.sheets import read_business_sheet
-
-    return tuple(
-        row.get("Stage ID", "") for row in read_business_sheet("roadmap_stages")
-        if row.get("Roadmap ID", "") == roadmap_id
-    )
+def _stage_ids_for_roadmap(roadmap_id: str, *, read_context: RequirementsReadContext) -> tuple:
+    """Internal helper: always requires an existing read_context."""
+    return read_context.stage_ids_for_roadmap(roadmap_id)
 
 
-def _roadmap_ids_for_object(object_id: str) -> tuple:
-    from business_core.sheets import read_business_sheet
-
-    return tuple(
-        row.get("Roadmap ID", "") for row in read_business_sheet("roadmaps")
-        if row.get("Object ID", "") == object_id
-    )
+def _roadmap_ids_for_object(object_id: str, *, read_context: RequirementsReadContext) -> tuple:
+    """Internal helper: always requires an existing read_context."""
+    return read_context.roadmap_ids_for_object(object_id)
 
 
 def _summarize(scope_type: str, scope_id: str, statuses: tuple, configuration_errors: tuple = ()) -> RequirementsSummary:
@@ -543,67 +706,98 @@ def _summarize(scope_type: str, scope_id: str, statuses: tuple, configuration_er
     )
 
 
-def evaluate_stage_requirements(stage_id: str) -> RequirementsSummary:
+def evaluate_stage_requirements(stage_id: str, *, read_context: RequirementsReadContext | None = None) -> RequirementsSummary:
     """Read-only. Evaluates every requirement for one stage. Calls the
     combined resolver once (not get_requirements_for_stage() +
     _configuration_errors_for_stage() separately) to avoid a redundant
-    second STAGE_ENTITY_RELATIONS read."""
-    requirements, configuration_errors = _resolve_stage_requirements_and_errors(stage_id)
-    statuses = tuple(_evaluate_requirement(r) for r in requirements)
+    second STAGE_ENTITY_RELATIONS read.
+
+    Phase 16C.1B1: read_context optional, see get_requirements_for_stage()'s
+    docstring for the exact contract — one throwaway context per call
+    when omitted.
+    """
+    context = read_context if read_context is not None else RequirementsReadContext()
+    requirements, configuration_errors = _resolve_stage_requirements_and_errors(stage_id, read_context=context)
+    statuses = tuple(_evaluate_requirement(r, read_context=context) for r in requirements)
     return _summarize("stage", stage_id, statuses, configuration_errors=configuration_errors)
 
 
-def get_requirements_for_roadmap(roadmap_id: str) -> tuple:
-    """Read-only: concatenation of get_requirements_for_stage() over
-    every stage belonging to this roadmap — a roadmap has no
-    independent requirement source of its own (see module docstring)."""
+def get_requirements_for_roadmap(roadmap_id: str, *, read_context: RequirementsReadContext | None = None) -> tuple:
+    """Read-only: every requirement across every stage belonging to
+    this roadmap — a roadmap has no independent requirement source of
+    its own (see module docstring).
+
+    Phase 16C.1B1: shares ONE read_context across every constituent
+    stage (calling the internal _resolve_stage_requirements_and_errors()
+    resolver directly, rather than the public get_requirements_for_stage()
+    entrypoint, which would otherwise create a separate throwaway
+    context per stage and reintroduce the very N+1 this phase removes).
+    read_context optional — one throwaway context per call when
+    omitted.
+    """
+    context = read_context if read_context is not None else RequirementsReadContext()
     requirements: list = []
-    for stage_id in _stage_ids_for_roadmap(roadmap_id):
-        requirements.extend(get_requirements_for_stage(stage_id))
+    for stage_id in _stage_ids_for_roadmap(roadmap_id, read_context=context):
+        reqs, _ = _resolve_stage_requirements_and_errors(stage_id, read_context=context)
+        requirements.extend(reqs)
     return tuple(requirements)
 
 
-def evaluate_roadmap_requirements(roadmap_id: str) -> RequirementsSummary:
+def evaluate_roadmap_requirements(roadmap_id: str, *, read_context: RequirementsReadContext | None = None) -> RequirementsSummary:
     """Read-only aggregate over every stage of this roadmap. A
     configuration error on ANY constituent stage propagates upward —
     the roadmap can never be reported safely complete while a child
-    stage has broken relation data, in deterministic stage order. Calls
-    the combined per-stage resolver once per stage (not
-    get_requirements_for_roadmap() + a separate error-collection pass)
-    to avoid a redundant second STAGE_ENTITY_RELATIONS read per stage."""
+    stage has broken relation data, in deterministic stage order.
+
+    Phase 16C.1B1: shares ONE read_context across every stage and the
+    final per-requirement evaluation pass — read_context optional, one
+    throwaway context per call when omitted.
+    """
+    context = read_context if read_context is not None else RequirementsReadContext()
     all_requirements: list = []
     all_errors: list = []
-    for stage_id in _stage_ids_for_roadmap(roadmap_id):
-        reqs, errs = _resolve_stage_requirements_and_errors(stage_id)
+    for stage_id in _stage_ids_for_roadmap(roadmap_id, read_context=context):
+        reqs, errs = _resolve_stage_requirements_and_errors(stage_id, read_context=context)
         all_requirements.extend(reqs)
         all_errors.extend(errs)
-    statuses = tuple(_evaluate_requirement(r) for r in all_requirements)
+    statuses = tuple(_evaluate_requirement(r, read_context=context) for r in all_requirements)
     return _summarize("roadmap", roadmap_id, statuses, configuration_errors=tuple(all_errors))
 
 
-def get_requirements_for_object(object_id: str) -> tuple:
-    """Read-only: concatenation of get_requirements_for_roadmap() over
-    every roadmap whose Object ID matches — an object has no
-    independent requirement source of its own either (see module
-    docstring); it is reached only through its roadmap(s)."""
+def get_requirements_for_object(object_id: str, *, read_context: RequirementsReadContext | None = None) -> tuple:
+    """Read-only: every requirement across every roadmap whose Object
+    ID matches — an object has no independent requirement source of
+    its own either (see module docstring); it is reached only through
+    its roadmap(s).
+
+    Phase 16C.1B1: shares ONE read_context across every roadmap/stage —
+    read_context optional, one throwaway context per call when omitted.
+    """
+    context = read_context if read_context is not None else RequirementsReadContext()
     requirements: list = []
-    for roadmap_id in _roadmap_ids_for_object(object_id):
-        requirements.extend(get_requirements_for_roadmap(roadmap_id))
+    for roadmap_id in _roadmap_ids_for_object(object_id, read_context=context):
+        for stage_id in _stage_ids_for_roadmap(roadmap_id, read_context=context):
+            reqs, _ = _resolve_stage_requirements_and_errors(stage_id, read_context=context)
+            requirements.extend(reqs)
     return tuple(requirements)
 
 
-def evaluate_object_requirements(object_id: str) -> RequirementsSummary:
+def evaluate_object_requirements(object_id: str, *, read_context: RequirementsReadContext | None = None) -> RequirementsSummary:
     """Read-only aggregate over every roadmap tied to this object. A
     configuration error on any descendant stage propagates all the way
-    up, in deterministic roadmap-then-stage order. Calls the combined
-    per-stage resolver once per stage, same reasoning as
-    evaluate_roadmap_requirements()."""
+    up, in deterministic roadmap-then-stage order.
+
+    Phase 16C.1B1: shares ONE read_context across every roadmap/stage
+    and the final per-requirement evaluation pass — read_context
+    optional, one throwaway context per call when omitted.
+    """
+    context = read_context if read_context is not None else RequirementsReadContext()
     all_requirements: list = []
     all_errors: list = []
-    for roadmap_id in _roadmap_ids_for_object(object_id):
-        for stage_id in _stage_ids_for_roadmap(roadmap_id):
-            reqs, errs = _resolve_stage_requirements_and_errors(stage_id)
+    for roadmap_id in _roadmap_ids_for_object(object_id, read_context=context):
+        for stage_id in _stage_ids_for_roadmap(roadmap_id, read_context=context):
+            reqs, errs = _resolve_stage_requirements_and_errors(stage_id, read_context=context)
             all_requirements.extend(reqs)
             all_errors.extend(errs)
-    statuses = tuple(_evaluate_requirement(r) for r in all_requirements)
+    statuses = tuple(_evaluate_requirement(r, read_context=context) for r in all_requirements)
     return _summarize("object", object_id, statuses, configuration_errors=tuple(all_errors))

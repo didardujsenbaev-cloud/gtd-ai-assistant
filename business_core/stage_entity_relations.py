@@ -1054,7 +1054,9 @@ class DocumentRequirementsSource:
     unsupported_entity_type_relation_ids: tuple = ()    # active relations at this stage, non-document_template
 
 
-def get_document_requirements_source_for_stage(stage_id: str) -> DocumentRequirementsSource:
+def get_document_requirements_source_for_stage(
+    stage_id: str, read_context=None,
+) -> DocumentRequirementsSource:
     """
     Strictly read-only. Implements the Phase 18C-4 precedence rule:
 
@@ -1078,11 +1080,19 @@ def get_document_requirements_source_for_stage(stage_id: str) -> DocumentRequire
       4. A non-document_template active relation at this stage is
          excluded from document-requirements consideration entirely
          but is still visible via `unsupported_entity_type_relation_ids`.
+
+    `read_context` (Phase 16C.1B1): passed straight through to
+    get_relations_for_stage()/list_relations()'s own existing
+    `read_context` parameter — this function adds no new caching of its
+    own, it only forwards the caller's context (e.g.
+    business_core.document_requirements.RequirementsReadContext, which
+    is duck-type compatible) so STAGE_ENTITY_RELATIONS is read at most
+    once per shared evaluation instead of once per stage.
     """
     if not stage_id:
         return DocumentRequirementsSource(stage_id=stage_id, source="legacy")
 
-    all_active = get_relations_for_stage(stage_id)  # active only, all entity types, sheet order
+    all_active = get_relations_for_stage(stage_id, read_context=read_context)  # active only, all entity types, sheet order
     doc_relations = tuple(r for r in all_active if r.get("Entity Type", "") == "document_template")
     unsupported_ids = tuple(
         r.get("Relation ID", "") for r in all_active if r.get("Entity Type", "") != "document_template"
