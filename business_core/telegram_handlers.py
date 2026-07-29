@@ -6012,6 +6012,111 @@ async def reviewdoc_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await _reply(update, "❌ Не удалось получить состояние проверки реквизитов.", parse_mode=None)
 
 
+def _render_document_search_item(item, index: int) -> list:
+    """Pure per-item rendering — never shows file_name (may contain PII
+    per the original upload filename), raw extracted_fields, Confirmed
+    Fields JSON, actor, or audit metadata."""
+    lines = [f"{index}. {item.document_id} — {item.document_name or '—'}"]
+
+    if item.effective_document_date:
+        marker = {"human": "✅", "ai": "🤖"}.get(item.document_date_source, "")
+        lines.append(f"   Дата: {item.effective_document_date} {marker}".rstrip())
+
+    if item.effective_direction:
+        marker = {"human": "✅", "ai": "🤖"}.get(item.direction_source, "")
+        lines.append(f"   Направление: {_render_direction(item.effective_direction)} {marker}".rstrip())
+
+    lines.append(f"   Проверка: {_REVIEW_STATUS_LABELS.get(item.review_status, item.review_status)}")
+    lines.append(f"   Требует действия: {_render_tristate_bool(item.effective_requires_action)}")
+
+    if item.cache_warning:
+        lines.append("   ⚠️ Состояние подтверждений требует проверки")
+    elif item.has_conflict:
+        lines.append("   ⚠️ Есть конфликт AI и подтверждённых данных")
+
+    return lines
+
+
+def _render_document_search_result(result) -> str:
+    """Pure rendering of a business_core.document_search
+    .DocumentSearchResult — never references a Sheets column name, never
+    shows business_id per-line (already implied by the search itself)."""
+    lines = [f"🔎 Найдено документов: {result.total_matches}"]
+    if result.total_matches:
+        start = result.offset + 1
+        end = result.offset + result.returned_count
+        lines.append(f"Показано: {start}–{end} из {result.total_matches}")
+    lines.append("")
+
+    if not result.items:
+        lines.append("Документы не найдены.")
+    else:
+        for i, item in enumerate(result.items, start=result.offset + 1):
+            lines.extend(_render_document_search_item(item, i))
+            lines.append("")
+
+    lines.append("Подробнее:")
+    lines.append("/docanalysis document_id=<ID>")
+
+    if result.offset + result.returned_count < result.total_matches:
+        next_offset = result.offset + result.limit
+        lines.append("")
+        lines.append("Следующая страница:")
+        lines.append(f"/finddocs ... offset={next_offset}")
+
+    return "\n".join(lines)
+
+
+async def finddocs_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /finddocs business_id=BIZ-001 date_from=2026-07-01 date_to=2026-07-31
+               direction=internal requires_action=true has_expiration=false
+               review_status=partially_confirmed conflict=true
+               limit=10 offset=0 sort=date_desc
+
+    Read-only, business-scoped search over EFFECTIVE structured fields
+    (confirmed human value if reviewed, AI value if unreviewed, no
+    value at all if rejected — never raw AI value where a human
+    decision overrides it). business_id is a mandatory filter/boundary,
+    not a permission check (this bot has no RBAC — single-operator).
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg())
+        return
+
+    raw = " ".join(context.args or [])
+    kv = _parse_kv_args(raw)
+
+    from business_core.document_search import parse_search_criteria, search_documents
+
+    criteria, error = parse_search_criteria(kv)
+    if error:
+        await _reply(
+            update,
+            f"❌ {error}\n\n"
+            "Пример:\n"
+            "/finddocs business_id=BIZ-001 date_from=2026-07-01 date_to=2026-07-31 "
+            "direction=internal limit=10",
+            parse_mode=None,
+        )
+        return
+
+    try:
+        from business_core.sheets import SheetsQuotaExceededError, TransientSheetsReadError
+
+        result = search_documents(criteria)
+        text = _render_document_search_result(result)
+        for part in _split_message_by_lines(text):
+            await update.message.reply_text(part, parse_mode=None)
+    except SheetsQuotaExceededError:
+        await _reply(update, "⚠️ Google Sheets временно перегружен. Повторите запрос немного позже.", parse_mode=None)
+    except TransientSheetsReadError:
+        await _reply(update, "⚠️ Не удалось временно прочитать данные Google Sheets. Попробуйте позже.", parse_mode=None)
+    except Exception as e:
+        log.error(f"finddocs_cmd error: {e}")
+        await _reply(update, "❌ Не удалось выполнить поиск документов.", parse_mode=None)
+
+
 def _render_confirmation_mutation_result(result: dict, document_id: str, field: str) -> str:
     """Pure rendering of a business_core.document_confirmation mutation
     result dict — never a raw exception/APIError/project_number."""
@@ -14045,6 +14150,9 @@ def register_business_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("confirmdocfield", confirmdocfield_cmd))
     app.add_handler(CommandHandler("rejectdocfield", rejectdocfield_cmd))
     app.add_handler(CommandHandler("cleardocfield", cleardocfield_cmd))
+
+    # Phase 16B.5: Search and Reports by Effective Document Fields
+    app.add_handler(CommandHandler("finddocs", finddocs_cmd))
 
     # Phase 17B: Telegram Document Requirements Interface
     app.add_handler(CommandHandler("missingdocs", missingdocs_cmd))
