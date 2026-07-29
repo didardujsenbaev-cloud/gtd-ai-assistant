@@ -6266,6 +6266,189 @@ async def docreport_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await _reply(update, "❌ Не удалось сформировать отчёт по документам.", parse_mode=None)
 
 
+_COVERAGE_FLAG_LABELS = {
+    "needs_review": "не подтверждён полностью",
+    "conflict": "конфликт AI/подтверждение",
+    "expired": "срок истёк",
+    "duplicate_only": "только дубликаты",
+    "cache_warning": "требует проверки cache",
+    "invalid_expiry": "некорректная дата окончания",
+}
+
+_COVERAGE_BASE_STATUS_LABELS = {
+    "missing": "отсутствует",
+    "partial": "частично",
+    "optional_missing": "не найден (опционально)",
+}
+
+
+def _render_coverage_item(item, index: int) -> list:
+    lines = [f"{index}. {item.requirement_name}"]
+    if item.stage_id:
+        lines.append(f"   Этап: {item.stage_id}")
+    if item.base_status == "partial":
+        lines.append(f"   Статус: частично — найдено {item.canonical_document_count} из {item.minimum_count}")
+    elif item.base_status in _COVERAGE_BASE_STATUS_LABELS:
+        lines.append(f"   Статус: {_COVERAGE_BASE_STATUS_LABELS[item.base_status]}")
+    else:
+        lines.append("   Статус: найден")
+    for flag in item.quality_flags:
+        label = _COVERAGE_FLAG_LABELS.get(flag, flag)
+        lines.append(f"   ⚠️ {label}")
+    return lines
+
+
+def _render_document_coverage_result(result) -> str:
+    """
+    Pure rendering of a business_core.document_coverage
+    .DocumentCoverageResult — aggregates plus individually-rendered
+    items ONLY for missing/partial/optional_missing/flagged-present
+    requirements (never a fully clean requirement, never a Document
+    ID/name/actor/raw value).
+    """
+    s = result.summary
+    lines = [
+        "📋 Покрытие документов",
+        f"Roadmap: {result.criteria.roadmap_id}",
+    ]
+    if result.criteria.stage_id:
+        lines.append(f"Этап: {result.criteria.stage_id}")
+    lines.append(f"На дату: {result.criteria.as_of} (UTC)")
+    lines.append("")
+    lines.extend([
+        f"Итого требований: {s.total_requirements}",
+        f"• Выполнено: {s.present_count}",
+        f"• Частично: {s.partial_count}",
+        f"• Не хватает: {s.missing_count}",
+        f"• Блокирующих пробелов: {s.blocking_missing_count}",
+        "",
+        "Требуют внимания:",
+        f"• Не проверены полностью: {s.needs_review_count}",
+        f"• Конфликты: {s.conflict_count}",
+        f"• Истёкшие: {s.expired_count}",
+        f"• Только дубликаты: {s.duplicate_only_count}",
+        f"• Ошибки cache/date: {s.cache_warning_count}",
+    ])
+
+    missing_or_partial = [i for i in result.items if i.base_status in ("missing", "partial")]
+    optional_missing = [i for i in result.items if i.base_status == "optional_missing"]
+    flagged_present = [i for i in result.items if i.base_status == "present" and i.quality_flags]
+
+    idx = 1
+    if missing_or_partial:
+        lines.append("")
+        lines.append("Не хватает:")
+        for item in missing_or_partial:
+            lines.extend(_render_coverage_item(item, idx))
+            idx += 1
+    if optional_missing:
+        lines.append("")
+        lines.append("Опциональные не найдены:")
+        for item in optional_missing:
+            lines.extend(_render_coverage_item(item, idx))
+            idx += 1
+    if flagged_present:
+        lines.append("")
+        lines.append("Требуют внимания:")
+        for item in flagged_present:
+            lines.extend(_render_coverage_item(item, idx))
+            idx += 1
+
+    lines.append("")
+    lines.append("Команда деталей:")
+    lines.append(f" /docsrequired roadmap_id={result.criteria.roadmap_id}")
+
+    if result.warnings:
+        lines.append("")
+        lines.append(f"⚠️ Предупреждения при подготовке отчёта: {len(result.warnings)}")
+
+    return "\n".join(lines)
+
+
+async def docgaps_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /docgaps roadmap_id=RM-003 [stage_id=STAGE-019] [include_optional=true|false] [as_of=YYYY-MM-DD]
+
+    Read-only coverage report combining business_core.document_requirements'
+    base requirement status with business_core.document_search's effective-
+    document quality layer (review/conflict/expiry/duplicate signals) —
+    never a second implementation of either. Aggregates plus individual
+    items for anything needing attention; a fully satisfied, unflagged
+    requirement is never rendered individually. No Document ID, name,
+    actor, or raw value is ever shown.
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg())
+        return
+
+    raw = " ".join(context.args or [])
+    kv = _parse_kv_args(raw)
+
+    from business_core.document_coverage import (
+        parse_coverage_criteria, generate_document_coverage,
+        ERROR_ROADMAP_NOT_FOUND, ERROR_ROADMAP_MISSING_BUSINESS_ID,
+        ERROR_STAGE_NOT_FOUND, ERROR_STAGE_NOT_IN_ROADMAP,
+        ERROR_UNKNOWN_ENGINE_STATUS, ERROR_COVERAGE_CONFIGURATION_ERROR, ERROR_COVERAGE_INVARIANT_FAILED,
+    )
+
+    criteria, error = parse_coverage_criteria(kv)
+    if error:
+        await _reply(
+            update,
+            f"❌ {error}\n\n"
+            "Пример:\n"
+            "/docgaps roadmap_id=RM-003 stage_id=STAGE-019 include_optional=false",
+            parse_mode=None,
+        )
+        return
+
+    try:
+        from business_core.sheets import SheetsQuotaExceededError, TransientSheetsReadError
+
+        result = generate_document_coverage(criteria)
+        if not result.ok:
+            if result.error_code == ERROR_ROADMAP_NOT_FOUND:
+                await _reply(update, f"❌ Roadmap {criteria.roadmap_id} не найден.", parse_mode=None)
+            elif result.error_code == ERROR_ROADMAP_MISSING_BUSINESS_ID:
+                await _reply(update, "❌ У roadmap отсутствует Business ID.", parse_mode=None)
+            elif result.error_code == ERROR_STAGE_NOT_FOUND:
+                await _reply(update, f"❌ Этап {criteria.stage_id} не найден.", parse_mode=None)
+            elif result.error_code == ERROR_STAGE_NOT_IN_ROADMAP:
+                await _reply(
+                    update,
+                    f"❌ Этап {criteria.stage_id} не принадлежит roadmap {criteria.roadmap_id}.",
+                    parse_mode=None,
+                )
+            elif result.error_code == ERROR_COVERAGE_CONFIGURATION_ERROR:
+                await _reply(
+                    update,
+                    "⚠️ Не удалось безопасно сформировать покрытие документов: "
+                    "в настройке требований обнаружена ошибка.",
+                    parse_mode=None,
+                )
+            elif result.error_code in (ERROR_UNKNOWN_ENGINE_STATUS, ERROR_COVERAGE_INVARIANT_FAILED):
+                await _reply(
+                    update,
+                    "❌ Не удалось безопасно сформировать отчёт: "
+                    "внутренняя проверка итогов не пройдена.",
+                    parse_mode=None,
+                )
+            else:
+                await _reply(update, "❌ Не удалось сформировать отчёт покрытия документов.", parse_mode=None)
+            return
+
+        text = _render_document_coverage_result(result)
+        for part in _split_message_by_lines(text):
+            await update.message.reply_text(part, parse_mode=None)
+    except SheetsQuotaExceededError:
+        await _reply(update, "⚠️ Google Sheets временно перегружен. Повторите запрос немного позже.", parse_mode=None)
+    except TransientSheetsReadError:
+        await _reply(update, "⚠️ Не удалось временно прочитать данные Google Sheets. Попробуйте позже.", parse_mode=None)
+    except Exception as e:
+        log.error(f"docgaps_cmd error: {e}")
+        await _reply(update, "❌ Не удалось сформировать отчёт покрытия документов.", parse_mode=None)
+
+
 def _render_confirmation_mutation_result(result: dict, document_id: str, field: str) -> str:
     """Pure rendering of a business_core.document_confirmation mutation
     result dict — never a raw exception/APIError/project_number."""
@@ -14305,6 +14488,9 @@ def register_business_handlers(app: Application) -> None:
 
     # Phase 16B.6: Business Document Report by Effective Fields
     app.add_handler(CommandHandler("docreport", docreport_cmd))
+
+    # Phase 16C.2: Document Requirements Coverage
+    app.add_handler(CommandHandler("docgaps", docgaps_cmd))
 
     # Phase 17B: Telegram Document Requirements Interface
     app.add_handler(CommandHandler("missingdocs", missingdocs_cmd))
