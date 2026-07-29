@@ -6657,17 +6657,14 @@ def _render_document_gap_next(result) -> str:
         for action in secondary:
             for i, step in enumerate(action.instruction_lines, start=1):
                 lines.append(f"{i}. {step}")
-        lines.append("")
-        lines.append("Повторная проверка:")
-        lines.append(f"/docgap roadmap_id={result.criteria.roadmap_id} requirement_id={result.criteria.requirement_id}")
     else:
         lines.append("Что сделать:")
         for i, step in enumerate(primary.instruction_lines, start=1):
             lines.append(f"{i}. {step}")
-        lines.append("")
-        lines.append("Повторно проверить требование:")
-        lines.append("")
-        lines.append(f"/docgap roadmap_id={result.criteria.roadmap_id} requirement_id={result.criteria.requirement_id}")
+
+    lines.append("")
+    lines.append("Повторно проверить:")
+    lines.append(f"/docgap roadmap_id={result.criteria.roadmap_id} requirement_id={result.criteria.requirement_id}")
 
     lines.append("")
     if not result.required:

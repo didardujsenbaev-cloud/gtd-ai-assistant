@@ -104,7 +104,7 @@ class TestDocgapnextMissingRender(unittest.TestCase):
             "OBTAIN_MISSING_DOCUMENT",
             "Получить требуемый документ.",
             "Загрузить его в систему.",
-            "Повторно проверить требование через /docgap.",
+            "После загрузки обновить проверку требования.",
         ), base_status="missing")
         with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
              patch("business_core.document_gap_next.generate_document_gap_next", return_value=result):
@@ -119,6 +119,10 @@ class TestDocgapnextMissingRender(unittest.TestCase):
         self.assertIn("/docgap roadmap_id=RM-003 requirement_id=STAGE-011:DOC-008", text)
         self.assertIn("блокирует завершение этапа", text)
         self.assertIn("/missingdocs roadmap_id=RM-003", text)
+        self.assertEqual(text.count("/docgap"), 1)
+        self.assertIn("Повторно проверить:", text)
+        self.assertNotIn("Повторная проверка:", text)
+        self.assertNotIn("Повторно проверить требование:", text)
 
 
 class TestDocgapnextMultipleFlagsRender(unittest.TestCase):
@@ -145,6 +149,10 @@ class TestDocgapnextMultipleFlagsRender(unittest.TestCase):
         self.assertIn("Проверить извлечённые structured data.", text)
         # follow-up command must appear only once, in its own block
         self.assertEqual(text.count("/docgap roadmap_id=RM-003 requirement_id=STAGE-014:DOC-012"), 1)
+        self.assertEqual(text.count("/docgap"), 1)
+        self.assertIn("Повторно проверить:", text)
+        self.assertNotIn("Повторная проверка:", text)
+        self.assertNotIn("Повторно проверить требование:", text)
 
 
 class TestDocgapnextBlockingOptionalMessaging(unittest.TestCase):
@@ -247,6 +255,24 @@ class TestDocgapnextErrorHandling(unittest.TestCase):
             asyncio.run(th.docgapnext_cmd(update, context))
         text = update.message.reply_text.call_args[0][0]
         self.assertIn("неподдерживаемое состояние", text)
+
+    def test_all_error_responses_never_show_followup_command(self):
+        error_codes = [
+            ERROR_ROADMAP_NOT_FOUND, ERROR_ROADMAP_MISSING_BUSINESS_ID,
+            ERROR_REQUIREMENT_NOT_FOUND, ERROR_AMBIGUOUS_REQUIREMENT_ID,
+            ERROR_UNKNOWN_ENGINE_STATUS, ERROR_COVERAGE_CONFIGURATION_ERROR,
+            ERROR_COVERAGE_INVARIANT_FAILED, ERROR_UNSUPPORTED_BASE_STATUS,
+            ERROR_UNSUPPORTED_QUALITY_FLAG,
+        ]
+        for code in error_codes:
+            update, context = _cmd("/docgapnext roadmap_id=RM-003 requirement_id=STAGE-011:DOC-008")
+            result = _result(ok=False, error_code=code)
+            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
+                 patch("business_core.document_gap_next.generate_document_gap_next", return_value=result):
+                asyncio.run(th.docgapnext_cmd(update, context))
+            text = update.message.reply_text.call_args[0][0]
+            self.assertNotIn("/docgap", text, msg=f"error_code={code}")
+            self.assertNotIn("Повторно проверить:", text, msg=f"error_code={code}")
 
     def test_sheets_quota_exceeded_shows_retry_message(self):
         from business_core.sheets import SheetsQuotaExceededError

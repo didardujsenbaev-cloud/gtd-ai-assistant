@@ -92,7 +92,7 @@ _BASE_STATUS_ACTIONS = {
         instruction_lines=(
             "Получить требуемый документ.",
             "Загрузить его в систему.",
-            "Повторно проверить требование через /docgap.",
+            "После загрузки обновить проверку требования.",
         ),
     ),
     "partial": DocumentGapNextAction(
@@ -100,7 +100,7 @@ _BASE_STATUS_ACTIONS = {
         instruction_lines=(
             "Получить недостающее количество документов.",
             "Загрузить их в систему.",
-            "Повторно проверить требование через /docgap.",
+            "После загрузки обновить проверку требования.",
         ),
     ),
     "optional_missing": DocumentGapNextAction(
@@ -108,7 +108,7 @@ _BASE_STATUS_ACTIONS = {
         instruction_lines=(
             "Решить, нужен ли опциональный документ для этого объекта.",
             "При необходимости получить и загрузить его.",
-            "Повторно проверить требование через /docgap.",
+            "После загрузки обновить проверку требования.",
         ),
     ),
 }
@@ -117,7 +117,7 @@ _NO_ACTION_REQUIRED = DocumentGapNextAction(
     action_code="NO_ACTION_REQUIRED",
     instruction_lines=(
         "Дополнительных действий по текущему состоянию не требуется.",
-        "При изменении документа повторно проверить требование.",
+        "При изменении документа обновить проверку требования.",
     ),
 )
 
@@ -126,7 +126,6 @@ _QUALITY_FLAG_ACTIONS = {
         action_code="UPLOAD_CANONICAL_DOCUMENT",
         instruction_lines=(
             "Загрузить отдельный документ, а не точную копию уже существующего файла.",
-            "Повторно проверить требование.",
         ),
     ),
     "expired": DocumentGapNextAction(
@@ -134,7 +133,6 @@ _QUALITY_FLAG_ACTIONS = {
         instruction_lines=(
             "Получить актуальную версию документа или продлить срок действия.",
             "Загрузить актуальный документ.",
-            "Повторно проверить требование.",
         ),
     ),
     "conflict": DocumentGapNextAction(
@@ -142,7 +140,6 @@ _QUALITY_FLAG_ACTIONS = {
         instruction_lines=(
             "Проверить конфликтующие значения.",
             "Подтвердить корректное значение или исправить structured data.",
-            "Повторно проверить требование.",
         ),
     ),
     "needs_review": DocumentGapNextAction(
@@ -150,7 +147,6 @@ _QUALITY_FLAG_ACTIONS = {
         instruction_lines=(
             "Проверить извлечённые structured data.",
             "Подтвердить или исправить значения.",
-            "Повторно проверить требование.",
         ),
     ),
     "invalid_expiry": DocumentGapNextAction(
@@ -158,7 +154,6 @@ _QUALITY_FLAG_ACTIONS = {
         instruction_lines=(
             "Проверить значение срока действия.",
             "Исправить некорректную дату.",
-            "Повторно проверить требование.",
         ),
     ),
     "cache_warning": DocumentGapNextAction(
@@ -166,7 +161,6 @@ _QUALITY_FLAG_ACTIONS = {
         instruction_lines=(
             "Повторно проверить quality-данные документа.",
             "Убедиться, что structured data обработаны корректно.",
-            "Повторно проверить требование.",
         ),
     ),
 }

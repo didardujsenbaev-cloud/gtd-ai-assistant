@@ -322,5 +322,122 @@ class TestPrivacy(unittest.TestCase):
         self.assertEqual(result.warnings, ())
 
 
+class TestActionTextNoFollowUpDuplicate(unittest.TestCase):
+    """Phase 16C.6.1: instruction_lines must never repeat the /docgap
+    follow-up command or the generic 'Повторно проверить требование'
+    phrase — that belongs solely to the single Telegram follow-up block."""
+
+    def _all_actions(self):
+        actions = list(dgn._BASE_STATUS_ACTIONS.values())
+        actions.append(dgn._NO_ACTION_REQUIRED)
+        actions.extend(dgn._QUALITY_FLAG_ACTIONS.values())
+        return actions
+
+    def test_no_action_mentions_docgap(self):
+        for action in self._all_actions():
+            for line in action.instruction_lines:
+                self.assertNotIn("/docgap", line, msg=f"{action.action_code}: {line!r}")
+
+    def test_no_action_repeats_generic_followup_phrase(self):
+        for action in self._all_actions():
+            for line in action.instruction_lines:
+                self.assertNotIn("Повторно проверить требование", line,
+                                  msg=f"{action.action_code}: {line!r}")
+
+    def test_base_status_actions_exact_wording(self):
+        self.assertEqual(
+            dgn._BASE_STATUS_ACTIONS["missing"].instruction_lines,
+            (
+                "Получить требуемый документ.",
+                "Загрузить его в систему.",
+                "После загрузки обновить проверку требования.",
+            ),
+        )
+        self.assertEqual(
+            dgn._BASE_STATUS_ACTIONS["partial"].instruction_lines,
+            (
+                "Получить недостающее количество документов.",
+                "Загрузить их в систему.",
+                "После загрузки обновить проверку требования.",
+            ),
+        )
+        self.assertEqual(
+            dgn._BASE_STATUS_ACTIONS["optional_missing"].instruction_lines,
+            (
+                "Решить, нужен ли опциональный документ для этого объекта.",
+                "При необходимости получить и загрузить его.",
+                "После загрузки обновить проверку требования.",
+            ),
+        )
+        self.assertEqual(
+            dgn._NO_ACTION_REQUIRED.instruction_lines,
+            (
+                "Дополнительных действий по текущему состоянию не требуется.",
+                "При изменении документа обновить проверку требования.",
+            ),
+        )
+
+    def test_quality_flag_actions_exact_wording(self):
+        self.assertEqual(
+            dgn._QUALITY_FLAG_ACTIONS["duplicate_only"].instruction_lines,
+            ("Загрузить отдельный документ, а не точную копию уже существующего файла.",),
+        )
+        self.assertEqual(
+            dgn._QUALITY_FLAG_ACTIONS["expired"].instruction_lines,
+            (
+                "Получить актуальную версию документа или продлить срок действия.",
+                "Загрузить актуальный документ.",
+            ),
+        )
+        self.assertEqual(
+            dgn._QUALITY_FLAG_ACTIONS["conflict"].instruction_lines,
+            (
+                "Проверить конфликтующие значения.",
+                "Подтвердить корректное значение или исправить structured data.",
+            ),
+        )
+        self.assertEqual(
+            dgn._QUALITY_FLAG_ACTIONS["needs_review"].instruction_lines,
+            (
+                "Проверить извлечённые structured data.",
+                "Подтвердить или исправить значения.",
+            ),
+        )
+        self.assertEqual(
+            dgn._QUALITY_FLAG_ACTIONS["invalid_expiry"].instruction_lines,
+            (
+                "Проверить значение срока действия.",
+                "Исправить некорректную дату.",
+            ),
+        )
+        self.assertEqual(
+            dgn._QUALITY_FLAG_ACTIONS["cache_warning"].instruction_lines,
+            (
+                "Повторно проверить quality-данные документа.",
+                "Убедиться, что structured data обработаны корректно.",
+            ),
+        )
+
+    def test_secondary_actions_no_docgap_reference(self):
+        result = _run(_detail_result(detail=_detail(
+            base_status="present", quality_flags=("expired", "needs_review"),
+        )))
+        for action in result.secondary_actions:
+            for line in action.instruction_lines:
+                self.assertNotIn("/docgap", line)
+
+    def test_action_codes_unchanged(self):
+        self.assertEqual(dgn._BASE_STATUS_ACTIONS["missing"].action_code, "OBTAIN_MISSING_DOCUMENT")
+        self.assertEqual(dgn._BASE_STATUS_ACTIONS["partial"].action_code, "OBTAIN_REMAINING_DOCUMENTS")
+        self.assertEqual(dgn._BASE_STATUS_ACTIONS["optional_missing"].action_code, "OPTIONAL_DOCUMENT_NOT_PROVIDED")
+        self.assertEqual(dgn._NO_ACTION_REQUIRED.action_code, "NO_ACTION_REQUIRED")
+        self.assertEqual(dgn._QUALITY_FLAG_ACTIONS["duplicate_only"].action_code, "UPLOAD_CANONICAL_DOCUMENT")
+        self.assertEqual(dgn._QUALITY_FLAG_ACTIONS["expired"].action_code, "OBTAIN_CURRENT_DOCUMENT")
+        self.assertEqual(dgn._QUALITY_FLAG_ACTIONS["conflict"].action_code, "RESOLVE_STRUCTURED_DATA_CONFLICT")
+        self.assertEqual(dgn._QUALITY_FLAG_ACTIONS["needs_review"].action_code, "CONFIRM_STRUCTURED_DATA")
+        self.assertEqual(dgn._QUALITY_FLAG_ACTIONS["invalid_expiry"].action_code, "FIX_EXPIRY_DATE")
+        self.assertEqual(dgn._QUALITY_FLAG_ACTIONS["cache_warning"].action_code, "RECHECK_QUALITY_DATA")
+
+
 if __name__ == "__main__":
     unittest.main()
