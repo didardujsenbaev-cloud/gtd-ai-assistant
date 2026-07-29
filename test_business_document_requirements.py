@@ -1051,9 +1051,30 @@ class TestMissingDocsCmd(unittest.TestCase):
         update, context = self._run("/missingdocs stage_id=STAGE-001", _scope_result17b(summary=summary))
         reply = update.message.reply_text.call_args[0][0]
         self.assertNotIn("✅ Все обязательные документы собраны.", reply)
-        self.assertIn("⚠️ Ошибка настройки требований к документам.", reply)
-        self.assertIn("REL-100", reply)
-        self.assertIn("Minimum Count must be >= 1", reply)
+        self.assertIn("⚠️ В настройке требований обнаружены ошибки.", reply)
+        self.assertIn("Количество ошибок: 1", reply)
+        # Phase 16C.4: raw relation/reason details are never rendered.
+        self.assertNotIn("REL-100", reply)
+        self.assertNotIn("Minimum Count must be >= 1", reply)
+
+    def test_configuration_error_no_row_payload_across_split_messages(self):
+        """Even with many configuration errors and a long requirements
+        list forcing multiple Telegram messages, no relation/entity
+        identifier or raw reason ever appears in any part."""
+        req = _req17b()
+        status = _status17b(req, status="present", matched_document_ids=("DREG-001",), matched_count=1)
+        errors = tuple(
+            (f"STAGE-{i:03d}", f"REL-{i:03d}", f"Entity ID 'DOC-{i:03d}' not found.")
+            for i in range(50)
+        )
+        summary = _summary17b(items=(status,), configuration_errors=errors, has_configuration_errors=True)
+        update, context = self._run("/missingdocs stage_id=STAGE-001", _scope_result17b(summary=summary))
+        for call in update.message.reply_text.call_args_list:
+            part = call[0][0]
+            self.assertNotIn("REL-", part)
+            self.assertNotIn("not found", part)
+        all_text = "\n".join(call[0][0] for call in update.message.reply_text.call_args_list)
+        self.assertIn("Количество ошибок: 50", all_text)
 
 
 class TestDocsRequiredCmd(unittest.TestCase):
@@ -1102,13 +1123,49 @@ class TestDocsRequiredCmd(unittest.TestCase):
         reply = update.message.reply_text.call_args[0][0]
         self.assertIn("Object ID: OBJ-001", reply)
 
-    def test_full_card_shows_matched_document_ids(self):
+    def test_full_card_never_shows_matched_document_ids(self):
+        """Phase 16C.4: /docsrequired must never leak Document Registry
+        IDs — only structural identifiers (Requirement ID, Document
+        Template ID, Stage ID) and aggregate counts."""
         req = _req17b()
         status = _status17b(req, status="present", matched_document_ids=("DREG-001", "DREG-002"), matched_count=2)
         summary = _summary17b(items=(status,))
         update, context = self._run("/docsrequired stage_id=STAGE-001", _scope_result17b(summary=summary))
         reply = update.message.reply_text.call_args[0][0]
-        self.assertIn("Matched Document IDs: DREG-001, DREG-002", reply)
+        self.assertNotIn("Matched Document IDs", reply)
+        self.assertNotIn("DREG-001", reply)
+        self.assertNotIn("DREG-002", reply)
+
+    def test_full_card_shows_requirement_id_and_docgap_command(self):
+        req = _req17b()
+        status = _status17b(req, status="present", matched_document_ids=("DREG-001", "DREG-002"), matched_count=2)
+        summary = _summary17b(items=(status,))
+        update, context = self._run("/docsrequired stage_id=STAGE-001", _scope_result17b(summary=summary))
+        reply = update.message.reply_text.call_args[0][0]
+        self.assertIn("Requirement ID: STAGE-001:DOC-001", reply)
+        self.assertIn("/docgap roadmap_id=RM-001 requirement_id=STAGE-001:DOC-001", reply)
+
+    def test_docgap_command_uses_requirement_roadmap_id_for_stage_scope(self):
+        """A stage-scoped /docsrequired call must still build the
+        /docgap command using item.requirement.roadmap_id — never the
+        stage_id the caller passed as the scope."""
+        req = _req17b(roadmap_id="RM-042")
+        status = _status17b(req, status="missing")
+        summary = _summary17b(items=(status,))
+        update, context = self._run("/docsrequired stage_id=STAGE-001", _scope_result17b(summary=summary))
+        reply = update.message.reply_text.call_args[0][0]
+        self.assertIn("/docgap roadmap_id=RM-042 requirement_id=STAGE-001:DOC-001", reply)
+
+    def test_docgap_command_uses_requirement_roadmap_id_for_object_scope(self):
+        req = _req17b(roadmap_id="RM-077")
+        status = _status17b(req, status="missing")
+        summary = _summary17b(items=(status,), scope_type="object", scope_id="OBJ-001")
+        update, context = self._run(
+            "/docsrequired object_id=OBJ-001",
+            _scope_result17b(summary=summary, scope_type="object", scope_id="OBJ-001"),
+        )
+        reply = update.message.reply_text.call_args[0][0]
+        self.assertIn("/docgap roadmap_id=RM-077 requirement_id=STAGE-001:DOC-001", reply)
 
     def test_full_card_shows_every_requirement_not_just_missing(self):
         present_status = _status17b(_req17b(document_template_id="DOC-001"), status="present",
@@ -1130,6 +1187,24 @@ class TestDocsRequiredCmd(unittest.TestCase):
         reply = update.message.reply_text.call_args[0][0]
         self.assertIn("Required: yes", reply)
         self.assertIn("Blocking: yes", reply)
+
+    def test_optional_requirement_rendering(self):
+        req = _req17b(required=False, blocking=False)
+        status = _status17b(req, status="optional_missing")
+        summary = _summary17b(items=(status,))
+        update, context = self._run("/docsrequired stage_id=STAGE-001", _scope_result17b(summary=summary))
+        reply = update.message.reply_text.call_args[0][0]
+        self.assertIn("необязательный отсутствует", reply)
+        self.assertIn("Required: no", reply)
+        self.assertIn("Blocking: no", reply)
+
+    def test_ordering_unchanged(self):
+        first = _status17b(_req17b(document_template_id="DOC-A", requirement_id="STAGE-001:DOC-A"), status="missing")
+        second = _status17b(_req17b(document_template_id="DOC-B", requirement_id="STAGE-001:DOC-B"), status="present")
+        summary = _summary17b(items=(first, second))
+        update, context = self._run("/docsrequired stage_id=STAGE-001", _scope_result17b(summary=summary))
+        reply = update.message.reply_text.call_args[0][0]
+        self.assertLess(reply.index("STAGE-001:DOC-A"), reply.index("STAGE-001:DOC-B"))
 
     def test_status_labels_exact_russian(self):
         th = _fresh_th()
@@ -1185,9 +1260,45 @@ class TestDocsRequiredCmd(unittest.TestCase):
         update, context = self._run("/docsrequired stage_id=STAGE-001", _scope_result17b(summary=summary))
         reply = update.message.reply_text.call_args[0][0]
         self.assertIn("Complete: no", reply)
-        self.assertIn("⚠️ Ошибка настройки требований к документам.", reply)
-        self.assertIn("REL-100", reply)
-        self.assertIn("DOC-999", reply)
+        self.assertIn("⚠️ В настройке требований обнаружены ошибки.", reply)
+        self.assertIn("Количество ошибок: 1", reply)
+        # Phase 16C.4: raw relation ID / dangling entity ID never rendered.
+        self.assertNotIn("REL-100", reply)
+        self.assertNotIn("DOC-999", reply)
+
+
+class TestConfigurationErrorWarningSharedAcrossCommands(unittest.TestCase):
+    """Phase 16C.4: /docsrequired and /missingdocs must render the
+    exact same safe configuration-error warning — one shared
+    implementation, never two."""
+
+    def test_both_commands_call_the_same_helper(self):
+        import inspect
+        th = _fresh_th()
+        docsrequired_source = inspect.getsource(th.docsrequired_cmd)
+        missingdocs_source = inspect.getsource(th.missingdocs_cmd)
+        self.assertIn("_configuration_error_warning_lines(summary)", docsrequired_source)
+        self.assertIn("_configuration_error_warning_lines(summary)", missingdocs_source)
+
+    def test_helper_never_renders_relation_or_entity_identifiers(self):
+        th = _fresh_th()
+        dr = _fresh_dr()
+        summary = _summary17b(
+            items=(),
+            configuration_errors=(("STAGE-001", "REL-999", "Entity ID 'DOC-777' not found."),),
+            has_configuration_errors=True,
+        )
+        lines = th._configuration_error_warning_lines(summary)
+        text = "\n".join(lines)
+        self.assertNotIn("REL-999", text)
+        self.assertNotIn("DOC-777", text)
+        self.assertNotIn("STAGE-001", text)
+        self.assertIn("Количество ошибок: 1", text)
+
+    def test_helper_returns_empty_when_no_configuration_errors(self):
+        th = _fresh_th()
+        summary = _summary17b(items=())
+        self.assertEqual(th._configuration_error_warning_lines(summary), [])
 
 
 class TestSplitMessageByLines(unittest.TestCase):

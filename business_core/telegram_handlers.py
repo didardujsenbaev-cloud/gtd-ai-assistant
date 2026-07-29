@@ -6884,24 +6884,31 @@ def _scope_header_lines(result) -> list:
 
 def _configuration_error_warning_lines(summary) -> list:
     """
-    Phase 18C-4A: rendered only when summary.has_configuration_errors
-    is True (never for any summary produced before this phase, since
-    the field defaults to False) — never a stack trace, only the
-    existing human-readable validation-error strings already produced
-    by business_core.stage_entity_relations.
+    Phase 18C-4A / hardened Phase 16C.4: rendered only when
+    summary.has_configuration_errors is True (never for any summary
+    produced before Phase 18C-4A, since the field defaults to False).
+
+    Phase 16C.4: shows only an aggregate error COUNT — never a
+    per-error breakdown. summary.configuration_errors itself (each a
+    (stage_id, relation_id, reason) tuple) is read only for its length;
+    no Stage ID/Relation ID/Entity ID/Template ID/raw reason text is
+    ever rendered, matching the same no-internal-identifiers contract
+    /docgaps and /docgap already established. Callers needing the
+    underlying detail must consult the sheet/admin tooling directly —
+    this is intentionally a "something is wrong, ask an administrator"
+    signal, not a diagnostic dump.
     """
     if not getattr(summary, "has_configuration_errors", False):
         return []
-    lines = [
-        "⚠️ Ошибка настройки требований к документам.",
-        "Некоторые связи этапа повреждены или дублируются.",
-        "Требуется проверка администратора.",
+    error_count = len(summary.configuration_errors)
+    return [
+        "⚠️ В настройке требований обнаружены ошибки.",
+        "Отчёт может быть неполным.",
         "",
+        f"Количество ошибок: {error_count}",
+        "",
+        "Обратитесь к администратору системы для проверки связей требований.",
     ]
-    for stage_id, relation_id, reason in summary.configuration_errors:
-        lines.append(f"- Stage ID: {stage_id or '—'}, Relation ID: {relation_id or '—'}")
-        lines.append(f"  Причина: {reason}")
-    return lines
 
 
 async def missingdocs_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -7019,17 +7026,20 @@ async def docsrequired_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         lines.append(f"Complete: {'yes' if summary.is_complete else 'no'}")
         lines.append("")
 
-        for item in summary.items:
+        for index, item in enumerate(summary.items, start=1):
             req = item.requirement
-            matched_ids = ", ".join(item.matched_document_ids) if item.matched_document_ids else "—"
-            lines.append(f"- Document Template ID: {req.document_template_id}")
-            lines.append(f"  Name: {_requirement_display_name(req)}")
-            lines.append(f"  Stage ID: {req.stage_id or '—'}")
-            lines.append(f"  Status: {_STATUS_LABELS_RU.get(item.status, item.status)}")
-            lines.append(f"  Matched Document IDs: {matched_ids}")
-            lines.append(f"  Matched count / Minimum count: {item.matched_count}/{req.minimum_count}")
-            lines.append(f"  Required: {'yes' if req.required else 'no'}")
-            lines.append(f"  Blocking: {'yes' if req.blocking else 'no'}")
+            lines.append(f"{index}. {_requirement_display_name(req)}")
+            lines.append(f"   Requirement ID: {req.requirement_id}")
+            lines.append(f"   Document Template ID: {req.document_template_id}")
+            lines.append(f"   Stage ID: {req.stage_id or '—'}")
+            lines.append(f"   Status: {_STATUS_LABELS_RU.get(item.status, item.status)}")
+            lines.append(f"   Matched count / Minimum count: {item.matched_count}/{req.minimum_count}")
+            lines.append(f"   Required: {'yes' if req.required else 'no'}")
+            lines.append(f"   Blocking: {'yes' if req.blocking else 'no'}")
+            lines.append("")
+            lines.append("   Подробнее:")
+            lines.append(f"   /docgap roadmap_id={req.roadmap_id} requirement_id={req.requirement_id}")
+            lines.append("")
 
         if summary.has_configuration_errors:
             lines.append("")
