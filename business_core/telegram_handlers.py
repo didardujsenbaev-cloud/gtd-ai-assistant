@@ -6628,6 +6628,160 @@ async def docgap_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await _reply(update, "❌ Не удалось получить данные по требованию.", parse_mode=None)
 
 
+def _render_document_gap_next(result) -> str:
+    """
+    Pure rendering of a business_core.document_gap_next
+    .DocumentGapNextResult — safe requirement name/status/action text
+    only, never a Document ID/file/document name/raw value.
+    """
+    lines = [
+        "📌 Следующий шаг по требованию",
+        "",
+        f"Roadmap: {result.criteria.roadmap_id}",
+    ]
+    if result.stage_id:
+        lines.append(f"Этап: {result.stage_id}")
+    lines.append(f"Требование: {result.requirement_name}")
+    lines.append(f"Статус: {_COVERAGE_BASE_STATUS_LABELS.get(result.base_status, 'найдено')}")
+    lines.append("")
+
+    primary = result.primary_action
+    secondary = result.secondary_actions
+
+    if secondary:
+        lines.append("Основное действие:")
+        for i, step in enumerate(primary.instruction_lines, start=1):
+            lines.append(f"{i}. {step}")
+        lines.append("")
+        lines.append("Дополнительно:")
+        for action in secondary:
+            for i, step in enumerate(action.instruction_lines, start=1):
+                lines.append(f"{i}. {step}")
+        lines.append("")
+        lines.append("Повторная проверка:")
+        lines.append(f"/docgap roadmap_id={result.criteria.roadmap_id} requirement_id={result.criteria.requirement_id}")
+    else:
+        lines.append("Что сделать:")
+        for i, step in enumerate(primary.instruction_lines, start=1):
+            lines.append(f"{i}. {step}")
+        lines.append("")
+        lines.append("Повторно проверить требование:")
+        lines.append("")
+        lines.append(f"/docgap roadmap_id={result.criteria.roadmap_id} requirement_id={result.criteria.requirement_id}")
+
+    lines.append("")
+    if not result.required:
+        lines.append("Требование является опциональным.")
+    elif result.blocking:
+        lines.append("⚠️ Требование блокирует завершение этапа.")
+    else:
+        lines.append("Требование обязательное, но не помечено как блокирующее.")
+
+    lines.append("")
+    lines.append("Вернуться к списку:")
+    lines.append(f"/missingdocs roadmap_id={result.criteria.roadmap_id}")
+
+    return "\n".join(lines)
+
+
+async def docgapnext_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /docgapnext roadmap_id=RM-003 requirement_id=<ID> [as_of=YYYY-MM-DD]
+
+    Read-only recommended-next-action layer over
+    business_core.document_gap_detail's drill-down — never a second
+    coverage/requirements/effective analysis, never a Document ID/file/
+    document name shown. Generic-fallback-only (Phase 16C.6 v1) — no
+    template-specific instruction text.
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg())
+        return
+
+    raw = " ".join(context.args or [])
+    kv = _parse_kv_args(raw)
+
+    from business_core.document_gap_next import (
+        parse_gap_next_criteria, generate_document_gap_next,
+        ERROR_UNSUPPORTED_BASE_STATUS, ERROR_UNSUPPORTED_QUALITY_FLAG,
+    )
+    from business_core.document_gap_detail import (
+        ERROR_REQUIREMENT_NOT_FOUND, ERROR_AMBIGUOUS_REQUIREMENT_ID,
+    )
+    from business_core.document_coverage import (
+        ERROR_ROADMAP_NOT_FOUND, ERROR_ROADMAP_MISSING_BUSINESS_ID,
+        ERROR_UNKNOWN_ENGINE_STATUS, ERROR_COVERAGE_CONFIGURATION_ERROR, ERROR_COVERAGE_INVARIANT_FAILED,
+    )
+
+    criteria, error = parse_gap_next_criteria(kv)
+    if error:
+        await _reply(
+            update,
+            f"❌ {error}\n\n"
+            "Пример:\n"
+            "/docgapnext roadmap_id=RM-003 requirement_id=STAGE-011:DOC-008",
+            parse_mode=None,
+        )
+        return
+
+    try:
+        from business_core.sheets import SheetsQuotaExceededError, TransientSheetsReadError
+
+        result = generate_document_gap_next(criteria)
+        if not result.ok:
+            if result.error_code == ERROR_ROADMAP_NOT_FOUND:
+                await _reply(update, f"❌ Roadmap {criteria.roadmap_id} не найден.", parse_mode=None)
+            elif result.error_code == ERROR_ROADMAP_MISSING_BUSINESS_ID:
+                await _reply(update, "❌ У roadmap отсутствует Business ID.", parse_mode=None)
+            elif result.error_code == ERROR_REQUIREMENT_NOT_FOUND:
+                await _reply(
+                    update,
+                    "❌ Требование с таким ID не найдено в указанном roadmap.",
+                    parse_mode=None,
+                )
+            elif result.error_code == ERROR_AMBIGUOUS_REQUIREMENT_ID:
+                await _reply(
+                    update,
+                    "❌ Найдено несколько требований с этим ID. Уточнение пока не поддерживается.",
+                    parse_mode=None,
+                )
+            elif result.error_code == ERROR_COVERAGE_CONFIGURATION_ERROR:
+                await _reply(
+                    update,
+                    "⚠️ Не удалось безопасно определить следующий шаг: "
+                    "в настройке требований обнаружена ошибка.",
+                    parse_mode=None,
+                )
+            elif result.error_code in (ERROR_UNKNOWN_ENGINE_STATUS, ERROR_COVERAGE_INVARIANT_FAILED):
+                await _reply(
+                    update,
+                    "⚠️ Не удалось безопасно определить следующий шаг: "
+                    "внутренняя проверка данных не пройдена.",
+                    parse_mode=None,
+                )
+            elif result.error_code in (ERROR_UNSUPPORTED_BASE_STATUS, ERROR_UNSUPPORTED_QUALITY_FLAG):
+                await _reply(
+                    update,
+                    "⚠️ Не удалось безопасно определить следующий шаг: "
+                    "обнаружено неподдерживаемое состояние.",
+                    parse_mode=None,
+                )
+            else:
+                await _reply(update, "❌ Не удалось определить следующий шаг по требованию.", parse_mode=None)
+            return
+
+        text = _render_document_gap_next(result)
+        for part in _split_message_by_lines(text):
+            await update.message.reply_text(part, parse_mode=None)
+    except SheetsQuotaExceededError:
+        await _reply(update, "⚠️ Google Sheets временно перегружен. Повторите запрос немного позже.", parse_mode=None)
+    except TransientSheetsReadError:
+        await _reply(update, "⚠️ Не удалось временно прочитать данные Google Sheets. Попробуйте позже.", parse_mode=None)
+    except Exception as e:
+        log.error(f"docgapnext_cmd error: {e}")
+        await _reply(update, "❌ Не удалось определить следующий шаг по требованию.", parse_mode=None)
+
+
 def _render_confirmation_mutation_result(result: dict, document_id: str, field: str) -> str:
     """Pure rendering of a business_core.document_confirmation mutation
     result dict — never a raw exception/APIError/project_number."""
@@ -14688,6 +14842,9 @@ def register_business_handlers(app: Application) -> None:
 
     # Phase 16C.3: Requirement Coverage Drill-Down
     app.add_handler(CommandHandler("docgap", docgap_cmd))
+
+    # Phase 16C.6: Safe Next Action for Document Gap
+    app.add_handler(CommandHandler("docgapnext", docgapnext_cmd))
 
     # Phase 17B: Telegram Document Requirements Interface
     app.add_handler(CommandHandler("missingdocs", missingdocs_cmd))
