@@ -5452,18 +5452,116 @@ def _is_sensitive_field_key(key: str) -> bool:
     return False
 
 
+# Phase 16B.2.2: Sensitive Extracted Field Value Redaction.
+# Root cause of the residual leak: 16B.2.1 only filtered by KEY name —
+# a safe key (e.g. "representative") whose VALUE embeds a sensitive
+# fragment ("Дуйсенбаев Диара Рымбаевич, ИИН 860714351651") passed
+# through untouched. These patterns are all label+value — a bare run of
+# digits is NEVER redacted on its own (would false-positive on phone
+# numbers, document numbers, cadastral numbers, etc.), per the same
+# "no bare wide token" principle as the key-level denylist. Only email
+# and IBAN are matched by shape alone (both are inherently unambiguous
+# formats with near-zero false-positive risk even without a label).
+_REDACT_MARKER = "[скрыто]"
+_REDACT_MARKER_FULL = "[чувствительные данные скрыты]"
+
+_IIN_BIN_VALUE_RE = re.compile(
+    r"(?P<label>ИИН|IIN|БИН|BIN)(?P<colon>\s*:)?\s*(?P<value>(?:\d[\s\-]*){10,14})",
+    re.IGNORECASE,
+)
+_PASSPORT_VALUE_RE = re.compile(
+    r"(?P<label>паспорт|passport)(?P<colon>\s*:)?\s*(?P<value>[\w№]+(?:\s[\w№]+){0,2})",
+    re.IGNORECASE,
+)
+_BANK_ACCOUNT_VALUE_RE = re.compile(
+    r"(?P<label>банковск(?:ий|ого)\s+сч[её]т|расч[её]тный\s+сч[её]т|bank\s*account)"
+    r"(?P<colon>\s*:)?\s*(?P<value>[\d\s\-]{6,34})",
+    re.IGNORECASE,
+)
+_IBAN_LABELED_VALUE_RE = re.compile(
+    r"(?P<label>IBAN)(?P<colon>\s*:)?\s*(?P<value>[A-Z0-9\s]{10,34})",
+    re.IGNORECASE,
+)
+_BARE_IBAN_RE = re.compile(r"\b[A-Za-z]{2}\d{2}[A-Za-z0-9]{10,30}\b")
+_PHONE_VALUE_RE = re.compile(
+    r"(?P<label>телефон|phone)(?P<colon>\s*:)?\s*(?P<value>[\d\s\-+()]{5,20})",
+    re.IGNORECASE,
+)
+_BARE_EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
+_POWER_OF_ATTORNEY_VALUE_RE = re.compile(
+    r"(?P<label>доверенность|power\s+of\s+attorney)(?P<colon>\s*:)?\s*(?P<value>[\w№/\-]+(?:\s[\w№/\-]+){0,2})",
+    re.IGNORECASE,
+)
+_NOTARY_LICENSE_VALUE_RE = re.compile(
+    r"(?P<label>лицензия\s+нотариуса|notary\s+license)(?P<colon>\s*:)?\s*(?P<value>[\w№/\-]+(?:\s[\w№/\-]+){0,2})",
+    re.IGNORECASE,
+)
+
+
+def _redact_labeled_match(match: "re.Match", min_digits: int = 0) -> str:
+    value = match.group("value")
+    if min_digits and sum(ch.isdigit() for ch in value) < min_digits:
+        return match.group(0)  # not enough digits to be the real thing — leave untouched
+    label = match.group("label")
+    colon = match.group("colon") or ""
+    return f"{label}{colon} {_REDACT_MARKER}"
+
+
+def _redact_bare_shape_match(match: "re.Match", full_text: str) -> str:
+    # If the match consumes the ENTIRE (stripped) value, there is no
+    # separable safe part left — use the "whole value hidden" marker
+    # instead of the inline one, per the approved fallback policy.
+    if match.group(0).strip() == full_text.strip():
+        return _REDACT_MARKER_FULL
+    return _REDACT_MARKER
+
+
+def _redact_sensitive_value_fragments(value: str) -> tuple[str, bool]:
+    """Redacts label+value sensitive fragments inside a single field
+    VALUE (the key itself already passed the key-level filter). Returns
+    (redacted_text, was_redacted). Never mutates the caller's data —
+    operates on a local string copy only."""
+    text = str(value)
+    original = text
+    text = _IIN_BIN_VALUE_RE.sub(lambda m: _redact_labeled_match(m, min_digits=10), text)
+    text = _PASSPORT_VALUE_RE.sub(_redact_labeled_match, text)
+    text = _BANK_ACCOUNT_VALUE_RE.sub(lambda m: _redact_labeled_match(m, min_digits=6), text)
+    text = _IBAN_LABELED_VALUE_RE.sub(_redact_labeled_match, text)
+    text = _BARE_IBAN_RE.sub(lambda m: _redact_bare_shape_match(m, original), text)
+    text = _PHONE_VALUE_RE.sub(lambda m: _redact_labeled_match(m, min_digits=5), text)
+    text = _BARE_EMAIL_RE.sub(lambda m: _redact_bare_shape_match(m, original), text)
+    text = _POWER_OF_ATTORNEY_VALUE_RE.sub(_redact_labeled_match, text)
+    text = _NOTARY_LICENSE_VALUE_RE.sub(_redact_labeled_match, text)
+    return text, text != original
+
+
 def _split_safe_and_sensitive_fields(fields: dict) -> tuple[dict, int]:
     """Splits an extracted_fields dict into (safe_fields, hidden_count).
-    Values are never inspected/redacted here — bounds on value LENGTH
+
+    Two independent layers, per Phase 16B.2.1/16B.2.2:
+      1. Key-level: a sensitive KEY name (ИИН/БИН/паспорт/... in the key
+         itself) removes the whole field — never shown, key or value.
+      2. Value-level: a safe key whose VALUE embeds a labeled sensitive
+         fragment (e.g. "representative": "..., ИИН 860714351651") is
+         still shown, but with that fragment redacted in place.
+
+    hidden_count contract (Phase 16B.2.2 §5): a fully-hidden key counts
+    once; a safe key with at least one redacted value fragment also
+    counts once — never more than once per field, however many
+    fragments were redacted inside its value. Bounds on value LENGTH
     are already applied at write time (business_core.document_intelligence
-    .bounded_extracted_fields), before the value ever reaches Sheets."""
+    .bounded_extracted_fields), before the value ever reaches Sheets —
+    this function never mutates the input dict or its values."""
     safe: dict = {}
     hidden = 0
     for key, value in (fields or {}).items():
         if _is_sensitive_field_key(key):
             hidden += 1
-        else:
-            safe[key] = value
+            continue
+        redacted_value, was_redacted = _redact_sensitive_value_fragments(value)
+        safe[key] = redacted_value
+        if was_redacted:
+            hidden += 1
     return safe, hidden
 
 
