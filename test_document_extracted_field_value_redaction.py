@@ -47,6 +47,16 @@ class _FakeResult:
         defaults.update(kw)
         for k, v in defaults.items():
             setattr(self, k, v)
+        # Phase 16B.4: /docanalysis renders through effective_structured_fields.
+        from business_core.document_intelligence import bool_to_cell
+        from business_core.document_confirmation import build_effective_structured_fields
+        content_row = {
+            "Document Number": self.document_number, "Document Date": self.document_date,
+            "Issued By": self.issued_by, "Valid From": self.valid_from, "Valid Until": self.valid_until,
+            "Has Expiration": bool_to_cell(self.has_expiration), "Direction": self.direction,
+            "Requires Action": bool_to_cell(self.requires_action),
+        }
+        self.effective_structured_fields = build_effective_structured_fields(content_row, {})
 
 
 class TestRedactSensitiveValueFragments(unittest.TestCase):
@@ -306,7 +316,7 @@ class TestRenderDocumentAnalysisValueRedaction(unittest.TestCase):
             fields={"representative": "Иванов Иван, ИИН 123456789012"},
         )
         text = th._render_document_analysis(result)
-        self.assertIn("Дата: 2026-07-22", text)
+        self.assertIn("Дата документа: 2026-07-22", text)
         self.assertIn("Направление: внутренний", text)
 
 

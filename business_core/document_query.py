@@ -21,6 +21,10 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from business_core.document_confirmation import EffectiveStructuredFields
 
 
 @dataclass(frozen=True)
@@ -75,7 +79,23 @@ class DocumentAnalysisResult:
         "review_field_status"}} for each of the 8 canonical fields.
         DISPLAY ONLY — never fed back into DOCUMENT_REGISTRY/Template
         ID/Status/Stage/Completion Gate/relations, and never used to
-        skip/short-circuit exact-duplicate detection.
+        skip/short-circuit exact-duplicate detection. Kept unchanged
+        for backward compatibility — see effective_structured_fields
+        below for the typed Phase 16B.4 replacement Telegram rendering
+        now uses.
+
+    Phase 16B.4 addition (typed, additive — effective_fields above is
+    NOT removed/renamed):
+      effective_structured_fields — business_core.document_confirmation
+        .EffectiveStructuredFields, one EffectiveStructuredField per
+        canonical field with per-field-correct Python types (bool | None
+        for has_expiration/requires_action, str for the rest) and
+        source="human"|"ai"|"none" (rejected fields: confirmed_value=
+        effective_value=None). This is what both /docanalysis and
+        /reviewdoc now render through the one shared formatter — see
+        business_core.telegram_handlers
+        ._render_effective_structured_fields_block(). None for any
+        status other than "completed".
     """
     status: str
     document_id: str = ""
@@ -112,6 +132,7 @@ class DocumentAnalysisResult:
     review_status: str = "unreviewed"
     review_version: int = 0
     effective_fields: dict = field(default_factory=dict)
+    effective_structured_fields: "EffectiveStructuredFields | None" = None
 
 
 def _parse_fields_json(raw: str) -> tuple[dict, bool]:
@@ -206,11 +227,13 @@ def get_document_analysis(document_id: str) -> DocumentAnalysisResult:
     # reanalysis is reflected immediately without any extra write.
     from business_core.document_confirmation import (
         parse_confirmed_fields_json, parse_review_version, compute_effective_fields,
+        build_effective_structured_fields,
     )
     confirmed_fields = parse_confirmed_fields_json(content.get("Confirmed Fields JSON", ""))
     review_status = content.get("Structured Review Status", "") or "unreviewed"
     review_version = parse_review_version(content.get("Structured Review Version", ""))
     effective_fields = compute_effective_fields(content, confirmed_fields)
+    effective_structured_fields = build_effective_structured_fields(content, confirmed_fields)
 
     duplicate_status = content.get("Duplicate Status", "") or ""
     duplicate_of_document_id = content.get("Duplicate Of Document ID", "") or ""
@@ -259,6 +282,7 @@ def get_document_analysis(document_id: str) -> DocumentAnalysisResult:
         review_status=review_status,
         review_version=review_version,
         effective_fields=effective_fields,
+        effective_structured_fields=effective_structured_fields,
     )
 
 

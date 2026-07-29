@@ -761,6 +761,20 @@ class _FakeResult:
         defaults.update(kw)
         for k, v in defaults.items():
             setattr(self, k, v)
+        # Phase 16B.4: /docanalysis now renders through
+        # effective_structured_fields, not the raw fields above —
+        # synthesize it (unreviewed/AI-passthrough) from those same raw
+        # values so these pre-16B.4 tests keep exercising the same
+        # AI-value-display scenarios via the real typed render path.
+        from business_core.document_intelligence import bool_to_cell
+        from business_core.document_confirmation import build_effective_structured_fields
+        content_row = {
+            "Document Number": self.document_number, "Document Date": self.document_date,
+            "Issued By": self.issued_by, "Valid From": self.valid_from, "Valid Until": self.valid_until,
+            "Has Expiration": bool_to_cell(self.has_expiration), "Direction": self.direction,
+            "Requires Action": bool_to_cell(self.requires_action),
+        }
+        self.effective_structured_fields = build_effective_structured_fields(content_row, {})
 
 
 class TestTelegramStructuredFieldsUX(unittest.TestCase):
@@ -775,8 +789,8 @@ class TestTelegramStructuredFieldsUX(unittest.TestCase):
         )
         text = th._render_document_analysis(result)
         self.assertIn("Реквизиты:", text)
-        self.assertIn("Номер: 18/02-10", text)
-        self.assertIn("Дата: 2026-07-22", text)
+        self.assertIn("Номер документа: 18/02-10", text)
+        self.assertIn("Дата документа: 2026-07-22", text)
         self.assertIn("Кем выдан: Нотариус Ким Д.В.", text)
         self.assertIn("Действует с: 2026-01-01", text)
         self.assertIn("Действует до: 2027-01-01", text)
@@ -792,18 +806,19 @@ class TestTelegramStructuredFieldsUX(unittest.TestCase):
         self.assertIn("Есть срок действия: не определено", text)
         self.assertIn("Требует действия: не определено", text)
 
-    def test_empty_string_fields_not_shown(self):
-        """Only direction/booleans always render — empty
-        number/date/issuer/valid_from/valid_until lines are omitted
-        entirely, not shown as '—'."""
+    def test_empty_fields_shown_with_ai_marker(self):
+        """Phase 16B.4: ALL 8 fields are now always shown (unlike the
+        pre-16B.4 skip-if-empty behavior) — an empty/unreviewed field
+        renders as 'не определено' with the 🤖 AI marker, consistent
+        with /reviewdoc."""
         th = _fresh_th()
         result = _FakeResult()
         text = th._render_document_analysis(result)
-        self.assertNotIn("Номер:", text)
-        self.assertNotIn("Дата:", text)
-        self.assertNotIn("Кем выдан:", text)
-        self.assertNotIn("Действует с:", text)
-        self.assertNotIn("Действует до:", text)
+        self.assertIn("Номер документа: не определено 🤖 AI, не проверено", text)
+        self.assertIn("Дата документа: не определено 🤖 AI, не проверено", text)
+        self.assertIn("Кем выдан: не определено 🤖 AI, не проверено", text)
+        self.assertIn("Действует с: не определено 🤖 AI, не проверено", text)
+        self.assertIn("Действует до: не определено 🤖 AI, не проверено", text)
 
     def test_direction_all_values_render(self):
         th = _fresh_th()
@@ -844,15 +859,15 @@ class TestTelegramStructuredFieldsUX(unittest.TestCase):
         self.assertNotIn("result.fields", requisites_section)
 
     def test_document_number_is_always_canonical_never_arbitrary(self):
-        """Document Number shown is result.document_number (canonical
-        structured field) — the requisites block never falls back to an
-        arbitrary extracted_fields number."""
+        """Document Number shown is result.effective_structured_fields
+        (canonical structured field, Phase 16B.4) — the requisites
+        block never falls back to an arbitrary extracted_fields number."""
         import inspect
         th = _fresh_th()
         source = inspect.getsource(th._render_document_analysis)
         requisites_start = source.index("Реквизиты")
         requisites_section = source[requisites_start:requisites_start + 800]
-        self.assertIn("result.document_number", requisites_section)
+        self.assertIn("result.effective_structured_fields", requisites_section)
 
 
 if __name__ == "__main__":

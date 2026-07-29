@@ -42,6 +42,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
 log = logging.getLogger(__name__)
@@ -201,7 +202,11 @@ def compute_effective_fields(content_row: dict, confirmed_fields: dict) -> dict:
             result[field] = {
                 "effective_value": confirmed_value,
                 "source": "confirmed",
-                "conflict": confirmed_value != ai_value,
+                # Phase 16B.4 §3: a conflict only exists when the AI
+                # value is actually known — an empty/never-determined
+                # AI value is not "different" from a human's confirmed
+                # value, it's simply absent.
+                "conflict": bool(ai_value) and confirmed_value != ai_value,
                 "ai_value": ai_value,
                 "review_field_status": STATUS_CONFIRMED,
             }
@@ -222,6 +227,168 @@ def compute_effective_fields(content_row: dict, confirmed_fields: dict) -> dict:
                 "review_field_status": STATUS_UNREVIEWED,
             }
     return result
+
+
+def _typed_value(field: str, raw: str):
+    """Converts a canonical Sheets-string value into its typed Python
+    form for display/consumption: bool | None for the two boolean
+    fields, str (never None) for everything else. The Sheets/cache
+    contract itself only ever stores canonical strings — this is
+    purely a read-side typing convenience, no new storage format."""
+    if field in ("has_expiration", "requires_action"):
+        from business_core.document_intelligence import cell_to_bool
+        return cell_to_bool(raw)
+    return raw or ""
+
+
+@dataclass(frozen=True)
+class EffectiveStructuredField:
+    """
+    Phase 16B.4: one field's full effective-value view — the single
+    typed unit both /docanalysis and /reviewdoc render through the same
+    shared formatter (business_core.telegram_handlers
+    ._render_effective_structured_fields_block()), so there is exactly
+    ONE implementation of the confirmed/rejected/unreviewed/conflict
+    rules, never two.
+
+    effective_value/ai_value/confirmed_value are str for every field
+    except has_expiration/requires_action, where they are bool | None.
+
+    Rejected-field contract (Phase 16B.4 §1): confirmed_value is always
+    None once rejected (a reject decision never carries a value —
+    see business_core.document_confirmation.reject_field()), and
+    effective_value is ALSO None — never the AI value, never "" as if
+    merely unset. A renderer must check review_field_status ==
+    "rejected" FIRST and show "отклонено человеком" rather than trying
+    to render effective_value/source at all for that case.
+    """
+    field_name: str
+    ai_value: object              # str, or bool | None for the 2 boolean fields
+    confirmed_value: object       # same typing; None if never confirmed
+    effective_value: object       # same typing; None if rejected
+    review_field_status: str      # "unreviewed" | "confirmed" | "rejected"
+    source: str                   # "human" | "ai" | "none"
+    conflict: bool
+    confirmed_by: str = ""
+    confirmed_at: str = ""
+    review_version: int = 0
+
+
+@dataclass(frozen=True)
+class EffectiveStructuredFields:
+    """One EffectiveStructuredField per canonical field, in
+    ALLOWED_STRUCTURED_FIELDS order."""
+    document_number: EffectiveStructuredField
+    document_date: EffectiveStructuredField
+    issued_by: EffectiveStructuredField
+    valid_from: EffectiveStructuredField
+    valid_until: EffectiveStructuredField
+    has_expiration: EffectiveStructuredField
+    direction: EffectiveStructuredField
+    requires_action: EffectiveStructuredField
+
+    def __iter__(self):
+        """Iterates in ALLOWED_STRUCTURED_FIELDS canonical order — lets
+        a renderer loop over all 8 without hardcoding attribute names a
+        second time."""
+        for name in ALLOWED_STRUCTURED_FIELDS:
+            yield getattr(self, name)
+
+
+def build_effective_structured_fields(content_row: dict, confirmed_fields: dict) -> EffectiveStructuredFields:
+    """
+    Typed counterpart of compute_effective_fields() — that function is
+    kept unchanged as the internal compatibility layer (existing
+    consumers of the untyped dict, e.g. DocumentAnalysisResult
+    .effective_fields, are never broken); this wraps its output into
+    EffectiveStructuredField with per-field-correct Python types and
+    the source/rejected semantics from Phase 16B.4 §1-2:
+      - confirmed:  source="human"
+      - rejected:   source="none", confirmed_value=None, effective_value=None
+      - unreviewed: source="ai" (even when the AI value itself is empty
+        — "unreviewed" is about REVIEW state, not about whether AI
+        found anything; see Phase 16B.4 §B).
+    """
+    raw = compute_effective_fields(content_row, confirmed_fields)
+    fields = {}
+    for field_name in ALLOWED_STRUCTURED_FIELDS:
+        entry = raw[field_name]
+        review_entry = confirmed_fields.get(field_name)
+        status = entry["review_field_status"]
+        ai_typed = _typed_value(field_name, entry["ai_value"])
+
+        if status == STATUS_CONFIRMED:
+            source = "human"
+            confirmed_typed = _typed_value(
+                field_name, review_entry.get("value", "") if isinstance(review_entry, dict) else "",
+            )
+            effective_typed = confirmed_typed
+        elif status == STATUS_REJECTED:
+            source = "none"
+            confirmed_typed = None
+            effective_typed = None
+        else:
+            source = "ai"
+            confirmed_typed = None
+            effective_typed = ai_typed
+
+        fields[field_name] = EffectiveStructuredField(
+            field_name=field_name,
+            ai_value=ai_typed,
+            confirmed_value=confirmed_typed,
+            effective_value=effective_typed,
+            review_field_status=status,
+            source=source,
+            conflict=bool(entry["conflict"]),
+            confirmed_by=(review_entry.get("confirmed_by", "") if isinstance(review_entry, dict) else ""),
+            confirmed_at=(review_entry.get("confirmed_at", "") if isinstance(review_entry, dict) else ""),
+            review_version=(review_entry.get("version", 0) if isinstance(review_entry, dict) else 0),
+        )
+    return EffectiveStructuredFields(**fields)
+
+
+def get_effective_structured_fields(document_id: str) -> "EffectiveStructuredFields | None":
+    """Convenience read helper — ONE get_document_analysis() call (1
+    document_registry read + 1 document_content read, same as any other
+    caller of that function; 0 DOCUMENT_FIELD_REVIEWS reads). Returns
+    None if the document isn't found or has no completed analysis yet
+    — callers needing the raw status should use get_document_analysis()
+    directly instead."""
+    from business_core.document_query import get_document_analysis
+
+    result = get_document_analysis(document_id)
+    if result.status != "completed":
+        return None
+    return result.effective_structured_fields
+
+
+def get_effective_document_date(document_id: str | None = None, *, fields: "EffectiveStructuredFields | None" = None) -> str:
+    """Pass an already-loaded `fields` (from get_effective_structured_fields()
+    or DocumentAnalysisResult.effective_structured_fields) to read
+    several fields off ONE prior call without triggering a second read
+    per field — passing only `document_id` does its own single read."""
+    if fields is None:
+        fields = get_effective_structured_fields(document_id)
+    if fields is None or fields.document_date.effective_value is None:
+        return ""
+    return fields.document_date.effective_value
+
+
+def get_effective_direction(document_id: str | None = None, *, fields: "EffectiveStructuredFields | None" = None) -> str:
+    if fields is None:
+        fields = get_effective_structured_fields(document_id)
+    if fields is None:
+        return "unknown"
+    value = fields.direction.effective_value
+    return value if value else "unknown"
+
+
+def get_effective_requires_action(document_id: str | None = None, *, fields: "EffectiveStructuredFields | None" = None) -> bool | None:
+    if fields is None:
+        fields = get_effective_structured_fields(document_id)
+    if fields is None:
+        return None
+    return fields.requires_action.effective_value
 
 
 def compute_mutation_id(document_id: str, field: str, decision: str, value: str, expected_version: int) -> str:

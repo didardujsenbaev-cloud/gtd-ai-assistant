@@ -5754,34 +5754,20 @@ def _render_document_analysis(result) -> str:
             if hidden_count:
                 card_lines.append(f"🔒 Скрыто чувствительных полей: {hidden_count}")
 
-    # Phase 16B.2: structured fields ("Реквизиты") — only non-empty
-    # values, except direction/booleans which always render with a
-    # "не определено" fallback. Deliberately does NOT show: raw
-    # extracted_fields, confidence/alias/warning internals, prompt,
-    # hash, or any sensitive-document-number heuristics — Document
-    # Number here is ALWAYS the canonical structured field, never an
-    # arbitrary number pulled from extracted_fields at render time.
-    requisites_lines = []
-    if result.document_number:
-        requisites_lines.append(f"Номер: {result.document_number}")
-    if result.document_date:
-        requisites_lines.append(f"Дата: {result.document_date}")
-    if result.issued_by:
-        requisites_lines.append(f"Кем выдан: {result.issued_by}")
-    if result.valid_from:
-        requisites_lines.append(f"Действует с: {result.valid_from}")
-    if result.valid_until:
-        requisites_lines.append(f"Действует до: {result.valid_until}")
-    requisites_lines.append(
-        f"Есть срок действия: {_render_tristate_bool(result.has_expiration)}"
-    )
-    requisites_lines.append(f"Направление: {_render_direction(result.direction)}")
-    requisites_lines.append(
-        f"Требует действия: {_render_tristate_bool(result.requires_action)}"
-    )
+    # Phase 16B.4: structured fields ("Реквизиты") — rendered through
+    # the ONE shared effective-field formatter also used by /reviewdoc
+    # (_render_effective_structured_fields_block), so confirmed/
+    # rejected/unreviewed/conflict rules are never implemented twice.
+    # Deliberately does NOT show: Confirmed Fields JSON, Review ID,
+    # Mutation ID, raw audit rows, full actor ID, or any
+    # sensitive-document-number heuristics — Document Number here is
+    # ALWAYS the canonical structured field, never an arbitrary number
+    # pulled from extracted_fields at render time.
     card_lines.append("")
     card_lines.append("Реквизиты:")
-    card_lines.extend(requisites_lines)
+    card_lines.extend(_render_effective_structured_fields_block(
+        result.effective_structured_fields, numbered=False,
+    ))
 
     # Phase 16B.1: exact-duplicate detection — informational only. Never
     # shows the full SHA-256 hash, raw AI JSON, or any automatic-relation
@@ -5884,11 +5870,13 @@ _BOOLEAN_FIELDS = ("has_expiration", "requires_action")
 
 
 def _render_effective_field_value(field: str, raw_value: str) -> str:
-    """Renders an effective_fields[field]["effective_value"]/["ai_value"]
-    string (always the raw Sheets representation — "true"/"false"/""
+    """Renders a RAW canonical Sheets-string value ("true"/"false"/""
     for booleans, a canonical direction string, or a plain string/ISO
-    date) using the SAME localized labels as /docanalysis's Реквизиты
-    block, never a second, inconsistent rendering."""
+    date) — used where only the untyped legacy dict is available (e.g.
+    business_core.document_confirmation mutation results' own
+    "confirmed_fields" dict, which is not the typed EffectiveStructuredFields
+    model). For the typed model, use _render_typed_field_value()
+    instead — see _render_effective_structured_fields_block()."""
     from business_core.document_intelligence import cell_to_bool
 
     if field == "direction":
@@ -5896,6 +5884,63 @@ def _render_effective_field_value(field: str, raw_value: str) -> str:
     if field in _BOOLEAN_FIELDS:
         return _render_tristate_bool(cell_to_bool(raw_value))
     return raw_value or "не определено"
+
+
+def _render_typed_field_value(field_name: str, value) -> str:
+    """Renders an EffectiveStructuredField's already-typed
+    effective_value/ai_value (bool | None for the 2 boolean fields, str
+    for everything else — never a raw "true"/"false" string here)."""
+    if field_name == "direction":
+        return _render_direction(value or "unknown")
+    if field_name in _BOOLEAN_FIELDS:
+        return _render_tristate_bool(value)
+    return value if value else "не определено"
+
+
+def _render_effective_structured_fields_block(fields, numbered: bool) -> list:
+    """
+    Phase 16B.4: the ONE shared formatter for the 8 canonical
+    structured fields — used by BOTH /docanalysis ("Реквизиты") and
+    /reviewdoc (numbered list). Confirmed/rejected/unreviewed/conflict
+    rendering rules exist in exactly this one place, never duplicated.
+
+    fields: business_core.document_confirmation.EffectiveStructuredFields,
+    or None (not-yet-completed/not-found document — callers already
+    show an earlier-status message in that case, so this returns []).
+
+    Rules (Phase 16B.4 §B):
+      rejected:            "<label>: отклонено человеком ❌" — the
+                            rejected AI value is NEVER shown as if it
+                            were still in effect.
+      confirmed:            "<label>: <value> ✅ подтверждено", plus a
+                            SEPARATE "⚠️ AI сейчас предлагает: <value>"
+                            line only if field.conflict is True.
+      unreviewed:           "<label>: <value or 'не определено'> 🤖 AI,
+                            не проверено" — shown even when the AI value
+                            itself is empty/unknown (unreviewed is a
+                            review-state marker, not "AI found nothing").
+    """
+    if fields is None:
+        return []
+
+    lines = []
+    for i, field in enumerate(fields, start=1):
+        label = _STRUCTURED_FIELD_LABELS[field.field_name]
+        prefix = f"{i}. " if numbered else ""
+
+        if field.review_field_status == "rejected":
+            lines.append(f"{prefix}{label}: отклонено человеком ❌")
+            continue
+
+        value_text = _render_typed_field_value(field.field_name, field.effective_value)
+        if field.review_field_status == "confirmed":
+            lines.append(f"{prefix}{label}: {value_text} ✅ подтверждено")
+            if field.conflict:
+                ai_text = _render_typed_field_value(field.field_name, field.ai_value)
+                lines.append(f"⚠️ AI сейчас предлагает: {ai_text}")
+        else:
+            lines.append(f"{prefix}{label}: {value_text} 🤖 AI, не проверено")
+    return lines
 
 
 def _render_review_card(result) -> str:
@@ -5915,21 +5960,7 @@ def _render_review_card(result) -> str:
         return f"ℹ️ Проверка реквизитов недоступна: статус анализа '{result.status}'."
 
     lines = ["📄 Проверка реквизитов", "", f"Document ID: {result.document_id}", ""]
-    for i, field in enumerate(_document_confirmation_module().ALLOWED_STRUCTURED_FIELDS, start=1):
-        entry = result.effective_fields.get(field, {})
-        label = _STRUCTURED_FIELD_LABELS[field]
-        value_text = _render_effective_field_value(field, entry.get("effective_value", ""))
-        field_status = entry.get("review_field_status", "unreviewed")
-        if field_status == "confirmed":
-            indicator = "✅ подтверждено"
-            if entry.get("conflict"):
-                new_ai = _render_effective_field_value(field, entry.get("ai_value", ""))
-                indicator += f" (⚠️ новое AI-значение отличается: {new_ai})"
-        elif field_status == "rejected":
-            indicator = "❌ отклонено"
-        else:
-            indicator = "🤖 AI, не проверено"
-        lines.append(f"{i}. {label}: {value_text} {indicator}")
+    lines.extend(_render_effective_structured_fields_block(result.effective_structured_fields, numbered=True))
 
     lines.append("")
     lines.append(f"Статус проверки: {_REVIEW_STATUS_LABELS.get(result.review_status, result.review_status)}")

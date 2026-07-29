@@ -46,6 +46,16 @@ class _FakeResult:
         defaults.update(kw)
         for k, v in defaults.items():
             setattr(self, k, v)
+        # Phase 16B.4: /docanalysis renders through effective_structured_fields.
+        from business_core.document_intelligence import bool_to_cell
+        from business_core.document_confirmation import build_effective_structured_fields
+        content_row = {
+            "Document Number": self.document_number, "Document Date": self.document_date,
+            "Issued By": self.issued_by, "Valid From": self.valid_from, "Valid Until": self.valid_until,
+            "Has Expiration": bool_to_cell(self.has_expiration), "Direction": self.direction,
+            "Requires Action": bool_to_cell(self.requires_action),
+        }
+        self.effective_structured_fields = build_effective_structured_fields(content_row, {})
 
 
 class TestIsSensitiveFieldKey(unittest.TestCase):
@@ -211,7 +221,7 @@ class TestRenderRequisitesUnaffected(unittest.TestCase):
         text = th._render_document_analysis(result)
         self.assertIn("Document ID: DREG-001", text)
         self.assertIn("Реквизиты:", text)
-        self.assertIn("Номер: 18/02-10", text)
+        self.assertIn("Номер документа: 18/02-10", text)
 
     def test_duplicate_block_unchanged(self):
         th = _fresh_th()
@@ -231,7 +241,7 @@ class TestRenderRequisitesUnaffected(unittest.TestCase):
             fields={"owner_iin": "123"},
         )
         text = th._render_document_analysis(result)
-        self.assertIn("Дата: 2026-07-22", text)
+        self.assertIn("Дата документа: 2026-07-22", text)
         self.assertIn("Направление: внутренний", text)
 
 

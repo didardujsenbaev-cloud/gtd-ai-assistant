@@ -40,18 +40,42 @@ def _cmd(cmdline: str):
     return update, context
 
 
-def _fake_result(**kw):
-    from business_core.document_query import DocumentAnalysisResult
-    defaults = dict(status="completed", document_id="DREG-004", review_status="unreviewed",
-                    review_version=0, effective_fields={})
-    defaults.update(kw)
-    return DocumentAnalysisResult(**defaults)
-
-
 def _effective(value, source="ai", conflict=False, review_field_status="unreviewed", ai_value=None):
     return {"effective_value": value, "source": source, "conflict": conflict,
             "ai_value": ai_value if ai_value is not None else value,
             "review_field_status": review_field_status}
+
+
+def _typed_from_legacy_dict(effective_fields: dict):
+    """Converts the old untyped per-field dict shape (as built by
+    _effective() above) into the Phase 16B.4 typed EffectiveStructuredFields
+    — lets these tests keep expressing scenarios in the old dict shape
+    while exercising the real typed rendering path."""
+    from business_core.document_confirmation import EffectiveStructuredField, EffectiveStructuredFields, ALLOWED_STRUCTURED_FIELDS
+
+    kwargs = {}
+    for name in ALLOWED_STRUCTURED_FIELDS:
+        entry = effective_fields.get(name) or _effective("")
+        kwargs[name] = EffectiveStructuredField(
+            field_name=name,
+            ai_value=entry.get("ai_value", ""),
+            confirmed_value=entry.get("effective_value") if entry.get("review_field_status") == "confirmed" else None,
+            effective_value=None if entry.get("review_field_status") == "rejected" else entry.get("effective_value", ""),
+            review_field_status=entry.get("review_field_status", "unreviewed"),
+            source=entry.get("source", "ai"),
+            conflict=entry.get("conflict", False),
+        )
+    return EffectiveStructuredFields(**kwargs)
+
+
+def _fake_result(**kw):
+    from business_core.document_query import DocumentAnalysisResult
+    effective_fields = kw.pop("effective_fields", {})
+    defaults = dict(status="completed", document_id="DREG-004", review_status="unreviewed",
+                    review_version=0, effective_fields=effective_fields,
+                    effective_structured_fields=_typed_from_legacy_dict(effective_fields))
+    defaults.update(kw)
+    return DocumentAnalysisResult(**defaults)
 
 
 class TestReviewdocCmd(unittest.TestCase):
@@ -102,7 +126,7 @@ class TestReviewdocCmd(unittest.TestCase):
              patch("business_core.document_query.get_document_analysis", return_value=result):
             asyncio.run(th.reviewdoc_cmd(update, context))
         text = update.message.reply_text.call_args[0][0]
-        self.assertIn("❌ отклонено", text)
+        self.assertIn("отклонено человеком ❌", text)
 
     def test_conflict_shown(self):
         """Reanalysis conflict is surfaced without any automatic change."""
@@ -120,7 +144,7 @@ class TestReviewdocCmd(unittest.TestCase):
             asyncio.run(th.reviewdoc_cmd(update, context))
         text = update.message.reply_text.call_args[0][0]
         self.assertIn("2026-07-22", text)  # effective (confirmed) value shown
-        self.assertIn("новое AI-значение отличается: 2026-07-23", text)
+        self.assertIn("AI сейчас предлагает: 2026-07-23", text)
 
     def test_missing_document_id(self):
         update, context = _cmd("/reviewdoc")
