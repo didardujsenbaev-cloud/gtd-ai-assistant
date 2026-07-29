@@ -136,16 +136,37 @@ class EffectiveDocumentRecord:
     cache_warning: bool
 
 
-def load_effective_document_records(business_id: str) -> tuple:
+def load_effective_document_records(
+    business_id: str, *, registry_rows=None, content_rows=None,
+) -> tuple:
     """
     Read-only. Exactly 2 Sheets reads total (document_registry,
-    document_content), regardless of how many rows exist — never
-    DOCUMENT_FIELD_REVIEWS, never a per-document read.
+    document_content) by default, regardless of how many rows exist —
+    never DOCUMENT_FIELD_REVIEWS, never a per-document read.
+
+    Phase 16C.1B2: `registry_rows`/`content_rows` (each an optional
+    Sequence[dict], e.g. list or tuple — never a raw Sheets/gspread
+    worksheet object) let a caller that already holds these rows (e.g.
+    a future coverage report sharing a
+    business_core.document_requirements.RequirementsReadContext's own
+    cached `sheet_rows["document_registry"]`) skip the corresponding
+    Sheets read entirely. The check is always `is None`, never
+    truthiness — `registry_rows=[]`/`()` is a deliberate, explicit
+    "here is an empty snapshot", never a signal to fall back to a live
+    read. Every existing caller (/finddocs, /docreport,
+    search_documents(), generate_document_report()) passes neither
+    argument, so their call budget and results are byte-for-byte
+    unchanged. Provided rows are only ever iterated/read here — never
+    mutated, sorted in place, cleared, appended to, cached globally, or
+    retained past this call. Malformed/duplicate rows inside a provided
+    sequence go through the exact same warning/dedup logic as rows this
+    function would have read itself — no second parsing path.
 
     Returns (list[EffectiveDocumentRecord], list[str] warnings). Never
-    raises SheetsQuotaExceededError/TransientSheetsReadError itself —
-    those propagate from read_business_sheet() exactly like every other
-    read in this codebase; callers catch them the same way /docanalysis,
+    raises SheetsQuotaExceededError/TransientSheetsReadError itself
+    (only reachable when this function performs its own read) — those
+    propagate from read_business_sheet() exactly like every other read
+    in this codebase; callers catch them the same way /docanalysis,
     /reviewdoc and /finddocs already do.
 
     Business boundary applied at the registry level, first — a document
@@ -154,15 +175,18 @@ def load_effective_document_records(business_id: str) -> tuple:
     content): first occurrence wins deterministically, flagged via a
     warning, never a crash and never two records for one ID.
     """
-    from business_core.sheets import read_business_sheet
     from business_core.document_confirmation import (
         parse_confirmed_fields_json, parse_review_version, build_effective_structured_fields,
     )
 
     warnings: list = []
 
-    registry_rows = read_business_sheet("document_registry")
-    content_rows = read_business_sheet("document_content")
+    if registry_rows is None:
+        from business_core.sheets import read_business_sheet
+        registry_rows = read_business_sheet("document_registry")
+    if content_rows is None:
+        from business_core.sheets import read_business_sheet
+        content_rows = read_business_sheet("document_content")
 
     registry_by_id: dict = {}
     for row in registry_rows:
