@@ -1,0 +1,10 @@
+# Railway CLI upload exclusions.
+# railway up also respects .gitignore by default.
+# Keep this file minimal and additive.
+
+# Internal governance document: local-only, deliberately untracked.
+SYSTEM_CONSTITUTION.md
+
+# Git metadata is not required by the production build/runtime.
+.git
+.git/**
