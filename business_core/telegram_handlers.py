@@ -6150,6 +6150,122 @@ async def finddocs_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await _reply(update, "❌ Не удалось выполнить поиск документов.", parse_mode=None)
 
 
+def _render_document_report_result(result) -> str:
+    """
+    Pure rendering of a business_core.document_report.DocumentReportResult.
+    Aggregates ONLY — never a Document ID, name, actor, raw value, or
+    warnings payload (a non-empty warnings count is shown, never its
+    content).
+    """
+    s = result.summary
+    lines = [
+        "📊 Отчёт по документам",
+        f"Бизнес: {result.criteria.business_id}",
+        f"На дату: {result.criteria.as_of} (UTC)",
+        "",
+        f"Всего документов: {s.total_documents}",
+        "",
+        "Проверка:",
+        f"• Не проверено: {s.review_unreviewed_count}",
+        f"• Частично подтверждено: {s.review_partially_confirmed_count}",
+        f"• Полностью подтверждено: {s.review_confirmed_count}",
+        f"• Есть отклонённые поля: {s.review_rejected_count}",
+        "",
+        "Качество данных:",
+        f"• Конфликты AI/подтверждение: {s.conflict_true_count}",
+        f"• Конфликт неизвестен: {s.conflict_unknown_count}",
+        f"• Требуют проверки cache: {s.cache_warning_count}",
+        "",
+        "Требуют действия:",
+        f"• Да: {s.requires_action_true_count}",
+        f"• Нет: {s.requires_action_false_count}",
+        f"• Не определено: {s.requires_action_unknown_count}",
+        "",
+        "Срок действия:",
+        f"• Есть: {s.has_expiration_true_count}",
+        f"• Нет: {s.has_expiration_false_count}",
+        f"• Не определено: {s.has_expiration_unknown_count}",
+        f"• Дата Valid Until присутствует: {s.valid_until_present_count}",
+        "",
+        "Истечение:",
+        f"• Уже истекли: {s.expired_count}",
+        f"• В течение 7 дней: {s.expires_7d_count}",
+        f"• В течение 30 дней: {s.expires_30d_count}",
+        f"• Позже: {s.expires_later_count}",
+        f"• Дата не определена: {s.no_valid_until_count}",
+        "",
+        "Дубликаты:",
+        f"• Точные дубликаты: {s.exact_duplicate_count}",
+        f"• Новые/canonical: {s.new_document_count}",
+        f"• Статус не определён: {s.unknown_duplicate_status_count}",
+    ]
+    if result.warnings:
+        lines.append("")
+        lines.append(f"⚠️ Предупреждения при подготовке отчёта: {len(result.warnings)}")
+    return "\n".join(lines)
+
+
+async def docreport_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /docreport business_id=BIZ-001 [as_of=YYYY-MM-DD] [include_duplicates=true|false]
+
+    Read-only, business-scoped AGGREGATE report over EFFECTIVE structured
+    fields — never a per-document list (see /finddocs for that). Output
+    is aggregates only: no Document ID, name, actor, or raw value.
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg())
+        return
+
+    raw = " ".join(context.args or [])
+    kv = _parse_kv_args(raw)
+
+    from business_core.document_report import (
+        parse_report_criteria, generate_document_report,
+        ERROR_BUSINESS_NOT_FOUND, ERROR_REPORT_INVARIANT_FAILED,
+    )
+
+    criteria, error = parse_report_criteria(kv)
+    if error:
+        await _reply(
+            update,
+            f"❌ {error}\n\n"
+            "Пример:\n"
+            "/docreport business_id=BIZ-001 as_of=2026-07-29 include_duplicates=false",
+            parse_mode=None,
+        )
+        return
+
+    try:
+        from business_core.sheets import SheetsQuotaExceededError, TransientSheetsReadError
+
+        result = generate_document_report(criteria)
+        if not result.ok:
+            if result.error_code == ERROR_BUSINESS_NOT_FOUND:
+                await _reply(update, f"❌ Бизнес {criteria.business_id} не найден.", parse_mode=None)
+            elif result.error_code == ERROR_REPORT_INVARIANT_FAILED:
+                await _reply(
+                    update,
+                    "❌ Не удалось безопасно сформировать отчёт: "
+                    "внутренняя проверка итогов не пройдена.",
+                    parse_mode=None,
+                )
+            else:
+                await _reply(update, "❌ Не удалось сформировать отчёт по документам.", parse_mode=None)
+            return
+
+        text = _render_document_report_result(result)
+        for part in _split_message_by_lines(text):
+            await update.message.reply_text(part, parse_mode=None)
+    except SheetsQuotaExceededError:
+        await _reply(update, "⚠️ Google Sheets временно перегружен. Повторите запрос немного позже.", parse_mode=None)
+    except TransientSheetsReadError:
+        await _reply(update, "⚠️ Не удалось временно прочитать данные Google Sheets. Попробуйте позже.", parse_mode=None)
+    except Exception as e:
+        log.error(f"docreport_cmd error: {e}")
+        await _reply(update, "❌ Не удалось сформировать отчёт по документам.", parse_mode=None)
+
+
 def _render_confirmation_mutation_result(result: dict, document_id: str, field: str) -> str:
     """Pure rendering of a business_core.document_confirmation mutation
     result dict — never a raw exception/APIError/project_number."""
@@ -14186,6 +14302,9 @@ def register_business_handlers(app: Application) -> None:
 
     # Phase 16B.5: Search and Reports by Effective Document Fields
     app.add_handler(CommandHandler("finddocs", finddocs_cmd))
+
+    # Phase 16B.6: Business Document Report by Effective Fields
+    app.add_handler(CommandHandler("docreport", docreport_cmd))
 
     # Phase 17B: Telegram Document Requirements Interface
     app.add_handler(CommandHandler("missingdocs", missingdocs_cmd))

@@ -103,6 +103,151 @@ class DocumentSearchResult:
     warnings: tuple = ()
 
 
+@dataclass(frozen=True)
+class EffectiveDocumentRecord:
+    """
+    Phase 16B.6: one document's full effective-state view — the single
+    shared unit both search_documents() (business_core.document_search)
+    and business_core.document_report's aggregation consume, built by
+    ONE loader (load_effective_document_records()) so the malformed-
+    JSON/cache_warning/has_conflict/effective-field-construction
+    contract exists exactly once, never duplicated across modules.
+
+    effective_fields is None only when build_effective_structured_fields()
+    itself raised — cache_warning is always True in that case too, and
+    callers must treat every effective-value read as unavailable (never
+    guess/fall back to a raw AI value).
+
+    has_conflict: bool | None — None means the review cache for this
+    document is malformed/inconsistent (cache_warning is also True in
+    that case) — NEVER coerced to False.
+    """
+    document_id: str
+    business_id: str
+    document_name: str
+    file_name: str
+    created_at: str
+    duplicate_status: str
+    duplicate_of_document_id: str
+    review_status: str
+    review_version: int
+    effective_fields: object  # EffectiveStructuredFields | None
+    has_conflict: bool | None
+    cache_warning: bool
+
+
+def load_effective_document_records(business_id: str) -> tuple:
+    """
+    Read-only. Exactly 2 Sheets reads total (document_registry,
+    document_content), regardless of how many rows exist — never
+    DOCUMENT_FIELD_REVIEWS, never a per-document read.
+
+    Returns (list[EffectiveDocumentRecord], list[str] warnings). Never
+    raises SheetsQuotaExceededError/TransientSheetsReadError itself —
+    those propagate from read_business_sheet() exactly like every other
+    read in this codebase; callers catch them the same way /docanalysis,
+    /reviewdoc and /finddocs already do.
+
+    Business boundary applied at the registry level, first — a document
+    belonging to another Business ID never even enters the candidate
+    set. Duplicate Document ID within one business (registry or
+    content): first occurrence wins deterministically, flagged via a
+    warning, never a crash and never two records for one ID.
+    """
+    from business_core.sheets import read_business_sheet
+    from business_core.document_confirmation import (
+        parse_confirmed_fields_json, parse_review_version, build_effective_structured_fields,
+    )
+
+    warnings: list = []
+
+    registry_rows = read_business_sheet("document_registry")
+    content_rows = read_business_sheet("document_content")
+
+    registry_by_id: dict = {}
+    for row in registry_rows:
+        doc_id = row.get("Document ID", "")
+        if not doc_id or row.get("Business ID", "") != business_id:
+            continue
+        if doc_id in registry_by_id:
+            warnings.append(f"DUPLICATE_DOCUMENT_ID_REGISTRY:{doc_id}")
+            continue
+        registry_by_id[doc_id] = row
+
+    content_by_id: dict = {}
+    for row in content_rows:
+        doc_id = row.get("Document ID", "")
+        if not doc_id:
+            continue
+        if doc_id in content_by_id:
+            warnings.append(f"DUPLICATE_DOCUMENT_ID_CONTENT:{doc_id}")
+            continue
+        content_by_id[doc_id] = row
+
+    records: list = []
+    for doc_id, reg_row in registry_by_id.items():
+        content_row = content_by_id.get(doc_id)
+        if content_row is None:
+            continue  # never analyzed -> no structured fields to search/report on
+
+        cache_warning = False
+
+        # parse_confirmed_fields_json() itself never raises — it safely
+        # falls back to {} for malformed JSON, which would be
+        # indistinguishable from a genuinely empty "{}"/unreviewed
+        # document. Detect malformed-but-non-empty JSON explicitly here
+        # so it becomes a visible cache_warning, never silently treated
+        # as "nothing to review".
+        raw_confirmed_json = (content_row.get("Confirmed Fields JSON", "") or "").strip()
+        if raw_confirmed_json:
+            try:
+                _parsed_check = json.loads(raw_confirmed_json)
+                if not isinstance(_parsed_check, dict):
+                    cache_warning = True
+            except (ValueError, TypeError):
+                cache_warning = True
+
+        confirmed_fields = parse_confirmed_fields_json(content_row.get("Confirmed Fields JSON", ""))
+
+        review_status = content_row.get("Structured Review Status", "") or "unreviewed"
+        if review_status not in _REVIEW_STATUS_VALUES:
+            review_status = "unreviewed"
+            cache_warning = True
+
+        review_version = parse_review_version(content_row.get("Structured Review Version", ""))
+
+        try:
+            effective = build_effective_structured_fields(content_row, confirmed_fields)
+        except Exception:
+            effective = None
+            cache_warning = True
+
+        if effective is None:
+            has_conflict = None
+        else:
+            has_conflict = any(f.conflict for f in effective)
+
+        if cache_warning:
+            has_conflict = None  # never coerced to False — Phase 16B.5 §A
+
+        records.append(EffectiveDocumentRecord(
+            document_id=doc_id,
+            business_id=reg_row.get("Business ID", ""),
+            document_name=_sanitize_document_name(reg_row.get("Document Name", "")),
+            file_name=reg_row.get("File Name", ""),
+            created_at=reg_row.get("Created At", ""),
+            duplicate_status=content_row.get("Duplicate Status", "") or "",
+            duplicate_of_document_id=content_row.get("Duplicate Of Document ID", "") or "",
+            review_status=review_status,
+            review_version=review_version,
+            effective_fields=effective,
+            has_conflict=has_conflict,
+            cache_warning=cache_warning,
+        ))
+
+    return records, warnings
+
+
 def _parse_bool_param(name: str, raw: str) -> tuple:
     v = (raw or "").strip().lower()
     if v == "true":
@@ -257,91 +402,27 @@ def search_documents(criteria: DocumentSearchCriteria) -> DocumentSearchResult:
     """
     Read-only. Exactly 2 Sheets reads total (document_registry,
     document_content), regardless of how many rows exist or match —
-    never DOCUMENT_FIELD_REVIEWS, never a per-document read.
+    never DOCUMENT_FIELD_REVIEWS, never a per-document read. Delegates
+    the bulk read/join/effective-state construction to
+    load_effective_document_records() (Phase 16B.6) — the same loader
+    business_core.document_report uses, so there is exactly one
+    implementation of that contract.
 
     Raises SheetsQuotaExceededError/TransientSheetsReadError exactly
     like any other read in this codebase — callers (Telegram handlers)
     catch these the same way /docanalysis and /reviewdoc already do.
     """
-    from business_core.sheets import read_business_sheet
-    from business_core.document_confirmation import (
-        parse_confirmed_fields_json, parse_review_version, build_effective_structured_fields,
-    )
-
-    warnings: list = []
-
-    registry_rows = read_business_sheet("document_registry")
-    content_rows = read_business_sheet("document_content")
-
-    # Business boundary applied at the registry level, first — a
-    # document belonging to another Business ID never even enters the
-    # candidate set. Duplicate Document ID within one business: first
-    # occurrence wins deterministically, flagged via a warning, never a
-    # crash and never two rows shown for one ID.
-    registry_by_id: dict = {}
-    for row in registry_rows:
-        doc_id = row.get("Document ID", "")
-        if not doc_id or row.get("Business ID", "") != criteria.business_id:
-            continue
-        if doc_id in registry_by_id:
-            warnings.append(f"DUPLICATE_DOCUMENT_ID_REGISTRY:{doc_id}")
-            continue
-        registry_by_id[doc_id] = row
-
-    content_by_id: dict = {}
-    for row in content_rows:
-        doc_id = row.get("Document ID", "")
-        if not doc_id:
-            continue
-        if doc_id in content_by_id:
-            warnings.append(f"DUPLICATE_DOCUMENT_ID_CONTENT:{doc_id}")
-            continue
-        content_by_id[doc_id] = row
+    records, warnings = load_effective_document_records(criteria.business_id)
+    warnings = list(warnings)
 
     entries: list = []
-    for doc_id, reg_row in registry_by_id.items():
-        content_row = content_by_id.get(doc_id)
-        if content_row is None:
-            continue  # never analyzed -> no structured fields to search/filter by
-
-        cache_warning = False
-
-        # parse_confirmed_fields_json() itself never raises — it safely
-        # falls back to {} for malformed JSON, which would be
-        # indistinguishable from a genuinely empty "{}"/unreviewed
-        # document. Detect malformed-but-non-empty JSON explicitly here
-        # so it becomes a visible cache_warning, never silently treated
-        # as "nothing to review".
-        raw_confirmed_json = (content_row.get("Confirmed Fields JSON", "") or "").strip()
-        if raw_confirmed_json:
-            try:
-                _parsed_check = json.loads(raw_confirmed_json)
-                if not isinstance(_parsed_check, dict):
-                    cache_warning = True
-            except (ValueError, TypeError):
-                cache_warning = True
-
-        confirmed_fields = parse_confirmed_fields_json(content_row.get("Confirmed Fields JSON", ""))
-
-        review_status = content_row.get("Structured Review Status", "") or "unreviewed"
-        if review_status not in _REVIEW_STATUS_VALUES:
-            review_status = "unreviewed"
-            cache_warning = True
-
-        review_version = parse_review_version(content_row.get("Structured Review Version", ""))
-
-        try:
-            effective = build_effective_structured_fields(content_row, confirmed_fields)
-        except Exception:
-            effective = None
-            cache_warning = True
-
+    for record in records:
+        effective = record.effective_fields
         if effective is None:
             eff_date, eff_date_source = "", "none"
             eff_direction, eff_direction_source = "", "none"
             eff_requires_action = None
             eff_has_expiration = None
-            has_conflict = None
         else:
             eff_date = effective.document_date.effective_value or ""
             eff_date_source = effective.document_date.source
@@ -349,10 +430,8 @@ def search_documents(criteria: DocumentSearchCriteria) -> DocumentSearchResult:
             eff_direction_source = effective.direction.source
             eff_requires_action = effective.requires_action.effective_value
             eff_has_expiration = effective.has_expiration.effective_value
-            has_conflict = any(f.conflict for f in effective)
 
-        if cache_warning:
-            has_conflict = None  # never coerced to False — Phase 16B.5 §A
+        has_conflict = record.has_conflict
 
         # ── Filters (Phase 16B.5 §D) ──
         if criteria.document_date_from or criteria.document_date_to:
@@ -372,31 +451,31 @@ def search_documents(criteria: DocumentSearchCriteria) -> DocumentSearchResult:
         if criteria.has_expiration is not None and eff_has_expiration is not criteria.has_expiration:
             continue
 
-        if criteria.review_status is not None and review_status != criteria.review_status:
+        if criteria.review_status is not None and record.review_status != criteria.review_status:
             continue
 
         if criteria.conflict is not None and has_conflict is not criteria.conflict:
             continue
 
         item = DocumentSearchItem(
-            document_id=doc_id,
-            document_name=_sanitize_document_name(reg_row.get("Document Name", "")),
-            file_name=reg_row.get("File Name", ""),
-            business_id=reg_row.get("Business ID", ""),
+            document_id=record.document_id,
+            document_name=record.document_name,
+            file_name=record.file_name,
+            business_id=record.business_id,
             effective_document_date=eff_date,
             document_date_source=eff_date_source,
             effective_direction=eff_direction,
             direction_source=eff_direction_source,
             effective_requires_action=eff_requires_action,
             effective_has_expiration=eff_has_expiration,
-            review_status=review_status,
-            review_version=review_version,
+            review_status=record.review_status,
+            review_version=record.review_version,
             has_conflict=has_conflict,
-            duplicate_status=content_row.get("Duplicate Status", "") or "",
-            duplicate_of_document_id=content_row.get("Duplicate Of Document ID", "") or "",
-            cache_warning=cache_warning,
+            duplicate_status=record.duplicate_status,
+            duplicate_of_document_id=record.duplicate_of_document_id,
+            cache_warning=record.cache_warning,
         )
-        entries.append((item, reg_row.get("Created At", "")))
+        entries.append((item, record.created_at))
 
     entries = _sort_entries(entries, criteria.sort)
     total_matches = len(entries)
