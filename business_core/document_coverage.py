@@ -117,6 +117,22 @@ class DocumentCoverageItem:
     unmatched_document_count: int
     quality_flags: tuple = ()
     warning_count: int = 0
+    # Phase 16C.3: additive per-category counters, surfaced from the
+    # exact same _quality_for_item() computation that already derives
+    # quality_flags — never a second analysis pass. Each canonical
+    # document falls into exactly one review bucket (fully_confirmed_
+    # count vs needs_review_count) and exactly one expiry bucket
+    # (valid/expired/unknown/invalid_expiry_count), so
+    # valid_expiry_count + expired_document_count + unknown_expiry_count
+    # + invalid_expiry_count == canonical_document_count always holds.
+    fully_confirmed_count: int = 0
+    needs_review_count: int = 0
+    conflict_document_count: int = 0
+    cache_warning_document_count: int = 0
+    valid_expiry_count: int = 0
+    expired_document_count: int = 0
+    unknown_expiry_count: int = 0
+    invalid_expiry_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -254,6 +270,16 @@ def _quality_for_item(matched_document_ids: tuple, effective_by_id: dict, minimu
     unknown_expiry_count = 0
     invalid_expiry_count = 0
 
+    # Phase 16C.3: per-document counters for /docgap's drill-down —
+    # each contributes to at most one of fully_confirmed/needs_review,
+    # and cache_warning_document_count counts a document ONCE even if
+    # multiple of its own signals (cache_warning flag, has_conflict is
+    # None, unknown review status) would independently qualify it.
+    fully_confirmed_count = 0
+    needs_review_count = 0
+    conflict_document_count = 0
+    cache_warning_document_count = 0
+
     for doc_id in matched_document_ids:
         rec = effective_by_id.get(doc_id)
         if rec is None:
@@ -266,28 +292,44 @@ def _quality_for_item(matched_document_ids: tuple, effective_by_id: dict, minimu
             cache_warning = True
             continue
 
-        if rec.cache_warning or rec.has_conflict is None:
+        doc_cache_warning = rec.cache_warning or rec.has_conflict is None
+        if doc_cache_warning:
             cache_warning = True
 
         if rec.duplicate_status == _EXACT_DUPLICATE:
             exact_duplicate_matched_count += 1
+            if doc_cache_warning:
+                cache_warning_document_count += 1
             continue  # exact duplicates are never canonical evidence
 
         canonical_count += 1
 
         if rec.has_conflict is True:
             conflict = True
+            conflict_document_count += 1
 
         review_status = rec.review_status
+        doc_needs_review = False
         if review_status in _REVIEW_STATUS_NEEDS_REVIEW_VALUES:
             needs_review = True
+            doc_needs_review = True
         elif review_status not in _KNOWN_REVIEW_STATUSES:
             # Phase 16C.2 §6: an unrecognized status is never silently
             # treated as confirmed — flag both needs_review and a safe
             # cache warning.
             needs_review = True
+            doc_needs_review = True
             cache_warning = True
+            doc_cache_warning = True
         # else: "confirmed" -> no needs_review contribution from this document
+
+        if doc_needs_review:
+            needs_review_count += 1
+        else:
+            fully_confirmed_count += 1
+
+        if doc_cache_warning:
+            cache_warning_document_count += 1
 
         raw_valid_until = None
         if rec.effective_fields is not None:
@@ -326,6 +368,14 @@ def _quality_for_item(matched_document_ids: tuple, effective_by_id: dict, minimu
         "unmatched_document_count": unmatched_document_count,
         "quality_flags": tuple(flags),
         "warning_count": unmatched_document_count,
+        "fully_confirmed_count": fully_confirmed_count,
+        "needs_review_count": needs_review_count,
+        "conflict_document_count": conflict_document_count,
+        "cache_warning_document_count": cache_warning_document_count,
+        "valid_expiry_count": valid_count,
+        "expired_document_count": expired_count,
+        "unknown_expiry_count": unknown_expiry_count,
+        "invalid_expiry_count": invalid_expiry_count,
     }
 
 
@@ -459,6 +509,14 @@ def generate_document_coverage(criteria: DocumentCoverageCriteria) -> DocumentCo
             unmatched_document_count=quality["unmatched_document_count"],
             quality_flags=quality["quality_flags"],
             warning_count=quality["warning_count"],
+            fully_confirmed_count=quality["fully_confirmed_count"],
+            needs_review_count=quality["needs_review_count"],
+            conflict_document_count=quality["conflict_document_count"],
+            cache_warning_document_count=quality["cache_warning_document_count"],
+            valid_expiry_count=quality["valid_expiry_count"],
+            expired_document_count=quality["expired_document_count"],
+            unknown_expiry_count=quality["unknown_expiry_count"],
+            invalid_expiry_count=quality["invalid_expiry_count"],
         ))
 
     total_requirements = len(items)

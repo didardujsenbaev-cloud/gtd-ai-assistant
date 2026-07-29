@@ -6449,6 +6449,185 @@ async def docgaps_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await _reply(update, "❌ Не удалось сформировать отчёт покрытия документов.", parse_mode=None)
 
 
+_GAP_QUALITY_EXPLANATIONS = {
+    "needs_review": "Structured data не подтверждены полностью.",
+    "conflict": "Есть конфликт между AI и подтверждёнными значениями.",
+    "duplicate_only": (
+        "Для покрытия недостаточно canonical документов: "
+        "часть найденных файлов является точными дубликатами."
+    ),
+    "expired": "Недостаточно документов с актуальным сроком действия.",
+    "cache_warning": "Часть quality-данных требует дополнительной проверки.",
+    "invalid_expiry": "Есть некорректная дата срока действия.",
+}
+
+
+def _render_document_gap_detail(result) -> str:
+    """
+    Pure rendering of a business_core.document_gap_detail
+    .DocumentGapDetailResult — aggregate counts and safe labels only,
+    never a Document ID/name/actor/raw value.
+    """
+    d = result.detail
+    lines = [
+        "🔍 Требование к документу",
+        "",
+        f"Roadmap: {result.criteria.roadmap_id}",
+    ]
+    if d.stage_id:
+        lines.append(f"Этап: {d.stage_id}")
+    lines.append(f"Требование: {d.requirement_name}")
+    lines.append("")
+
+    if d.base_status == "missing":
+        lines.append("Основной статус: отсутствует")
+        lines.append(f"Требуется документов: {d.minimum_count}")
+        lines.append(f"Найдено системой: {d.matched_document_count}")
+        lines.append("")
+        lines.append("Причина:")
+        lines.append("• Подходящие документы не найдены.")
+    elif d.base_status == "partial":
+        lines.append("Основной статус: частично")
+        lines.append(f"Требуется документов: {d.minimum_count}")
+        lines.append(f"Найдено системой: {d.matched_document_count}")
+        lines.append("")
+        lines.append("Причина:")
+        lines.append(f"• Найдено {d.matched_document_count} из {d.minimum_count} необходимых документов.")
+    elif d.base_status == "optional_missing":
+        lines.append("Основной статус: не найден (опционально)")
+        lines.append(f"Найдено системой: {d.matched_document_count}")
+    else:
+        lines.append("Основной статус: найдено")
+        lines.append(f"Требуется документов: {d.minimum_count}")
+        lines.append(f"Найдено системой: {d.matched_document_count}")
+        lines.append(f"Canonical документов: {d.canonical_document_count}")
+        if d.exact_duplicate_matched_count:
+            lines.append(f"• Точных дубликатов: {d.exact_duplicate_matched_count}")
+        if d.unmatched_document_count:
+            lines.append(f"• Не сопоставлено с quality layer: {d.unmatched_document_count}")
+
+    if d.base_status in ("present", "partial") and d.canonical_document_count:
+        lines.append("")
+        lines.append("Качество:")
+        lines.append(f"• Полностью подтверждено: {d.fully_confirmed_count}")
+        lines.append(f"• Требует проверки: {d.needs_review_count}")
+        lines.append(f"• Конфликты: {d.conflict_document_count}")
+        lines.append(f"• Предупреждения cache: {d.cache_warning_document_count}")
+        lines.append("")
+        lines.append("Срок действия:")
+        lines.append(f"• С подтверждённым актуальным сроком: {d.valid_expiry_count}")
+        lines.append(f"• Истёкшие: {d.expired_document_count}")
+        lines.append(f"• Без даты срока: {d.unknown_expiry_count}")
+        lines.append(f"• Некорректная дата: {d.invalid_expiry_count}")
+
+    for flag in d.quality_flags:
+        explanation = _GAP_QUALITY_EXPLANATIONS.get(flag)
+        if explanation:
+            lines.append("")
+            lines.append(f"⚠️ {explanation}")
+
+    lines.append("")
+    if not d.required:
+        lines.append("Требование является опциональным.")
+    elif d.blocking:
+        lines.append("Это требование блокирует завершение этапа.")
+    else:
+        lines.append("Требование обязательное, но не помечено как блокирующее.")
+
+    lines.append("")
+    lines.append("Вернуться к сводке:")
+    lines.append(f"/docgaps roadmap_id={result.criteria.roadmap_id}")
+
+    return "\n".join(lines)
+
+
+async def docgap_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /docgap roadmap_id=RM-003 requirement_id=<ID> [as_of=YYYY-MM-DD]
+
+    Read-only drill-down into ONE requirement from
+    business_core.document_coverage's coverage report — never a second
+    requirements/effective engine, never a Document ID/name/actor/raw
+    value shown.
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg())
+        return
+
+    raw = " ".join(context.args or [])
+    kv = _parse_kv_args(raw)
+
+    from business_core.document_gap_detail import (
+        parse_gap_detail_criteria, generate_document_gap_detail,
+        ERROR_REQUIREMENT_NOT_FOUND, ERROR_AMBIGUOUS_REQUIREMENT_ID,
+    )
+    from business_core.document_coverage import (
+        ERROR_ROADMAP_NOT_FOUND, ERROR_ROADMAP_MISSING_BUSINESS_ID,
+        ERROR_UNKNOWN_ENGINE_STATUS, ERROR_COVERAGE_CONFIGURATION_ERROR, ERROR_COVERAGE_INVARIANT_FAILED,
+    )
+
+    criteria, error = parse_gap_detail_criteria(kv)
+    if error:
+        await _reply(
+            update,
+            f"❌ {error}\n\n"
+            "Пример:\n"
+            "/docgap roadmap_id=RM-003 requirement_id=STAGE-014:DTPL-001",
+            parse_mode=None,
+        )
+        return
+
+    try:
+        from business_core.sheets import SheetsQuotaExceededError, TransientSheetsReadError
+
+        result = generate_document_gap_detail(criteria)
+        if not result.ok:
+            if result.error_code == ERROR_ROADMAP_NOT_FOUND:
+                await _reply(update, f"❌ Roadmap {criteria.roadmap_id} не найден.", parse_mode=None)
+            elif result.error_code == ERROR_ROADMAP_MISSING_BUSINESS_ID:
+                await _reply(update, "❌ У roadmap отсутствует Business ID.", parse_mode=None)
+            elif result.error_code == ERROR_REQUIREMENT_NOT_FOUND:
+                await _reply(
+                    update,
+                    "❌ Требование с таким ID не найдено в указанном roadmap.",
+                    parse_mode=None,
+                )
+            elif result.error_code == ERROR_AMBIGUOUS_REQUIREMENT_ID:
+                await _reply(
+                    update,
+                    "❌ Найдено несколько требований с этим ID. Уточнение пока не поддерживается.",
+                    parse_mode=None,
+                )
+            elif result.error_code == ERROR_COVERAGE_CONFIGURATION_ERROR:
+                await _reply(
+                    update,
+                    "⚠️ Не удалось безопасно сформировать данные: "
+                    "в настройке требований обнаружена ошибка.",
+                    parse_mode=None,
+                )
+            elif result.error_code in (ERROR_UNKNOWN_ENGINE_STATUS, ERROR_COVERAGE_INVARIANT_FAILED):
+                await _reply(
+                    update,
+                    "⚠️ Не удалось безопасно сформировать данные: "
+                    "внутренняя проверка итогов не пройдена.",
+                    parse_mode=None,
+                )
+            else:
+                await _reply(update, "❌ Не удалось получить данные по требованию.", parse_mode=None)
+            return
+
+        text = _render_document_gap_detail(result)
+        for part in _split_message_by_lines(text):
+            await update.message.reply_text(part, parse_mode=None)
+    except SheetsQuotaExceededError:
+        await _reply(update, "⚠️ Google Sheets временно перегружен. Повторите запрос немного позже.", parse_mode=None)
+    except TransientSheetsReadError:
+        await _reply(update, "⚠️ Не удалось временно прочитать данные Google Sheets. Попробуйте позже.", parse_mode=None)
+    except Exception as e:
+        log.error(f"docgap_cmd error: {e}")
+        await _reply(update, "❌ Не удалось получить данные по требованию.", parse_mode=None)
+
+
 def _render_confirmation_mutation_result(result: dict, document_id: str, field: str) -> str:
     """Pure rendering of a business_core.document_confirmation mutation
     result dict — never a raw exception/APIError/project_number."""
@@ -14491,6 +14670,9 @@ def register_business_handlers(app: Application) -> None:
 
     # Phase 16C.2: Document Requirements Coverage
     app.add_handler(CommandHandler("docgaps", docgaps_cmd))
+
+    # Phase 16C.3: Requirement Coverage Drill-Down
+    app.add_handler(CommandHandler("docgap", docgap_cmd))
 
     # Phase 17B: Telegram Document Requirements Interface
     app.add_handler(CommandHandler("missingdocs", missingdocs_cmd))

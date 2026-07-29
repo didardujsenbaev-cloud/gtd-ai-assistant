@@ -653,6 +653,110 @@ class TestCallBudget(unittest.TestCase):
             self.assertNotIn(forbidden, source)
 
 
+class TestPhase16C3AdditiveCounters(unittest.TestCase):
+    """Phase 16C.3: new numeric fields on DocumentCoverageItem, sourced
+    from the exact same _quality_for_item() computation — never a
+    second analysis pass. Confirms additive backward compatibility and
+    the expiry-bucket invariant."""
+
+    def test_fully_confirmed_and_needs_review_counts(self):
+        docs = [
+            _doc_row("DREG-1", "RM-1", "DOC-1", family_id="FAM-A"),
+            _doc_row("DREG-2", "RM-1", "DOC-1", family_id="FAM-B"),
+        ]
+        contents = [
+            _content_row("DREG-1", review_status="confirmed"),
+            _content_row("DREG-2", review_status="unreviewed"),
+        ]
+        sheets = _Sheets(
+            roadmaps=[_roadmap_row("RM-1")],
+            stages=[_stage_row("STAGE-1", "RM-1", ["DOC-1"])],
+            templates=[_template_row("DOC-1")],
+            documents=docs, contents=contents,
+        )
+        result = _run(sheets)
+        item = result.items[0]
+        self.assertEqual(item.fully_confirmed_count, 1)
+        self.assertEqual(item.needs_review_count, 1)
+        self.assertEqual(item.fully_confirmed_count + item.needs_review_count, item.canonical_document_count)
+
+    def test_conflict_document_count(self):
+        content_row = _content_row("DREG-1", review_status="confirmed")
+        content_row["Document Date"] = "2026-01-01"
+        content_row["Confirmed Fields JSON"] = '{"document_date":{"status":"confirmed","value":"2026-02-01"}}'
+        sheets = _Sheets(
+            roadmaps=[_roadmap_row("RM-1")],
+            stages=[_stage_row("STAGE-1", "RM-1", ["DOC-1"])],
+            templates=[_template_row("DOC-1")],
+            documents=[_doc_row("DREG-1", "RM-1", "DOC-1")],
+            contents=[content_row],
+        )
+        result = _run(sheets)
+        self.assertEqual(result.items[0].conflict_document_count, 1)
+
+    def test_cache_warning_document_count_no_double_count(self):
+        """A document that is BOTH cache_warning=True AND has an
+        unknown review status must count once, not twice, in
+        cache_warning_document_count."""
+        sheets = _Sheets(
+            roadmaps=[_roadmap_row("RM-1")],
+            stages=[_stage_row("STAGE-1", "RM-1", ["DOC-1"])],
+            templates=[_template_row("DOC-1")],
+            documents=[_doc_row("DREG-1", "RM-1", "DOC-1")],
+            contents=[_content_row(
+                "DREG-1", review_status="some-future-status",
+                confirmed_fields_json="not-json-and-not-empty{",
+            )],
+        )
+        result = _run(sheets)
+        self.assertEqual(result.items[0].cache_warning_document_count, 1)
+
+    def test_expiry_buckets_sum_to_canonical_count(self):
+        docs = [
+            _doc_row("DREG-1", "RM-1", "DOC-1", family_id="FAM-A"),
+            _doc_row("DREG-2", "RM-1", "DOC-1", family_id="FAM-B"),
+            _doc_row("DREG-3", "RM-1", "DOC-1", family_id="FAM-C"),
+            _doc_row("DREG-4", "RM-1", "DOC-1", family_id="FAM-D"),
+        ]
+        contents = [
+            _content_row("DREG-1", valid_until="2099-01-01"),
+            _content_row("DREG-2", valid_until="2020-01-01"),
+            _content_row("DREG-3", valid_until=""),
+            _content_row("DREG-4", valid_until="not-a-date"),
+        ]
+        sheets = _Sheets(
+            roadmaps=[_roadmap_row("RM-1")],
+            stages=[_stage_row("STAGE-1", "RM-1", ["DOC-1"])],
+            templates=[_template_row("DOC-1")],
+            documents=docs, contents=contents,
+        )
+        result = _run(sheets)
+        item = result.items[0]
+        self.assertEqual(item.valid_expiry_count, 1)
+        self.assertEqual(item.expired_document_count, 1)
+        self.assertEqual(item.unknown_expiry_count, 1)
+        self.assertEqual(item.invalid_expiry_count, 1)
+        self.assertEqual(
+            item.valid_expiry_count + item.expired_document_count
+            + item.unknown_expiry_count + item.invalid_expiry_count,
+            item.canonical_document_count,
+        )
+
+    def test_additive_fields_do_not_change_existing_summary(self):
+        sheets = _Sheets(
+            roadmaps=[_roadmap_row("RM-1")],
+            stages=[_stage_row("STAGE-1", "RM-1", ["DOC-1"])],
+            templates=[_template_row("DOC-1")],
+            documents=[_doc_row("DREG-1", "RM-1", "DOC-1")],
+        )
+        result = _run(sheets)
+        self.assertTrue(result.ok)
+        self.assertEqual(result.summary.present_count, 1)
+        # New fields default safely to 0 for a document with no content row.
+        self.assertEqual(result.items[0].fully_confirmed_count, 0)
+        self.assertEqual(result.items[0].needs_review_count, 0)
+
+
 class TestBusinessBoundary(unittest.TestCase):
     def test_documents_outside_roadmap_never_counted(self):
         sheets = _Sheets(
