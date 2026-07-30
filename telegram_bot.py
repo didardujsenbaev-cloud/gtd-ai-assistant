@@ -4342,7 +4342,6 @@ def main():
     app.add_handler(CommandHandler("tasks", show_tasks))
     app.add_handler(CommandHandler("projects", show_projects))
     app.add_handler(CommandHandler("project", project_command))
-    app.add_handler(CommandHandler("cancel", np_cancel_command))
     app.add_handler(CommandHandler("stats", show_stats))
     app.add_handler(CommandHandler("done", done_task))
     app.add_handler(CommandHandler("waiting", show_waiting))
@@ -4392,6 +4391,20 @@ def main():
     except Exception as _bc_err:
         print(f"   ⚠️  Business Core handlers не загружены: {_bc_err}")
     # ────────────────────────────────────────────────────────
+
+    # Phase 16C.8.2B.1: standalone generic /cancel must be registered
+    # AFTER every ConversationHandler with its own /cancel fallback
+    # (GTD's Weekly Review/Quarterly Review/Mind Sweep above, and every
+    # Business Core conversation registered by register_business_handlers()
+    # just above) — PTB's Application.process_update() runs only the
+    # FIRST matching handler per group (group 0 here, the default for
+    # every handler in this file), so a conversation-unaware
+    # CommandHandler("cancel", ...) registered earlier would silently
+    # intercept /cancel before any active conversation's own fallback
+    # ever gets checked, leaving that conversation's state (and any
+    # pending user_data) uncleaned. See the Phase 16C.8.2B production
+    # defect diagnosis for the full root-cause analysis.
+    app.add_handler(CommandHandler("cancel", np_cancel_command))
 
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
