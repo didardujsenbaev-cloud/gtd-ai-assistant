@@ -6833,11 +6833,28 @@ async def docgap_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await _reply(update, "❌ Не удалось получить данные по требованию.", parse_mode=None)
 
 
+_UPLOAD_ELIGIBLE_ACTION_CODES = frozenset({
+    "OBTAIN_MISSING_DOCUMENT",
+    "OBTAIN_REMAINING_DOCUMENTS",
+    "OPTIONAL_DOCUMENT_NOT_PROVIDED",
+    "OBTAIN_CURRENT_DOCUMENT",
+    "UPLOAD_CANONICAL_DOCUMENT",
+})
+
+
 def _render_document_gap_next(result) -> str:
     """
     Pure rendering of a business_core.document_gap_next
     .DocumentGapNextResult — safe requirement name/status/action text
     only, never a Document ID/file/document name/raw value.
+
+    Phase 16C.8.2C: an optional ready-to-copy /uploaddoc command is
+    shown only when result.primary_action.action_code (never
+    base_status/quality_flags directly — that priority is already
+    centralized in document_gap_next.py, this renderer never
+    re-interprets it) is upload-eligible AND business_id/roadmap_id/
+    stage_id/document_template_id are all non-empty. Secondary actions
+    never trigger the block on their own.
     """
     lines = [
         "📌 Следующий шаг по требованию",
@@ -6866,6 +6883,21 @@ def _render_document_gap_next(result) -> str:
         lines.append("Что сделать:")
         for i, step in enumerate(primary.instruction_lines, start=1):
             lines.append(f"{i}. {step}")
+
+    if (
+        primary is not None
+        and primary.action_code in _UPLOAD_ELIGIBLE_ACTION_CODES
+        and result.business_id
+        and result.criteria.roadmap_id
+        and result.stage_id
+        and result.document_template_id
+    ):
+        lines.append("")
+        lines.append("Загрузить документ:")
+        lines.append(
+            f"/uploaddoc business={result.business_id} roadmap={result.criteria.roadmap_id} "
+            f"stage={result.stage_id} template={result.document_template_id}"
+        )
 
     lines.append("")
     lines.append("Повторно проверить:")
