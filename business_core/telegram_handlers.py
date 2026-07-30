@@ -4769,6 +4769,10 @@ UPLOADDOC_REQUIRED_ARGS = ("business", "name")
 
 # Phase 16C.8.2B: /uploaddoc optional prefilled association context.
 UPLOADDOC_PREFILL_KEYS = ("business", "roadmap", "stage", "template")
+# Phase 16C.8.3A: optional, opaque, UX-navigation-only — never parsed,
+# never required, never counted toward the required-together set below.
+UPLOADDOC_PREFILL_OPTIONAL_KEYS = ("requirement",)
+UPLOADDOC_PREFILL_ALLOWED_KEYS = UPLOADDOC_PREFILL_KEYS + UPLOADDOC_PREFILL_OPTIONAL_KEYS
 
 
 def _parse_uploaddoc_prefill_args(raw: str) -> tuple:
@@ -4794,7 +4798,7 @@ def _parse_uploaddoc_prefill_args(raw: str) -> tuple:
         if m.group(1):
             key = m.group(1)
             val = (m.group(2) or m.group(3) or m.group(4) or "").strip()
-            if key not in UPLOADDOC_PREFILL_KEYS:
+            if key not in UPLOADDOC_PREFILL_ALLOWED_KEYS:
                 if key not in unknown:
                     unknown.append(key)
                 continue
@@ -4815,7 +4819,7 @@ def _parse_uploaddoc_prefill_args(raw: str) -> tuple:
     if unknown:
         return None, (
             f"❌ Неизвестный параметр загрузки: {unknown[0]}.\n\n"
-            "Разрешены:\nbusiness, roadmap, stage, template"
+            "Разрешены:\nbusiness, roadmap, stage, template, requirement"
         )
     if duplicates:
         return None, f"❌ Параметр загрузки указан несколько раз: {duplicates[0]}."
@@ -4832,7 +4836,7 @@ def _parse_uploaddoc_prefill_args(raw: str) -> tuple:
     return seen, None
 
 
-UPLOADDOC_ASSOCIATION_KEYS = ("business", "client", "object", "roadmap", "stage", "template")
+UPLOADDOC_ASSOCIATION_KEYS = ("business", "client", "object", "roadmap", "stage", "template", "requirement")
 
 
 def _parse_uploaddoc_prefilled_details(raw: str) -> tuple:
@@ -5021,6 +5025,7 @@ async def uploaddoc_receive_details(update: Update, context: ContextTypes.DEFAUL
 
     raw = update.message.text or ""
     prefill = context.user_data.get("ud_prefill")
+    requirement_id = ""
 
     if prefill is not None:
         parsed, error = _parse_uploaddoc_prefilled_details(raw)
@@ -5035,6 +5040,12 @@ async def uploaddoc_receive_details(update: Update, context: ContextTypes.DEFAUL
         template_id = prefill["template"]
         name = parsed["name"]
         notes = parsed["notes"]
+        # Phase 16C.8.3A: opaque, UX-navigation-only — never parsed,
+        # never validated against the requirements engine, never
+        # forwarded to persistence (see upload_and_register_document's
+        # explicit-kwargs call site below, which has no requirement_id
+        # parameter at all).
+        requirement_id = prefill.get("requirement", "")
     else:
         kv = _parse_kv_args(raw)
 
@@ -5119,6 +5130,7 @@ async def uploaddoc_receive_details(update: Update, context: ContextTypes.DEFAUL
         "folder_level": folder["level"],
         "folder_source_id": folder["source_id"],
         "folder_name": folder_name,
+        "requirement_id": requirement_id,
         "op_state": "pending",
     }
     context.user_data["ud_confirmed_snapshot"] = snapshot
@@ -5362,13 +5374,28 @@ async def uploaddoc_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             return ConversationHandler.END
 
         document_id = result["document_id"]
-        await update.message.reply_text(
-            _document_creation_message(
-                result, document_name=snap["document_name"],
-                file_name=real_name, drive_file_url=web_view_link,
-            ),
-            reply_markup=ReplyKeyboardRemove(),
+        success_text = _document_creation_message(
+            result, document_name=snap["document_name"],
+            file_name=real_name, drive_file_url=web_view_link,
         )
+
+        # Phase 16C.8.3A: safe, UX-only navigation appended to the same
+        # success message — never a second reply_text call, never a
+        # change to _document_creation_message() itself (shared with
+        # /registerdoc). roadmap_id/requirement_id come straight from
+        # the in-memory snapshot, never re-derived or validated here.
+        nav_roadmap_id = snap.get("roadmap_id", "")
+        nav_requirement_id = snap.get("requirement_id", "")
+        if nav_roadmap_id:
+            nav_lines = ["", "Вернуться к списку:", f"/missingdocs roadmap_id={nav_roadmap_id}"]
+            if nav_requirement_id:
+                nav_lines = [
+                    "", "Повторно проверить требование:",
+                    f"/docgap roadmap_id={nav_roadmap_id} requirement_id={nav_requirement_id}",
+                ] + nav_lines
+            success_text += "\n" + "\n".join(nav_lines)
+
+        await update.message.reply_text(success_text, reply_markup=ReplyKeyboardRemove())
 
         # Phase 16A: enqueue enrichment analysis ONLY after the upload has
         # fully succeeded (uploaded, authoritative metadata, registry

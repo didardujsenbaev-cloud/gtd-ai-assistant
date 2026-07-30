@@ -1168,6 +1168,126 @@ class TestUploadDocPrefillEntry(unittest.TestCase):
         self.assertNotIn("leak", text)
 
 
+class TestUploadDocRequirementEntry(unittest.TestCase):
+    """Phase 16C.8.3A: optional requirement= prefill arg — opaque,
+    UX-navigation-only, never required alone, never parsed."""
+
+    def _run(self, args, user_data=None):
+        th = _fresh_th()
+        update = _entry_update()
+        context = _entry_ctx(args)
+        if user_data is not None:
+            context.user_data = user_data
+
+        async def run():
+            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+                return await th.uploaddoc_start(update, context)
+
+        result = asyncio.run(run())
+        return th, update, context, result
+
+    def test_four_keys_plus_requirement_valid(self):
+        th, update, context, result = self._run([
+            "business=BIZ-001", "roadmap=RM-001", "stage=STAGE-001",
+            "template=DOC-IZH-KP-001", "requirement=STAGE-001:DOC-IZH-KP-001",
+        ])
+        self.assertEqual(result, th.UD_FILE)
+
+    def test_exact_opaque_requirement_preserved(self):
+        th, update, context, result = self._run([
+            "business=BIZ-001", "roadmap=RM-001", "stage=STAGE-001",
+            "template=DOC-IZH-KP-001", "requirement=STAGE-001:DOC-IZH-KP-001",
+        ])
+        self.assertEqual(context.user_data["ud_prefill"]["requirement"], "STAGE-001:DOC-IZH-KP-001")
+
+    def test_requirement_optional_without_breaking_existing(self):
+        th, update, context, result = self._run(
+            ["business=BIZ-001", "roadmap=RM-001", "stage=STAGE-001", "template=DOC-IZH-KP-001"],
+        )
+        self.assertEqual(result, th.UD_FILE)
+        self.assertNotIn("requirement", context.user_data["ud_prefill"])
+
+    def test_requirement_alone_rejected(self):
+        th, update, context, result = self._run(["requirement=STAGE-001:DOC-IZH-KP-001"])
+        self.assertEqual(result, ConversationHandler.END)
+        text = update.message.reply_text.call_args[0][0]
+        self.assertIn("business", text)
+        self.assertIn("roadmap", text)
+        self.assertIn("stage", text)
+        self.assertIn("template", text)
+
+    def test_requirement_plus_partial_context_rejected(self):
+        th, update, context, result = self._run([
+            "business=BIZ-001", "roadmap=RM-001", "requirement=STAGE-001:DOC-IZH-KP-001",
+        ])
+        self.assertEqual(result, ConversationHandler.END)
+        text = update.message.reply_text.call_args[0][0]
+        self.assertIn("stage", text)
+        self.assertIn("template", text)
+
+    def test_duplicate_requirement_rejected(self):
+        th, update, context, result = self._run([
+            "business=BIZ-001", "roadmap=RM-001", "stage=STAGE-001", "template=DOC-1",
+            "requirement=STAGE-001:DOC-1", "requirement=OTHER-VALUE",
+        ])
+        self.assertEqual(result, ConversationHandler.END)
+        text = update.message.reply_text.call_args[0][0]
+        self.assertIn("requirement", text)
+
+    def test_empty_requirement_rejected(self):
+        # A bare trailing `key=` with nothing after it (no quotes) is
+        # tokenized as a malformed bare token by the existing parser —
+        # the same pre-existing behavior applies to every other key
+        # (business=, roadmap=, etc.), not something new here. The
+        # "cannot be empty" check is reached via an explicit empty
+        # quoted value instead.
+        th, update, context, result = self._run([
+            "business=BIZ-001", "roadmap=RM-001", "stage=STAGE-001", "template=DOC-1", 'requirement=""',
+        ])
+        self.assertEqual(result, ConversationHandler.END)
+        text = update.message.reply_text.call_args[0][0]
+        self.assertIn("requirement", text)
+        self.assertIn("пуст", text)
+
+    def test_unknown_keys_still_rejected(self):
+        th, update, context, result = self._run([
+            "business=BIZ-001", "roadmap=RM-001", "stage=STAGE-001", "template=DOC-1", "foo=bar",
+        ])
+        self.assertEqual(result, ConversationHandler.END)
+
+    def test_allowed_key_message_includes_requirement(self):
+        th, update, context, result = self._run([
+            "business=BIZ-001", "roadmap=RM-001", "stage=STAGE-001", "template=DOC-1", "foo=bar",
+        ])
+        text = update.message.reply_text.call_args[0][0]
+        self.assertIn("requirement", text)
+
+    def test_no_parsing_of_opaque_requirement(self):
+        """The value has no colon-delimited stage/template shape at
+        all — proving it's stored verbatim, never validated/derived."""
+        th, update, context, result = self._run([
+            "business=BIZ-001", "roadmap=RM-001", "stage=STAGE-001",
+            "template=DOC-IZH-KP-001", "requirement=OPAQUE-VALUE-NO-DELIMITER",
+        ])
+        self.assertEqual(result, th.UD_FILE)
+        self.assertEqual(context.user_data["ud_prefill"]["requirement"], "OPAQUE-VALUE-NO-DELIMITER")
+
+    def test_zero_entry_reads(self):
+        with patch("business_core.sheets.read_business_sheet") as mock_read:
+            th, update, context, result = self._run([
+                "business=BIZ-001", "roadmap=RM-001", "stage=STAGE-001",
+                "template=DOC-1", "requirement=STAGE-001:DOC-1",
+            ])
+        mock_read.assert_not_called()
+
+    def test_zero_entry_writes(self):
+        import inspect
+        th = _fresh_th()
+        source = inspect.getsource(th.uploaddoc_start)
+        for forbidden in ("upload_file", "create_document", "register_document", "append_business_row"):
+            self.assertNotIn(forbidden, source)
+
+
 class TestUploadDocPrefillFileStep(unittest.TestCase):
     """uploaddoc_receive_file behavior when ud_prefill is active."""
 
@@ -1430,9 +1550,13 @@ class TestUploadDocPrefillDetailsStep(unittest.TestCase):
         self.assertEqual(snap["notes"], "заметка")
 
     def test_requirement_id_absent(self):
+        """Phase 16C.8.3A: the snapshot always carries a requirement_id
+        key (matching the existing client_id/object_id convention),
+        defaulting to "" when no requirement= prefill arg was given —
+        never a missing key, never a synthesized/parsed value."""
         th, update, context, result = self._run('name="Технический паспорт"', prefill=self.PREFILL)
         snap = context.user_data["ud_confirmed_snapshot"]
-        self.assertNotIn("requirement_id", snap)
+        self.assertEqual(snap.get("requirement_id", ""), "")
 
     def test_zero_writes_before_confirm(self):
         with patch("integrations.google_drive_adapter.upload_file") as mock_upload, \
@@ -1440,6 +1564,452 @@ class TestUploadDocPrefillDetailsStep(unittest.TestCase):
             th, update, context, result = self._run('name="Технический паспорт"', prefill=self.PREFILL)
         mock_upload.assert_not_called()
         mock_register.assert_not_called()
+
+
+class TestUploadDocRequirementDetailsStep(unittest.TestCase):
+    """Phase 16C.8.3A: requirement_id merge/immutability/snapshot
+    behavior when ud_prefill carries an optional requirement= arg."""
+
+    PREFILL = {
+        "business": "BIZ-001", "roadmap": "RM-001", "stage": "STAGE-001",
+        "template": "DOC-IZH-KP-001", "requirement": "STAGE-001:DOC-IZH-KP-001",
+    }
+
+    def _run(self, text, prefill=None, ud=None):
+        th = _fresh_th()
+        user_data = {"ud": ud if ud is not None else _ud_draft()}
+        if prefill is not None:
+            user_data["ud_prefill"] = dict(prefill)
+        update, context = _text_update(text), _ctx(user_data=user_data)
+
+        async def run():
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(patch("business_core.sheets.read_business_sheet",
+                                           side_effect=_read_business_sheet_side_effect))
+                stack.enter_context(patch("business_core.object_manager.find_object_by_id",
+                                           side_effect=_find_object_by_id_side_effect))
+                stack.enter_context(patch("business_core.person_manager.find_person_by_id",
+                                           return_value={"biz_ids": ["BIZ-001"], "drive_folder_id": "PRSFOLDER1"}))
+                stack.enter_context(patch("integrations.google_drive_adapter.get_drive_service",
+                                           return_value=MagicMock()))
+                stack.enter_context(patch("integrations.google_drive_adapter.get_file_metadata",
+                                           return_value=GOOD_FOLDER_META))
+                return await th.uploaddoc_receive_details(update, context)
+
+        result = asyncio.run(run())
+        return th, update, context, result
+
+    def test_valid_file_preserves_requirement(self):
+        th = _fresh_th()
+        prefill = dict(self.PREFILL)
+        update, context = _doc_update(), _ctx(user_data={"ud_prefill": prefill})
+        asyncio.run(th.uploaddoc_receive_file(update, context))
+        self.assertEqual(context.user_data["ud_prefill"]["requirement"], "STAGE-001:DOC-IZH-KP-001")
+
+    def test_recoverable_details_error_preserves_requirement(self):
+        th, update, context, result = self._run('name=""', prefill=self.PREFILL)
+        self.assertEqual(result, th.UD_DETAILS)
+        self.assertEqual(context.user_data["ud_prefill"]["requirement"], "STAGE-001:DOC-IZH-KP-001")
+
+    def test_requirement_in_details_rejected(self):
+        th, update, context, result = self._run(
+            'name="Doc" requirement=STAGE-001:DOC-IZH-KP-001', prefill=self.PREFILL,
+        )
+        self.assertEqual(result, th.UD_DETAILS)
+        self.assertNotIn("ud_confirmed_snapshot", context.user_data)
+
+    def test_same_requirement_in_details_rejected(self):
+        """Same value as the prefill — still rejected, immutable field
+        resubmission is never treated as a no-op."""
+        th, update, context, result = self._run(
+            'name="Doc" requirement=STAGE-001:DOC-IZH-KP-001', prefill=self.PREFILL,
+        )
+        self.assertEqual(result, th.UD_DETAILS)
+
+    def test_conflicting_requirement_in_details_rejected(self):
+        th, update, context, result = self._run(
+            'name="Doc" requirement=OTHER-STAGE:OTHER-DOC', prefill=self.PREFILL,
+        )
+        self.assertEqual(result, th.UD_DETAILS)
+        self.assertNotIn("ud_confirmed_snapshot", context.user_data)
+
+    def test_requirement_rejection_shows_immutable_context_message(self):
+        th, update, context, result = self._run(
+            'name="Doc" requirement=OTHER-STAGE:OTHER-DOC', prefill=self.PREFILL,
+        )
+        text = update.message.reply_text.call_args[0][0]
+        self.assertIn("уже задан командой /uploaddoc", text)
+
+    def test_snapshot_exact_requirement_id(self):
+        th, update, context, result = self._run('name="Технический паспорт"', prefill=self.PREFILL)
+        snap = context.user_data["ud_confirmed_snapshot"]
+        self.assertEqual(snap["requirement_id"], "STAGE-001:DOC-IZH-KP-001")
+
+    def test_requirement_removed_from_ud_prefill_after_snapshot(self):
+        th, update, context, result = self._run('name="Технический паспорт"', prefill=self.PREFILL)
+        self.assertNotIn("ud_prefill", context.user_data)
+
+    def test_requirement_value_never_parsed(self):
+        """An opaque value with no colon-delimited stage/template
+        shape at all — proving it flows through as an opaque string,
+        never split or reconstructed."""
+        prefill = dict(self.PREFILL)
+        prefill["requirement"] = "OPAQUE-NO-DELIMITER-VALUE"
+        th, update, context, result = self._run('name="Технический паспорт"', prefill=prefill)
+        snap = context.user_data["ud_confirmed_snapshot"]
+        self.assertEqual(snap["requirement_id"], "OPAQUE-NO-DELIMITER-VALUE")
+        self.assertEqual(snap["stage_id"], "STAGE-001")
+        self.assertEqual(snap["document_template_id"], "DOC-IZH-KP-001")
+
+
+class TestUploadDocRequirementPersistenceBoundary(unittest.TestCase):
+    """Phase 16C.8.3A: requirement_id must never reach persistence,
+    the registry row, or analysis input."""
+
+    def _run_confirm_with_requirement(self):
+        th = _fresh_th()
+        snap = _confirmed_snapshot(requirement_id="STAGE-001:DOC-IZH-KP-001")
+        user_data = {"ud_confirmed_snapshot": snap}
+        update, context = _text_update("✅ Подтвердить"), _ctx(user_data=user_data)
+
+        upload_mock = MagicMock(return_value={"file_id": "NEWFILE1", "file_url": "unused",
+                                                "filename": "passport.pdf", "dry_run": False})
+        append_mock = MagicMock(return_value=2)
+        found = (2, dict(zip(DOC_HEADERS, [
+            "DREG-001", "DFAM-001", "1", "BIZ-001", "PRS-001", "OBJ-001", "RM-001", "",
+            "", snap["document_name"], "uploaded", "NEWFILE1",
+            "https://drive.google.com/file/d/NEWFILE1/view", "passport.pdf", "application/pdf",
+            "2026-01-01 00:00:00 UTC", "dida", "", "", "", "", "2026-01-01 00:00:00 UTC",
+            "2026-01-01 00:00:00 UTC",
+        ])))
+
+        register_mock = MagicMock(wraps=None)
+
+        async def run():
+            with contextlib.ExitStack() as stack:
+                for p in _fake_tmp_patches():
+                    stack.enter_context(p)
+                stack.enter_context(patch(
+                    "business_core.document_registry_manager.resolve_and_validate_links",
+                    return_value={"ok": True, "resolved": {
+                        "business_id": "BIZ-001", "client_id": "PRS-001", "object_id": "OBJ-001",
+                        "roadmap_id": "RM-001", "stage_id": "", "document_template_id": "",
+                    }}))
+                stack.enter_context(patch("integrations.google_drive_adapter.get_drive_service",
+                                           return_value=MagicMock()))
+                stack.enter_context(patch("integrations.google_drive_adapter.upload_file", upload_mock))
+                stack.enter_context(patch("integrations.google_drive_adapter.get_file_metadata",
+                                           return_value=GOOD_UPLOAD_META))
+                stack.enter_context(patch("integrations.google_drive_adapter.trash_file",
+                                           return_value={"ok": True, "error": ""}))
+                stack.enter_context(patch("business_core.sheets.get_business_sheet",
+                                           return_value=_make_doc_sheet()))
+                stack.enter_context(patch("business_core.sheets.append_business_row", append_mock))
+                stack.enter_context(patch("business_core.sheets.find_row_by_id", return_value=found))
+                register_spy = stack.enter_context(patch(
+                    "business_core.business_builder.upload_and_register_document",
+                    wraps=__import__("business_core.business_builder", fromlist=["upload_and_register_document"])
+                    .upload_and_register_document,
+                ))
+                enqueue_spy = stack.enter_context(patch("business_core.telegram_handlers._enqueue_document_analysis"))
+                result = await th.uploaddoc_confirm(update, context)
+                return result, register_spy, enqueue_spy, append_mock
+
+        result, register_spy, enqueue_spy, append_mock = asyncio.run(run())
+        return th, update, context, result, register_spy, enqueue_spy, append_mock
+
+    def test_upload_and_register_document_receives_no_requirement_id(self):
+        th, update, context, result, register_spy, enqueue_spy, append_mock = self._run_confirm_with_requirement()
+        register_spy.assert_called_once()
+        _, kwargs = register_spy.call_args
+        self.assertNotIn("requirement_id", kwargs)
+
+    def test_no_snap_passthrough(self):
+        import inspect
+        th = _fresh_th()
+        source = inspect.getsource(th.uploaddoc_confirm)
+        self.assertNotIn("**snap", source)
+
+    def test_registry_row_unchanged_no_requirement_field(self):
+        th, update, context, result, register_spy, enqueue_spy, append_mock = self._run_confirm_with_requirement()
+        row = append_mock.call_args[0][1]
+        self.assertEqual(len(row), len(DOC_HEADERS))
+        self.assertNotIn("Requirement ID", DOC_HEADERS)
+
+    def test_analysis_enqueue_args_contain_no_requirement_id(self):
+        th, update, context, result, register_spy, enqueue_spy, append_mock = self._run_confirm_with_requirement()
+        enqueue_spy.assert_called_once()
+        args, kwargs = enqueue_spy.call_args
+        self.assertNotIn("STAGE-001:DOC-IZH-KP-001", args)
+        self.assertNotIn("requirement_id", kwargs)
+
+    def test_post_write_verification_unchanged(self):
+        th, update, context, result, register_spy, enqueue_spy, append_mock = self._run_confirm_with_requirement()
+        self.assertEqual(result, ConversationHandler.END)
+
+    def test_zero_new_persistence_writes(self):
+        th, update, context, result, register_spy, enqueue_spy, append_mock = self._run_confirm_with_requirement()
+        append_mock.assert_called_once()
+
+
+class TestUploadDocRequirementSuccessUX(unittest.TestCase):
+    """Phase 16C.8.3A: success-message navigation — requirement_id and
+    roadmap_id present/absent combinations, exactly one reply_text
+    call, failure paths show no navigation."""
+
+    def _run_confirm(self, requirement_id="", roadmap_id="RM-001"):
+        th = _fresh_th()
+        snap = _confirmed_snapshot(requirement_id=requirement_id, roadmap_id=roadmap_id)
+        user_data = {"ud_confirmed_snapshot": snap}
+        update, context = _text_update("✅ Подтвердить"), _ctx(user_data=user_data)
+
+        upload_mock = MagicMock(return_value={"file_id": "NEWFILE1", "file_url": "unused",
+                                                "filename": "passport.pdf", "dry_run": False})
+        append_mock = MagicMock(return_value=2)
+        found = (2, dict(zip(DOC_HEADERS, [
+            "DREG-001", "DFAM-001", "1", "BIZ-001", "PRS-001", "OBJ-001", roadmap_id, "",
+            "", snap["document_name"], "uploaded", "NEWFILE1",
+            "https://drive.google.com/file/d/NEWFILE1/view", "passport.pdf", "application/pdf",
+            "2026-01-01 00:00:00 UTC", "dida", "", "", "", "", "2026-01-01 00:00:00 UTC",
+            "2026-01-01 00:00:00 UTC",
+        ])))
+
+        async def run():
+            with contextlib.ExitStack() as stack:
+                for p in _fake_tmp_patches():
+                    stack.enter_context(p)
+                stack.enter_context(patch(
+                    "business_core.document_registry_manager.resolve_and_validate_links",
+                    return_value={"ok": True, "resolved": {
+                        "business_id": "BIZ-001", "client_id": "PRS-001", "object_id": "OBJ-001",
+                        "roadmap_id": roadmap_id, "stage_id": "", "document_template_id": "",
+                    }}))
+                stack.enter_context(patch("integrations.google_drive_adapter.get_drive_service",
+                                           return_value=MagicMock()))
+                stack.enter_context(patch("integrations.google_drive_adapter.upload_file", upload_mock))
+                stack.enter_context(patch("integrations.google_drive_adapter.get_file_metadata",
+                                           return_value=GOOD_UPLOAD_META))
+                stack.enter_context(patch("integrations.google_drive_adapter.trash_file",
+                                           return_value={"ok": True, "error": ""}))
+                stack.enter_context(patch("business_core.sheets.get_business_sheet",
+                                           return_value=_make_doc_sheet()))
+                stack.enter_context(patch("business_core.sheets.append_business_row", append_mock))
+                stack.enter_context(patch("business_core.sheets.find_row_by_id", return_value=found))
+                stack.enter_context(patch("business_core.telegram_handlers._enqueue_document_analysis"))
+                return await th.uploaddoc_confirm(update, context)
+
+        result = asyncio.run(run())
+        return th, update, context, result
+
+    def test_requirement_present_shows_exact_docgap(self):
+        th, update, context, result = self._run_confirm(requirement_id="STAGE-001:DOC-IZH-KP-001")
+        reply = update.message.reply_text.call_args[0][0]
+        self.assertIn("/docgap roadmap_id=RM-001 requirement_id=STAGE-001:DOC-IZH-KP-001", reply)
+
+    def test_requirement_present_shows_missingdocs(self):
+        th, update, context, result = self._run_confirm(requirement_id="STAGE-001:DOC-IZH-KP-001")
+        reply = update.message.reply_text.call_args[0][0]
+        self.assertIn("/missingdocs roadmap_id=RM-001", reply)
+
+    def test_requirement_absent_roadmap_present_no_docgap(self):
+        th, update, context, result = self._run_confirm(requirement_id="")
+        reply = update.message.reply_text.call_args[0][0]
+        self.assertNotIn("/docgap", reply)
+
+    def test_requirement_absent_roadmap_present_shows_missingdocs(self):
+        th, update, context, result = self._run_confirm(requirement_id="")
+        reply = update.message.reply_text.call_args[0][0]
+        self.assertIn("/missingdocs roadmap_id=RM-001", reply)
+
+    def test_roadmap_absent_no_navigation_at_all(self):
+        th, update, context, result = self._run_confirm(requirement_id="STAGE-001:DOC-IZH-KP-001", roadmap_id="")
+        reply = update.message.reply_text.call_args[0][0]
+        self.assertNotIn("/docgap", reply)
+        self.assertNotIn("/missingdocs", reply)
+
+    def test_docgap_exactly_once(self):
+        th, update, context, result = self._run_confirm(requirement_id="STAGE-001:DOC-IZH-KP-001")
+        reply = update.message.reply_text.call_args[0][0]
+        self.assertEqual(reply.count("/docgap"), 1)
+
+    def test_missingdocs_exactly_once(self):
+        th, update, context, result = self._run_confirm(requirement_id="STAGE-001:DOC-IZH-KP-001")
+        reply = update.message.reply_text.call_args[0][0]
+        self.assertEqual(reply.count("/missingdocs"), 1)
+
+    def test_exact_roadmap_id(self):
+        th, update, context, result = self._run_confirm(
+            requirement_id="STAGE-001:DOC-IZH-KP-001", roadmap_id="RM-777",
+        )
+        reply = update.message.reply_text.call_args[0][0]
+        self.assertIn("roadmap_id=RM-777", reply)
+
+    def test_exact_opaque_requirement_id(self):
+        th, update, context, result = self._run_confirm(requirement_id="OPAQUE-NO-DELIMITER")
+        reply = update.message.reply_text.call_args[0][0]
+        self.assertIn("requirement_id=OPAQUE-NO-DELIMITER", reply)
+
+    def test_commands_remain_one_line(self):
+        th, update, context, result = self._run_confirm(requirement_id="STAGE-001:DOC-IZH-KP-001")
+        reply = update.message.reply_text.call_args[0][0]
+        docgap_lines = [l for l in reply.splitlines() if l.strip().startswith("/docgap")]
+        missingdocs_lines = [l for l in reply.splitlines() if l.strip().startswith("/missingdocs")]
+        self.assertEqual(len(docgap_lines), 1)
+        self.assertEqual(len(missingdocs_lines), 1)
+
+    def test_no_partial_command(self):
+        th, update, context, result = self._run_confirm(requirement_id="", roadmap_id="")
+        reply = update.message.reply_text.call_args[0][0]
+        self.assertNotIn("roadmap_id=", reply)
+        self.assertNotIn("requirement_id=", reply)
+
+    def test_existing_creation_message_fields_unchanged(self):
+        th, update, context, result = self._run_confirm(requirement_id="STAGE-001:DOC-IZH-KP-001")
+        reply = update.message.reply_text.call_args[0][0]
+        self.assertIn("✅ Документ загружен и зарегистрирован", reply)
+        self.assertIn("Document ID:", reply)
+
+    def test_exactly_one_reply_text_on_success(self):
+        th, update, context, result = self._run_confirm(requirement_id="STAGE-001:DOC-IZH-KP-001")
+        self.assertEqual(update.message.reply_text.call_count, 1)
+
+    def test_navigation_appended_to_same_reply(self):
+        th, update, context, result = self._run_confirm(requirement_id="STAGE-001:DOC-IZH-KP-001")
+        self.assertEqual(update.message.reply_text.call_count, 1)
+        reply = update.message.reply_text.call_args[0][0]
+        self.assertIn("✅ Документ загружен и зарегистрирован", reply)
+        self.assertIn("/docgap", reply)
+
+    def test_enqueue_called_after_reply(self):
+        th = _fresh_th()
+        snap = _confirmed_snapshot(requirement_id="STAGE-001:DOC-IZH-KP-001")
+        user_data = {"ud_confirmed_snapshot": snap}
+        update, context = _text_update("✅ Подтвердить"), _ctx(user_data=user_data)
+        call_order = []
+        update.message.reply_text = AsyncMock(side_effect=lambda *a, **kw: call_order.append("reply"))
+
+        upload_mock = MagicMock(return_value={"file_id": "NEWFILE1", "file_url": "unused",
+                                                "filename": "passport.pdf", "dry_run": False})
+        append_mock = MagicMock(return_value=2)
+        found = (2, dict(zip(DOC_HEADERS, [
+            "DREG-001", "DFAM-001", "1", "BIZ-001", "PRS-001", "OBJ-001", "RM-001", "",
+            "", snap["document_name"], "uploaded", "NEWFILE1",
+            "https://drive.google.com/file/d/NEWFILE1/view", "passport.pdf", "application/pdf",
+            "2026-01-01 00:00:00 UTC", "dida", "", "", "", "", "2026-01-01 00:00:00 UTC",
+            "2026-01-01 00:00:00 UTC",
+        ])))
+
+        async def run():
+            with contextlib.ExitStack() as stack:
+                for p in _fake_tmp_patches():
+                    stack.enter_context(p)
+                stack.enter_context(patch(
+                    "business_core.document_registry_manager.resolve_and_validate_links",
+                    return_value={"ok": True, "resolved": {
+                        "business_id": "BIZ-001", "client_id": "PRS-001", "object_id": "OBJ-001",
+                        "roadmap_id": "RM-001", "stage_id": "", "document_template_id": "",
+                    }}))
+                stack.enter_context(patch("integrations.google_drive_adapter.get_drive_service",
+                                           return_value=MagicMock()))
+                stack.enter_context(patch("integrations.google_drive_adapter.upload_file", upload_mock))
+                stack.enter_context(patch("integrations.google_drive_adapter.get_file_metadata",
+                                           return_value=GOOD_UPLOAD_META))
+                stack.enter_context(patch("integrations.google_drive_adapter.trash_file",
+                                           return_value={"ok": True, "error": ""}))
+                stack.enter_context(patch("business_core.sheets.get_business_sheet",
+                                           return_value=_make_doc_sheet()))
+                stack.enter_context(patch("business_core.sheets.append_business_row", append_mock))
+                stack.enter_context(patch("business_core.sheets.find_row_by_id", return_value=found))
+
+                def _enqueue_side_effect(*a, **kw):
+                    call_order.append("enqueue")
+
+                stack.enter_context(patch("business_core.telegram_handlers._enqueue_document_analysis",
+                                           side_effect=_enqueue_side_effect))
+                return await th.uploaddoc_confirm(update, context)
+
+        asyncio.run(run())
+        self.assertEqual(call_order, ["reply", "enqueue"])
+
+    def test_enqueue_count_unchanged(self):
+        th = _fresh_th()
+        snap = _confirmed_snapshot(requirement_id="STAGE-001:DOC-IZH-KP-001")
+        user_data = {"ud_confirmed_snapshot": snap}
+        update, context = _text_update("✅ Подтвердить"), _ctx(user_data=user_data)
+
+        upload_mock = MagicMock(return_value={"file_id": "NEWFILE1", "file_url": "unused",
+                                                "filename": "passport.pdf", "dry_run": False})
+        append_mock = MagicMock(return_value=2)
+        found = (2, dict(zip(DOC_HEADERS, [
+            "DREG-001", "DFAM-001", "1", "BIZ-001", "PRS-001", "OBJ-001", "RM-001", "",
+            "", snap["document_name"], "uploaded", "NEWFILE1",
+            "https://drive.google.com/file/d/NEWFILE1/view", "passport.pdf", "application/pdf",
+            "2026-01-01 00:00:00 UTC", "dida", "", "", "", "", "2026-01-01 00:00:00 UTC",
+            "2026-01-01 00:00:00 UTC",
+        ])))
+        enqueue_mock = MagicMock()
+
+        async def run():
+            with contextlib.ExitStack() as stack:
+                for p in _fake_tmp_patches():
+                    stack.enter_context(p)
+                stack.enter_context(patch(
+                    "business_core.document_registry_manager.resolve_and_validate_links",
+                    return_value={"ok": True, "resolved": {
+                        "business_id": "BIZ-001", "client_id": "PRS-001", "object_id": "OBJ-001",
+                        "roadmap_id": "RM-001", "stage_id": "", "document_template_id": "",
+                    }}))
+                stack.enter_context(patch("integrations.google_drive_adapter.get_drive_service",
+                                           return_value=MagicMock()))
+                stack.enter_context(patch("integrations.google_drive_adapter.upload_file", upload_mock))
+                stack.enter_context(patch("integrations.google_drive_adapter.get_file_metadata",
+                                           return_value=GOOD_UPLOAD_META))
+                stack.enter_context(patch("integrations.google_drive_adapter.trash_file",
+                                           return_value={"ok": True, "error": ""}))
+                stack.enter_context(patch("business_core.sheets.get_business_sheet",
+                                           return_value=_make_doc_sheet()))
+                stack.enter_context(patch("business_core.sheets.append_business_row", append_mock))
+                stack.enter_context(patch("business_core.sheets.find_row_by_id", return_value=found))
+                stack.enter_context(patch("business_core.telegram_handlers._enqueue_document_analysis",
+                                           enqueue_mock))
+                return await th.uploaddoc_confirm(update, context)
+
+        result = asyncio.run(run())
+        enqueue_mock.assert_called_once()
+
+    def test_failure_path_contains_no_navigation(self):
+        th = _fresh_th()
+        snap = _confirmed_snapshot(requirement_id="STAGE-001:DOC-IZH-KP-001")
+        user_data = {"ud_confirmed_snapshot": snap}
+        update, context = _text_update("✅ Подтвердить"), _ctx(user_data=user_data)
+
+        async def run():
+            with contextlib.ExitStack() as stack:
+                for p in _fake_tmp_patches():
+                    stack.enter_context(p)
+                stack.enter_context(patch(
+                    "business_core.document_registry_manager.resolve_and_validate_links",
+                    return_value={"ok": True, "resolved": {
+                        "business_id": "BIZ-001", "client_id": "PRS-001", "object_id": "OBJ-001",
+                        "roadmap_id": "RM-001", "stage_id": "", "document_template_id": "",
+                    }}))
+                stack.enter_context(patch("integrations.google_drive_adapter.get_drive_service",
+                                           return_value=MagicMock()))
+                stack.enter_context(patch("integrations.google_drive_adapter.upload_file",
+                                           side_effect=Exception("drive down")))
+                return await th.uploaddoc_confirm(update, context)
+
+        asyncio.run(run())
+        reply = update.message.reply_text.call_args[0][0]
+        self.assertNotIn("/docgap", reply)
+        self.assertNotIn("/missingdocs", reply)
+
+    def test_privacy_no_new_exposure(self):
+        th, update, context, result = self._run_confirm(requirement_id="STAGE-001:DOC-IZH-KP-001")
+        reply = update.message.reply_text.call_args[0][0]
+        self.assertNotIn("tgfile123", reply)
+        self.assertNotIn("uniq123", reply)
+        self.assertNotIn("OBJFOLDER1", reply)
 
 
 class TestUploadDocPrefillCleanup(unittest.TestCase):
@@ -1496,6 +2066,93 @@ class TestUploadDocPrefillCleanup(unittest.TestCase):
                 return await th.uploaddoc_start(update, context)
 
         asyncio.run(run())
+        self.assertNotIn("ud_prefill", context.user_data)
+
+    def test_cancel_clears_requirement_context(self):
+        """Phase 16C.8.3A: /cancel clears ud_prefill even when it
+        carries a requirement= value — no new cleanup key, same
+        generic pop already covers it."""
+        th = _fresh_th()
+        update, context = _text_update("/cancel"), _ctx(
+            user_data={"ud": _ud_draft(), "ud_prefill": {"business": "BIZ-001", "requirement": "STAGE-001:DOC-1"}},
+        )
+        asyncio.run(th.uploaddoc_cancel(update, context))
+        self.assertNotIn("ud_prefill", context.user_data)
+
+    def test_reentry_clears_stale_requirement(self):
+        th = _fresh_th()
+        update = _entry_update()
+        context = _entry_ctx([])
+        context.user_data = {"ud_prefill": {"business": "STALE", "requirement": "STALE:REQ"}}
+
+        async def run():
+            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+                return await th.uploaddoc_start(update, context)
+
+        asyncio.run(run())
+        self.assertNotIn("ud_prefill", context.user_data)
+
+    def test_persistence_failure_clears_requirement_context(self):
+        th = _fresh_th()
+        snap = _confirmed_snapshot(requirement_id="STAGE-001:DOC-1")
+        user_data = {"ud_confirmed_snapshot": snap}
+        update, context = _text_update("✅ Подтвердить"), _ctx(user_data=user_data)
+
+        async def run():
+            with contextlib.ExitStack() as stack:
+                for p in _fake_tmp_patches():
+                    stack.enter_context(p)
+                stack.enter_context(patch(
+                    "business_core.document_registry_manager.resolve_and_validate_links",
+                    return_value={"ok": True, "resolved": {
+                        "business_id": "BIZ-001", "client_id": "PRS-001", "object_id": "OBJ-001",
+                        "roadmap_id": "RM-001", "stage_id": "", "document_template_id": "",
+                    }}))
+                stack.enter_context(patch("integrations.google_drive_adapter.get_drive_service",
+                                           return_value=MagicMock()))
+                stack.enter_context(patch("integrations.google_drive_adapter.upload_file",
+                                           side_effect=Exception("drive down")))
+                return await th.uploaddoc_confirm(update, context)
+
+        asyncio.run(run())
+        self.assertNotIn("ud_confirmed_snapshot", context.user_data)
+        self.assertNotIn("ud_prefill", context.user_data)
+
+    def test_post_write_verification_failure_clears_requirement_context(self):
+        th = _fresh_th()
+        snap = _confirmed_snapshot(requirement_id="STAGE-001:DOC-1")
+        user_data = {"ud_confirmed_snapshot": snap}
+        update, context = _text_update("✅ Подтвердить"), _ctx(user_data=user_data)
+
+        upload_mock = MagicMock(return_value={"file_id": "NEWFILE1", "file_url": "unused",
+                                                "filename": "passport.pdf", "dry_run": False})
+
+        async def run():
+            with contextlib.ExitStack() as stack:
+                for p in _fake_tmp_patches():
+                    stack.enter_context(p)
+                stack.enter_context(patch(
+                    "business_core.document_registry_manager.resolve_and_validate_links",
+                    return_value={"ok": True, "resolved": {
+                        "business_id": "BIZ-001", "client_id": "PRS-001", "object_id": "OBJ-001",
+                        "roadmap_id": "RM-001", "stage_id": "", "document_template_id": "",
+                    }}))
+                stack.enter_context(patch("integrations.google_drive_adapter.get_drive_service",
+                                           return_value=MagicMock()))
+                stack.enter_context(patch("integrations.google_drive_adapter.upload_file", upload_mock))
+                stack.enter_context(patch("integrations.google_drive_adapter.get_file_metadata",
+                                           return_value=GOOD_UPLOAD_META))
+                stack.enter_context(patch("integrations.google_drive_adapter.trash_file",
+                                           return_value={"ok": True, "error": ""}))
+                stack.enter_context(patch(
+                    "business_core.business_builder.upload_and_register_document",
+                    return_value={"ok": False, "code": "DOCUMENT_POST_WRITE_VERIFICATION_FAILED",
+                                   "error": "mismatch", "document_id": "DREG-001"},
+                ))
+                return await th.uploaddoc_confirm(update, context)
+
+        asyncio.run(run())
+        self.assertNotIn("ud_confirmed_snapshot", context.user_data)
         self.assertNotIn("ud_prefill", context.user_data)
 
 
