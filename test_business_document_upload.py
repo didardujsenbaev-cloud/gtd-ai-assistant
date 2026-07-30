@@ -1006,6 +1006,516 @@ class TestResolveTargetDriveFolder(unittest.TestCase):
 
 
 # ────────────────────────────────────────────────────────────
+# Phase 16C.8.2B: /uploaddoc prefilled args contract
+# ────────────────────────────────────────────────────────────
+
+def _entry_update():
+    update = MagicMock()
+    update.message.reply_text = AsyncMock()
+    update.effective_user = MagicMock(username="dida", id=123)
+    return update
+
+
+def _entry_ctx(args):
+    context = MagicMock()
+    context.user_data = {}
+    context.args = args
+    return context
+
+
+class TestUploadDocPrefillEntry(unittest.TestCase):
+    """uploaddoc_start with optional prefill args (business=/roadmap=/
+    stage=/template=) — entry-time parse/validate only, 0 reads/writes."""
+
+    def _run(self, args, user_data=None):
+        th = _fresh_th()
+        update = _entry_update()
+        context = _entry_ctx(args)
+        if user_data is not None:
+            context.user_data = user_data
+
+        async def run():
+            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+                return await th.uploaddoc_start(update, context)
+
+        result = asyncio.run(run())
+        return th, update, context, result
+
+    def test_no_args_keeps_current_behavior(self):
+        th, update, context, result = self._run([])
+        self.assertEqual(result, th.UD_FILE)
+        self.assertNotIn("ud_prefill", context.user_data)
+        text = update.message.reply_text.call_args[0][0]
+        self.assertIn("Отправь один документ", text)
+
+    def test_no_args_clears_stale_ud_prefill(self):
+        th, update, context, result = self._run([], user_data={"ud_prefill": {"business": "OLD"}})
+        self.assertEqual(result, th.UD_FILE)
+        self.assertNotIn("ud_prefill", context.user_data)
+
+    def test_valid_four_key_args_enters_ud_file(self):
+        th, update, context, result = self._run(
+            ["business=BIZ-001", "roadmap=RM-001", "stage=STAGE-001", "template=DOC-IZH-KP-001"],
+        )
+        self.assertEqual(result, th.UD_FILE)
+
+    def test_exact_prefill_stored(self):
+        th, update, context, result = self._run(
+            ["business=BIZ-001", "roadmap=RM-001", "stage=STAGE-001", "template=DOC-IZH-KP-001"],
+        )
+        self.assertEqual(context.user_data["ud_prefill"], {
+            "business": "BIZ-001", "roadmap": "RM-001", "stage": "STAGE-001", "template": "DOC-IZH-KP-001",
+        })
+
+    def test_order_of_args_does_not_matter(self):
+        th, update, context, result = self._run(
+            ["template=DOC-IZH-KP-001", "business=BIZ-001", "stage=STAGE-001", "roadmap=RM-001"],
+        )
+        self.assertEqual(context.user_data["ud_prefill"]["business"], "BIZ-001")
+        self.assertEqual(context.user_data["ud_prefill"]["template"], "DOC-IZH-KP-001")
+
+    def test_quoted_values_handled(self):
+        th, update, context, result = self._run(
+            ['business="BIZ-001"', "roadmap=RM-001", "stage=STAGE-001", "template=DOC-IZH-KP-001"],
+        )
+        self.assertEqual(context.user_data["ud_prefill"]["business"], "BIZ-001")
+
+    def test_partial_prefill_ends_conversation(self):
+        th, update, context, result = self._run(["business=BIZ-001", "roadmap=RM-001"])
+        self.assertEqual(result, ConversationHandler.END)
+
+    def test_missing_key_list_deterministic(self):
+        th, update, context, result = self._run(["business=BIZ-001", "roadmap=RM-001"])
+        text = update.message.reply_text.call_args[0][0]
+        self.assertIn("stage", text)
+        self.assertIn("template", text)
+
+    def test_unknown_key_ends_conversation(self):
+        th, update, context, result = self._run(
+            ["business=BIZ-001", "roadmap=RM-001", "stage=STAGE-001", "template=DOC-1", "foo=bar"],
+        )
+        self.assertEqual(result, ConversationHandler.END)
+
+    def test_client_rejected_at_entry(self):
+        th, update, context, result = self._run(
+            ["business=BIZ-001", "roadmap=RM-001", "stage=STAGE-001", "template=DOC-1", "client=PRS-001"],
+        )
+        self.assertEqual(result, ConversationHandler.END)
+
+    def test_object_rejected_at_entry(self):
+        th, update, context, result = self._run(
+            ["business=BIZ-001", "roadmap=RM-001", "stage=STAGE-001", "template=DOC-1", "object=OBJ-001"],
+        )
+        self.assertEqual(result, ConversationHandler.END)
+
+    def test_name_rejected_at_entry(self):
+        th, update, context, result = self._run(
+            ["business=BIZ-001", "roadmap=RM-001", "stage=STAGE-001", "template=DOC-1", 'name="Doc"'],
+        )
+        self.assertEqual(result, ConversationHandler.END)
+
+    def test_notes_rejected_at_entry(self):
+        th, update, context, result = self._run(
+            ["business=BIZ-001", "roadmap=RM-001", "stage=STAGE-001", "template=DOC-1", 'notes="x"'],
+        )
+        self.assertEqual(result, ConversationHandler.END)
+
+    def test_duplicate_key_rejected(self):
+        th, update, context, result = self._run(
+            ["business=BIZ-001", "business=BIZ-002", "roadmap=RM-001", "stage=STAGE-001", "template=DOC-1"],
+        )
+        self.assertEqual(result, ConversationHandler.END)
+        text = update.message.reply_text.call_args[0][0]
+        self.assertIn("business", text)
+
+    def test_malformed_token_rejected(self):
+        th, update, context, result = self._run(
+            ["business=BIZ-001", "roadmap=RM-001", "stage=STAGE-001", "template=DOC-1", "garbage"],
+        )
+        self.assertEqual(result, ConversationHandler.END)
+
+    def test_empty_value_rejected(self):
+        th, update, context, result = self._run(
+            ["business=", "roadmap=RM-001", "stage=STAGE-001", "template=DOC-1"],
+        )
+        self.assertEqual(result, ConversationHandler.END)
+
+    def test_failure_leaves_no_upload_state(self):
+        th, update, context, result = self._run(["business=BIZ-001", "roadmap=RM-001"])
+        self.assertNotIn("ud", context.user_data)
+        self.assertNotIn("ud_confirmed_snapshot", context.user_data)
+        self.assertNotIn("ud_prefill", context.user_data)
+
+    def test_entry_does_zero_reads(self):
+        with patch("business_core.sheets.read_business_sheet") as mock_read:
+            th, update, context, result = self._run(
+                ["business=BIZ-001", "roadmap=RM-001", "stage=STAGE-001", "template=DOC-1"],
+            )
+        mock_read.assert_not_called()
+
+    def test_entry_does_zero_writes(self):
+        import inspect
+        th = _fresh_th()
+        source = inspect.getsource(th.uploaddoc_start)
+        for forbidden in ("upload_file", "create_document", "register_document", "append_business_row"):
+            self.assertNotIn(forbidden, source)
+
+    def test_raw_input_not_echoed_unknown_key(self):
+        th, update, context, result = self._run(
+            ["business=BIZ-001", "roadmap=RM-001", "stage=STAGE-001", "template=DOC-1", "SECRETVALUE=leak"],
+        )
+        text = update.message.reply_text.call_args[0][0]
+        self.assertNotIn("leak", text)
+
+
+class TestUploadDocPrefillFileStep(unittest.TestCase):
+    """uploaddoc_receive_file behavior when ud_prefill is active."""
+
+    def test_valid_document_preserves_prefill(self):
+        th = _fresh_th()
+        prefill = {"business": "BIZ-001", "roadmap": "RM-001", "stage": "STAGE-001", "template": "DOC-1"}
+        update, context = _doc_update(), _ctx(user_data={"ud_prefill": dict(prefill)})
+        result = asyncio.run(th.uploaddoc_receive_file(update, context))
+        self.assertEqual(result, th.UD_DETAILS)
+        self.assertEqual(context.user_data["ud_prefill"], prefill)
+
+    def test_prefilled_prompt_asks_only_name_notes(self):
+        th = _fresh_th()
+        prefill = {"business": "BIZ-001", "roadmap": "RM-001", "stage": "STAGE-001", "template": "DOC-1"}
+        update, context = _doc_update(), _ctx(user_data={"ud_prefill": prefill})
+        asyncio.run(th.uploaddoc_receive_file(update, context))
+        text = update.message.reply_text.call_args[0][0]
+        self.assertIn("name=", text)
+        self.assertIn("notes=", text)
+        self.assertNotIn("business=BIZ-001 name=", text)
+
+    def test_generic_prompt_unchanged_without_prefill(self):
+        th = _fresh_th()
+        update, context = _doc_update(), _ctx()
+        asyncio.run(th.uploaddoc_receive_file(update, context))
+        text = update.message.reply_text.call_args[0][0]
+        self.assertIn("business=BIZ-001", text)
+        self.assertIn("client=, object=, roadmap=, stage=, template=, notes=", text)
+
+    def test_wrong_content_type_preserves_prefill(self):
+        th = _fresh_th()
+        prefill = {"business": "BIZ-001", "roadmap": "RM-001", "stage": "STAGE-001", "template": "DOC-1"}
+        update, context = _non_doc_update("photo"), _ctx(user_data={"ud_prefill": dict(prefill)})
+        result = asyncio.run(th.uploaddoc_receive_file(update, context))
+        self.assertEqual(result, th.UD_FILE)
+        self.assertEqual(context.user_data["ud_prefill"], prefill)
+
+    def test_file_metadata_privacy_unchanged(self):
+        th = _fresh_th()
+        prefill = {"business": "BIZ-001", "roadmap": "RM-001", "stage": "STAGE-001", "template": "DOC-1"}
+        update, context = _doc_update(), _ctx(user_data={"ud_prefill": prefill})
+        asyncio.run(th.uploaddoc_receive_file(update, context))
+        text = update.message.reply_text.call_args[0][0]
+        self.assertNotIn("tgfile123", text)
+        self.assertNotIn("uniq123", text)
+
+
+class TestUploadDocPrefillDetailsStep(unittest.TestCase):
+    """uploaddoc_receive_details merge/precedence behavior when
+    ud_prefill is active."""
+
+    PREFILL = {"business": "BIZ-001", "roadmap": "RM-001", "stage": "STAGE-001", "template": "DOC-IZH-KP-001"}
+
+    def _run(self, text, prefill=None, ud=None):
+        th = _fresh_th()
+        user_data = {"ud": ud if ud is not None else _ud_draft()}
+        if prefill is not None:
+            user_data["ud_prefill"] = dict(prefill)
+        update, context = _text_update(text), _ctx(user_data=user_data)
+
+        async def run():
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(patch("business_core.sheets.read_business_sheet",
+                                           side_effect=_read_business_sheet_side_effect))
+                stack.enter_context(patch("business_core.object_manager.find_object_by_id",
+                                           side_effect=_find_object_by_id_side_effect))
+                stack.enter_context(patch("business_core.person_manager.find_person_by_id",
+                                           return_value={"biz_ids": ["BIZ-001"], "drive_folder_id": "PRSFOLDER1"}))
+                stack.enter_context(patch("integrations.google_drive_adapter.get_drive_service",
+                                           return_value=MagicMock()))
+                stack.enter_context(patch("integrations.google_drive_adapter.get_file_metadata",
+                                           return_value=GOOD_FOLDER_META))
+                return await th.uploaddoc_receive_details(update, context)
+
+        result = asyncio.run(run())
+        return th, update, context, result
+
+    def test_valid_name_accepted(self):
+        th, update, context, result = self._run('name="Технический паспорт"', prefill=self.PREFILL)
+        self.assertEqual(result, th.UD_CONFIRM)
+
+    def test_valid_notes_accepted(self):
+        th, update, context, result = self._run(
+            'name="Технический паспорт" notes="важно"', prefill=self.PREFILL,
+        )
+        snap = context.user_data["ud_confirmed_snapshot"]
+        self.assertEqual(snap["notes"], "важно")
+
+    def test_missing_name_remains_ud_details(self):
+        th, update, context, result = self._run("notes=x", prefill=self.PREFILL)
+        self.assertEqual(result, th.UD_DETAILS)
+
+    def test_empty_name_remains_ud_details(self):
+        th, update, context, result = self._run('name=""', prefill=self.PREFILL)
+        self.assertEqual(result, th.UD_DETAILS)
+
+    def test_business_key_rejected(self):
+        th, update, context, result = self._run('name="Doc" business=BIZ-002', prefill=self.PREFILL)
+        self.assertEqual(result, th.UD_DETAILS)
+
+    def test_roadmap_key_rejected(self):
+        th, update, context, result = self._run('name="Doc" roadmap=RM-001', prefill=self.PREFILL)
+        self.assertEqual(result, th.UD_DETAILS)
+
+    def test_stage_key_rejected(self):
+        th, update, context, result = self._run('name="Doc" stage=STAGE-001', prefill=self.PREFILL)
+        self.assertEqual(result, th.UD_DETAILS)
+
+    def test_template_key_rejected(self):
+        th, update, context, result = self._run('name="Doc" template=DOC-IZH-KP-001', prefill=self.PREFILL)
+        self.assertEqual(result, th.UD_DETAILS)
+
+    def test_same_association_value_rejected(self):
+        """Even the SAME value as the prefill must be rejected — the
+        field is immutable, resubmission is never a no-op."""
+        th, update, context, result = self._run('name="Doc" business=BIZ-001', prefill=self.PREFILL)
+        self.assertEqual(result, th.UD_DETAILS)
+        self.assertNotIn("ud_confirmed_snapshot", context.user_data)
+
+    def test_conflicting_association_value_rejected(self):
+        th, update, context, result = self._run('name="Doc" business=BIZ-999', prefill=self.PREFILL)
+        self.assertEqual(result, th.UD_DETAILS)
+        self.assertNotIn("ud_confirmed_snapshot", context.user_data)
+
+    def test_client_rejected_in_details(self):
+        th, update, context, result = self._run('name="Doc" client=PRS-001', prefill=self.PREFILL)
+        self.assertEqual(result, th.UD_DETAILS)
+
+    def test_object_rejected_in_details(self):
+        th, update, context, result = self._run('name="Doc" object=OBJ-001', prefill=self.PREFILL)
+        self.assertEqual(result, th.UD_DETAILS)
+
+    def test_unknown_key_rejected_in_details(self):
+        th, update, context, result = self._run('name="Doc" foo=bar', prefill=self.PREFILL)
+        self.assertEqual(result, th.UD_DETAILS)
+
+    def test_duplicate_name_rejected(self):
+        th, update, context, result = self._run('name="A" name="B"', prefill=self.PREFILL)
+        self.assertEqual(result, th.UD_DETAILS)
+
+    def test_malformed_token_rejected_in_details(self):
+        th, update, context, result = self._run('name="Doc" garbage', prefill=self.PREFILL)
+        self.assertEqual(result, th.UD_DETAILS)
+
+    def test_recoverable_error_retains_ud(self):
+        th, update, context, result = self._run('name=""', prefill=self.PREFILL)
+        self.assertIn("ud", context.user_data)
+
+    def test_recoverable_error_retains_ud_prefill(self):
+        th, update, context, result = self._run('name=""', prefill=self.PREFILL)
+        self.assertIn("ud_prefill", context.user_data)
+        self.assertEqual(context.user_data["ud_prefill"], self.PREFILL)
+
+    def test_recoverable_error_creates_no_snapshot(self):
+        th, update, context, result = self._run('name=""', prefill=self.PREFILL)
+        self.assertNotIn("ud_confirmed_snapshot", context.user_data)
+
+    def test_valid_merge_uses_exact_prefill_values(self):
+        th, update, context, result = self._run('name="Технический паспорт"', prefill=self.PREFILL)
+        snap = context.user_data["ud_confirmed_snapshot"]
+        self.assertEqual(snap["business_id"], "BIZ-001")
+        self.assertEqual(snap["roadmap_id"], "RM-001")
+        self.assertEqual(snap["stage_id"], "STAGE-001")
+        self.assertEqual(snap["document_template_id"], "DOC-IZH-KP-001")
+        self.assertEqual(snap["document_name"], "Технический паспорт")
+
+    def test_resolve_and_validate_links_called(self):
+        th = _fresh_th()
+        user_data = {"ud": _ud_draft(), "ud_prefill": dict(self.PREFILL)}
+        update, context = _text_update('name="Doc"'), _ctx(user_data=user_data)
+
+        async def run():
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(patch("business_core.sheets.read_business_sheet",
+                                           side_effect=_read_business_sheet_side_effect))
+                stack.enter_context(patch("business_core.object_manager.find_object_by_id",
+                                           side_effect=_find_object_by_id_side_effect))
+                stack.enter_context(patch("business_core.person_manager.find_person_by_id",
+                                           return_value={"biz_ids": ["BIZ-001"], "drive_folder_id": "PRSFOLDER1"}))
+                stack.enter_context(patch("integrations.google_drive_adapter.get_drive_service",
+                                           return_value=MagicMock()))
+                stack.enter_context(patch("integrations.google_drive_adapter.get_file_metadata",
+                                           return_value=GOOD_FOLDER_META))
+                mock_resolve = stack.enter_context(
+                    patch("business_core.document_registry_manager.resolve_and_validate_links",
+                          wraps=__import__("business_core.document_registry_manager",
+                                            fromlist=["resolve_and_validate_links"]).resolve_and_validate_links),
+                )
+                await th.uploaddoc_receive_details(update, context)
+                mock_resolve.assert_called_once()
+
+        asyncio.run(run())
+
+    def test_resolve_target_drive_folder_called(self):
+        th = _fresh_th()
+        user_data = {"ud": _ud_draft(), "ud_prefill": dict(self.PREFILL)}
+        update, context = _text_update('name="Doc"'), _ctx(user_data=user_data)
+
+        async def run():
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(patch("business_core.sheets.read_business_sheet",
+                                           side_effect=_read_business_sheet_side_effect))
+                stack.enter_context(patch("business_core.object_manager.find_object_by_id",
+                                           side_effect=_find_object_by_id_side_effect))
+                stack.enter_context(patch("business_core.person_manager.find_person_by_id",
+                                           return_value={"biz_ids": ["BIZ-001"], "drive_folder_id": "PRSFOLDER1"}))
+                stack.enter_context(patch("integrations.google_drive_adapter.get_drive_service",
+                                           return_value=MagicMock()))
+                stack.enter_context(patch("integrations.google_drive_adapter.get_file_metadata",
+                                           return_value=GOOD_FOLDER_META))
+                mock_folder = stack.enter_context(
+                    patch("business_core.document_registry_manager.resolve_target_drive_folder",
+                          wraps=__import__("business_core.document_registry_manager",
+                                            fromlist=["resolve_target_drive_folder"]).resolve_target_drive_folder),
+                )
+                await th.uploaddoc_receive_details(update, context)
+                mock_folder.assert_called_once()
+
+        asyncio.run(run())
+
+    def test_inconsistent_ids_use_existing_failure_semantics(self):
+        conflicting_template = [{"Document Template ID": "DOC-OTHER-001", "Biz ID": "BIZ-002"}]
+
+        def side_effect(key, *a, **kw):
+            if key == "document_template_registry":
+                return conflicting_template
+            return _read_business_sheet_side_effect(key, *a, **kw)
+
+        th = _fresh_th()
+        prefill = {"business": "BIZ-001", "roadmap": "RM-001", "stage": "STAGE-001", "template": "DOC-OTHER-001"}
+        user_data = {"ud": _ud_draft(), "ud_prefill": prefill}
+        update, context = _text_update('name="Doc"'), _ctx(user_data=user_data)
+
+        async def run():
+            with patch("business_core.sheets.read_business_sheet", side_effect=side_effect), \
+                 patch("business_core.object_manager.find_object_by_id", side_effect=_find_object_by_id_side_effect), \
+                 patch("business_core.business_builder.get_person_biz_ids", return_value=["BIZ-001"]):
+                return await th.uploaddoc_receive_details(update, context)
+
+        result = asyncio.run(run())
+        self.assertEqual(result, ConversationHandler.END)
+        self.assertNotIn("ud_prefill", context.user_data)
+
+    def test_snapshot_exact_fields(self):
+        """client_id/object_id are passed in as "" (per §8 — the
+        prefill flow never accepts them), but the existing
+        resolve_and_validate_links() auto-fill chain still derives
+        them from the roadmap's own Object ID exactly as it already
+        does for the generic flow — this is unchanged existing
+        behavior, not something this subphase controls."""
+        th, update, context, result = self._run('name="Технический паспорт" notes="заметка"', prefill=self.PREFILL)
+        snap = context.user_data["ud_confirmed_snapshot"]
+        self.assertEqual(snap["business_id"], "BIZ-001")
+        self.assertEqual(snap["object_id"], "OBJ-001")
+        self.assertEqual(snap["client_id"], "PRS-001")
+        self.assertEqual(snap["roadmap_id"], "RM-001")
+        self.assertEqual(snap["stage_id"], "STAGE-001")
+        self.assertEqual(snap["document_template_id"], "DOC-IZH-KP-001")
+        self.assertEqual(snap["document_name"], "Технический паспорт")
+        self.assertEqual(snap["notes"], "заметка")
+
+    def test_requirement_id_absent(self):
+        th, update, context, result = self._run('name="Технический паспорт"', prefill=self.PREFILL)
+        snap = context.user_data["ud_confirmed_snapshot"]
+        self.assertNotIn("requirement_id", snap)
+
+    def test_zero_writes_before_confirm(self):
+        with patch("integrations.google_drive_adapter.upload_file") as mock_upload, \
+             patch("business_core.business_builder.upload_and_register_document") as mock_register:
+            th, update, context, result = self._run('name="Технический паспорт"', prefill=self.PREFILL)
+        mock_upload.assert_not_called()
+        mock_register.assert_not_called()
+
+
+class TestUploadDocPrefillCleanup(unittest.TestCase):
+    """ud_prefill lifecycle across every terminal path."""
+
+    def test_cancel_command_clears_ud_prefill(self):
+        th = _fresh_th()
+        update, context = _text_update("/cancel"), _ctx(
+            user_data={"ud": _ud_draft(), "ud_prefill": {"business": "BIZ-001"}},
+        )
+        asyncio.run(th.uploaddoc_cancel(update, context))
+        self.assertNotIn("ud_prefill", context.user_data)
+
+    def test_confirm_cancel_button_clears_ud_prefill(self):
+        th = _fresh_th()
+        update = _text_update("❌ Отмена")
+        context = _ctx(user_data={
+            "ud_confirmed_snapshot": _confirmed_snapshot(), "ud_prefill": {"business": "BIZ-001"},
+        })
+        asyncio.run(th.uploaddoc_confirm(update, context))
+        self.assertNotIn("ud_prefill", context.user_data)
+
+    def test_successful_completion_clears_ud_prefill(self):
+        th, update, context, result = TestUploadDocPrefillDetailsStep()._run(
+            'name="Технический паспорт"', prefill=TestUploadDocPrefillDetailsStep.PREFILL,
+        )
+        # By the time UD_CONFIRM is reached, ud_prefill has already
+        # been folded into the snapshot and cleared.
+        self.assertNotIn("ud_prefill", context.user_data)
+
+    def test_terminal_details_failure_clears_ud_prefill(self):
+        th = _fresh_th()
+        prefill = {"business": "BIZ-999", "roadmap": "RM-001", "stage": "STAGE-001", "template": "DOC-1"}
+        user_data = {"ud": _ud_draft(), "ud_prefill": prefill}
+        update, context = _text_update('name="Doc"'), _ctx(user_data=user_data)
+
+        async def run():
+            with patch("business_core.sheets.read_business_sheet", side_effect=_read_business_sheet_side_effect), \
+                 patch("business_core.object_manager.find_object_by_id", side_effect=_find_object_by_id_side_effect):
+                return await th.uploaddoc_receive_details(update, context)
+
+        result = asyncio.run(run())
+        self.assertEqual(result, ConversationHandler.END)
+        self.assertNotIn("ud_prefill", context.user_data)
+
+    def test_reentry_clears_prior_prefill(self):
+        th = _fresh_th()
+        update = _entry_update()
+        context = _entry_ctx([])
+        context.user_data = {"ud_prefill": {"business": "STALE"}}
+
+        async def run():
+            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+                return await th.uploaddoc_start(update, context)
+
+        asyncio.run(run())
+        self.assertNotIn("ud_prefill", context.user_data)
+
+
+class TestUploadDocPrefillPrivacy(unittest.TestCase):
+    def test_no_file_id_or_folder_id_in_entry_errors(self):
+        th = _fresh_th()
+        update = _entry_update()
+        context = _entry_ctx(["business=BIZ-001", "roadmap=RM-001"])
+
+        async def run():
+            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+                return await th.uploaddoc_start(update, context)
+
+        asyncio.run(run())
+        text = update.message.reply_text.call_args[0][0]
+        self.assertNotIn("folder", text.lower())
+        self.assertNotIn("drive.google.com", text)
+
+
+# ────────────────────────────────────────────────────────────
 # Regression: existing Phase 15A commands and registration untouched
 # ────────────────────────────────────────────────────────────
 

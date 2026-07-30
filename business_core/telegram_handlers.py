@@ -4767,15 +4767,165 @@ async def syncstageknowledge_cmd(update: Update, context: ContextTypes.DEFAULT_T
 
 UPLOADDOC_REQUIRED_ARGS = ("business", "name")
 
+# Phase 16C.8.2B: /uploaddoc optional prefilled association context.
+UPLOADDOC_PREFILL_KEYS = ("business", "roadmap", "stage", "template")
+
+
+def _parse_uploaddoc_prefill_args(raw: str) -> tuple:
+    """
+    Narrow, entry-only parser for /uploaddoc's optional prefill args
+    (business=/roadmap=/stage=/template=). Never reused by other
+    commands, and _parse_kv_args() itself is left untouched — that
+    parser silently overwrites duplicate keys and turns bare tokens
+    into positional _posN entries, neither of which is safe to accept
+    for an immutable association context that gets locked in for the
+    whole /uploaddoc conversation.
+
+    Returns (values_dict, None) on success, (None, error_message) on
+    any failure. Never raises. Never echoes the raw input text back —
+    every error message names only the specific key/token involved.
+    """
+    import re
+    token_pattern = r'(\w+)=(?:"([^"]*?)"|\'([^\']*?)\'|(\S+))|(\S+)'
+    seen: dict = {}
+    duplicates: list = []
+    unknown: list = []
+    for m in re.finditer(token_pattern, raw):
+        if m.group(1):
+            key = m.group(1)
+            val = (m.group(2) or m.group(3) or m.group(4) or "").strip()
+            if key not in UPLOADDOC_PREFILL_KEYS:
+                if key not in unknown:
+                    unknown.append(key)
+                continue
+            if key in seen:
+                if key not in duplicates:
+                    duplicates.append(key)
+                continue
+            if not val:
+                return None, f"❌ Параметр загрузки не может быть пустым: {key}."
+            seen[key] = val
+        else:
+            return None, (
+                "❌ Некорректный формат параметров загрузки.\n\n"
+                "Используйте:\n"
+                "/uploaddoc business=... roadmap=... stage=... template=..."
+            )
+
+    if unknown:
+        return None, (
+            f"❌ Неизвестный параметр загрузки: {unknown[0]}.\n\n"
+            "Разрешены:\nbusiness, roadmap, stage, template"
+        )
+    if duplicates:
+        return None, f"❌ Параметр загрузки указан несколько раз: {duplicates[0]}."
+
+    missing = [k for k in UPLOADDOC_PREFILL_KEYS if k not in seen]
+    if missing:
+        return None, (
+            "❌ Неполный контекст загрузки.\n"
+            f"Не хватает: {', '.join(missing)}.\n\n"
+            "Используйте:\n"
+            "/uploaddoc business=... roadmap=... stage=... template=..."
+        )
+
+    return seen, None
+
+
+UPLOADDOC_ASSOCIATION_KEYS = ("business", "client", "object", "roadmap", "stage", "template")
+
+
+def _parse_uploaddoc_prefilled_details(raw: str) -> tuple:
+    """
+    Phase 16C.8.2B: narrow parser for UD_DETAILS when ud_prefill is
+    active — only name=/notes= are accepted. Any association-field
+    key (business=/client=/object=/roadmap=/stage=/template=) is
+    rejected outright, whether its value matches or conflicts with
+    the prefilled context — those fields are already fixed by
+    /uploaddoc's own args and are immutable for this conversation.
+
+    Returns (values_dict, None) on success, (None, error_message) on
+    any failure. Never raises, never echoes raw input.
+    """
+    import re
+    token_pattern = r'(\w+)=(?:"([^"]*?)"|\'([^\']*?)\'|(\S+))|(\S+)'
+    seen: dict = {}
+    duplicates: list = []
+    unknown: list = []
+    association_hit = False
+    for m in re.finditer(token_pattern, raw):
+        if m.group(1):
+            key = m.group(1)
+            val = (m.group(2) or m.group(3) or m.group(4) or "").strip()
+            if key in UPLOADDOC_ASSOCIATION_KEYS:
+                association_hit = True
+                continue
+            if key not in ("name", "notes"):
+                if key not in unknown:
+                    unknown.append(key)
+                continue
+            if key in seen:
+                if key not in duplicates:
+                    duplicates.append(key)
+                continue
+            seen[key] = val
+        else:
+            return None, (
+                "❌ Некорректный формат данных документа.\n\n"
+                'Введите:\nname="Название документа"\n\n'
+                'Опционально:\nnotes="Комментарий"'
+            )
+
+    if association_hit:
+        return None, (
+            "❌ Контекст документа уже задан командой /uploaddoc.\n"
+            "В поле деталей можно указать только:\n"
+            "name=...\n"
+            "notes=..."
+        )
+    if unknown:
+        return None, f"❌ Неизвестный параметр: {unknown[0]}.\n\nРазрешены:\nname, notes"
+    if duplicates:
+        return None, f"❌ Параметр указан несколько раз: {duplicates[0]}."
+
+    name = seen.get("name", "").strip()
+    if not name:
+        return None, (
+            "❌ Укажите название документа:\n\n"
+            'name="Название документа"\n\n'
+            'Опционально:\nnotes="Комментарий"'
+        )
+
+    return {"name": name, "notes": seen.get("notes", "").strip()}, None
+
 
 async def uploaddoc_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """/uploaddoc — начать загрузку одного документа."""
+    """
+    /uploaddoc — начать загрузку одного документа.
+
+    Optionally accepts prefilled association args (Phase 16C.8.2B):
+    /uploaddoc business=BIZ-001 roadmap=RM-003 stage=STAGE-011 template=DOC-008
+    All four are required together if any are given — this is a
+    read-free, write-free, 0-Sheets/0-Drive entry-time parse/validate
+    only; the values are still passed through the existing
+    resolve_and_validate_links()/resolve_target_drive_folder() chain
+    unchanged once the conversation reaches UD_DETAILS.
+    """
     if not _is_bc_enabled():
         await _reply(update, _bc_disabled_msg())
         return ConversationHandler.END
 
     context.user_data.pop("ud", None)
     context.user_data.pop("ud_confirmed_snapshot", None)
+    context.user_data.pop("ud_prefill", None)
+
+    raw = " ".join(context.args or [])
+    if raw.strip():
+        values, error = _parse_uploaddoc_prefill_args(raw)
+        if error:
+            await update.message.reply_text(error)
+            return ConversationHandler.END
+        context.user_data["ud_prefill"] = dict(values)
 
     await update.message.reply_text(
         "📎 Отправь один документ (Telegram document — файл, не фото и не голосовое).\n\n"
@@ -4830,16 +4980,30 @@ async def uploaddoc_receive_file(update: Update, context: ContextTypes.DEFAULT_T
     lines = ["✅ Файл получен: " + (doc.file_name or "(без имени)")]
     if validation["code"] == "DOCUMENT_ANALYSIS_UNSUPPORTED":
         lines.append(_document_creation_message(validation))
-    lines.extend([
-        "",
-        "Теперь одной строкой укажи данные документа:",
-        "",
-        'business=BIZ-001 name="Технический паспорт"',
-        "",
-        "Опционально: client=, object=, roadmap=, stage=, template=, notes=",
-        "",
-        "/cancel — отменить.",
-    ])
+
+    if context.user_data.get("ud_prefill") is not None:
+        lines.extend([
+            "",
+            "Введите данные документа:",
+            "",
+            'name="Название документа"',
+            "",
+            "Опционально:",
+            'notes="Комментарий"',
+            "",
+            "/cancel — отменить.",
+        ])
+    else:
+        lines.extend([
+            "",
+            "Теперь одной строкой укажи данные документа:",
+            "",
+            'business=BIZ-001 name="Технический паспорт"',
+            "",
+            "Опционально: client=, object=, roadmap=, stage=, template=, notes=",
+            "",
+            "/cancel — отменить.",
+        ])
     await update.message.reply_text("\n".join(lines))
     return UD_DETAILS
 
@@ -4852,29 +5016,46 @@ async def uploaddoc_receive_details(update: Update, context: ContextTypes.DEFAUL
             reply_markup=ReplyKeyboardRemove(),
         )
         context.user_data.pop("ud_confirmed_snapshot", None)
+        context.user_data.pop("ud_prefill", None)
         return ConversationHandler.END
 
     raw = update.message.text or ""
-    kv = _parse_kv_args(raw)
+    prefill = context.user_data.get("ud_prefill")
 
-    business_id = kv.get("business", "").strip()
-    name = kv.get("name", "").strip()
-    client_id = kv.get("client", "").strip()
-    object_id = kv.get("object", "").strip()
-    roadmap_id = kv.get("roadmap", "").strip()
-    stage_id = kv.get("stage", "").strip()
-    template_id = kv.get("template", "").strip()
-    notes = kv.get("notes", "").strip()
+    if prefill is not None:
+        parsed, error = _parse_uploaddoc_prefilled_details(raw)
+        if error:
+            await update.message.reply_text(error)
+            return UD_DETAILS
+        business_id = prefill["business"]
+        client_id = ""
+        object_id = ""
+        roadmap_id = prefill["roadmap"]
+        stage_id = prefill["stage"]
+        template_id = prefill["template"]
+        name = parsed["name"]
+        notes = parsed["notes"]
+    else:
+        kv = _parse_kv_args(raw)
 
-    missing = [a for a in UPLOADDOC_REQUIRED_ARGS if not kv.get(a, "").strip()]
-    if missing:
-        await update.message.reply_text(
-            "❌ Использование:\n"
-            'business=BIZ-001 name="Технический паспорт"\n\n'
-            "Опционально: client=, object=, roadmap=, stage=, template=, notes=\n\n"
-            f"Отсутствуют обязательные поля: {', '.join(missing)}"
-        )
-        return UD_DETAILS
+        business_id = kv.get("business", "").strip()
+        name = kv.get("name", "").strip()
+        client_id = kv.get("client", "").strip()
+        object_id = kv.get("object", "").strip()
+        roadmap_id = kv.get("roadmap", "").strip()
+        stage_id = kv.get("stage", "").strip()
+        template_id = kv.get("template", "").strip()
+        notes = kv.get("notes", "").strip()
+
+        missing = [a for a in UPLOADDOC_REQUIRED_ARGS if not kv.get(a, "").strip()]
+        if missing:
+            await update.message.reply_text(
+                "❌ Использование:\n"
+                'business=BIZ-001 name="Технический паспорт"\n\n'
+                "Опционально: client=, object=, roadmap=, stage=, template=, notes=\n\n"
+                f"Отсутствуют обязательные поля: {', '.join(missing)}"
+            )
+            return UD_DETAILS
 
     try:
         from business_core.document_registry_manager import (
@@ -4888,6 +5069,7 @@ async def uploaddoc_receive_details(update: Update, context: ContextTypes.DEFAUL
         if not validation["ok"]:
             await update.message.reply_text(f"❌ {validation['error']}")
             context.user_data.pop("ud", None)
+            context.user_data.pop("ud_prefill", None)
             return ConversationHandler.END
 
         resolved = validation["resolved"]
@@ -4901,6 +5083,7 @@ async def uploaddoc_receive_details(update: Update, context: ContextTypes.DEFAUL
         if not folder["ok"]:
             await update.message.reply_text(f"❌ {folder['error']}")
             context.user_data.pop("ud", None)
+            context.user_data.pop("ud_prefill", None)
             return ConversationHandler.END
 
         # Best-effort friendly folder name for the confirmation card —
@@ -4919,6 +5102,7 @@ async def uploaddoc_receive_details(update: Update, context: ContextTypes.DEFAUL
         log.error(f"uploaddoc_receive_details error: {e}")
         await update.message.reply_text("❌ Не удалось подготовить загрузку документа.")
         context.user_data.pop("ud", None)
+        context.user_data.pop("ud_prefill", None)
         return ConversationHandler.END
 
     snapshot = {
@@ -4939,6 +5123,10 @@ async def uploaddoc_receive_details(update: Update, context: ContextTypes.DEFAUL
     }
     context.user_data["ud_confirmed_snapshot"] = snapshot
     context.user_data.pop("ud", None)
+    # Phase 16C.8.2B: the immutable association context now lives in
+    # the snapshot itself — ud_prefill is no longer needed and is
+    # cleared here to avoid two competing copies of the same data.
+    context.user_data.pop("ud_prefill", None)
 
     size_line = f"{snapshot['tg_file_size']} B" if snapshot.get("tg_file_size") else "—"
     folder_label = f"{folder['level']} {folder['source_id']}" if folder["level"] else "—"
@@ -4980,6 +5168,7 @@ async def uploaddoc_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if "Отмена" in text:
         context.user_data.pop("ud_confirmed_snapshot", None)
         context.user_data.pop("ud", None)
+        context.user_data.pop("ud_prefill", None)
         await update.message.reply_text("Отменено.", reply_markup=ReplyKeyboardRemove())
         return ConversationHandler.END
 
@@ -4990,6 +5179,7 @@ async def uploaddoc_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             "Начни заново: /uploaddoc",
             reply_markup=ReplyKeyboardRemove(),
         )
+        context.user_data.pop("ud_prefill", None)
         return ConversationHandler.END
 
     op_state = snap.get("op_state")
@@ -5001,12 +5191,14 @@ async def uploaddoc_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return UD_CONFIRM
     if op_state == "completed":
         context.user_data.pop("ud_confirmed_snapshot", None)
+        context.user_data.pop("ud_prefill", None)
         await update.message.reply_text(
             "✅ Этот документ уже был загружен.", reply_markup=ReplyKeyboardRemove(),
         )
         return ConversationHandler.END
     if op_state == "verification_failed":
         context.user_data.pop("ud_confirmed_snapshot", None)
+        context.user_data.pop("ud_prefill", None)
         await update.message.reply_text(
             "⚠️ Регистрация уже выполнена, но post-write verification не прошла ранее. "
             "Повторная загрузка не выполняется — требуется ручная проверка.",
@@ -5036,6 +5228,7 @@ async def uploaddoc_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 reply_markup=ReplyKeyboardRemove(),
             )
             context.user_data.pop("ud_confirmed_snapshot", None)
+            context.user_data.pop("ud_prefill", None)
             return ConversationHandler.END
 
         try:
@@ -5050,6 +5243,7 @@ async def uploaddoc_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 reply_markup=ReplyKeyboardRemove(),
             )
             context.user_data.pop("ud_confirmed_snapshot", None)
+            context.user_data.pop("ud_prefill", None)
             return ConversationHandler.END
 
         from integrations.google_drive_adapter import (
@@ -5078,6 +5272,7 @@ async def uploaddoc_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 reply_markup=ReplyKeyboardRemove(),
             )
             context.user_data.pop("ud_confirmed_snapshot", None)
+            context.user_data.pop("ud_prefill", None)
             return ConversationHandler.END
 
         drive_file_id = upload_result["file_id"]
@@ -5107,6 +5302,7 @@ async def uploaddoc_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 _document_creation_message(invalid_result), reply_markup=ReplyKeyboardRemove(),
             )
             context.user_data.pop("ud_confirmed_snapshot", None)
+            context.user_data.pop("ud_prefill", None)
             return ConversationHandler.END
 
         real_name = meta["name"]
@@ -5140,6 +5336,7 @@ async def uploaddoc_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 _document_creation_message(final_result), reply_markup=ReplyKeyboardRemove(),
             )
             context.user_data.pop("ud_confirmed_snapshot", None)
+            context.user_data.pop("ud_prefill", None)
             return ConversationHandler.END
 
         if result["code"] == "DOCUMENT_POST_WRITE_VERIFICATION_FAILED":
@@ -5152,6 +5349,7 @@ async def uploaddoc_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 _document_creation_message(result), reply_markup=ReplyKeyboardRemove(),
             )
             context.user_data.pop("ud_confirmed_snapshot", None)
+            context.user_data.pop("ud_prefill", None)
             return ConversationHandler.END
 
         if not result["ok"]:
@@ -5160,6 +5358,7 @@ async def uploaddoc_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 _document_creation_message(result), reply_markup=ReplyKeyboardRemove(),
             )
             context.user_data.pop("ud_confirmed_snapshot", None)
+            context.user_data.pop("ud_prefill", None)
             return ConversationHandler.END
 
         document_id = result["document_id"]
@@ -5190,12 +5389,14 @@ async def uploaddoc_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     context.user_data.pop("ud_confirmed_snapshot", None)
     context.user_data.pop("ud", None)
+    context.user_data.pop("ud_prefill", None)
     return ConversationHandler.END
 
 
 async def uploaddoc_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.pop("ud", None)
     context.user_data.pop("ud_confirmed_snapshot", None)
+    context.user_data.pop("ud_prefill", None)
     await update.message.reply_text("Отменено.", reply_markup=ReplyKeyboardRemove())
     return ConversationHandler.END
 
