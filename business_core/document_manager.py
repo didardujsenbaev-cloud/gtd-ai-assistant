@@ -51,6 +51,10 @@ _DOCUMENT_FIELDS = [
     "Uploaded At", "Uploaded By",
     "Reviewed At", "Reviewed By", "Rejection Reason",
     "Notes", "Created At", "Updated At",
+    # Phase 16C.9C: read_row_by_headers() already returns "" for any
+    # wanted header absent from a sparse/legacy row — no special-casing
+    # needed for pre-migration rows.
+    "Archived At", "Archived By", "Archive Reason", "Previous Status",
 ]
 
 
@@ -101,6 +105,10 @@ def _document_row_to_dict(row_num: int, v: dict) -> dict:
         "notes":                v["Notes"],
         "created_at":           v["Created At"],
         "updated_at":           v["Updated At"],
+        "archived_at":          v["Archived At"],
+        "archived_by":          v["Archived By"],
+        "archive_reason":       v["Archive Reason"],
+        "previous_status":      v["Previous Status"],
     }
 
 
@@ -552,3 +560,56 @@ def update_document_status(document_id: str, status: str) -> dict:
     except Exception as exc:
         log.error(f"update_document_status({document_id}) error: {exc}")
         return {"ok": False, "changed": False, "code": "", "error": str(exc)}
+
+
+def archive_document_row(
+    document_id: str,
+    *,
+    archived_at: str,
+    archived_by: str,
+    archive_reason: str,
+    previous_status: str,
+) -> dict:
+    """
+    Phase 16C.9C: low-level Archive row write. Does not validate the
+    transition matrix, does not decide idempotency, does not read
+    Drive/DOCUMENT_CONTENT/DOCUMENT_FIELD_REVIEWS — business_builder.
+    archive_document() already did all of that before calling this.
+
+    Writes exactly six fields in one update_business_row() call (one
+    batch_update request) — never multiple update_cell calls, never a
+    call to update_document_status():
+        Status = "archived"
+        Archived At = archived_at
+        Archived By = archived_by
+        Archive Reason = archive_reason
+        Previous Status = previous_status
+        Updated At = archived_at
+
+    Returns:
+        {"ok": bool, "changed": bool, "code": str, "error": str | None}
+    """
+    if not document_id:
+        return {"ok": False, "changed": False, "code": "DOCUMENT_NOT_FOUND", "error": "document_id не указан"}
+
+    found = _find_document_row(document_id)
+    if not found:
+        return {"ok": False, "changed": False, "code": "DOCUMENT_NOT_FOUND", "error": f"Document '{document_id}' не найден"}
+    row_num, _current = found
+
+    try:
+        from business_core.sheets import update_business_row
+
+        update_business_row("document_registry", row_num, {
+            "Status": "archived",
+            "Archived At": archived_at,
+            "Archived By": archived_by,
+            "Archive Reason": archive_reason,
+            "Previous Status": previous_status,
+            "Updated At": archived_at,
+        })
+        log.info(f"archive_document_row: {document_id} -> archived")
+        return {"ok": True, "changed": True, "code": "DOCUMENT_ARCHIVED", "error": None}
+    except Exception as exc:
+        log.error(f"archive_document_row({document_id}) error: {exc}")
+        return {"ok": False, "changed": False, "code": "DOCUMENT_ARCHIVE_WRITE_FAILED", "error": None}

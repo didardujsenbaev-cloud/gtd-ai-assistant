@@ -4473,6 +4473,9 @@ def _document_result(
     compensation_attempted: bool = False, compensation_succeeded: bool = False,
     analysis_status: str = "", warnings: tuple = (), conflicting_document_ids: tuple = (),
     retry_safe: bool = True,
+    # Phase 16C.9C: Document Archive — optional, empty-default so every
+    # existing caller's output is byte-identical to before this change.
+    document_name: str = "", archived_at: str = "", archived_by: str = "", archive_reason: str = "",
 ) -> dict:
     """Shared result-builder for every Document orchestration function
     (ADR-020 §21/§8 of business_builder.py's design) — the stable,
@@ -4489,6 +4492,8 @@ def _document_result(
         "compensation_attempted": compensation_attempted, "compensation_succeeded": compensation_succeeded,
         "analysis_status": analysis_status, "warnings": tuple(warnings),
         "conflicting_document_ids": tuple(conflicting_document_ids), "retry_safe": retry_safe,
+        "document_name": document_name, "archived_at": archived_at,
+        "archived_by": archived_by, "archive_reason": archive_reason,
     }
 
 
@@ -5963,6 +5968,183 @@ def transition_document_status(document_id: str, target_status: str) -> dict:
         document_id=document_id, business_id=business_id,
         previous_status=previous_status, requested_status=target_status,
         final_status=target_status, changed=changed,
+    )
+
+
+# ─────────────────────────────────────────────────────────────
+# Phase 16C.9C: Document Archive Domain Operation.
+#
+# archive_document() is the sole canonical orchestration boundary for
+# archiving a Document — telegram_handlers.py (no command exists yet)
+# must call this, never document_manager.archive_document_row()
+# directly, never sheets.update_business_row() directly, never
+# transition_document_status()/update_document_status() as a
+# substitute (those never write the four durable archive-metadata
+# fields). Archive means Status = "archived" on exactly the named
+# Document ID row — no Drive mutation, no DOCUMENT_CONTENT mutation,
+# no DOCUMENT_FIELD_REVIEWS mutation, no family-wide effect, no
+# restore (not implemented in this phase).
+# ─────────────────────────────────────────────────────────────
+
+_DOCUMENT_ARCHIVE_REASON_MAX_LENGTH = 500
+_DOCUMENT_ARCHIVE_ACTOR_RE = re.compile(r"^telegram:[0-9]+$")
+
+
+def archive_document(
+    document_id: str,
+    reason: str,
+    archived_by: str,
+    *,
+    dry_run: bool = False,
+) -> dict:
+    """
+    Phase 16C.9C (ADR-020 archive extension): the sole canonical
+    Document-archive orchestration boundary.
+
+    Validation order, all before any write:
+      A. required document_id (trimmed)
+      B. required, length-bounded reason (trimmed)
+      C. archived_by must match exactly telegram:{digits}
+      D. Document exists (DOCUMENT_NOT_FOUND)
+      E. already-archived short-circuit (idempotent no-op, zero
+         further reads/writes — also covers legacy rows with
+         incomplete archive metadata: never repaired, never
+         overwritten)
+      F. ordinary transition-matrix validation, reusing
+         _DOCUMENT_ORDINARY_TRANSITIONS as-is (INVALID_DOCUMENT_TRANSITION
+         for e.g. superseded -> archived)
+      G. (dry_run only) return preview, no write, no generated
+         timestamp
+      H. generate one canonical timestamp, used for both Archived At
+         and Updated At
+      I. one manager write (archive_document_row)
+      J. post-write re-read + six-field verification
+      K. structured result
+
+    No Drive/DOCUMENT_CONTENT/DOCUMENT_FIELD_REVIEWS/requirements/
+    Telegram calls anywhere in this function.
+    """
+    from business_core.document_manager import find_document_by_id, archive_document_row
+
+    document_id = (document_id or "").strip()
+    if not document_id:
+        return _document_result(ok=False, code="DOCUMENT_NOT_FOUND", error="document_id обязателен")
+
+    reason = (reason or "").strip()
+    if not reason:
+        return _document_result(
+            ok=False, code="DOCUMENT_ARCHIVE_REASON_REQUIRED",
+            error="reason обязателен", document_id=document_id,
+        )
+    if len(reason) > _DOCUMENT_ARCHIVE_REASON_MAX_LENGTH:
+        return _document_result(
+            ok=False, code="DOCUMENT_ARCHIVE_REASON_TOO_LONG",
+            error=f"reason не может превышать {_DOCUMENT_ARCHIVE_REASON_MAX_LENGTH} символов",
+            document_id=document_id,
+        )
+
+    if not archived_by or not _DOCUMENT_ARCHIVE_ACTOR_RE.match(archived_by):
+        return _document_result(
+            ok=False, code="DOCUMENT_ARCHIVE_ACTOR_INVALID",
+            error="archived_by должен точно соответствовать формату telegram:{numeric_id}",
+            document_id=document_id,
+        )
+
+    document = find_document_by_id(document_id)
+    if document is None:
+        return _document_result(ok=False, code="DOCUMENT_NOT_FOUND", error=f"Document {document_id} не найден", document_id=document_id)
+
+    business_id = document.get("business_id", "")
+    document_name = document.get("document_name", "")
+    roadmap_id = document.get("roadmap_id", "")
+    stage_id = document.get("stage_id", "")
+    document_template_id = document.get("document_template_id", "")
+    current_status = document.get("status", "")
+
+    if current_status == "archived":
+        # Idempotent no-op — also covers a legacy archived row with
+        # incomplete/blank archive metadata: never repaired, never
+        # overwritten, existing (possibly blank) values returned as-is.
+        return _document_result(
+            ok=True, code="DOCUMENT_ARCHIVE_ALREADY_ARCHIVED", error=None,
+            document_id=document_id, business_id=business_id, document_name=document_name,
+            roadmap_id=roadmap_id, stage_id=stage_id, document_template_id=document_template_id,
+            previous_status=document.get("previous_status", ""),
+            requested_status="archived", final_status="archived",
+            archived_at=document.get("archived_at", ""), archived_by=document.get("archived_by", ""),
+            archive_reason=document.get("archive_reason", ""),
+            changed=False, retry_safe=True,
+        )
+
+    allowed_targets = _DOCUMENT_ORDINARY_TRANSITIONS.get(current_status, (current_status,))
+    if "archived" not in allowed_targets:
+        return _document_result(
+            ok=False, code="INVALID_DOCUMENT_TRANSITION",
+            error=f"Переход '{current_status}' → 'archived' не разрешён",
+            document_id=document_id, business_id=business_id, document_name=document_name,
+            roadmap_id=roadmap_id, stage_id=stage_id, document_template_id=document_template_id,
+            previous_status=current_status, requested_status="archived", final_status=current_status,
+        )
+
+    if dry_run:
+        return _document_result(
+            ok=True, code="DOCUMENT_ARCHIVE_PREVIEW", error=None,
+            document_id=document_id, business_id=business_id, document_name=document_name,
+            roadmap_id=roadmap_id, stage_id=stage_id, document_template_id=document_template_id,
+            previous_status=current_status, requested_status="archived", final_status="archived",
+            archived_at="", archived_by=archived_by, archive_reason=reason,
+            changed=False, retry_safe=True,
+        )
+
+    from datetime import timezone
+    archived_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+    write_result = archive_document_row(
+        document_id, archived_at=archived_at, archived_by=archived_by,
+        archive_reason=reason, previous_status=current_status,
+    )
+    if not write_result["ok"]:
+        return _document_result(
+            ok=False, code=write_result.get("code") or "DOCUMENT_ARCHIVE_WRITE_FAILED", error=None,
+            document_id=document_id, business_id=business_id, document_name=document_name,
+            roadmap_id=roadmap_id, stage_id=stage_id, document_template_id=document_template_id,
+            previous_status=current_status, requested_status="archived", final_status=current_status,
+            retry_safe=False,
+        )
+
+    reread = find_document_by_id(document_id)
+    if reread is None:
+        log.error(f"archive_document({document_id}) post-write verification: document missing on re-read")
+        return _document_result(
+            ok=False, code="DOCUMENT_ARCHIVE_POST_WRITE_VERIFICATION_FAILED", error=None,
+            document_id=document_id, business_id=business_id, document_name=document_name,
+            roadmap_id=roadmap_id, stage_id=stage_id, document_template_id=document_template_id,
+            previous_status=current_status, requested_status="archived", final_status=current_status,
+            retry_safe=False,
+        )
+
+    expected = {
+        "status": "archived", "archived_at": archived_at, "archived_by": archived_by,
+        "archive_reason": reason, "previous_status": current_status, "updated_at": archived_at,
+    }
+    mismatches = {k: {"expected": v, "actual": reread.get(k)} for k, v in expected.items() if reread.get(k) != v}
+    if mismatches:
+        log.error(f"archive_document({document_id}) post-write verification mismatch fields: {sorted(mismatches.keys())}")
+        return _document_result(
+            ok=False, code="DOCUMENT_ARCHIVE_POST_WRITE_VERIFICATION_FAILED", error=None,
+            document_id=document_id, business_id=business_id, document_name=document_name,
+            roadmap_id=roadmap_id, stage_id=stage_id, document_template_id=document_template_id,
+            previous_status=current_status, requested_status="archived", final_status=current_status,
+            retry_safe=False,
+        )
+
+    return _document_result(
+        ok=True, code="DOCUMENT_ARCHIVED", error=None,
+        document_id=document_id, business_id=business_id, document_name=document_name,
+        roadmap_id=roadmap_id, stage_id=stage_id, document_template_id=document_template_id,
+        previous_status=current_status, requested_status="archived", final_status="archived",
+        archived_at=archived_at, archived_by=archived_by, archive_reason=reason,
+        changed=True, retry_safe=True,
     )
 
 
