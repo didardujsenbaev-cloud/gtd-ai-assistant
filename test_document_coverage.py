@@ -769,5 +769,101 @@ class TestBusinessBoundary(unittest.TestCase):
         self.assertEqual(result.items[0].base_status, "missing")
 
 
+class TestTypedUploadContextPropagation(unittest.TestCase):
+    """Phase 16C.8.2A: business_id/document_template_id are threaded
+    from the already-loaded DocumentRequirement straight onto
+    DocumentCoverageItem — never derived by parsing requirement_id."""
+
+    def _fake_engine_summary(self, requirement_id, stage_id, document_template_id, business_id):
+        from business_core.document_requirements import (
+            DocumentRequirement, DocumentRequirementStatus, RequirementsSummary, STATUS_MISSING,
+        )
+        req = DocumentRequirement(
+            requirement_id=requirement_id, document_template_id=document_template_id,
+            stage_id=stage_id, business_id=business_id,
+        )
+        status = DocumentRequirementStatus(requirement=req, matched_document_ids=(), matched_count=0,
+                                            status=STATUS_MISSING)
+        return RequirementsSummary(scope_type="roadmap", scope_id="RM-1", items=(status,))
+
+    def _run_with_fake_engine(self, requirement_id, stage_id, document_template_id, business_id):
+        summary = self._fake_engine_summary(requirement_id, stage_id, document_template_id, business_id)
+        # Roadmap-level Business ID is always non-empty here — that's a
+        # separate concern (ERROR_ROADMAP_MISSING_BUSINESS_ID) from the
+        # per-requirement business_id field under test.
+        #
+        # patch.object(dcov, ...) — never the string-path
+        # patch("business_core.document_coverage....") form, per this
+        # file's own documented hazard (see
+        # test_not_applicable_is_not_mapped_and_returns_typed_failure):
+        # the string form re-resolves its target via sys.modules at
+        # patch time, which can be a DIFFERENT module object than this
+        # test file's own `dcov` reference whenever another test
+        # file's module-reload helper (_fresh_th()/_fresh_dr()/
+        # _fresh_drq() in test_business_document_requirements.py) has
+        # already swapped business_core.document_coverage out of
+        # sys.modules earlier in a full-suite run. patch.object(dcov,
+        # ...) patches the exact object this test already holds, so it
+        # can never target the wrong module instance. The
+        # business_core.sheets.read_business_sheet string-path patch
+        # below is unaffected by this hazard: RequirementsReadContext
+        # .roadmap_by_id() does a fresh `from business_core.sheets
+        # import read_business_sheet_cached` at call time, so it
+        # always resolves against whatever is currently in
+        # sys.modules — the same thing this patch targets.
+        with patch.object(dcov, "evaluate_roadmap_requirements", return_value=summary), \
+             patch("business_core.sheets.read_business_sheet",
+                   side_effect=lambda key, *a, **kw: {"roadmaps": [_roadmap_row("RM-1", business_id="BIZ-ROADMAP")]}.get(key, [])):
+            criteria = dcov.DocumentCoverageCriteria(roadmap_id="RM-1", as_of="2026-07-29")
+            result = dcov.generate_document_coverage(criteria)
+        self.assertTrue(result.ok, result.error_code)
+        self.assertEqual(len(result.items), 1)
+        return result
+
+    def test_coverage_item_exact_business_id(self):
+        result = self._run_with_fake_engine("STAGE-1:DOC-1", "STAGE-1", "DOC-1", "BIZ-001")
+        self.assertEqual(result.items[0].business_id, "BIZ-001")
+
+    def test_coverage_item_exact_document_template_id(self):
+        result = self._run_with_fake_engine("STAGE-1:DOC-1", "STAGE-1", "DOC-1", "BIZ-001")
+        self.assertEqual(result.items[0].document_template_id, "DOC-1")
+
+    def test_opaque_requirement_id_not_parsed(self):
+        """requirement_id deliberately does NOT follow the
+        stage_id:template_id convention — document_template_id/
+        business_id must still come through exactly, proving no
+        string-splitting of requirement_id occurs anywhere."""
+        result = self._run_with_fake_engine(
+            requirement_id="REQ-ALPHA-001", stage_id="STAGE-011",
+            document_template_id="DOC-008", business_id="BIZ-001",
+        )
+        item = result.items[0]
+        self.assertEqual(item.requirement_id, "REQ-ALPHA-001")
+        self.assertEqual(item.stage_id, "STAGE-011")
+        self.assertEqual(item.document_template_id, "DOC-008")
+        self.assertEqual(item.business_id, "BIZ-001")
+
+    def test_empty_business_id_stays_empty(self):
+        result = self._run_with_fake_engine("STAGE-1:DOC-1", "STAGE-1", "DOC-1", business_id="")
+        self.assertEqual(result.items[0].business_id, "")
+
+    def test_empty_document_template_id_stays_empty(self):
+        result = self._run_with_fake_engine("STAGE-1:DOC-1", "STAGE-1", "", business_id="BIZ-001")
+        self.assertEqual(result.items[0].document_template_id, "")
+
+    def test_existing_fixture_omitting_new_fields_still_works(self):
+        """A DocumentCoverageItem built the old way (no business_id/
+        document_template_id kwargs) must still construct successfully
+        with safe empty defaults — backward compatibility guard."""
+        item = dcov.DocumentCoverageItem(
+            requirement_id="STAGE-1:DOC-1", requirement_name="Doc", stage_id="STAGE-1",
+            required=True, blocking=True, minimum_count=1, base_status="present",
+            matched_document_count=1, canonical_document_count=1,
+            exact_duplicate_matched_count=0, unmatched_document_count=0,
+        )
+        self.assertEqual(item.business_id, "")
+        self.assertEqual(item.document_template_id, "")
+
+
 if __name__ == "__main__":
     unittest.main()

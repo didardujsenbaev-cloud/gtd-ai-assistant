@@ -439,5 +439,67 @@ class TestActionTextNoFollowUpDuplicate(unittest.TestCase):
         self.assertEqual(dgn._QUALITY_FLAG_ACTIONS["cache_warning"].action_code, "RECHECK_QUALITY_DATA")
 
 
+class TestTypedUploadContextPropagation(unittest.TestCase):
+    """Phase 16C.8.2A: business_id/document_template_id are copied
+    straight from DocumentGapDetail onto DocumentGapNextResult — no
+    second read, no requirement_id parsing, empty on any failure."""
+
+    def test_result_exact_business_id(self):
+        result = _run(_detail_result(detail=_detail(base_status="missing", business_id="BIZ-001",
+                                                      document_template_id="DOC-008")))
+        self.assertEqual(result.business_id, "BIZ-001")
+
+    def test_result_exact_document_template_id(self):
+        result = _run(_detail_result(detail=_detail(base_status="missing", business_id="BIZ-001",
+                                                      document_template_id="DOC-008")))
+        self.assertEqual(result.document_template_id, "DOC-008")
+
+    def test_opaque_requirement_id_not_parsed(self):
+        result = _run(
+            _detail_result(
+                detail=_detail(base_status="missing", stage_id="STAGE-011",
+                                business_id="BIZ-001", document_template_id="DOC-008",
+                                requirement_id="REQ-ALPHA-001"),
+                requirement_id="REQ-ALPHA-001",
+            ),
+            requirement_id="REQ-ALPHA-001",
+        )
+        self.assertEqual(result.criteria.requirement_id, "REQ-ALPHA-001")
+        self.assertEqual(result.stage_id, "STAGE-011")
+        self.assertEqual(result.document_template_id, "DOC-008")
+        self.assertEqual(result.business_id, "BIZ-001")
+
+    def test_empty_business_id_stays_empty(self):
+        result = _run(_detail_result(detail=_detail(base_status="missing", business_id="",
+                                                      document_template_id="DOC-008")))
+        self.assertEqual(result.business_id, "")
+
+    def test_empty_document_template_id_stays_empty(self):
+        result = _run(_detail_result(detail=_detail(base_status="missing", business_id="BIZ-001",
+                                                      document_template_id="")))
+        self.assertEqual(result.document_template_id, "")
+
+    def test_failure_result_business_id_empty(self):
+        result = _run(_detail_result(ok=False, error_code=ERROR_REQUIREMENT_NOT_FOUND))
+        self.assertEqual(result.business_id, "")
+
+    def test_failure_result_document_template_id_empty(self):
+        result = _run(_detail_result(ok=False, error_code=ERROR_REQUIREMENT_NOT_FOUND))
+        self.assertEqual(result.document_template_id, "")
+
+    def test_existing_fixture_omitting_new_fields_still_works(self):
+        """A DocumentGapNextResult built the old way (no business_id/
+        document_template_id kwargs) must still construct successfully
+        with safe empty defaults — backward compatibility guard."""
+        criteria = dgn.DocumentGapNextCriteria(roadmap_id="RM-1", requirement_id="STAGE-1:DOC-1", as_of="2026-07-29")
+        result = dgn.DocumentGapNextResult(
+            criteria=criteria, ok=True, error_code="", requirement_name="Doc", stage_id="STAGE-1",
+            base_status="missing", blocking=True, required=True, quality_flags=(),
+            primary_action=None, secondary_actions=(), warnings=(), generated_at="2026-07-29 10:00:00 UTC",
+        )
+        self.assertEqual(result.business_id, "")
+        self.assertEqual(result.document_template_id, "")
+
+
 if __name__ == "__main__":
     unittest.main()

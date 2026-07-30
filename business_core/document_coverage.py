@@ -133,6 +133,8 @@ class DocumentCoverageItem:
     expired_document_count: int = 0
     unknown_expiry_count: int = 0
     invalid_expiry_count: int = 0
+    business_id: str = ""
+    document_template_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -517,6 +519,8 @@ def generate_document_coverage(criteria: DocumentCoverageCriteria) -> DocumentCo
             expired_document_count=quality["expired_document_count"],
             unknown_expiry_count=quality["unknown_expiry_count"],
             invalid_expiry_count=quality["invalid_expiry_count"],
+            business_id=req.business_id,
+            document_template_id=req.document_template_id,
         ))
 
     total_requirements = len(items)

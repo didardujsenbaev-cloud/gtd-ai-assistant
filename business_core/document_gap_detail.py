@@ -69,6 +69,8 @@ class DocumentGapDetail:
     unknown_expiry_count: int
     invalid_expiry_count: int
     quality_flags: tuple = ()
+    business_id: str = ""
+    document_template_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -200,6 +202,8 @@ def generate_document_gap_detail(criteria: DocumentGapDetailCriteria) -> Documen
         unknown_expiry_count=item.unknown_expiry_count,
         invalid_expiry_count=item.invalid_expiry_count,
         quality_flags=item.quality_flags,
+        business_id=item.business_id,
+        document_template_id=item.document_template_id,
     )
 
     return DocumentGapDetailResult(

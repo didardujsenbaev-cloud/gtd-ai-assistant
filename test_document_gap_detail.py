@@ -496,5 +496,62 @@ class TestCallBudget(unittest.TestCase):
         self.assertEqual(spy.call_count, 1)
 
 
+class TestTypedUploadContextPropagation(unittest.TestCase):
+    """Phase 16C.8.2A: business_id/document_template_id are copied
+    straight from DocumentCoverageItem onto DocumentGapDetail — no
+    second read, no requirement_id parsing."""
+
+    def _run_with_item(self, requirement_id, business_id, document_template_id, stage_id="STAGE-011"):
+        item = dcov.DocumentCoverageItem(
+            requirement_id=requirement_id, requirement_name="Doc", stage_id=stage_id,
+            required=True, blocking=True, minimum_count=1, base_status="missing",
+            matched_document_count=0, canonical_document_count=0,
+            exact_duplicate_matched_count=0, unmatched_document_count=0,
+            business_id=business_id, document_template_id=document_template_id,
+        )
+        fake_result = dcov.DocumentCoverageResult(
+            criteria=dcov.DocumentCoverageCriteria(roadmap_id="RM-1", as_of="2026-07-29"),
+            ok=True, error_code="", summary=None, items=(item,), warnings=(),
+            generated_at="2026-07-29 10:00:00 UTC",
+        )
+        with patch("business_core.document_coverage.generate_document_coverage", return_value=fake_result):
+            criteria = dgd.DocumentGapDetailCriteria(
+                roadmap_id="RM-1", requirement_id=requirement_id, as_of="2026-07-29",
+            )
+            return dgd.generate_document_gap_detail(criteria)
+
+    def test_gap_detail_exact_business_id(self):
+        result = self._run_with_item("STAGE-011:DOC-008", "BIZ-001", "DOC-008")
+        self.assertEqual(result.detail.business_id, "BIZ-001")
+
+    def test_gap_detail_exact_document_template_id(self):
+        result = self._run_with_item("STAGE-011:DOC-008", "BIZ-001", "DOC-008")
+        self.assertEqual(result.detail.document_template_id, "DOC-008")
+
+    def test_opaque_requirement_id_not_parsed(self):
+        result = self._run_with_item("REQ-ALPHA-001", "BIZ-001", "DOC-008", stage_id="STAGE-011")
+        self.assertEqual(result.detail.requirement_id, "REQ-ALPHA-001")
+        self.assertEqual(result.detail.stage_id, "STAGE-011")
+        self.assertEqual(result.detail.document_template_id, "DOC-008")
+        self.assertEqual(result.detail.business_id, "BIZ-001")
+
+    def test_empty_business_id_stays_empty(self):
+        result = self._run_with_item("STAGE-011:DOC-008", "", "DOC-008")
+        self.assertEqual(result.detail.business_id, "")
+
+    def test_empty_document_template_id_stays_empty(self):
+        result = self._run_with_item("STAGE-011:DOC-008", "BIZ-001", "")
+        self.assertEqual(result.detail.document_template_id, "")
+
+    def test_failure_result_business_id_and_template_empty(self):
+        """On any typed failure, detail is None entirely — nothing to
+        assert on business_id/document_template_id since there's no
+        detail object at all; this guards that assumption stays true."""
+        sheets = _basic_fixture()
+        result = _run(sheets, requirement_id="STAGE-1:DOC-999")
+        self.assertFalse(result.ok)
+        self.assertIsNone(result.detail)
+
+
 if __name__ == "__main__":
     unittest.main()

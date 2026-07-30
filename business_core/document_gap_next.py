@@ -84,6 +84,8 @@ class DocumentGapNextResult:
     secondary_actions: tuple
     warnings: tuple
     generated_at: str
+    business_id: str = ""
+    document_template_id: str = ""
 
 
 _BASE_STATUS_ACTIONS = {
@@ -301,4 +303,5 @@ def generate_document_gap_next(criteria: DocumentGapNextCriteria) -> DocumentGap
         base_status=detail.base_status, blocking=detail.blocking, required=detail.required,
         quality_flags=detail.quality_flags, primary_action=primary_action,
         secondary_actions=secondary_actions, warnings=(), generated_at=generated_at,
+        business_id=detail.business_id, document_template_id=detail.document_template_id,
     )
