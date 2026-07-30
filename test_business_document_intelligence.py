@@ -66,6 +66,9 @@ DOC_REGISTRY_HEADERS = [
     "Uploaded At", "Uploaded By",
     "Reviewed At", "Reviewed By", "Rejection Reason",
     "Notes", "Created At", "Updated At",
+    # Phase 16C.9B: Document Archive schema foundation — additive, end
+    # of list only. See migrate_document_registry_archive_fields.py.
+    "Archived At", "Archived By", "Archive Reason", "Previous Status",
 ]
 
 

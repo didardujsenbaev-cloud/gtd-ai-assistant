@@ -49,6 +49,9 @@ DOC_HEADERS = [
     "Uploaded At", "Uploaded By",
     "Reviewed At", "Reviewed By", "Rejection Reason",
     "Notes", "Created At", "Updated At",
+    # Phase 16C.9B: Document Archive schema foundation — additive, end
+    # of list only. See migrate_document_registry_archive_fields.py.
+    "Archived At", "Archived By", "Archive Reason", "Previous Status",
 ]
 
 
@@ -2197,6 +2200,18 @@ class TestRegressionExistingCommands(unittest.TestCase):
     def test_document_registry_prefix_unchanged(self):
         from business_core.sheets import _ID_PREFIXES
         self.assertEqual(_ID_PREFIXES["document_registry"], "DREG")
+
+    def test_document_content_headers_unchanged(self):
+        from business_core.sheets import BUSINESS_HEADERS
+        self.assertEqual(len(BUSINESS_HEADERS["document_content"]), 35)
+
+    def test_document_field_reviews_headers_unchanged(self):
+        from business_core.sheets import BUSINESS_HEADERS
+        self.assertEqual(BUSINESS_HEADERS["document_field_reviews"], [
+            "Review ID", "Mutation ID", "Document ID", "Business ID", "Field Name",
+            "AI Value", "Confirmed Value", "Decision", "Actor", "Reviewed At",
+            "Review Version", "Source Analysis Completed At",
+        ])
 
 
 if __name__ == "__main__":

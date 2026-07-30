@@ -439,6 +439,16 @@ BUSINESS_HEADERS: dict[str, list[str]] = {
         "Uploaded At", "Uploaded By",
         "Reviewed At", "Reviewed By", "Rejection Reason",
         "Notes", "Created At", "Updated At",
+        # Phase 16C.9B: Document Archive schema foundation — purely
+        # additive, appended at the physical end (23 -> 27 columns).
+        # No transition/write logic in this phase; see
+        # migrate_document_registry_archive_fields.py for the header
+        # migration and Phase 16C.9C (not yet built) for the future
+        # /archivedoc write path (contracts: Archived By =
+        # "telegram:{numeric_telegram_user_id}", Archived At = the
+        # existing canonical datetime.now(timezone.utc).strftime(
+        # "%Y-%m-%d %H:%M:%S UTC") helper — not introduced here).
+        "Archived At", "Archived By", "Archive Reason", "Previous Status",
     ],
     # Phase 16A: Document Intelligence Foundation.
     # Purely additive — DOCUMENT_REGISTRY's schema/headers are NOT touched.
