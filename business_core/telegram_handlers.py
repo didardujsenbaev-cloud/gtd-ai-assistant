@@ -6875,13 +6875,18 @@ def _render_document_gap_next(result) -> str:
     .DocumentGapNextResult — safe requirement name/status/action text
     only, never a Document ID/file/document name/raw value.
 
-    Phase 16C.8.2C: an optional ready-to-copy /uploaddoc command is
-    shown only when result.primary_action.action_code (never
-    base_status/quality_flags directly — that priority is already
-    centralized in document_gap_next.py, this renderer never
+    Phase 16C.8.2C/16C.8.3B: an optional ready-to-copy /uploaddoc
+    command is shown only when result.primary_action.action_code
+    (never base_status/quality_flags directly — that priority is
+    already centralized in document_gap_next.py, this renderer never
     re-interprets it) is upload-eligible AND business_id/roadmap_id/
-    stage_id/document_template_id are all non-empty. Secondary actions
-    never trigger the block on their own.
+    stage_id/document_template_id/criteria.requirement_id are all
+    non-empty. Secondary actions never trigger the block on their own.
+    requirement_id is the exact opaque value the caller already
+    supplied to /docgapnext (result.criteria.requirement_id) — never
+    reconstructed from stage_id/document_template_id, never parsed,
+    never re-read — the same field already rendered verbatim one
+    block below in the /docgap return command.
     """
     lines = [
         "📌 Следующий шаг по требованию",
@@ -6918,12 +6923,14 @@ def _render_document_gap_next(result) -> str:
         and result.criteria.roadmap_id
         and result.stage_id
         and result.document_template_id
+        and result.criteria.requirement_id
     ):
         lines.append("")
         lines.append("Загрузить документ:")
         lines.append(
             f"/uploaddoc business={result.business_id} roadmap={result.criteria.roadmap_id} "
-            f"stage={result.stage_id} template={result.document_template_id}"
+            f"stage={result.stage_id} template={result.document_template_id} "
+            f"requirement={result.criteria.requirement_id}"
         )
 
     lines.append("")

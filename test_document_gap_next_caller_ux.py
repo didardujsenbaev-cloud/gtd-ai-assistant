@@ -322,25 +322,44 @@ class TestDocgapnextUploadNavigation(unittest.TestCase):
 
     # ── visibility matrix: shown ──
 
+    @staticmethod
+    def _uploaddoc_line(text):
+        return next(line for line in text.splitlines() if line.strip().startswith("/uploaddoc"))
+
     def test_missing_shows_exact_command(self):
         text = self._run(_result(primary=_action("OBTAIN_MISSING_DOCUMENT", "step")))
-        self.assertIn("/uploaddoc business=BIZ-001 roadmap=RM-003 stage=STAGE-011 template=DOC-008", text)
+        self.assertEqual(
+            self._uploaddoc_line(text),
+            "/uploaddoc business=BIZ-001 roadmap=RM-003 stage=STAGE-011 template=DOC-008 requirement=STAGE-011:DOC-008",
+        )
 
     def test_partial_shows_exact_command(self):
         text = self._run(_result(primary=_action("OBTAIN_REMAINING_DOCUMENTS", "step")))
-        self.assertIn("/uploaddoc business=BIZ-001 roadmap=RM-003 stage=STAGE-011 template=DOC-008", text)
+        self.assertEqual(
+            self._uploaddoc_line(text),
+            "/uploaddoc business=BIZ-001 roadmap=RM-003 stage=STAGE-011 template=DOC-008 requirement=STAGE-011:DOC-008",
+        )
 
     def test_optional_missing_shows_exact_command(self):
         text = self._run(_result(primary=_action("OPTIONAL_DOCUMENT_NOT_PROVIDED", "step")))
-        self.assertIn("/uploaddoc business=BIZ-001 roadmap=RM-003 stage=STAGE-011 template=DOC-008", text)
+        self.assertEqual(
+            self._uploaddoc_line(text),
+            "/uploaddoc business=BIZ-001 roadmap=RM-003 stage=STAGE-011 template=DOC-008 requirement=STAGE-011:DOC-008",
+        )
 
     def test_expired_shows_exact_command(self):
         text = self._run(_result(primary=_action("OBTAIN_CURRENT_DOCUMENT", "step"), base_status="present"))
-        self.assertIn("/uploaddoc business=BIZ-001 roadmap=RM-003 stage=STAGE-011 template=DOC-008", text)
+        self.assertEqual(
+            self._uploaddoc_line(text),
+            "/uploaddoc business=BIZ-001 roadmap=RM-003 stage=STAGE-011 template=DOC-008 requirement=STAGE-011:DOC-008",
+        )
 
     def test_duplicate_only_shows_exact_command(self):
         text = self._run(_result(primary=_action("UPLOAD_CANONICAL_DOCUMENT", "step"), base_status="present"))
-        self.assertIn("/uploaddoc business=BIZ-001 roadmap=RM-003 stage=STAGE-011 template=DOC-008", text)
+        self.assertEqual(
+            self._uploaddoc_line(text),
+            "/uploaddoc business=BIZ-001 roadmap=RM-003 stage=STAGE-011 template=DOC-008 requirement=STAGE-011:DOC-008",
+        )
 
     # ── visibility matrix: hidden ──
 
@@ -401,6 +420,7 @@ class TestDocgapnextUploadNavigation(unittest.TestCase):
         self.assertNotIn("business=", text)
         self.assertNotIn("roadmap=", text)
         self.assertNotIn("template=", text)
+        self.assertNotIn("requirement=", text)
 
     # ── command contract ──
 
@@ -410,6 +430,7 @@ class TestDocgapnextUploadNavigation(unittest.TestCase):
         self.assertIn("roadmap=RM-003", text)
         self.assertIn("stage=STAGE-011", text)
         self.assertIn("template=DOC-008", text)
+        self.assertIn("requirement=STAGE-011:DOC-008", text)
 
     def test_no_forbidden_id_suffix_keys(self):
         text = self._run(_result(primary=_action("OBTAIN_MISSING_DOCUMENT", "step")))
@@ -446,6 +467,16 @@ class TestDocgapnextUploadNavigation(unittest.TestCase):
         text = self._run(_result(primary=_action("OBTAIN_MISSING_DOCUMENT", "step"), document_template_id="DOC-999"))
         self.assertIn("template=DOC-999", text)
 
+    def test_exact_requirement_id_in_uploaddoc(self):
+        text = self._run(_result(primary=_action("OBTAIN_MISSING_DOCUMENT", "step"), requirement_id="REQ-XYZ-001"))
+        uploaddoc_line = self._uploaddoc_line(text)
+        self.assertIn("requirement=REQ-XYZ-001", uploaddoc_line)
+
+    def test_requirement_appears_exactly_once_in_uploaddoc_line(self):
+        text = self._run(_result(primary=_action("OBTAIN_MISSING_DOCUMENT", "step")))
+        uploaddoc_line = self._uploaddoc_line(text)
+        self.assertEqual(uploaddoc_line.count("requirement="), 1)
+
     def test_command_exactly_once(self):
         text = self._run(_result(primary=_action("OBTAIN_MISSING_DOCUMENT", "step")))
         self.assertEqual(text.count("/uploaddoc"), 1)
@@ -476,7 +507,10 @@ class TestDocgapnextUploadNavigation(unittest.TestCase):
             secondary=(_action("OBTAIN_CURRENT_DOCUMENT", "step2"),),
             base_status="present", quality_flags=("duplicate_only", "expired"),
         ))
-        self.assertIn("/uploaddoc business=BIZ-001 roadmap=RM-003 stage=STAGE-011 template=DOC-008", text)
+        self.assertEqual(
+            self._uploaddoc_line(text),
+            "/uploaddoc business=BIZ-001 roadmap=RM-003 stage=STAGE-011 template=DOC-008 requirement=STAGE-011:DOC-008",
+        )
         self.assertEqual(text.count("/uploaddoc"), 1)
 
     def test_expired_plus_needs_review_shows_command(self):
@@ -485,7 +519,10 @@ class TestDocgapnextUploadNavigation(unittest.TestCase):
             secondary=(_action("CONFIRM_STRUCTURED_DATA", "step2"),),
             base_status="present", quality_flags=("expired", "needs_review"),
         ))
-        self.assertIn("/uploaddoc business=BIZ-001 roadmap=RM-003 stage=STAGE-011 template=DOC-008", text)
+        self.assertEqual(
+            self._uploaddoc_line(text),
+            "/uploaddoc business=BIZ-001 roadmap=RM-003 stage=STAGE-011 template=DOC-008 requirement=STAGE-011:DOC-008",
+        )
 
     def test_conflict_plus_needs_review_hides_command(self):
         text = self._run(_result(
@@ -544,17 +581,48 @@ class TestDocgapnextUploadNavigation(unittest.TestCase):
             roadmap_id="RM-00000000001-VERY-LONG-IDENTIFIER-VALUE",
             stage_id="STAGE-00000000001-VERY-LONG-IDENTIFIER-VALUE",
             document_template_id="DOC-00000000001-VERY-LONG-IDENTIFIER-VALUE",
+            requirement_id="STAGE-00000000001-VERY-LONG-IDENTIFIER-VALUE:DOC-00000000001-VERY-LONG-IDENTIFIER-VALUE",
         ))
         uploaddoc_lines = [line for line in text.splitlines() if line.strip().startswith("/uploaddoc")]
         self.assertEqual(len(uploaddoc_lines), 1)
         self.assertIn("business=BIZ-00000000001-VERY-LONG-IDENTIFIER", uploaddoc_lines[0])
         self.assertIn("template=DOC-00000000001-VERY-LONG-IDENTIFIER-VALUE", uploaddoc_lines[0])
+        self.assertIn(
+            "requirement=STAGE-00000000001-VERY-LONG-IDENTIFIER-VALUE:DOC-00000000001-VERY-LONG-IDENTIFIER-VALUE",
+            uploaddoc_lines[0],
+        )
 
     # ── existing behavior unchanged ──
 
     def test_existing_docgap_exact_once_unchanged(self):
         text = self._run(_result(primary=_action("OBTAIN_MISSING_DOCUMENT", "step")))
         self.assertEqual(text.count("/docgap roadmap_id=RM-003 requirement_id=STAGE-011:DOC-008"), 1)
+
+    # ── Phase 16C.8.3B: requirement-aware upload navigation ──
+
+    def test_identity_invariant_uploaddoc_requirement_equals_docgap_requirement_id(self):
+        """The requirement value shown in /uploaddoc and the
+        requirement_id shown in /docgap must be byte-identical — both
+        sourced from the exact same result.criteria.requirement_id
+        field, never independently derived."""
+        text = self._run(_result(primary=_action("OBTAIN_MISSING_DOCUMENT", "step"), requirement_id="REQ-IDENTITY-001"))
+        uploaddoc_line = self._uploaddoc_line(text)
+        docgap_line = next(line for line in text.splitlines() if line.strip().startswith("/docgap"))
+        uploaddoc_requirement = uploaddoc_line.split("requirement=", 1)[1]
+        docgap_requirement = docgap_line.split("requirement_id=", 1)[1]
+        self.assertEqual(uploaddoc_requirement, docgap_requirement)
+        self.assertEqual(uploaddoc_requirement, "REQ-IDENTITY-001")
+
+    def test_empty_requirement_id_hides_full_upload_block(self):
+        text = self._run(_result(primary=_action("OBTAIN_MISSING_DOCUMENT", "step"), requirement_id=""))
+        self.assertNotIn("/uploaddoc", text)
+        self.assertNotIn("Загрузить документ:", text)
+
+    def test_empty_requirement_id_does_not_fall_back_to_four_key_command(self):
+        """Missing requirement_id must hide the block entirely — never
+        silently render the old 4-key form as a fallback."""
+        text = self._run(_result(primary=_action("OBTAIN_MISSING_DOCUMENT", "step"), requirement_id=""))
+        self.assertNotIn("business=BIZ-001 roadmap=RM-003 stage=STAGE-011 template=DOC-008", text)
 
     def test_zero_writes(self):
         import inspect
