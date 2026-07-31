@@ -242,13 +242,27 @@ _INTERACTION_DOMAIN_TEST_FILES = frozenset({
     "test_interaction_caller_ux.py",
 })
 
+# Phase 17B-IR1 incident response: this exact registry was missing
+# these two files when Phase 17B's Identity & Access Control Foundation
+# test suite was written — an unmocked owner-bootstrap write path
+# (patch.object targeting a module reference invalidated by another
+# test file's sys.modules purge, the same failure shape as the
+# original PRS-003 incident) reached real production Sheets and
+# created a placeholder OWNER row (EMP-001/TGID-001/ARA-001/ASA-001,
+# Telegram User ID "999"). Registered here per the same PRS-003
+# precedent every other domain already follows.
+_IDENTITY_DOMAIN_TEST_FILES = frozenset({
+    "test_identity_registry.py",
+    "test_identity_domain.py",
+})
+
 _HARD_SOCKET_BLOCK_TEST_FILES = (
     _CLIENT_DOMAIN_TEST_FILES | _ROADMAP_DOMAIN_TEST_FILES
     | _ORGANIZATION_DOMAIN_TEST_FILES | _OTHER_HARDENED_TEST_FILES
     | _TASK_DOMAIN_TEST_FILES | _DOCUMENT_DOMAIN_TEST_FILES
     | _CHECKLIST_KNOWLEDGE_TEST_FILES | _PAYMENT_DOMAIN_TEST_FILES
     | _OFFER_DOMAIN_TEST_FILES | _LEAD_DOMAIN_TEST_FILES
-    | _INTERACTION_DOMAIN_TEST_FILES
+    | _INTERACTION_DOMAIN_TEST_FILES | _IDENTITY_DOMAIN_TEST_FILES
 )
 
 

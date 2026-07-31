@@ -566,6 +566,7 @@ class TestOwnerBootstrap(unittest.TestCase):
         os.environ["BC_OWNER_TELEGRAM_USER_ID"] = "999"
         bb = self._bb()
         with patch("business_core.identity_manager.find_active_owner_assignments", return_value=[]), \
+             patch("business_core.identity_manager.find_employee_by_telegram_user_id", return_value=None), \
              patch("business_core.identity_manager.create_pending_employee") as mock_create, \
              patch("business_core.identity_manager.link_telegram_identity") as mock_link, \
              patch("business_core.identity_manager._bootstrap_assign_owner_role") as mock_role, \
