@@ -259,6 +259,10 @@ _IDENTITY_DOMAIN_TEST_FILES = frozenset({
     # PRS-003/Phase-17B-IR1 precedent this conftest.py exists to
     # enforce.
     "test_identity_incident_remediation.py",
+    # Phase 17C: Authorization Domain test file, registered BEFORE any
+    # test logic was written, per the same PRS-003/Phase-17B-IR1
+    # precedent this conftest.py exists to enforce.
+    "test_authorization_domain.py",
 })
 
 _HARD_SOCKET_BLOCK_TEST_FILES = (

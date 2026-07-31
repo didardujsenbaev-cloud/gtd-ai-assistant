@@ -297,6 +297,74 @@ def find_active_scope_assignments(employee_id: str, access_role_assignment_id: s
     return result
 
 
+def find_active_telegram_identities_by_telegram_user_id(telegram_user_id) -> list[dict]:
+    """Read-only. All Status=='active' Telegram Identity rows matching
+    this exact numeric Telegram User ID — deliberately NOT resolved
+    through to Employee (unlike find_employee_by_telegram_user_id),
+    so that more than one active row for the same Telegram User ID
+    (a data-integrity anomaly, never expected in normal operation) is
+    detectable by the caller instead of being silently collapsed to
+    a single arbitrary match."""
+    if not is_valid_telegram_user_id(telegram_user_id):
+        return []
+    from business_core.sheets import read_business_sheet
+
+    telegram_user_id = str(telegram_user_id)
+    rows = read_business_sheet("telegram_identity_registry")
+    return [
+        _telegram_identity_row_to_dict(row)
+        for row in rows
+        if row.get("Telegram User ID", "") == telegram_user_id and row.get("Status", "") == "active"
+    ]
+
+
+def find_role_assignments_by_employee(employee_id: str, *, active_only: bool = False) -> list[dict]:
+    """Read-only. All Access Role Assignment rows for one Employee.
+    Status-agnostic by default (active_only=False) — callers that need
+    to distinguish malformed/expired/revoked rows from truly-absent
+    ones (e.g. the Authorization Domain's denial-precedence logic)
+    read status-agnostically and classify rows themselves; callers
+    that only care about currently-active rows may pass
+    active_only=True."""
+    if not employee_id:
+        return []
+    from business_core.sheets import read_business_sheet
+
+    rows = read_business_sheet("access_role_assignments")
+    result = []
+    for row in rows:
+        if row.get("Employee ID", "") != employee_id:
+            continue
+        if active_only and row.get("Status", "") != "active":
+            continue
+        result.append(_access_role_assignment_row_to_dict(row))
+    return result
+
+
+def find_scope_assignments_by_role_assignment(access_role_assignment_id: str, *, active_only: bool = False) -> list[dict]:
+    """Read-only. All Access Scope Assignment rows linked to this exact
+    Access Role Assignment ID — and ONLY this one. This is the helper
+    that structurally prevents combining a scope from one Access Role
+    Assignment with a different one: it is parameterized by Access
+    Role Assignment ID, not Employee ID, so there is no way to
+    accidentally return scopes belonging to a different role
+    assignment held by the same Employee. Status-agnostic by default,
+    same reasoning as find_role_assignments_by_employee()."""
+    if not access_role_assignment_id:
+        return []
+    from business_core.sheets import read_business_sheet
+
+    rows = read_business_sheet("access_scope_assignments")
+    result = []
+    for row in rows:
+        if row.get("Access Role Assignment ID", "") != access_role_assignment_id:
+            continue
+        if active_only and row.get("Status", "") != "active":
+            continue
+        result.append(_access_scope_assignment_row_to_dict(row))
+    return result
+
+
 def find_active_owner_assignments() -> list[dict]:
     """Read-only. Every active Access Role Assignment row with
     Role == 'OWNER', across all employees. Used exclusively by the
