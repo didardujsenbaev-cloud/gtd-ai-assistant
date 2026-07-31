@@ -501,3 +501,151 @@ def authorize_business_core_access(
 
     except Exception as exc:
         return _read_failed(result, str(exc))
+
+
+# ─────────────────────────────────────────────────────────────
+# Phase 17D: pure, read-only access-summary operation
+#
+# Describes the caller's own current identity/Employee/role/scope
+# state — it makes NO resource/action allow decision and must never
+# be used as an authorization shortcut. Reuses the exact same
+# identity-resolution and per-ARA/ASA classification rules as
+# authorize_business_core_access() so the two functions can never
+# disagree about what is "currently effective."
+# ─────────────────────────────────────────────────────────────
+
+def get_business_core_access_summary(telegram_user_id, *, now: Optional[str] = None) -> dict:
+    """
+    Read-only. Describes the calling Telegram user's own identity,
+    Employee status, effective roles, and effective scopes (grouped
+    under their exact Access Role Assignment — never combined across
+    ARAs). No writes, no cache. Incident/revoked rows are excluded
+    naturally by the same active-status/effective-time filtering
+    authorize_business_core_access() uses.
+    """
+    evaluated_at = now or _now_utc()
+    result = {
+        "ok": True,
+        "error": None,
+        "retry_safe": True,
+        "telegram_user_id": str(telegram_user_id) if telegram_user_id is not None else "",
+        "telegram_actor": None,
+        "identity_status": "not_found",
+        "employee_id": None,
+        "employee_status": None,
+        "can_use_business_core": False,
+        "roles": [],
+        "scopes_by_role_assignment": [],
+        "malformed_warnings": [],
+        "evaluated_at": evaluated_at,
+    }
+
+    try:
+        if not im.is_valid_telegram_user_id(telegram_user_id):
+            result["identity_status"] = "not_found"
+            return result
+
+        now_dt = _parse_canonical_timestamp(evaluated_at)
+        if now_dt is None:
+            return _read_failed_summary(result, "invalid 'now' evaluation timestamp")
+
+        telegram_user_id_str = str(telegram_user_id)
+        identities = im.find_active_telegram_identities_by_telegram_user_id(telegram_user_id_str)
+        if len(identities) == 0:
+            result["identity_status"] = "not_found"
+            return result
+        if len(identities) > 1:
+            result["identity_status"] = "ambiguous"
+            return result
+
+        identity = identities[0]
+        result["identity_status"] = "resolved"
+        result["telegram_actor"] = im.canonical_telegram_actor(telegram_user_id_str)
+
+        employee = im.find_employee(identity.get("employee_id", ""))
+        if employee is None:
+            return result
+        employee_id = employee.get("employee_id")
+        result["employee_id"] = employee_id
+        result["employee_status"] = employee.get("status")
+
+        if employee.get("status") != "active":
+            return result
+
+        role_assignments = im.find_role_assignments_by_employee(employee_id, active_only=False)
+        role_assignments = sorted(role_assignments, key=lambda ra: ra.get("access_role_assignment_id", ""))
+
+        effective_roles = []
+        malformed = set()
+        scopes_by_ara = []
+        has_any_effective_scope = False
+
+        for ara in role_assignments:
+            if ara.get("employee_id") != employee_id or ara.get("status") != "active":
+                continue
+
+            role = ara.get("role", "")
+            if role not in im.ACCESS_ROLES:
+                malformed.add("MALFORMED_ROLE_ASSIGNMENT")
+                continue
+
+            role_time_status = _in_force_status(ara.get("effective_from", ""), ara.get("effective_until", ""), now_dt)
+            if role_time_status == "MALFORMED":
+                malformed.add("MALFORMED_ROLE_ASSIGNMENT")
+                continue
+            if role_time_status != "IN_FORCE":
+                continue
+
+            effective_roles.append(role)
+
+            scopes = im.find_scope_assignments_by_role_assignment(
+                ara.get("access_role_assignment_id", ""), active_only=False,
+            )
+            scopes = sorted(scopes, key=lambda sa: sa.get("access_scope_assignment_id", ""))
+
+            counts_by_type: dict = {}
+            for asa in scopes:
+                if asa.get("employee_id") != ara.get("employee_id"):
+                    malformed.add("MALFORMED_SCOPE_ASSIGNMENT")
+                    continue
+                if asa.get("status") != "active":
+                    continue
+
+                scope_type = asa.get("scope_type", "")
+                if scope_type not in im.ACCESS_SCOPE_TYPES:
+                    malformed.add("MALFORMED_SCOPE_ASSIGNMENT")
+                    continue
+
+                scope_time_status = _in_force_status(asa.get("effective_from", ""), asa.get("effective_until", ""), now_dt)
+                if scope_time_status == "MALFORMED":
+                    malformed.add("MALFORMED_SCOPE_ASSIGNMENT")
+                    continue
+                if scope_time_status != "IN_FORCE":
+                    continue
+
+                counts_by_type[scope_type] = counts_by_type.get(scope_type, 0) + 1
+
+            for scope_type, target_count in counts_by_type.items():
+                scopes_by_ara.append({
+                    "access_role_assignment_id": ara.get("access_role_assignment_id"),
+                    "role": role,
+                    "scope_type": scope_type,
+                    "target_count": target_count,
+                })
+                has_any_effective_scope = True
+
+        result["roles"] = sorted(set(effective_roles))
+        result["scopes_by_role_assignment"] = scopes_by_ara
+        result["malformed_warnings"] = sorted(malformed)
+        result["can_use_business_core"] = bool(effective_roles) and has_any_effective_scope
+        return result
+
+    except Exception as exc:
+        return _read_failed_summary(result, str(exc))
+
+
+def _read_failed_summary(result: dict, error: str) -> dict:
+    result["ok"] = False
+    result["error"] = error
+    result["retry_safe"] = False
+    return result

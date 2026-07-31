@@ -263,6 +263,10 @@ _IDENTITY_DOMAIN_TEST_FILES = frozenset({
     # test logic was written, per the same PRS-003/Phase-17B-IR1
     # precedent this conftest.py exists to enforce.
     "test_authorization_domain.py",
+    # Phase 17D: Telegram Authorization Adapter test files, registered
+    # BEFORE any test logic was written, per the same precedent.
+    "test_telegram_authorization.py",
+    "test_bcaccess_telegram.py",
 })
 
 _HARD_SOCKET_BLOCK_TEST_FILES = (

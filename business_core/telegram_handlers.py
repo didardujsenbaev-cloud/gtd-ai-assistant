@@ -169,6 +169,113 @@ async def bc_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # ─────────────────────────────────────────────────────────────
+# /bcaccess — Phase 17D: pre-auth-safe self-diagnostic command.
+#
+# This handler calls ONLY get_telegram_business_core_access_summary()
+# — never authorization.py, identity_manager.py or business_core.sheets
+# directly. It never inspects context.args as a target Telegram User
+# ID (there is no target; /bcaccess always describes the caller's own
+# state). No raw Employee/Telegram Identity/Role/Scope Assignment IDs
+# are ever rendered.
+# ─────────────────────────────────────────────────────────────
+
+_BC_ACCESS_SCOPE_TYPE_LABELS = {
+    "ALL_BUSINESSES": "Все бизнесы",
+    "SELECTED_BUSINESSES": "Выбранные бизнесы: {count}",
+    "ASSIGNED_OBJECTS_ONLY": "Назначенные объекты: {count}",
+}
+
+_BC_ACCESS_EMPLOYEE_STATUS_LABELS = {
+    "active": "Активен",
+    "pending": "Ожидает активации",
+    "disabled": "Отключён",
+}
+
+
+def _render_bcaccess_scope_line(entry: dict) -> str:
+    label = _BC_ACCESS_SCOPE_TYPE_LABELS.get(entry.get("scope_type", ""), "Неизвестный тип доступа")
+    return label.format(count=entry.get("target_count", 0))
+
+
+def _render_bcaccess_message(result: dict) -> str:
+    """Pure string rendering — no Sheets/domain calls, no raw
+    EMP-/TGID-/ARA-/ASA- IDs, no other user's data."""
+    from business_core.telegram_authorization import USER_MESSAGES
+
+    if result["code"] == "PRIVATE_CHAT_REQUIRED":
+        return USER_MESSAGES["private_chat_required"]
+
+    if result["code"] in ("INVALID_TELEGRAM_UPDATE", "TELEGRAM_USER_NOT_FOUND"):
+        return USER_MESSAGES["identity_not_recognized"]
+
+    if result["code"] == "ACCESS_SUMMARY_UNAVAILABLE":
+        return USER_MESSAGES["temporarily_unavailable"]
+
+    summary = result.get("access_summary_result") or {}
+    telegram_user_id = result.get("telegram_user_id") or summary.get("telegram_user_id") or "—"
+
+    identity_status = summary.get("identity_status", "not_found")
+    if identity_status != "resolved":
+        return (
+            f"Telegram ID: {telegram_user_id}\n\n"
+            + USER_MESSAGES["identity_not_recognized"]
+        )
+
+    employee_status = summary.get("employee_status")
+    if employee_status == "pending":
+        return (
+            f"Telegram ID: {telegram_user_id}\n\n"
+            + USER_MESSAGES["employee_pending"]
+        )
+    if employee_status == "disabled":
+        return (
+            f"Telegram ID: {telegram_user_id}\n\n"
+            + USER_MESSAGES["employee_disabled"]
+        )
+
+    status_label = _BC_ACCESS_EMPLOYEE_STATUS_LABELS.get(employee_status, "Неизвестен")
+    lines = [
+        f"Telegram ID: {telegram_user_id}",
+        f"Статус: {status_label}",
+    ]
+
+    roles = summary.get("roles", [])
+    scopes = summary.get("scopes_by_role_assignment", [])
+    if not roles or not scopes:
+        lines.append("")
+        lines.append("Business Core: Нет активного доступа.")
+        return "\n".join(lines)
+
+    # Render each role with its own linked scope(s) — never combined
+    # across different Access Role Assignments.
+    roles_seen = []
+    for entry in scopes:
+        role = entry.get("role", "")
+        if role not in roles_seen:
+            roles_seen.append(role)
+    for role in roles_seen:
+        role_scopes = [e for e in scopes if e.get("role") == role]
+        scope_lines = ", ".join(_render_bcaccess_scope_line(e) for e in role_scopes)
+        lines.append(f"Роль: {role}")
+        lines.append(f"Доступ: {scope_lines}")
+
+    lines.append("")
+    can_use = summary.get("can_use_business_core", False)
+    lines.append(f"Business Core: {'Доступен' if can_use else 'Нет активного доступа'}")
+
+    return "\n".join(lines)
+
+
+async def bc_access(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/bcaccess — самодиагностика доступа к Business Core (только для себя)."""
+    from business_core.telegram_authorization import get_telegram_business_core_access_summary
+
+    result = await get_telegram_business_core_access_summary(update)
+    text = _render_bcaccess_message(result)
+    await _reply(update, text, parse_mode=None)
+
+
+# ─────────────────────────────────────────────────────────────
 # /bc — дашборд Business Core
 # ─────────────────────────────────────────────────────────────
 
@@ -15427,6 +15534,8 @@ def register_business_handlers(app: Application) -> None:
     # Простые команды
     app.add_handler(CommandHandler("bc",        bc_dashboard))
     app.add_handler(CommandHandler("bcstatus",  bc_status))
+    # Phase 17D: Telegram Authorization Adapter — pre-auth-safe self-diagnostic.
+    app.add_handler(CommandHandler("bcaccess",  bc_access))
     app.add_handler(CommandHandler("roadmaps",  show_roadmaps))
     app.add_handler(CommandHandler("clients",   show_clients))
     app.add_handler(CommandHandler("bcdrive",   bc_drive))

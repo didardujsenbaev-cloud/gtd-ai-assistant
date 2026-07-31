@@ -701,13 +701,64 @@ class TestArchitectureGuards(unittest.TestCase):
         self.assertNotIn("_telegram_username", source)
         self.assertNotIn(".username", source)
 
-    def test_telegram_handlers_untouched(self):
-        import subprocess
-        result = subprocess.run(
-            ["git", "diff", "--name-only", "HEAD", "--", "business_core/telegram_handlers.py"],
-            capture_output=True, text=True, cwd=".",
+    def test_bcaccess_telegram_adapter_isolation(self):
+        """
+        Phase 17D superseded the original Phase 17B guard (a live
+        `git diff HEAD -- telegram_handlers.py` check requiring zero
+        diff), since Phase 17D is explicitly approved to add the
+        /bcaccess handler to that file. This is the durable
+        replacement architecture guard, covering every invariant the
+        original zero-diff check was a (now-obsolete) proxy for:
+
+        - bc_access() and its rendering helpers never reach
+          identity_manager.py or business_core.sheets directly —
+          every read goes exclusively through
+          get_telegram_business_core_access_summary() (scoped to
+          bc_access's own source, not the whole module, since
+          telegram_handlers.py legitimately imports business_core.sheets
+          in many other, unrelated pre-existing handlers);
+        - bc_access() calls only get_telegram_business_core_access_summary(update)
+          — never get_business_core_access_summary,
+          authorize_business_core_access, or
+          authorize_telegram_business_core_request directly;
+        - no other existing handler in the file calls either Telegram
+          authorization adapter;
+        - CommandHandler("bcaccess", bc_access) is registered exactly
+          once.
+        """
+        import ast
+
+        from business_core import telegram_handlers as th
+
+        with open("business_core/telegram_handlers.py", encoding="utf-8") as f:
+            source = f.read()
+        tree = ast.parse(source)
+
+        bc_access_src = (
+            inspect.getsource(th.bc_access)
+            + inspect.getsource(th._render_bcaccess_message)
+            + inspect.getsource(th._render_bcaccess_scope_line)
         )
-        self.assertEqual(result.stdout.strip(), "", "telegram_handlers.py must have zero diff in Phase 17B")
+        self.assertNotIn("identity_manager", bc_access_src)
+        self.assertNotIn("business_core.sheets", bc_access_src)
+        self.assertNotIn("get_business_sheet", bc_access_src)
+        self.assertNotIn("read_business_sheet", bc_access_src)
+
+        self.assertIn("get_telegram_business_core_access_summary(update)", bc_access_src)
+        self.assertNotIn("get_business_core_access_summary(", bc_access_src)
+        self.assertNotIn("authorize_business_core_access(", bc_access_src)
+        self.assertNotIn("authorize_telegram_business_core_request(", bc_access_src)
+
+        forbidden = ("authorize_telegram_business_core_request", "get_telegram_business_core_access_summary")
+        offenders = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.AsyncFunctionDef) and node.name != "bc_access":
+                func_src = ast.get_source_segment(source, node) or ""
+                if any(name in func_src for name in forbidden):
+                    offenders.append(node.name)
+        self.assertEqual(offenders, [], f"unexpected adapter usage in: {offenders}")
+
+        self.assertEqual(source.count('CommandHandler("bcaccess"'), 1)
 
     def test_gtd_files_untouched(self):
         import subprocess
