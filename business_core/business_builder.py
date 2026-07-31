@@ -10544,3 +10544,180 @@ def bootstrap_owner_from_env(*, dry_run: bool = True) -> dict:
     log.info(f"bootstrap_owner_from_env: OWNER bootstrap complete for employee={employee_id}")
     return _result(ok=True, code="OWNER_BOOTSTRAP_COMPLETE", changed=True,
                     completed_steps=completed, failed_step="", created_ids=created_ids)
+
+
+# ─────────────────────────────────────────────────────────────
+# Phase 17B-IR3A: dedicated, narrow incident-remediation
+# orchestration for exactly one confirmed incident (Phase 17B-IR1 —
+# an unmocked test run wrote a placeholder OWNER bootstrap to
+# production: EMP-001/TGID-001/ARA-001/ASA-001, Telegram User ID
+# "999"). Every target ID is a fixed constant, never a caller-
+# supplied argument, never sourced from Telegram or any normal user
+# input. Never called from application startup, migration, or
+# telegram_handlers.py — invoked exclusively via
+# remediate_identity_bootstrap_incident.py's explicit CLI.
+# ─────────────────────────────────────────────────────────────
+
+_IR3A_ARA_ID = "ARA-001"
+_IR3A_TGID_ID = "TGID-001"
+_IR3A_EMPLOYEE_ID = "EMP-001"
+_IR3A_ASA_ID = "ASA-001"
+_IR3A_TELEGRAM_USER_ID = "999"
+_IR3A_TELEGRAM_ACTOR = "telegram:999"
+_IR3A_REMEDIATION_ACTOR = "system:incident_remediation"
+_IR3A_REMEDIATION_REASON = "incident: unauthorized test bootstrap during Phase 17B validation"
+
+
+def _check_incident_preconditions() -> dict:
+    """Read-only. All 13 preconditions from the Phase 17B-IR3A design,
+    checked in order; returns the first failure found (fail-closed —
+    no need to enumerate every mismatch, one is sufficient to refuse
+    any write)."""
+    from business_core import identity_manager as im
+
+    def _fail(name):
+        return {"ok": False, "failed_precondition": name, "ara": None, "tgid": None, "emp": None, "asa": None}
+
+    ara = im.find_access_role_assignment(_IR3A_ARA_ID)
+    if ara is None:
+        return _fail("ARA_NOT_FOUND")
+    if ara.get("role") != "OWNER":
+        return _fail("ARA_ROLE_MISMATCH")
+    ara_already_remediated = (
+        ara.get("status") == "revoked"
+        and ara.get("revoked_by") == _IR3A_REMEDIATION_ACTOR
+        and ara.get("revoke_reason") == _IR3A_REMEDIATION_REASON
+    )
+    if ara.get("status") not in ("active",) and not ara_already_remediated:
+        return _fail("ARA_UNEXPECTED_STATUS")
+    if ara.get("employee_id") != _IR3A_EMPLOYEE_ID:
+        return _fail("ARA_EMPLOYEE_MISMATCH")
+    if ara.get("assigned_by") != im.SYSTEM_BOOTSTRAP_ACTOR:
+        return _fail("ARA_ASSIGNED_BY_MISMATCH")
+
+    tgid = im.find_telegram_identity(_IR3A_TGID_ID)
+    if tgid is None:
+        return _fail("TGID_NOT_FOUND")
+    if tgid.get("employee_id") != _IR3A_EMPLOYEE_ID:
+        return _fail("TGID_EMPLOYEE_MISMATCH")
+    if tgid.get("telegram_user_id") != _IR3A_TELEGRAM_USER_ID:
+        return _fail("TGID_USER_ID_MISMATCH")
+    if tgid.get("telegram_actor") != _IR3A_TELEGRAM_ACTOR:
+        return _fail("TGID_ACTOR_MISMATCH")
+    if tgid.get("linked_by") != im.SYSTEM_BOOTSTRAP_ACTOR:
+        return _fail("TGID_LINKED_BY_MISMATCH")
+
+    emp = im.find_employee(_IR3A_EMPLOYEE_ID)
+    if emp is None:
+        return _fail("EMP_NOT_FOUND")
+    if emp.get("created_by") != im.SYSTEM_BOOTSTRAP_ACTOR:
+        return _fail("EMP_CREATED_BY_MISMATCH")
+
+    asa = im.find_access_scope_assignment(_IR3A_ASA_ID)
+    if asa is None:
+        return _fail("ASA_NOT_FOUND")
+    asa_correctly_revoked = (
+        asa.get("status") == "revoked"
+        and asa.get("revoked_by") == _IR3A_REMEDIATION_ACTOR
+        and asa.get("revoke_reason") == _IR3A_REMEDIATION_REASON
+    )
+    if not asa_correctly_revoked:
+        return _fail("ASA_NOT_CORRECTLY_REVOKED")
+
+    return {"ok": True, "failed_precondition": "", "ara": ara, "tgid": tgid, "emp": emp, "asa": asa}
+
+
+def remediate_phase17b_identity_incident(*, dry_run: bool = True) -> dict:
+    """
+    Fixed-target incident remediation for exactly the Phase 17B-IR1
+    incident. Order: verify ASA-001 already revoked (never re-revoked
+    here) -> revoke ARA-001 (specialized path) -> revoke TGID-001
+    (existing revoke_telegram_identity) -> disable EMP-001 (existing
+    disable_employee). Stops immediately on any step failure, never
+    auto-retries, never rolls back completed steps.
+    """
+    from business_core import identity_manager as im
+
+    def _result(*, ok, code, changed=False, retry_safe=True, completed_steps=(), pending_steps=(),
+                failed_step="", result_by_step=None, verification_errors=()):
+        return {
+            "ok": ok, "code": code, "changed": changed, "retry_safe": retry_safe, "dry_run": dry_run,
+            "completed_steps": tuple(completed_steps), "pending_steps": tuple(pending_steps),
+            "failed_step": failed_step, "result_by_step": result_by_step or {},
+            "verification_errors": tuple(verification_errors),
+        }
+
+    pre = _check_incident_preconditions()
+    if not pre["ok"]:
+        return _result(ok=False, code="INCIDENT_PRECONDITION_FAILED", retry_safe=True, failed_step=pre["failed_precondition"])
+
+    ara, tgid, emp = pre["ara"], pre["tgid"], pre["emp"]
+
+    completed = ["verify_asa_already_revoked"]
+    pending = []
+    if ara["status"] == "active":
+        pending.append("revoke_ara")
+    if tgid["status"] == "active":
+        pending.append("revoke_tgid")
+    if emp["status"] == "active":
+        pending.append("disable_emp")
+
+    if dry_run:
+        return _result(ok=True, code="INCIDENT_REMEDIATION_PREVIEW", changed=False,
+                        completed_steps=tuple(completed), pending_steps=tuple(pending))
+
+    if not pending:
+        return _result(ok=True, code="INCIDENT_REMEDIATION_ALREADY_COMPLETE", changed=False,
+                        completed_steps=tuple(completed + ["revoke_ara", "revoke_tgid", "disable_emp"]))
+
+    result_by_step: dict = {}
+    actually_completed = ["verify_asa_already_revoked"]
+
+    if "revoke_ara" in pending:
+        r = im._remediate_revoke_incident_owner_role(
+            _IR3A_ARA_ID, expected_employee_id=_IR3A_EMPLOYEE_ID,
+            expected_telegram_user_id=_IR3A_TELEGRAM_USER_ID,
+            reason=_IR3A_REMEDIATION_REASON, actor=_IR3A_REMEDIATION_ACTOR,
+        )
+        result_by_step["revoke_ara"] = r
+        if not r["ok"]:
+            return _result(ok=False, code="INCIDENT_REMEDIATION_STEP_FAILED", retry_safe=r.get("retry_safe", False),
+                            completed_steps=tuple(actually_completed), failed_step="revoke_ara", result_by_step=result_by_step)
+    actually_completed.append("revoke_ara")
+
+    if "revoke_tgid" in pending:
+        r = im.revoke_telegram_identity(_IR3A_TGID_ID, reason=_IR3A_REMEDIATION_REASON, revoked_by=_IR3A_REMEDIATION_ACTOR)
+        result_by_step["revoke_tgid"] = r
+        if not r["ok"]:
+            return _result(ok=False, code="INCIDENT_REMEDIATION_STEP_FAILED", retry_safe=r.get("retry_safe", False),
+                            completed_steps=tuple(actually_completed), failed_step="revoke_tgid", result_by_step=result_by_step)
+    actually_completed.append("revoke_tgid")
+
+    if "disable_emp" in pending:
+        r = im.disable_employee(_IR3A_EMPLOYEE_ID, reason=_IR3A_REMEDIATION_REASON, disabled_by=_IR3A_REMEDIATION_ACTOR)
+        result_by_step["disable_emp"] = r
+        if not r["ok"]:
+            return _result(ok=False, code="INCIDENT_REMEDIATION_STEP_FAILED", retry_safe=r.get("retry_safe", False),
+                            completed_steps=tuple(actually_completed), failed_step="disable_emp", result_by_step=result_by_step)
+    actually_completed.append("disable_emp")
+
+    final_ara = im.find_access_role_assignment(_IR3A_ARA_ID)
+    final_tgid = im.find_telegram_identity(_IR3A_TGID_ID)
+    final_emp = im.find_employee(_IR3A_EMPLOYEE_ID)
+    verification_errors = []
+    if final_ara is None or final_ara.get("status") != "revoked":
+        verification_errors.append("ara_not_revoked")
+    if final_tgid is None or final_tgid.get("status") != "revoked":
+        verification_errors.append("tgid_not_revoked")
+    if final_emp is None or final_emp.get("status") != "disabled":
+        verification_errors.append("emp_not_disabled")
+
+    if verification_errors:
+        log.error(f"remediate_phase17b_identity_incident post-write verification errors: {verification_errors}")
+        return _result(ok=False, code="INCIDENT_REMEDIATION_POST_WRITE_VERIFICATION_FAILED", retry_safe=False,
+                        completed_steps=tuple(actually_completed), result_by_step=result_by_step,
+                        verification_errors=tuple(verification_errors))
+
+    log.info("remediate_phase17b_identity_incident: remediation complete")
+    return _result(ok=True, code="INCIDENT_REMEDIATION_COMPLETE", changed=True,
+                    completed_steps=tuple(actually_completed), result_by_step=result_by_step)

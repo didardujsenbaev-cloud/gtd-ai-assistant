@@ -254,6 +254,11 @@ _INTERACTION_DOMAIN_TEST_FILES = frozenset({
 _IDENTITY_DOMAIN_TEST_FILES = frozenset({
     "test_identity_registry.py",
     "test_identity_domain.py",
+    # Phase 17B-IR3A: dedicated incident-remediation test file,
+    # registered BEFORE any test logic was written, per the exact
+    # PRS-003/Phase-17B-IR1 precedent this conftest.py exists to
+    # enforce.
+    "test_identity_incident_remediation.py",
 })
 
 _HARD_SOCKET_BLOCK_TEST_FILES = (

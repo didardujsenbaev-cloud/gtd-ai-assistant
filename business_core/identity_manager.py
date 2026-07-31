@@ -183,6 +183,48 @@ def find_employee(employee_id: str) -> Optional[dict]:
     return _employee_row_to_dict(v)
 
 
+def find_access_role_assignment(access_role_assignment_id: str) -> Optional[dict]:
+    """Read-only, status-agnostic (unlike find_active_role_assignments,
+    this returns a row regardless of Status — needed to inspect an
+    already-revoked row, e.g. for incident-remediation preconditions).
+    Returns a dict or None."""
+    if not access_role_assignment_id:
+        return None
+    from business_core.sheets import find_row_by_id
+
+    found = find_row_by_id("access_role_assignments", access_role_assignment_id)
+    if not found:
+        return None
+    _row_num, v = found
+    return _access_role_assignment_row_to_dict(v)
+
+
+def find_telegram_identity(telegram_identity_id: str) -> Optional[dict]:
+    """Read-only, status-agnostic. Returns a dict or None."""
+    if not telegram_identity_id:
+        return None
+    from business_core.sheets import find_row_by_id
+
+    found = find_row_by_id("telegram_identity_registry", telegram_identity_id)
+    if not found:
+        return None
+    _row_num, v = found
+    return _telegram_identity_row_to_dict(v)
+
+
+def find_access_scope_assignment(access_scope_assignment_id: str) -> Optional[dict]:
+    """Read-only, status-agnostic. Returns a dict or None."""
+    if not access_scope_assignment_id:
+        return None
+    from business_core.sheets import find_row_by_id
+
+    found = find_row_by_id("access_scope_assignments", access_scope_assignment_id)
+    if not found:
+        return None
+    _row_num, v = found
+    return _access_scope_assignment_row_to_dict(v)
+
+
 def find_employee_by_telegram_user_id(telegram_user_id, active_only: bool = True) -> Optional[dict]:
     """
     Read-only. Resolves a numeric Telegram User ID to its Employee row
@@ -778,3 +820,110 @@ def _bootstrap_assign_owner_role(employee_id: str, *, assigned_by: str) -> dict:
     except Exception as exc:
         log.error(f"_bootstrap_assign_owner_role error: {exc}")
         return {"ok": False, "changed": False, "code": "ACCESS_ROLE_WRITE_FAILED", "error": None, "access_role_assignment_id": "", "retry_safe": False}
+
+
+# ─────────────────────────────────────────────────────────────
+# Phase 17B-IR3A: dedicated, narrow, fail-closed OWNER-role revoke
+# path for exactly one confirmed incident.
+#
+# assign_access_role()/revoke_access_role() above categorically refuse
+# to touch Role == "OWNER" because this module cannot prove a generic
+# caller is authorized to grant/revoke ownership (no authorization
+# domain exists yet — Phase 17C). This function does NOT weaken that
+# protection or add any bypass/force parameter usable by a normal
+# caller — it is a separate, specialized function whose only caller is
+# business_builder.remediate_phase17b_identity_incident(), itself
+# hardcoding the one confirmed incident's exact target IDs. Every
+# expected value is verified against the live row before any write;
+# any mismatch fails closed with zero writes.
+# ─────────────────────────────────────────────────────────────
+
+def _remediate_revoke_incident_owner_role(
+    access_role_assignment_id: str,
+    *,
+    expected_employee_id: str,
+    expected_telegram_user_id: str,
+    reason: str,
+    actor: str,
+) -> dict:
+    """
+    Reserved EXCLUSIVELY for the Phase 17B-IR3A incident-remediation
+    orchestration. Never callable with caller-supplied/arbitrary
+    target values from a normal user or Telegram command — every
+    "expected_*" value must match the live row exactly, and the row's
+    own "Assigned By" must equal SYSTEM_BOOTSTRAP_ACTOR, before any
+    write is attempted. Additionally cross-checks the target
+    Employee's active Telegram Identity (if any) against
+    expected_telegram_user_id as defense-in-depth, even though that
+    field doesn't live on the Access Role Assignment row itself.
+
+    Returns:
+        {"ok": bool, "changed": bool, "code": str, "error": None, "retry_safe": bool}
+    """
+    if not access_role_assignment_id or not reason or not reason.strip() or not actor:
+        return {"ok": False, "changed": False, "code": "ACTOR_REQUIRED", "error": None, "retry_safe": True}
+
+    from business_core.sheets import find_row_by_id, update_business_row
+
+    found = find_row_by_id("access_role_assignments", access_role_assignment_id)
+    if not found:
+        return {"ok": False, "changed": False, "code": "INCIDENT_TARGET_NOT_FOUND", "error": None, "retry_safe": True}
+    row_num, v = found
+    current = _access_role_assignment_row_to_dict(v)
+
+    if current.get("role") != "OWNER":
+        return {"ok": False, "changed": False, "code": "INCIDENT_ROLE_MISMATCH", "error": None, "retry_safe": True}
+    if current.get("employee_id") != expected_employee_id:
+        return {"ok": False, "changed": False, "code": "INCIDENT_EMPLOYEE_MISMATCH", "error": None, "retry_safe": True}
+    if current.get("assigned_by") != SYSTEM_BOOTSTRAP_ACTOR:
+        return {"ok": False, "changed": False, "code": "INCIDENT_ACTOR_MISMATCH", "error": None, "retry_safe": True}
+
+    identity = find_active_telegram_identity_by_employee(expected_employee_id)
+    if identity is None or identity.get("telegram_user_id") != expected_telegram_user_id:
+        return {"ok": False, "changed": False, "code": "INCIDENT_TELEGRAM_IDENTITY_MISMATCH", "error": None, "retry_safe": True}
+
+    if current.get("status") == "revoked":
+        if current.get("revoked_by") == actor and current.get("revoke_reason") == reason:
+            return {"ok": True, "changed": False, "code": "INCIDENT_OWNER_ROLE_ALREADY_REVOKED", "error": None, "retry_safe": True}
+        return {"ok": False, "changed": False, "code": "INCIDENT_CONFLICTING_PRIOR_REVOCATION", "error": None, "retry_safe": True}
+    if current.get("status") != "active":
+        return {"ok": False, "changed": False, "code": "INCIDENT_UNEXPECTED_STATUS", "error": None, "retry_safe": True}
+
+    identity_fields_before = {
+        "employee_id": current.get("employee_id"), "role": current.get("role"),
+        "effective_from": current.get("effective_from"), "effective_until": current.get("effective_until"),
+        "assigned_at": current.get("assigned_at"), "assigned_by": current.get("assigned_by"),
+    }
+
+    try:
+        now = _now_utc()
+        update_business_row("access_role_assignments", row_num, {
+            "Status": "revoked", "Revoked At": now, "Revoked By": actor, "Revoke Reason": reason,
+        })
+
+        reread = find_row_by_id("access_role_assignments", access_role_assignment_id)
+        if reread is None:
+            log.error(f"_remediate_revoke_incident_owner_role({access_role_assignment_id}) post-write verification: row missing")
+            return {"ok": False, "changed": False, "code": "INCIDENT_POST_WRITE_VERIFICATION_FAILED", "error": None, "retry_safe": False}
+        saved = _access_role_assignment_row_to_dict(reread[1])
+
+        identity_fields_after = {
+            "employee_id": saved.get("employee_id"), "role": saved.get("role"),
+            "effective_from": saved.get("effective_from"), "effective_until": saved.get("effective_until"),
+            "assigned_at": saved.get("assigned_at"), "assigned_by": saved.get("assigned_by"),
+        }
+        if (
+            saved.get("status") != "revoked"
+            or saved.get("revoked_by") != actor
+            or saved.get("revoke_reason") != reason
+            or not saved.get("revoked_at")
+            or identity_fields_after != identity_fields_before
+        ):
+            log.error(f"_remediate_revoke_incident_owner_role({access_role_assignment_id}) post-write verification mismatch")
+            return {"ok": False, "changed": False, "code": "INCIDENT_POST_WRITE_VERIFICATION_FAILED", "error": None, "retry_safe": False}
+
+        log.info(f"_remediate_revoke_incident_owner_role: {access_role_assignment_id} revoked by {actor}")
+        return {"ok": True, "changed": True, "code": "INCIDENT_OWNER_ROLE_REVOKED", "error": None, "retry_safe": True}
+    except Exception as exc:
+        log.error(f"_remediate_revoke_incident_owner_role({access_role_assignment_id}) error: {exc}")
+        return {"ok": False, "changed": False, "code": "INCIDENT_WRITE_FAILED", "error": None, "retry_safe": False}
