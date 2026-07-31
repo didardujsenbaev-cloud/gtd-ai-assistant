@@ -4721,6 +4721,305 @@ async def syncstageknowledge_cmd(update: Update, context: ContextTypes.DEFAULT_T
 
 
 # ─────────────────────────────────────────────────────────────
+# /archivedoc — Document Archive Telegram UX (Phase 16C.9D)
+#
+# Stateless CommandHandler, no ConversationHandler, no callback query,
+# no session state, no /cancel fallback — every invocation (preview or
+# confirmed) is one independent, fully self-contained command line.
+# Telegram calls business_builder.archive_document() only — never the
+# manager-layer row mutation or the older Status-only update path,
+# never any sheets.py write primitive, never Drive/
+# document_content/document_field_reviews/document_requirements.
+#
+# SECURITY NOTE (Phase 16C.9D audit §11/§21): this codebase has no
+# per-user authorization/allowlist system anywhere — _is_bc_enabled()
+# is a global feature flag, not access control. /archivedoc reuses
+# that exact same (sole existing) gate for consistency with every
+# other Business Core mutation command, none of which are any more
+# protected. Adding real per-user authorization is a separate,
+# cross-cutting security decision, out of scope for this command.
+# ─────────────────────────────────────────────────────────────
+
+ARCHIVEDOC_ALLOWED_KEYS = ("document_id", "reason", "confirm")
+ARCHIVEDOC_REASON_MAX_LENGTH_UX_HINT = 500  # domain remains authoritative; not enforced here
+
+
+def _parse_archivedoc_args(raw: str) -> tuple:
+    """
+    Narrow, entry-only parser for /archivedoc — architecture cloned
+    from _parse_uploaddoc_prefill_args() (Phase 16C.8.2B), never
+    _parse_kv_args() (silently last-wins on duplicates, turns unknown
+    bare tokens into positional args — unsafe for a destructive
+    command). Allowed keys only: document_id, reason, confirm.
+
+    Returns (values_dict, None) on success, (None, error_message) on
+    any failure. Never raises. Never echoes the raw input text back —
+    every error message names only the specific key/token involved,
+    never the full malformed command line.
+    """
+    import re
+    token_pattern = r'(\w+)=(?:"([^"]*?)"|\'([^\']*?)\'|(\S+))|(\S+)'
+    seen: dict = {}
+    duplicates: list = []
+    unknown: list = []
+    consumed_end = 0
+    for m in re.finditer(token_pattern, raw):
+        if m.start() != consumed_end and raw[consumed_end:m.start()].strip():
+            # A gap between matches means a dangling/unmatched token
+            # (e.g. an unclosed quote) was skipped by the regex engine
+            # rather than consumed — fail closed rather than silently
+            # ignore it.
+            return None, (
+                "❌ Некорректный формат параметров /archivedoc.\n\n"
+                "Используйте:\n"
+                "/archivedoc document_id=DREG-001 reason=\"Причина архивирования\""
+            )
+        consumed_end = m.end()
+
+        if m.group(1):
+            key = m.group(1)
+            if m.group(4) is not None and m.group(4)[:1] in ('"', "'"):
+                # The bare-token alternative matched a value starting
+                # with a quote character — this only happens when the
+                # quoted alternatives above it failed to find a
+                # matching closing quote (an unmatched/unclosed quote).
+                # Fail closed rather than store a value with a stray
+                # leading quote character.
+                return None, (
+                    "❌ Некорректный формат параметров /archivedoc "
+                    "(незакрытая кавычка).\n\n"
+                    "Используйте:\n"
+                    "/archivedoc document_id=DREG-001 reason=\"Причина архивирования\""
+                )
+            # Deliberately NOT .strip()'d — confirm=" yes"/confirm="yes "
+            # must NOT equal the exact string "yes" (Phase 16C.9D §7);
+            # document_id/reason remain the caller's exact quoted text,
+            # with the domain layer solely authoritative for trimming.
+            val = m.group(2) or m.group(3) or m.group(4) or ""
+            if key not in ARCHIVEDOC_ALLOWED_KEYS:
+                if key not in unknown:
+                    unknown.append(key)
+                continue
+            if key in seen:
+                if key not in duplicates:
+                    duplicates.append(key)
+                continue
+            seen[key] = val
+        else:
+            # A bare positional token (no "key=") — always rejected,
+            # this includes a dangling second word of an unquoted
+            # multi-word reason (e.g. "reason=ошибка загрузки" leaves
+            # "загрузки" as exactly this kind of bare token).
+            return None, (
+                "❌ Некорректный формат параметров /archivedoc.\n\n"
+                "Используйте:\n"
+                "/archivedoc document_id=DREG-001 reason=\"Причина архивирования\""
+            )
+
+    if raw[consumed_end:].strip():
+        return None, (
+            "❌ Некорректный формат параметров /archivedoc.\n\n"
+            "Используйте:\n"
+            "/archivedoc document_id=DREG-001 reason=\"Причина архивирования\""
+        )
+
+    if unknown:
+        return None, (
+            f"❌ Неизвестный параметр: {unknown[0]}.\n\n"
+            "Разрешены только: document_id, reason, confirm"
+        )
+    if duplicates:
+        return None, f"❌ Параметр указан несколько раз: {duplicates[0]}."
+
+    if "document_id" not in seen:
+        return None, (
+            "❌ Укажи document_id.\n\n"
+            "Используйте:\n"
+            "/archivedoc document_id=DREG-001 reason=\"Причина архивирования\""
+        )
+    if "reason" not in seen:
+        return None, (
+            "❌ Укажи reason.\n\n"
+            "Используйте:\n"
+            "/archivedoc document_id=DREG-001 reason=\"Причина архивирования\""
+        )
+
+    return seen, None
+
+
+def _archivedoc_actor(update: Update) -> str:
+    """
+    Derive the durable Archive actor exclusively from
+    update.effective_user.id — never username/full name/chat ID/
+    message ID, and never caller-suppliable (archived_by is not an
+    accepted /archivedoc parameter at all — see
+    _parse_archivedoc_args()'s ARCHIVEDOC_ALLOWED_KEYS). Returns ""
+    if unavailable, letting the caller render a safe typed error
+    without exposing internal object details.
+    """
+    user = getattr(update, "effective_user", None)
+    if user is None:
+        return ""
+    user_id = getattr(user, "id", None)
+    if not isinstance(user_id, int):
+        return ""
+    return f"telegram:{user_id}"
+
+
+def _archivedoc_usage() -> str:
+    return (
+        "❌ Использование:\n\n"
+        "Предпросмотр:\n"
+        "/archivedoc document_id=DREG-001 reason=\"Причина архивирования\"\n\n"
+        "Подтверждение:\n"
+        "/archivedoc document_id=DREG-001 reason=\"Причина архивирования\" confirm=yes\n\n"
+        "Первая команда только показывает предпросмотр — ничего не меняется.\n"
+        "Точное confirm=yes выполняет реальное архивирование.\n"
+        "Файл в Drive не удаляется.\n"
+        "Архивированный документ перестаёт учитываться в требованиях.\n"
+        "Восстановление в этой фазе не реализовано."
+    )
+
+
+def _archivedoc_result_message(result: dict, document_id: str) -> str:
+    """Render any business_builder.archive_document() result as safe
+    plain Russian text. Never shows Drive URL/File ID, the raw numeric
+    actor value, client data, document content, or a raw exception."""
+    code = result.get("code", "")
+
+    if code == "DOCUMENT_ARCHIVE_PREVIEW":
+        lines = ["📦 Предпросмотр архивирования документа", ""]
+        lines.append(f"Document ID: {document_id}")
+        if result.get("document_name"):
+            lines.append(f"Название: {result['document_name']}")
+        lines.append(f"Текущий статус: {result.get('previous_status', '')}")
+        lines.append("Новый статус: archived")
+        lines.append("")
+        lines.append(f"Причина: {result.get('archive_reason', '')}")
+        lines.append("Исполнитель: текущий пользователь Telegram")
+        lines.append("")
+        lines.append("⚠️ Файл в Drive не будет удалён.")
+        lines.append("⚠️ Документ перестанет учитываться в требованиях.")
+        lines.append("⚠️ Восстановление пока не реализовано.")
+        lines.append("")
+        lines.append("Для подтверждения повторите команду:")
+        lines.append(
+            f' /archivedoc document_id={document_id} reason="{result.get("archive_reason", "")}" confirm=yes'
+        )
+        return "\n".join(lines)
+
+    if code == "DOCUMENT_ARCHIVED":
+        lines = [f"✅ Документ {document_id} архивирован.", ""]
+        if result.get("document_name"):
+            lines.append(f"Название: {result['document_name']}")
+        lines.append(f"Предыдущий статус: {result.get('previous_status', '')}")
+        lines.append("Новый статус: archived")
+        lines.append(f"Причина: {result.get('archive_reason', '')}")
+        lines.append(f"Дата архивирования: {result.get('archived_at', '')}")
+        lines.append("")
+        lines.append("Файл в Drive не удалён.")
+        lines.append("Документ больше не учитывается в требованиях.")
+        return "\n".join(lines)
+
+    if code == "DOCUMENT_ARCHIVE_ALREADY_ARCHIVED":
+        lines = [f"ℹ️ Документ {document_id} уже архивирован.", ""]
+        has_metadata = bool(
+            result.get("archived_at") or result.get("archive_reason") or result.get("previous_status")
+        )
+        if has_metadata:
+            if result.get("previous_status"):
+                lines.append(f"Предыдущий статус: {result['previous_status']}")
+            if result.get("archived_at"):
+                lines.append(f"Дата архивирования: {result['archived_at']}")
+            if result.get("archive_reason"):
+                lines.append(f"Причина: {result['archive_reason']}")
+            if result.get("archived_by"):
+                lines.append("Исполнитель: пользователь Telegram")
+        else:
+            lines.append(
+                "Данные об архивировании недоступны: документ был архивирован "
+                "до внедрения журнала аудита."
+            )
+        return "\n".join(lines)
+
+    if code == "DOCUMENT_NOT_FOUND":
+        return f"❌ Документ {document_id} не найден."
+
+    if code == "DOCUMENT_ARCHIVE_REASON_REQUIRED":
+        return "❌ Укажи причину архивирования: reason=\"...\""
+
+    if code == "DOCUMENT_ARCHIVE_REASON_TOO_LONG":
+        return "❌ Причина архивирования не может превышать 500 символов."
+
+    if code == "DOCUMENT_ARCHIVE_ACTOR_INVALID":
+        return "❌ Не удалось определить пользователя Telegram."
+
+    if code == "INVALID_DOCUMENT_TRANSITION":
+        return f"❌ Документ {document_id} нельзя архивировать из текущего статуса."
+
+    if code in ("DOCUMENT_ARCHIVE_WRITE_FAILED", "DOCUMENT_ARCHIVE_POST_WRITE_VERIFICATION_FAILED"):
+        return (
+            f"⚠️ Результат архивирования документа {document_id} не удалось подтвердить.\n\n"
+            "Не повторяйте команду автоматически.\n\n"
+            f"Проверьте карточку:\n/doc document_id={document_id}\n\n"
+            "При необходимости обратитесь к администратору."
+        )
+
+    log.warning(f"_archivedoc_result_message: unmapped code={code!r} document_id={document_id}")
+    return "⚠️ Непредвиденный результат операции. Обратитесь к администратору."
+
+
+async def archivedoc_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /archivedoc document_id=DREG-001 reason="Причина архивирования"
+    /archivedoc document_id=DREG-001 reason="Причина архивирования" confirm=yes
+
+    Stateless — see the module-level comment above this function for
+    the full architecture rationale. Only exact, case-sensitive
+    confirm=yes executes the write (Phase 16C.9D §7 — intentionally
+    stricter than this codebase's other confirm=yes gates, which are
+    all case-insensitive); every other confirm value (or no confirm
+    key at all) is treated as a preview, never a parse error.
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg(), parse_mode=None)
+        return
+
+    raw = " ".join(context.args or [])
+    if not raw.strip():
+        await _reply(update, _archivedoc_usage(), parse_mode=None)
+        return
+
+    parsed, error = _parse_archivedoc_args(raw)
+    if error:
+        await _reply(update, error, parse_mode=None)
+        return
+
+    document_id = parsed["document_id"]
+    reason = parsed["reason"]
+    confirm_value = parsed.get("confirm", "")
+    confirmed = confirm_value == "yes"
+
+    actor = _archivedoc_actor(update)
+    if not actor:
+        await _reply(
+            update,
+            "❌ Не удалось определить пользователя Telegram.\nПовторите позже или обратитесь к администратору.",
+            parse_mode=None,
+        )
+        return
+
+    from business_core.business_builder import archive_document
+
+    result = archive_document(document_id, reason, actor, dry_run=not confirmed)
+    log.info(
+        f"archivedoc_cmd: document_id={document_id} code={result.get('code')} "
+        f"changed={result.get('changed')} retry_safe={result.get('retry_safe')} actor={actor}"
+    )
+    await _reply(update, _archivedoc_result_message(result, document_id), parse_mode=None)
+
+
+# ─────────────────────────────────────────────────────────────
 # Telegram Document Upload Foundation (Phase 15B)
 # ─────────────────────────────────────────────────────────────
 #
@@ -15079,6 +15378,10 @@ def register_business_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("docs4stage", docs4stage_cmd))
     app.add_handler(CommandHandler("updatedoc", updatedoc_cmd))
     app.add_handler(CommandHandler("syncstageknowledge", syncstageknowledge_cmd))
+
+    # Phase 16C.9D: Document Archive Telegram UX — stateless, no
+    # ConversationHandler, no /cancel fallback.
+    app.add_handler(CommandHandler("archivedoc", archivedoc_cmd))
 
     # Phase 15B: Telegram Document Upload Foundation
     app.add_handler(ConversationHandler(

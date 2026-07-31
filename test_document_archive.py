@@ -828,11 +828,29 @@ class TestArchitectureGuards(unittest.TestCase):
         self.assertNotIn("archive_document_row", source)
 
     def test_telegram_handlers_has_no_low_level_archive_write(self):
-        with open("business_core/telegram_handlers.py", encoding="utf-8") as f:
-            source = f.read()
-        # No archive-domain write path exists in Telegram in this phase
-        # at all (no /archivedoc command implemented yet).
-        self.assertNotIn("archive_document(", source)
+        # Phase 16C.9D superseded the original assumption behind this
+        # guard ("no archive-domain write path exists in Telegram in
+        # this phase at all") — /archivedoc now legitimately exists and
+        # calls business_builder.archive_document(). The guard is
+        # updated to prove the real boundary: archivedoc_cmd calls the
+        # one approved domain function and nothing lower-level, scoped
+        # to the function's own source (not a whole-file substring ban
+        # that would also reject the legitimate call).
+        import business_core.telegram_handlers as th
+        source = inspect.getsource(th.archivedoc_cmd)
+
+        self.assertIn("archive_document(", source)
+
+        for forbidden in (
+            "archive_document_row(",
+            "update_business_row(",
+            "update_document_status(",
+            "update_cell(",
+            "get_business_sheet(",
+            "append_business_row(",
+            "find_row_by_id(",
+        ):
+            self.assertNotIn(forbidden, source)
 
     def test_sheets_py_unchanged_by_this_phase(self):
         # Structural guard: sheets.py must still expose exactly the
