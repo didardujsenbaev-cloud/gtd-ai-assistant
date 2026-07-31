@@ -10352,3 +10352,195 @@ def update_interaction_notes(interaction_id: str, notes: str) -> dict:
         interaction_id=interaction_id, business_id=interaction.get("Business ID", ""),
         previous_status=interaction.get("Status", ""), final_status=interaction.get("Status", ""), changed=changed,
     )
+
+
+# ─────────────────────────────────────────────────────────────
+# Phase 17B: Identity & Access Control Foundation — Owner Bootstrap
+# Orchestration.
+#
+# This is the ONLY approved way to create an OWNER Access Role
+# Assignment in Phase 17B (identity_manager.assign_access_role()
+# categorically rejects Role == "OWNER" — see its docstring). This
+# function must NEVER be called from application startup, Telegram
+# handler registration, or any import side effect — it is invoked
+# exclusively and explicitly from migrate_identity_registries.py's
+# --bootstrap-owner CLI flag, requiring its own separate exact "YES"
+# confirmation.
+# ─────────────────────────────────────────────────────────────
+
+def bootstrap_owner_from_env(*, dry_run: bool = True) -> dict:
+    """
+    Reads BC_OWNER_TELEGRAM_USER_ID from the environment — never
+    accepted as a function argument, so it can only ever be driven by
+    deployment configuration, never by any caller-supplied value.
+
+    Returns a structured result (see Phase 17B design):
+        {
+            "ok": bool, "code": str, "changed": bool, "retry_safe": bool,
+            "dry_run": bool,
+            "completed_steps": tuple[str, ...], "failed_step": str,
+            "created_ids": dict, "verification_errors": tuple[str, ...],
+        }
+    """
+    from business_core import identity_manager as im
+
+    def _result(*, ok, code, changed=False, retry_safe=True, completed_steps=(), failed_step="",
+                created_ids=None, verification_errors=()):
+        return {
+            "ok": ok, "code": code, "changed": changed, "retry_safe": retry_safe, "dry_run": dry_run,
+            "completed_steps": tuple(completed_steps), "failed_step": failed_step,
+            "created_ids": created_ids or {}, "verification_errors": tuple(verification_errors),
+        }
+
+    raw_env = os.getenv("BC_OWNER_TELEGRAM_USER_ID", "").strip()
+    if not raw_env:
+        return _result(ok=False, code="OWNER_ENV_MISSING")
+    if not im.is_valid_telegram_user_id(raw_env):
+        return _result(ok=False, code="OWNER_ENV_INVALID")
+
+    # Existing-owner detection — must be unambiguous before any write.
+    active_owners = im.find_active_owner_assignments()
+    if len(active_owners) > 1:
+        return _result(ok=False, code="MULTIPLE_ACTIVE_OWNERS_CONFLICT", retry_safe=True)
+
+    existing_owner_employee = None
+    if len(active_owners) == 1:
+        owner_assignment = active_owners[0]
+        existing_owner_employee = im.find_employee(owner_assignment.get("employee_id", ""))
+        owner_identity = im.find_active_telegram_identity_by_employee(owner_assignment.get("employee_id", ""))
+        if owner_identity is not None and owner_identity.get("telegram_user_id") == raw_env:
+            # Idempotent: the same, correctly-bound owner already exists.
+            return _result(
+                ok=True, code="OWNER_BOOTSTRAP_ALREADY_COMPLETE", changed=False,
+                created_ids={
+                    "employee_id": owner_assignment.get("employee_id", ""),
+                    "telegram_identity_id": owner_identity.get("telegram_identity_id", ""),
+                    "access_role_assignment_id": owner_assignment.get("access_role_assignment_id", ""),
+                },
+            )
+        return _result(ok=False, code="OWNER_CONFLICT_DIFFERENT_TELEGRAM_ID", retry_safe=True)
+
+    # No active owner exists yet. Check whether raw_env is already
+    # bound to some OTHER (non-owner) employee.
+    bound_employee = im.find_employee_by_telegram_user_id(raw_env, active_only=True)
+    resumable_partial_employee_id = ""
+    if bound_employee is not None:
+        # Unambiguous-resume check: only safe to continue if BOTH the
+        # Employee and its Telegram Identity were themselves created
+        # by this exact bootstrap actor — otherwise this is a real,
+        # distinct employee and must fail closed.
+        identity_row = im.find_active_telegram_identity_by_employee(bound_employee["employee_id"])
+        if (
+            bound_employee.get("created_by") == im.SYSTEM_BOOTSTRAP_ACTOR
+            and identity_row is not None
+            and identity_row.get("linked_by") == im.SYSTEM_BOOTSTRAP_ACTOR
+        ):
+            resumable_partial_employee_id = bound_employee["employee_id"]
+        else:
+            return _result(ok=False, code="TELEGRAM_ID_BOUND_TO_NON_OWNER_EMPLOYEE", retry_safe=True)
+
+    proposed_steps = ("create_employee", "activate_employee", "link_telegram_identity", "assign_owner_role", "assign_all_businesses_scope")
+    if dry_run:
+        return _result(ok=True, code="OWNER_BOOTSTRAP_PREVIEW", changed=False, completed_steps=(), failed_step="",
+                        created_ids={}, verification_errors=())
+
+    completed: list[str] = []
+    created_ids: dict = {}
+
+    # Step 1+2: Employee (create-then-activate, since the manager
+    # layer only exposes create-as-pending — see identity_manager.
+    # create_pending_employee()'s contract).
+    if resumable_partial_employee_id:
+        employee_id = resumable_partial_employee_id
+        employee = im.find_employee(employee_id)
+        completed.append("create_employee")
+        if employee and employee.get("status") != "active":
+            activate_result = im.activate_employee(employee_id, activated_by=im.SYSTEM_BOOTSTRAP_ACTOR)
+            if not activate_result["ok"]:
+                return _result(ok=False, code="OWNER_BOOTSTRAP_WRITE_FAILED", retry_safe=False,
+                                completed_steps=completed, failed_step="activate_employee", created_ids=created_ids)
+        completed.append("activate_employee")
+    else:
+        create_result = im.create_pending_employee(display_label="Owner", created_by=im.SYSTEM_BOOTSTRAP_ACTOR)
+        if not create_result["ok"]:
+            return _result(ok=False, code="OWNER_BOOTSTRAP_WRITE_FAILED", retry_safe=create_result.get("retry_safe", False),
+                            completed_steps=completed, failed_step="create_employee", created_ids=created_ids)
+        employee_id = create_result["employee_id"]
+        completed.append("create_employee")
+        created_ids["employee_id"] = employee_id
+
+        activate_result = im.activate_employee(employee_id, activated_by=im.SYSTEM_BOOTSTRAP_ACTOR)
+        if not activate_result["ok"]:
+            return _result(ok=False, code="OWNER_BOOTSTRAP_WRITE_FAILED", retry_safe=False,
+                            completed_steps=completed, failed_step="activate_employee", created_ids=created_ids)
+        completed.append("activate_employee")
+
+    created_ids.setdefault("employee_id", employee_id)
+
+    # Step 3: Telegram Identity.
+    identity_row = im.find_active_telegram_identity_by_employee(employee_id)
+    if identity_row is not None:
+        created_ids["telegram_identity_id"] = identity_row.get("telegram_identity_id", "")
+    else:
+        link_result = im.link_telegram_identity(employee_id, raw_env, linked_by=im.SYSTEM_BOOTSTRAP_ACTOR)
+        if not link_result["ok"]:
+            return _result(ok=False, code="OWNER_BOOTSTRAP_WRITE_FAILED", retry_safe=link_result.get("retry_safe", False),
+                            completed_steps=completed, failed_step="link_telegram_identity", created_ids=created_ids)
+        created_ids["telegram_identity_id"] = link_result["telegram_identity_id"]
+    completed.append("link_telegram_identity")
+
+    # Step 4: OWNER Role Assignment (bootstrap-only write path).
+    existing_role_rows = [r for r in im.find_active_role_assignments(employee_id) if r.get("role") == "OWNER"]
+    if existing_role_rows:
+        access_role_assignment_id = existing_role_rows[0]["access_role_assignment_id"]
+    else:
+        role_result = im._bootstrap_assign_owner_role(employee_id, assigned_by=im.SYSTEM_BOOTSTRAP_ACTOR)
+        if not role_result["ok"]:
+            return _result(ok=False, code="OWNER_BOOTSTRAP_WRITE_FAILED", retry_safe=role_result.get("retry_safe", False),
+                            completed_steps=completed, failed_step="assign_owner_role", created_ids=created_ids)
+        access_role_assignment_id = role_result["access_role_assignment_id"]
+    created_ids["access_role_assignment_id"] = access_role_assignment_id
+    completed.append("assign_owner_role")
+
+    # Step 5: ALL_BUSINESSES Scope Assignment.
+    existing_scope_rows = [
+        r for r in im.find_active_scope_assignments(employee_id, access_role_assignment_id)
+        if r.get("scope_type") == "ALL_BUSINESSES"
+    ]
+    if existing_scope_rows:
+        access_scope_assignment_id = existing_scope_rows[0]["access_scope_assignment_id"]
+    else:
+        scope_result = im.assign_access_scope(
+            employee_id, access_role_assignment_id, "ALL_BUSINESSES", assigned_by=im.SYSTEM_BOOTSTRAP_ACTOR,
+        )
+        if not scope_result["ok"]:
+            return _result(ok=False, code="OWNER_BOOTSTRAP_WRITE_FAILED", retry_safe=scope_result.get("retry_safe", False),
+                            completed_steps=completed, failed_step="assign_all_businesses_scope", created_ids=created_ids)
+        access_scope_assignment_id = scope_result["access_scope_assignment_id"]
+    created_ids["access_scope_assignment_id"] = access_scope_assignment_id
+    completed.append("assign_all_businesses_scope")
+
+    # Final post-write verification: re-resolve the owner end-to-end.
+    verification_errors: list[str] = []
+    final_employee = im.find_employee(employee_id)
+    if final_employee is None or final_employee.get("status") != "active":
+        verification_errors.append("employee_not_active")
+    final_identity = im.find_active_telegram_identity_by_employee(employee_id)
+    if final_identity is None or final_identity.get("telegram_user_id") != raw_env:
+        verification_errors.append("telegram_identity_mismatch")
+    final_roles = im.find_active_role_assignments(employee_id)
+    if not any(r.get("role") == "OWNER" for r in final_roles):
+        verification_errors.append("owner_role_missing")
+    final_scopes = im.find_active_scope_assignments(employee_id, access_role_assignment_id)
+    if not any(s.get("scope_type") == "ALL_BUSINESSES" for s in final_scopes):
+        verification_errors.append("all_businesses_scope_missing")
+
+    if verification_errors:
+        log.error(f"bootstrap_owner_from_env post-write verification errors: {verification_errors}")
+        return _result(ok=False, code="OWNER_BOOTSTRAP_POST_WRITE_VERIFICATION_FAILED", retry_safe=False,
+                        completed_steps=completed, failed_step="", created_ids=created_ids,
+                        verification_errors=verification_errors)
+
+    log.info(f"bootstrap_owner_from_env: OWNER bootstrap complete for employee={employee_id}")
+    return _result(ok=True, code="OWNER_BOOTSTRAP_COMPLETE", changed=True,
+                    completed_steps=completed, failed_step="", created_ids=created_ids)

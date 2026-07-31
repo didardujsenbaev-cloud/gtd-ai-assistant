@@ -229,6 +229,16 @@ BUSINESS_SHEET_NAMES: dict[str, str] = {
     "template_stage_dependencies":    "TEMPLATE_STAGE_DEPENDENCIES",
     # Phase 16B.3: Human Confirmation of Structured Document Fields.
     "document_field_reviews":        "DOCUMENT_FIELD_REVIEWS",
+    # Phase 17B (Identity & Access Control Foundation): four completely
+    # separate registries — deliberately NOT people_registry/
+    # channel_registry/role_registry/person_role_assignments, which are
+    # organizational/CRM entities with a different purpose and lifecycle
+    # (see Phase 17A/17B audits). Schema-foundation only in this phase —
+    # no authorization domain, no Telegram wiring yet.
+    "employee_registry":              "EMPLOYEE_REGISTRY",
+    "telegram_identity_registry":     "TELEGRAM_IDENTITY_REGISTRY",
+    "access_role_assignments":        "ACCESS_ROLE_ASSIGNMENTS",
+    "access_scope_assignments":       "ACCESS_SCOPE_ASSIGNMENTS",
 }
 
 BUSINESS_HEADERS: dict[str, list[str]] = {
@@ -764,6 +774,51 @@ BUSINESS_HEADERS: dict[str, list[str]] = {
         "Depends On Template Stage ID", "Dependency Type", "Blocking", "Status",
         "Created At", "Updated At", "Notes",
     ],
+    # Phase 17B (Identity & Access Control Foundation, ADR pending):
+    # replace-don't-edit lifecycle (active -> revoked only; a
+    # replacement or re-grant always creates a new row, a revoked row
+    # is never reactivated) — mirrors Document Archive's write-once
+    # contract. No hard deletion anywhere in this domain.
+    "employee_registry": [
+        "Employee ID", "Person ID", "Display Label", "Status",
+        "Created At", "Created By",
+        "Activated At", "Activated By",
+        "Disabled At", "Disabled By", "Disable Reason",
+        "Notes",
+    ],
+    # Telegram User ID is stored as TEXT (never a numeric cell type) —
+    # large Telegram user IDs risk silent scientific-notation/locale
+    # reformatting in Sheets if stored as a number, exactly like every
+    # other ID in this schema. Telegram Actor is the derived, durable
+    # "telegram:{id}" string, stored explicitly rather than recomputed
+    # on every read.
+    "telegram_identity_registry": [
+        "Telegram Identity ID", "Employee ID", "Telegram User ID", "Telegram Actor",
+        "Status",
+        "Linked At", "Linked By",
+        "Revoked At", "Revoked By", "Revoke Reason",
+    ],
+    "access_role_assignments": [
+        "Access Role Assignment ID", "Employee ID", "Role", "Status",
+        "Effective From", "Effective Until",
+        "Assigned At", "Assigned By",
+        "Revoked At", "Revoked By", "Revoke Reason",
+    ],
+    # Access Scope Assignment ID always links to exactly one Access
+    # Role Assignment ID (not "the employee in general") so a single
+    # employee holding multiple roles can carry distinct scopes per
+    # role unambiguously. SELECTED_BUSINESSES is one row per Business
+    # ID (never a comma-list/JSON cell) — matches this schema's own
+    # established one-row-per-value convention (Document Family/
+    # Version, Payment Obligation/Transaction, etc.).
+    "access_scope_assignments": [
+        "Access Scope Assignment ID", "Employee ID", "Access Role Assignment ID",
+        "Scope Type", "Business ID", "Object ID",
+        "Status",
+        "Effective From", "Effective Until",
+        "Assigned At", "Assigned By",
+        "Revoked At", "Revoked By", "Revoke Reason",
+    ],
 }
 
 # ID-префиксы для generate_next_id
@@ -835,6 +890,11 @@ _ID_PREFIXES: dict[str, str] = {
     "template_stage_dependencies":    "TDEP",
     # Phase 16B.3: checked against every existing prefix above — no collisions.
     "document_field_reviews":         "DFR",
+    # Phase 17B: checked against every existing prefix above — no collisions.
+    "employee_registry":              "EMP",
+    "telegram_identity_registry":     "TGID",
+    "access_role_assignments":        "ARA",
+    "access_scope_assignments":       "ASA",
 }
 
 

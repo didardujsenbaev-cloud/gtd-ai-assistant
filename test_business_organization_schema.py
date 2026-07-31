@@ -222,13 +222,16 @@ class TestExistingRegistriesUntouched(unittest.TestCase):
         # (2026-07-28, DECISIONS.md §14a) legitimately added 1 more
         # (template_stage_dependencies) = 38. Phase 16B.3 (Human
         # Confirmation of Structured Document Fields) legitimately
-        # added 1 more (document_field_reviews) = 39 — this
-        # point-in-time closeout check is updated here rather than
-        # treated as a durable count invariant (same precedent as the
-        # removed git-diff-based TestAdditiveOnly guard in
+        # added 1 more (document_field_reviews) = 39. Phase 17B
+        # (Identity & Access Control Foundation) legitimately added 4
+        # more (employee_registry, telegram_identity_registry,
+        # access_role_assignments, access_scope_assignments) = 43 —
+        # this point-in-time closeout check is updated here rather
+        # than treated as a durable count invariant (same precedent as
+        # the removed git-diff-based TestAdditiveOnly guard in
         # test_business_organization_commands.py).
-        self.assertEqual(len(s.BUSINESS_SHEET_NAMES), 39)
-        self.assertEqual(len(s.BUSINESS_HEADERS), 39)
+        self.assertEqual(len(s.BUSINESS_SHEET_NAMES), 43)
+        self.assertEqual(len(s.BUSINESS_HEADERS), 43)
 
 
 class TestGTDAndEnvUntouched(unittest.TestCase):
