@@ -98,6 +98,11 @@ COMMAND_ENFORCEMENT_MAP = {
         "operation_kind": "MUTATION", "allowed_modes": ("NOTES_ONLY",), "requires_fresh_reread": True,
         "mutation_side_effect_class": "SINGLE_ROW_MUTATION", "idempotency_class": "IDEMPOTENT",
     },
+    "updatedocnotes": {
+        "resource": "DOCUMENT", "action": "UPDATE", "target_shape": "BUSINESS_AND_OBJECT",
+        "operation_kind": "MUTATION", "allowed_modes": ("NOTES_ONLY",), "requires_fresh_reread": True,
+        "mutation_side_effect_class": "SINGLE_ROW_MUTATION", "idempotency_class": "IDEMPOTENT",
+    },
 }
 
 _BC_ENFORCEMENT_NOT_FOUND_OR_DENIED_MSG = "Запись недоступна или не найдена."
@@ -4723,6 +4728,138 @@ async def updatedoc_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     except Exception as e:
         log.error(f"updatedoc_cmd error: {e}")
         await _reply(update, "❌ Не удалось обновить документ.")
+
+
+_UPDATEDOCNOTES_ALLOWED_KEYS = frozenset({"document_id", "notes"})
+
+
+def _document_notes_message(result, document_id: str) -> str:
+    """
+    Dedicated safe mapper for /updatedocnotes (Phase 17E-2A5) — mirrors
+    _obligation_notes_message's/_offer_notes_message's contract
+    exactly. NEVER renders result['error'], str/repr of the result, or
+    the raw result code. Deliberately does NOT reuse
+    _document_admin_message (which supports the legacy /updatedoc
+    Document Name mode and its own broader code set). business_builder.
+    update_document_admin_fields leaves code="" on both success and
+    infrastructure failure paths reachable through this Notes-only
+    call, so this mapper keys off the ok/changed flags directly rather
+    than a code string, using strict `is True`/`is False` identity
+    checks so a malformed result (truthy non-bool, wrong type, missing
+    keys) can never accidentally satisfy a branch.
+    """
+    if not isinstance(result, dict):
+        return "❌ Не удалось обновить Notes для Document."
+
+    if result.get("ok") is True and result.get("changed") is True:
+        return f"✅ Notes для Document {document_id} обновлены."
+    if result.get("ok") is True and result.get("changed") is False:
+        return f"ℹ️ Document {document_id} — изменений нет (значения совпадают)."
+    if result.get("ok") is not True and result.get("code") == "DOCUMENT_NOT_FOUND":
+        # Authorization already succeeded against this document_id — a
+        # NOT_FOUND surfacing only now means the record vanished
+        # between the mandatory second lookup and business_builder's
+        # own internal lookup (the accepted residual TOCTOU window),
+        # not a pre-authorization enumeration case.
+        return _BC_ENFORCEMENT_OWNERSHIP_CHANGED_MSG
+
+    return "❌ Не удалось обновить Notes для Document."
+
+
+async def updatedocnotes_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /updatedocnotes document_id=DOC-001 notes=...
+
+    Phase 17E-2A5: dedicated, fully authorized, single-purpose command
+    — DOCUMENT/UPDATE, target_shape=BUSINESS_AND_OBJECT, MUTATION,
+    requires_fresh_reread=True. Reuses business_builder.
+    update_document_admin_fields() only — never calls updatedoc_cmd,
+    any Document Name update path, or any status/relink/upload/
+    content/review/archive helper. /updatedoc itself is unchanged and
+    remains outside COMMAND_ENFORCEMENT_MAP. Exactly
+    {"document_id", "notes"} is the only permitted parsed key set —
+    any other key (including positional _posN keys) is rejected
+    before the finder ever runs.
+
+    Unlike the Business-only dedicated Notes commands, DOCUMENT is an
+    object-addressable resource — authorize_business_core_access()
+    structurally requires both business_id AND object_id for this
+    resource (TARGET_REQUIRED otherwise), so both are resolved from
+    the Document's own stored row (never caller-supplied) and both are
+    re-verified unchanged on the mandatory second lookup, exactly like
+    Business ID is for every other dedicated Notes command.
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg(), parse_mode=None)
+        return
+
+    if not await _validate_bc_transport_or_reply(update):
+        return
+
+    raw = " ".join(context.args or [])
+    args = _parse_kv_args(raw)
+
+    if not set(args.keys()) <= _UPDATEDOCNOTES_ALLOWED_KEYS:
+        await _reply(update, "❌ /updatedocnotes принимает только document_id и notes.", parse_mode=None)
+        return
+
+    document_id = args.get("document_id", "")
+    notes = args.get("notes", "")
+
+    if not document_id or not notes:
+        await _reply(
+            update,
+            "❌ Укажи document_id и notes.\n\nПример:\n"
+            "`/updatedocnotes document_id=DOC-001 notes=...`", parse_mode=None)
+        return
+
+    from business_core.document_manager import find_document_by_id
+    from business_core.business_builder import update_document_admin_fields
+
+    try:
+        first_row = await _resolve_target_in_thread(find_document_by_id, document_id)
+    except Exception:
+        await _reply(update, _BC_ENFORCEMENT_TEMPORARILY_UNAVAILABLE_MSG, parse_mode=None)
+        return
+
+    first_business_id = str((first_row or {}).get("business_id", "")).strip()
+    first_object_id = str((first_row or {}).get("object_id", "")).strip()
+    if first_row is None or not first_business_id or not first_object_id:
+        await _reply(update, _BC_ENFORCEMENT_NOT_FOUND_OR_DENIED_MSG, parse_mode=None)
+        return
+
+    if not await _authorize_or_reply(
+        update, resource="DOCUMENT", action="UPDATE",
+        business_id=first_business_id, object_id=first_object_id,
+    ):
+        return
+
+    try:
+        second_row = await _resolve_target_in_thread(find_document_by_id, document_id)
+    except Exception:
+        await _reply(update, _BC_ENFORCEMENT_TEMPORARILY_UNAVAILABLE_MSG, parse_mode=None)
+        return
+
+    second_business_id = str((second_row or {}).get("business_id", "")).strip()
+    second_object_id = str((second_row or {}).get("object_id", "")).strip()
+    if (
+        second_row is None or not second_business_id or not second_object_id
+        or second_business_id != first_business_id or second_object_id != first_object_id
+    ):
+        await _reply(update, _BC_ENFORCEMENT_OWNERSHIP_CHANGED_MSG, parse_mode=None)
+        return
+
+    try:
+        result = await _mutate_target_in_thread(update_document_admin_fields, document_id, {"Notes": notes})
+    except Exception:
+        # Fixed branch identifier only — no exception interpolation,
+        # no document_id, no Business ID, no Object ID, no Notes, no
+        # updates dict.
+        log.error("updatedocnotes_cmd mutation infrastructure failure")
+        await _reply(update, "❌ Не удалось обновить Notes для Document.", parse_mode=None)
+        return
+
+    await _reply(update, _document_notes_message(result, document_id), parse_mode=None)
 
 
 _STAGE_KNOWLEDGE_SOURCE_RU = {
@@ -16126,6 +16263,7 @@ def register_business_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("doc", doc_cmd))
     app.add_handler(CommandHandler("docs4stage", docs4stage_cmd))
     app.add_handler(CommandHandler("updatedoc", updatedoc_cmd))
+    app.add_handler(CommandHandler("updatedocnotes", updatedocnotes_cmd))
     app.add_handler(CommandHandler("syncstageknowledge", syncstageknowledge_cmd))
 
     # Phase 16C.9D: Document Archive Telegram UX — stateless, no

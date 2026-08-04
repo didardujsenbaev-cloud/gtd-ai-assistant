@@ -724,7 +724,7 @@ class TestDocumentCommandsRegisteredExactlyOnce(unittest.TestCase):
         src = path.read_text(encoding="utf-8")
         for name in (
             "registerdoc", "doc", "docs4stage", "uploaddoc", "analyzedoc",
-            "docanalysis", "missingdocs", "docsrequired", "updatedoc",
+            "docanalysis", "missingdocs", "docsrequired", "updatedoc", "updatedocnotes",
         ):
             self.assertEqual(
                 src.count(f'CommandHandler("{name}"'), 1,
@@ -741,7 +741,7 @@ class TestDocumentCommandsRegisteredExactlyOnce(unittest.TestCase):
             counts[name] = counts.get(name, 0) + 1
         document_names = {
             "registerdoc", "doc", "docs4stage", "uploaddoc", "analyzedoc",
-            "docanalysis", "missingdocs", "docsrequired", "updatedoc",
+            "docanalysis", "missingdocs", "docsrequired", "updatedoc", "updatedocnotes",
         }
         for name in document_names:
             self.assertEqual(counts.get(name, 0), 1, f"/{name} must appear exactly once across all registrations")

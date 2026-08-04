@@ -156,6 +156,11 @@ _EXPECTED_MUTATION_ENTRY = {
         "operation_kind": "MUTATION", "allowed_modes": ("NOTES_ONLY",), "requires_fresh_reread": True,
         "mutation_side_effect_class": "SINGLE_ROW_MUTATION", "idempotency_class": "IDEMPOTENT",
     },
+    "updatedocnotes": {
+        "resource": "DOCUMENT", "action": "UPDATE", "target_shape": "BUSINESS_AND_OBJECT",
+        "operation_kind": "MUTATION", "allowed_modes": ("NOTES_ONLY",), "requires_fresh_reread": True,
+        "mutation_side_effect_class": "SINGLE_ROW_MUTATION", "idempotency_class": "IDEMPOTENT",
+    },
 }
 
 _NON_ENFORCED_SAMPLE_HANDLERS = [
@@ -173,7 +178,7 @@ _NON_ENFORCED_SAMPLE_HANDLERS = [
 
 
 class TestEnforcementMap(unittest.TestCase):
-    def test_map_keys_exactly_ten_commands(self):
+    def test_map_keys_exactly_eleven_commands(self):
         expected_keys = set(_EXPECTED_MAP.keys()) | set(_EXPECTED_MUTATION_ENTRY.keys())
         self.assertEqual(set(th.COMMAND_ENFORCEMENT_MAP.keys()), expected_keys)
 
@@ -187,8 +192,8 @@ class TestEnforcementMap(unittest.TestCase):
             with self.subTest(command=key):
                 self.assertEqual(th.COMMAND_ENFORCEMENT_MAP[key], val)
 
-    def test_no_eleventh_command_in_map(self):
-        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 10)
+    def test_no_twelfth_command_in_map(self):
+        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 11)
 
     def test_updatelead_not_in_map(self):
         self.assertNotIn("updatelead", th.COMMAND_ENFORCEMENT_MAP)
@@ -198,6 +203,9 @@ class TestEnforcementMap(unittest.TestCase):
 
     def test_updateoffer_not_in_map(self):
         self.assertNotIn("updateoffer", th.COMMAND_ENFORCEMENT_MAP)
+
+    def test_updatedoc_not_in_map(self):
+        self.assertNotIn("updatedoc", th.COMMAND_ENFORCEMENT_MAP)
 
 
 class TestHandlersUseTransportPreflightAndAdapter(unittest.TestCase):
@@ -373,10 +381,15 @@ class TestPhase17E2A4H1OfferHardeningScope(unittest.TestCase):
     def test_telegram_handlers_change_confined_to_offer_mapper(self):
         # Phase 17E-2A5-H1 additionally approves _document_admin_message
         # (legacy mapper safety correction) in this same file.
+        # Phase 17E-2A5 additionally approves adding
+        # _document_notes_message and updatedocnotes_cmd.
         _assert_only_functions_changed_or_added(
             self, "business_core/telegram_handlers.py",
             allowed_changed_function_names={"register_business_handlers", "_document_admin_message"},
-            allowed_added_function_names={"_offer_notes_message", "updateoffernotes_cmd"},
+            allowed_added_function_names={
+                "_offer_notes_message", "updateoffernotes_cmd",
+                "_document_notes_message", "updatedocnotes_cmd",
+            },
         )
 
     def test_payment_manager_unchanged(self):
@@ -412,16 +425,18 @@ class TestPhase17E2A4H1OfferHardeningScope(unittest.TestCase):
         self.assertTrue(hasattr(th, "updateoffernotes_cmd"))
         self.assertIn("updateoffernotes", th.COMMAND_ENFORCEMENT_MAP)
 
-    def test_enforcement_map_now_ten_entries(self):
-        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 10)
-
     def test_updateoffer_cmd_unchanged(self):
         # Phase 17E-2A5-H1 additionally approves _document_admin_message
         # (legacy mapper safety correction) in this same file.
+        # Phase 17E-2A5 additionally approves adding
+        # _document_notes_message and updatedocnotes_cmd.
         _assert_only_functions_changed_or_added(
             self, "business_core/telegram_handlers.py",
             allowed_changed_function_names={"register_business_handlers", "_document_admin_message"},
-            allowed_added_function_names={"_offer_notes_message", "updateoffernotes_cmd"},
+            allowed_added_function_names={
+                "_offer_notes_message", "updateoffernotes_cmd",
+                "_document_notes_message", "updatedocnotes_cmd",
+            },
         )
         # Redundant with the file-level check above but explicit:
         # updateoffer_cmd itself must be byte-identical to HEAD.
@@ -430,6 +445,42 @@ class TestPhase17E2A4H1OfferHardeningScope(unittest.TestCase):
         with open("business_core/telegram_handlers.py", encoding="utf-8") as f:
             current_functions = _top_level_function_sources(f.read())
         self.assertEqual(head_functions["updateoffer_cmd"], current_functions["updateoffer_cmd"])
+
+    def test_updatedoc_cmd_and_doc_cmd_unchanged(self):
+        # Phase 17E-2A5: /updatedocnotes must not alter legacy
+        # /updatedoc or /doc in any way.
+        head_src = _git_show_head("business_core/telegram_handlers.py")
+        head_functions = _top_level_function_sources(head_src)
+        with open("business_core/telegram_handlers.py", encoding="utf-8") as f:
+            current_functions = _top_level_function_sources(f.read())
+        self.assertEqual(head_functions["updatedoc_cmd"], current_functions["updatedoc_cmd"])
+        self.assertEqual(head_functions["doc_cmd"], current_functions["doc_cmd"])
+
+    def test_updatedocnotes_command_exists_and_registered(self):
+        self.assertTrue(hasattr(th, "updatedocnotes_cmd"))
+        self.assertIn("updatedocnotes", th.COMMAND_ENFORCEMENT_MAP)
+
+    def test_enforcement_map_now_eleven_entries(self):
+        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 11)
+
+    def test_exactly_five_dedicated_mutation_handlers_use_mutate_helper(self):
+        dedicated = [
+            "updateinteractionnotes_cmd", "updateleadnotes_cmd",
+            "updateobligationnotes_cmd", "updateoffernotes_cmd", "updatedocnotes_cmd",
+        ]
+        for name in dedicated:
+            self.assertTrue(hasattr(th, name))
+            fn_src = inspect.getsource(getattr(th, name))
+            self.assertIn("_mutate_target_in_thread(", fn_src)
+        # No other _cmd function may reference the mutation helper.
+        other_cmd_names = [
+            n for n in dir(th)
+            if n.endswith("_cmd") and n not in dedicated and callable(getattr(th, n))
+        ]
+        for name in other_cmd_names:
+            with self.subTest(handler=name):
+                other_src = inspect.getsource(getattr(th, name))
+                self.assertNotIn("_mutate_target_in_thread(", other_src)
 
 
 class TestOfferWrapperContractScope(unittest.TestCase):
