@@ -583,12 +583,12 @@ class TestNoCallerSidePaymentPolicy(unittest.TestCase):
 
 class TestPaymentCommandRegistration(unittest.TestCase):
 
-    def test_all_14_commands_registered_exactly_once(self):
+    def test_all_15_commands_registered_exactly_once(self):
         path = BUSINESS_CORE / "telegram_handlers.py"
         src = path.read_text(encoding="utf-8")
         for name in (
             "newpaymenttemplate", "paymenttemplates", "paymenttemplate", "updatepaymenttemplate",
-            "newobligation", "obligations", "obligation", "updateobligation",
+            "newobligation", "obligations", "obligation", "updateobligation", "updateobligationnotes",
             "recordpayment", "payments", "payment", "confirmpayment", "reversepayment", "failpayment",
         ):
             self.assertEqual(src.count(f'CommandHandler("{name}"'), 1, f"/{name} must be registered exactly once")

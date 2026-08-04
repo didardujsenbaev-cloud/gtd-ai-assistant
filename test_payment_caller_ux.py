@@ -402,12 +402,12 @@ _PAYMENT_COMMANDS = (
 
 
 class TestCommandRegistration(unittest.TestCase):
-    def test_all_14_commands_registered_exactly_once(self):
+    def test_all_15_commands_registered_exactly_once(self):
         path = WORKSPACE / "business_core" / "telegram_handlers.py"
         src = path.read_text(encoding="utf-8")
         names = (
             "newpaymenttemplate", "paymenttemplates", "paymenttemplate", "updatepaymenttemplate",
-            "newobligation", "obligations", "obligation", "updateobligation",
+            "newobligation", "obligations", "obligation", "updateobligation", "updateobligationnotes",
             "recordpayment", "payments", "payment", "confirmpayment", "reversepayment", "failpayment",
         )
         for name in names:

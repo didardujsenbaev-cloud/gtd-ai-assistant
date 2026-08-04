@@ -88,6 +88,11 @@ COMMAND_ENFORCEMENT_MAP = {
         "operation_kind": "MUTATION", "allowed_modes": ("NOTES_ONLY",), "requires_fresh_reread": True,
         "mutation_side_effect_class": "SINGLE_ROW_MUTATION", "idempotency_class": "IDEMPOTENT",
     },
+    "updateobligationnotes": {
+        "resource": "FINANCE", "action": "UPDATE", "target_shape": "BUSINESS",
+        "operation_kind": "MUTATION", "allowed_modes": ("NOTES_ONLY",), "requires_fresh_reread": True,
+        "mutation_side_effect_class": "SINGLE_ROW_MUTATION", "idempotency_class": "IDEMPOTENT",
+    },
 }
 
 _BC_ENFORCEMENT_NOT_FOUND_OR_DENIED_MSG = "Запись недоступна или не найдена."
@@ -11923,6 +11928,123 @@ async def updateobligation_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
         await _reply(update, "❌ Не удалось обновить Payment Obligation.", parse_mode=None)
 
 
+_UPDATEOBLIGATIONNOTES_ALLOWED_KEYS = frozenset({"payment_obligation_id", "notes"})
+
+
+def _obligation_notes_message(result, payment_obligation_id: str) -> str:
+    """
+    Dedicated safe mapper for /updateobligationnotes (Phase 17E-2A3) —
+    mirrors _lead_notes_message's/_interaction_notes_message's contract.
+    NEVER renders result['error'], str/repr of the result, or the raw
+    result code. business_builder.update_payment_obligation_admin_fields
+    leaves code="" on both success and infrastructure failure (no
+    synthesized UPDATED/UNCHANGED code exists in this chain), so this
+    mapper keys off the ok/changed flags directly rather than a code
+    string, using strict `is True`/`is False` identity checks so a
+    malformed result (truthy non-bool, wrong type, missing keys) can
+    never accidentally satisfy a branch.
+    """
+    if not isinstance(result, dict):
+        return "❌ Не удалось обновить Notes для Payment Obligation."
+
+    if result.get("ok") is True and result.get("changed") is True:
+        return f"✅ Notes для Payment Obligation {payment_obligation_id} обновлены."
+    if result.get("ok") is True and result.get("changed") is False:
+        return f"ℹ️ Payment Obligation {payment_obligation_id} — изменений нет (значения совпадают)."
+    if result.get("ok") is not True and result.get("code") == "PAYMENT_OBLIGATION_NOT_FOUND":
+        # Authorization already succeeded against this
+        # payment_obligation_id — a NOT_FOUND surfacing only now means
+        # the record vanished between the mandatory second lookup and
+        # business_builder's own internal lookup (the accepted
+        # residual TOCTOU window), not a pre-authorization
+        # enumeration case.
+        return _BC_ENFORCEMENT_OWNERSHIP_CHANGED_MSG
+
+    return "❌ Не удалось обновить Notes для Payment Obligation."
+
+
+async def updateobligationnotes_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /updateobligationnotes payment_obligation_id=POB-001 notes=...
+
+    Phase 17E-2A3: dedicated, fully authorized, single-purpose command
+    — FINANCE/UPDATE, target_shape=BUSINESS, MUTATION,
+    requires_fresh_reread=True. Reuses business_builder.
+    update_payment_obligation_admin_fields() only — never calls
+    updateobligation_cmd, transition_payment_obligation_status(), or
+    any payment-transaction mutator. /updateobligation itself is
+    unchanged and remains outside COMMAND_ENFORCEMENT_MAP. Exactly
+    {"payment_obligation_id", "notes"} is the only permitted parsed
+    key set — any other key (including positional _posN keys) is
+    rejected before the finder ever runs.
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg(), parse_mode=None)
+        return
+
+    if not await _validate_bc_transport_or_reply(update):
+        return
+
+    raw = " ".join(context.args or [])
+    args = _parse_kv_args(raw)
+
+    if not set(args.keys()) <= _UPDATEOBLIGATIONNOTES_ALLOWED_KEYS:
+        await _reply(update, "❌ /updateobligationnotes принимает только payment_obligation_id и notes.", parse_mode=None)
+        return
+
+    payment_obligation_id = args.get("payment_obligation_id", "")
+    notes = args.get("notes", "")
+
+    if not payment_obligation_id or not notes:
+        await _reply(
+            update,
+            "❌ Укажи payment_obligation_id и notes.\n\nПример:\n"
+            "`/updateobligationnotes payment_obligation_id=POB-001 notes=...`", parse_mode=None)
+        return
+
+    from business_core.payment_manager import find_payment_obligation_by_id
+    from business_core.business_builder import update_payment_obligation_admin_fields
+
+    try:
+        first_row = await _resolve_target_in_thread(find_payment_obligation_by_id, payment_obligation_id)
+    except Exception:
+        await _reply(update, _BC_ENFORCEMENT_TEMPORARILY_UNAVAILABLE_MSG, parse_mode=None)
+        return
+
+    first_business_id = str((first_row or {}).get("Business ID", "")).strip()
+    if first_row is None or not first_business_id:
+        await _reply(update, _BC_ENFORCEMENT_NOT_FOUND_OR_DENIED_MSG, parse_mode=None)
+        return
+
+    if not await _authorize_or_reply(
+        update, resource="FINANCE", action="UPDATE", business_id=first_business_id,
+    ):
+        return
+
+    try:
+        second_row = await _resolve_target_in_thread(find_payment_obligation_by_id, payment_obligation_id)
+    except Exception:
+        await _reply(update, _BC_ENFORCEMENT_TEMPORARILY_UNAVAILABLE_MSG, parse_mode=None)
+        return
+
+    second_business_id = str((second_row or {}).get("Business ID", "")).strip()
+    if second_row is None or not second_business_id or second_business_id != first_business_id:
+        await _reply(update, _BC_ENFORCEMENT_OWNERSHIP_CHANGED_MSG, parse_mode=None)
+        return
+
+    try:
+        result = await _mutate_target_in_thread(update_payment_obligation_admin_fields, payment_obligation_id, {"Notes": notes})
+    except Exception:
+        # Fixed branch identifier only — no exception interpolation,
+        # no payment_obligation_id, no Business ID, no Notes, no
+        # updates dict.
+        log.error("updateobligationnotes_cmd mutation infrastructure failure")
+        await _reply(update, "❌ Не удалось обновить Notes для Payment Obligation.", parse_mode=None)
+        return
+
+    await _reply(update, _obligation_notes_message(result, payment_obligation_id), parse_mode=None)
+
+
 async def recordpayment_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     /recordpayment business_id=BIZ-001 payment_obligation_id=POB-001 client_id=PRS-001
@@ -15958,6 +16080,7 @@ def register_business_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("obligations",            obligations_cmd))
     app.add_handler(CommandHandler("obligation",             obligation_cmd))
     app.add_handler(CommandHandler("updateobligation",       updateobligation_cmd))
+    app.add_handler(CommandHandler("updateobligationnotes",  updateobligationnotes_cmd))
     app.add_handler(CommandHandler("recordpayment",          recordpayment_cmd))
     app.add_handler(CommandHandler("payments",               payments_cmd))
     app.add_handler(CommandHandler("payment",                payment_cmd))

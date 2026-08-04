@@ -53,6 +53,11 @@ _EXPECTED_MUTATION_ENTRY = {
         "operation_kind": "MUTATION", "allowed_modes": ("NOTES_ONLY",), "requires_fresh_reread": True,
         "mutation_side_effect_class": "SINGLE_ROW_MUTATION", "idempotency_class": "IDEMPOTENT",
     },
+    "updateobligationnotes": {
+        "resource": "FINANCE", "action": "UPDATE", "target_shape": "BUSINESS",
+        "operation_kind": "MUTATION", "allowed_modes": ("NOTES_ONLY",), "requires_fresh_reread": True,
+        "mutation_side_effect_class": "SINGLE_ROW_MUTATION", "idempotency_class": "IDEMPOTENT",
+    },
 }
 
 _NON_ENFORCED_SAMPLE_HANDLERS = [
@@ -70,7 +75,7 @@ _NON_ENFORCED_SAMPLE_HANDLERS = [
 
 
 class TestEnforcementMap(unittest.TestCase):
-    def test_map_keys_exactly_eight_commands(self):
+    def test_map_keys_exactly_nine_commands(self):
         expected_keys = set(_EXPECTED_MAP.keys()) | set(_EXPECTED_MUTATION_ENTRY.keys())
         self.assertEqual(set(th.COMMAND_ENFORCEMENT_MAP.keys()), expected_keys)
 
@@ -84,8 +89,8 @@ class TestEnforcementMap(unittest.TestCase):
             with self.subTest(command=key):
                 self.assertEqual(th.COMMAND_ENFORCEMENT_MAP[key], val)
 
-    def test_no_ninth_command_in_map(self):
-        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 8)
+    def test_no_tenth_command_in_map(self):
+        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 9)
 
     def test_updatelead_not_in_map(self):
         self.assertNotIn("updatelead", th.COMMAND_ENFORCEMENT_MAP)
