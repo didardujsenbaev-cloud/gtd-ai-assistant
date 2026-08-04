@@ -654,8 +654,8 @@ _OTHER_MUTATION_CANDIDATE_HANDLERS = [
 
 
 class TestArchitecture(unittest.TestCase):
-    def test_enforcement_map_has_exactly_nine_entries(self):
-        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 9)
+    def test_enforcement_map_has_exactly_ten_entries(self):
+        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 10)
 
     def test_six_phase_17e1_entries_unchanged(self):
         expected_six = {
@@ -1457,8 +1457,8 @@ class TestLeadNotesIsolation(unittest.TestCase):
 
 
 class TestLeadNotesArchitecture(unittest.TestCase):
-    def test_enforcement_map_has_exactly_nine_entries(self):
-        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 9)
+    def test_enforcement_map_has_exactly_ten_entries(self):
+        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 10)
 
     def test_updateleadnotes_metadata_exact(self):
         self.assertEqual(th.COMMAND_ENFORCEMENT_MAP["updateleadnotes"], {
@@ -2150,8 +2150,8 @@ class TestObligationNotesIsolation(unittest.TestCase):
 
 
 class TestObligationNotesArchitecture(unittest.TestCase):
-    def test_enforcement_map_has_exactly_nine_entries(self):
-        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 9)
+    def test_enforcement_map_has_exactly_ten_entries(self):
+        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 10)
 
     def test_updateobligationnotes_metadata_exact(self):
         self.assertEqual(th.COMMAND_ENFORCEMENT_MAP["updateobligationnotes"], {
@@ -2432,6 +2432,800 @@ class TestLegacyUpdateOfferNotesModeEndToEndExceptionSecrecy(unittest.TestCase):
         call = update.message.reply_text.call_args
         text = call.args[0] if call.args else call.kwargs.get("text", "")
         self.assertEqual(text, "ℹ️ Commercial Offer OFR-001 — изменений нет (значения совпадают).")
+
+
+# ═════════════════════════════════════════════════════════════
+# Phase 17E-2A4: /updateoffernotes — dedicated, single-purpose
+# mutation command. Mirrors the Obligation-notes section exactly:
+# business_builder.update_commercial_offer_admin_fields leaves
+# code="" on both success and infrastructure failure, so the safe
+# mapper keys off ok/changed flags rather than a code string.
+# ═════════════════════════════════════════════════════════════
+
+_OFFER_ROW = dict(_H1_OFFER_ROW)
+_OFFER_ROW_OTHER_BIZ = {**_OFFER_ROW, "Business ID": "BIZ-002"}
+_OFFER_ROW_MISSING_OWNERSHIP = {**_OFFER_ROW, "Business ID": ""}
+_OFFER_ROW_WHITESPACE_OWNERSHIP = {**_OFFER_ROW, "Business ID": "   "}
+
+_OFFER_FINDER_PATH = "business_core.offer_manager.find_commercial_offer_by_id"
+_OFFER_MUTATOR_PATH = "business_core.business_builder.update_commercial_offer_admin_fields"
+
+_OFFER_ID_ARG = "commercial_offer_id=OFR-001"
+_OFFER_NOTES_ARG = "notes=hello"
+_OFFER_ARGS = [_OFFER_ID_ARG, _OFFER_NOTES_ARG]
+
+
+class OfferNotesMutationTestBase(unittest.TestCase):
+    def _run_handler(self, update, args=None, *, finder_side_effect=None, finder_return=None,
+                      authz_result=None, mutator_return=None, mutator_side_effect=None):
+        patches = []
+        if finder_side_effect is not None:
+            patches.append(patch(_OFFER_FINDER_PATH, side_effect=finder_side_effect))
+        else:
+            patches.append(patch(_OFFER_FINDER_PATH, return_value=finder_return))
+
+        mock_authz = AsyncMock(return_value=authz_result if authz_result is not None else _allow_result())
+        patches.append(patch(_AUTHZ_PATH, new=mock_authz))
+
+        if mutator_side_effect is not None:
+            mock_mutator = MagicMock(side_effect=mutator_side_effect)
+        else:
+            mock_mutator = MagicMock(return_value=mutator_return if mutator_return is not None else
+                                      {"ok": True, "changed": True, "code": "", "error": None})
+        patches.append(patch(_OFFER_MUTATOR_PATH, new=mock_mutator))
+
+        ctx = _make_context(args if args is not None else _OFFER_ARGS)
+        with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+            for p in patches:
+                p.start()
+            try:
+                _run(th.updateoffernotes_cmd(update, ctx))
+            finally:
+                for p in reversed(patches):
+                    p.stop()
+        return mock_authz, mock_mutator
+
+    def _sent_text(self, update) -> str:
+        call = update.message.reply_text.call_args
+        return call.args[0] if call.args else call.kwargs.get("text", "")
+
+
+class TestOfferNotesTransport(OfferNotesMutationTestBase):
+    def test_group_zero_finder_and_mutation(self):
+        update = _make_update(chat_type="group")
+        with patch(_OFFER_FINDER_PATH) as mock_finder, patch(_OFFER_MUTATOR_PATH) as mock_mutator, \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+            _run(th.updateoffernotes_cmd(update, _make_context(_OFFER_ARGS)))
+        mock_finder.assert_not_called()
+        mock_mutator.assert_not_called()
+
+    def test_supergroup_zero_finder_and_mutation(self):
+        update = _make_update(chat_type="supergroup")
+        with patch(_OFFER_FINDER_PATH) as mock_finder, patch(_OFFER_MUTATOR_PATH) as mock_mutator, \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+            _run(th.updateoffernotes_cmd(update, _make_context(_OFFER_ARGS)))
+        mock_finder.assert_not_called()
+        mock_mutator.assert_not_called()
+
+    def test_channel_zero_finder_and_mutation(self):
+        update = _make_update(chat_type="channel")
+        with patch(_OFFER_FINDER_PATH) as mock_finder, patch(_OFFER_MUTATOR_PATH) as mock_mutator, \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+            _run(th.updateoffernotes_cmd(update, _make_context(_OFFER_ARGS)))
+        mock_finder.assert_not_called()
+        mock_mutator.assert_not_called()
+
+    def test_malformed_update_zero_finder_and_mutation(self):
+        update = SimpleNamespace()
+        with patch(_OFFER_FINDER_PATH) as mock_finder, patch(_OFFER_MUTATOR_PATH) as mock_mutator, \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+            _run(th.updateoffernotes_cmd(update, _make_context(_OFFER_ARGS)))
+        mock_finder.assert_not_called()
+        mock_mutator.assert_not_called()
+
+    def test_missing_effective_user_zero_finder_and_mutation(self):
+        update = _make_update(user_id=None)
+        with patch(_OFFER_FINDER_PATH) as mock_finder, patch(_OFFER_MUTATOR_PATH) as mock_mutator, \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+            _run(th.updateoffernotes_cmd(update, _make_context(_OFFER_ARGS)))
+        mock_finder.assert_not_called()
+        mock_mutator.assert_not_called()
+
+    def test_missing_user_id_zero_finder_and_mutation(self):
+        update = _make_update()
+        update.effective_user = SimpleNamespace(id=None)
+        with patch(_OFFER_FINDER_PATH) as mock_finder, patch(_OFFER_MUTATOR_PATH) as mock_mutator, \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+            _run(th.updateoffernotes_cmd(update, _make_context(_OFFER_ARGS)))
+        mock_finder.assert_not_called()
+        mock_mutator.assert_not_called()
+
+    def test_private_allow_path_reaches_mutation(self):
+        update = _make_update()
+        _, mock_mutator = self._run_handler(update, finder_return=_OFFER_ROW)
+        mock_mutator.assert_called_once()
+
+
+class TestOfferNotesArguments(OfferNotesMutationTestBase):
+    def test_missing_id_zero_finder_and_mutation(self):
+        update = _make_update()
+        with patch(_OFFER_FINDER_PATH) as mock_finder, patch(_OFFER_MUTATOR_PATH) as mock_mutator, \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+            _run(th.updateoffernotes_cmd(update, _make_context([_OFFER_NOTES_ARG])))
+        mock_finder.assert_not_called()
+        mock_mutator.assert_not_called()
+
+    def test_missing_notes_zero_finder_and_mutation(self):
+        update = _make_update()
+        with patch(_OFFER_FINDER_PATH) as mock_finder, patch(_OFFER_MUTATOR_PATH) as mock_mutator, \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+            _run(th.updateoffernotes_cmd(update, _make_context([_OFFER_ID_ARG])))
+        mock_finder.assert_not_called()
+        mock_mutator.assert_not_called()
+
+    def test_positional_target_rejected(self):
+        update = _make_update()
+        with patch(_OFFER_FINDER_PATH) as mock_finder, patch(_OFFER_MUTATOR_PATH) as mock_mutator, \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+            _run(th.updateoffernotes_cmd(update, _make_context(["OFR-001", _OFFER_NOTES_ARG])))
+        mock_finder.assert_not_called()
+        mock_mutator.assert_not_called()
+
+    def test_positional_trailing_text_rejected(self):
+        update = _make_update()
+        with patch(_OFFER_FINDER_PATH) as mock_finder, patch(_OFFER_MUTATOR_PATH) as mock_mutator, \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+            _run(th.updateoffernotes_cmd(update, _make_context(_OFFER_ARGS + ["extra"])))
+        mock_finder.assert_not_called()
+        mock_mutator.assert_not_called()
+
+    def test_unknown_key_rejected(self):
+        update = _make_update()
+        with patch(_OFFER_FINDER_PATH) as mock_finder, patch(_OFFER_MUTATOR_PATH) as mock_mutator, \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+            _run(th.updateoffernotes_cmd(update, _make_context(_OFFER_ARGS + ["foo=bar"])))
+        mock_finder.assert_not_called()
+        mock_mutator.assert_not_called()
+
+    def test_unknown_key_usage_message(self):
+        update = _make_update()
+        with patch(_OFFER_FINDER_PATH), patch(_OFFER_MUTATOR_PATH), \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+            _run(th.updateoffernotes_cmd(update, _make_context(_OFFER_ARGS + ["status=sent"])))
+        self.assertEqual(self._sent_text(update), "❌ /updateoffernotes принимает только commercial_offer_id и notes.")
+
+    def test_business_id_key_rejected(self):
+        update = _make_update()
+        with patch(_OFFER_FINDER_PATH) as mock_finder, patch(_OFFER_MUTATOR_PATH) as mock_mutator, \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+            _run(th.updateoffernotes_cmd(update, _make_context(_OFFER_ARGS + ["business_id=BIZ-001"])))
+        mock_finder.assert_not_called()
+        mock_mutator.assert_not_called()
+
+    def test_title_key_rejected(self):
+        update = _make_update()
+        with patch(_OFFER_FINDER_PATH) as mock_finder, patch(_OFFER_MUTATOR_PATH) as mock_mutator, \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+            _run(th.updateoffernotes_cmd(update, _make_context(_OFFER_ARGS + ["title=New Title"])))
+        mock_finder.assert_not_called()
+        mock_mutator.assert_not_called()
+
+    def test_scope_key_rejected(self):
+        update = _make_update()
+        with patch(_OFFER_FINDER_PATH) as mock_finder, patch(_OFFER_MUTATOR_PATH) as mock_mutator, \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+            _run(th.updateoffernotes_cmd(update, _make_context(_OFFER_ARGS + ["scope=New Scope"])))
+        mock_finder.assert_not_called()
+        mock_mutator.assert_not_called()
+
+    def test_quoted_amount_key_rejected(self):
+        update = _make_update()
+        with patch(_OFFER_FINDER_PATH) as mock_finder, patch(_OFFER_MUTATOR_PATH) as mock_mutator, \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+            _run(th.updateoffernotes_cmd(update, _make_context(_OFFER_ARGS + ["quoted_amount=200000"])))
+        mock_finder.assert_not_called()
+        mock_mutator.assert_not_called()
+
+    def test_amount_key_rejected(self):
+        update = _make_update()
+        with patch(_OFFER_FINDER_PATH) as mock_finder, patch(_OFFER_MUTATOR_PATH) as mock_mutator, \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+            _run(th.updateoffernotes_cmd(update, _make_context(_OFFER_ARGS + ["amount=200000"])))
+        mock_finder.assert_not_called()
+        mock_mutator.assert_not_called()
+
+    def test_currency_key_rejected(self):
+        update = _make_update()
+        with patch(_OFFER_FINDER_PATH) as mock_finder, patch(_OFFER_MUTATOR_PATH) as mock_mutator, \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+            _run(th.updateoffernotes_cmd(update, _make_context(_OFFER_ARGS + ["currency=USD"])))
+        mock_finder.assert_not_called()
+        mock_mutator.assert_not_called()
+
+    def test_valid_until_key_rejected(self):
+        update = _make_update()
+        with patch(_OFFER_FINDER_PATH) as mock_finder, patch(_OFFER_MUTATOR_PATH) as mock_mutator, \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+            _run(th.updateoffernotes_cmd(update, _make_context(_OFFER_ARGS + ["valid_until=2027-01-01"])))
+        mock_finder.assert_not_called()
+        mock_mutator.assert_not_called()
+
+    def test_object_id_key_rejected(self):
+        update = _make_update()
+        with patch(_OFFER_FINDER_PATH) as mock_finder, patch(_OFFER_MUTATOR_PATH) as mock_mutator, \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+            _run(th.updateoffernotes_cmd(update, _make_context(_OFFER_ARGS + ["object_id=OBJ-001"])))
+        mock_finder.assert_not_called()
+        mock_mutator.assert_not_called()
+
+    def test_service_id_key_rejected(self):
+        update = _make_update()
+        with patch(_OFFER_FINDER_PATH) as mock_finder, patch(_OFFER_MUTATOR_PATH) as mock_mutator, \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+            _run(th.updateoffernotes_cmd(update, _make_context(_OFFER_ARGS + ["service_id=SVC-001"])))
+        mock_finder.assert_not_called()
+        mock_mutator.assert_not_called()
+
+    def test_roadmap_id_key_rejected(self):
+        update = _make_update()
+        with patch(_OFFER_FINDER_PATH) as mock_finder, patch(_OFFER_MUTATOR_PATH) as mock_mutator, \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+            _run(th.updateoffernotes_cmd(update, _make_context(_OFFER_ARGS + ["roadmap_id=RDM-001"])))
+        mock_finder.assert_not_called()
+        mock_mutator.assert_not_called()
+
+    def test_offer_document_id_key_rejected(self):
+        update = _make_update()
+        with patch(_OFFER_FINDER_PATH) as mock_finder, patch(_OFFER_MUTATOR_PATH) as mock_mutator, \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+            _run(th.updateoffernotes_cmd(update, _make_context(_OFFER_ARGS + ["offer_document_id=DOC-001"])))
+        mock_finder.assert_not_called()
+        mock_mutator.assert_not_called()
+
+    def test_status_key_rejected(self):
+        update = _make_update()
+        with patch(_OFFER_FINDER_PATH) as mock_finder, patch(_OFFER_MUTATOR_PATH) as mock_mutator, \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+            _run(th.updateoffernotes_cmd(update, _make_context(_OFFER_ARGS + ["status=sent"])))
+        mock_finder.assert_not_called()
+        mock_mutator.assert_not_called()
+
+    def test_valid_key_set_continues(self):
+        update = _make_update()
+        _, mock_mutator = self._run_handler(update, finder_return=_OFFER_ROW)
+        mock_mutator.assert_called_once()
+
+
+class TestOfferNotesFirstLookup(OfferNotesMutationTestBase):
+    def test_finder_runs_via_asyncio_to_thread(self):
+        update = _make_update()
+        recorded = []
+
+        async def fake_to_thread(func, *args, **kwargs):
+            recorded.append((getattr(func, "__name__", None), args))
+            if len(recorded) == 1:
+                return _OFFER_ROW
+            return {"ok": True, "changed": True, "code": "", "error": None}
+
+        with patch("business_core.telegram_handlers.asyncio.to_thread", side_effect=fake_to_thread), \
+             patch(_AUTHZ_PATH, new=AsyncMock(return_value=_allow_result())), \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+            _run(th.updateoffernotes_cmd(update, _make_context(_OFFER_ARGS)))
+        self.assertIn("OFR-001", recorded[0][1])
+
+    def test_finder_called_before_authorization(self):
+        update = _make_update()
+        mock_authz, _ = self._run_handler(update, finder_return=_OFFER_ROW)
+        mock_authz.assert_called_once()
+
+    def test_finder_none_zero_authorization_and_mutation(self):
+        update = _make_update()
+        mock_authz, mock_mutator = self._run_handler(update, finder_return=None)
+        mock_authz.assert_not_called()
+        mock_mutator.assert_not_called()
+
+    def test_finder_none_generic_message(self):
+        update = _make_update()
+        self._run_handler(update, finder_return=None)
+        self.assertEqual(self._sent_text(update), "Запись недоступна или не найдена.")
+
+    def test_finder_exception_zero_authorization_and_mutation(self):
+        update = _make_update()
+
+        def boom(*_a, **_k):
+            raise RuntimeError("sheets down")
+
+        mock_authz, mock_mutator = self._run_handler(update, finder_side_effect=boom)
+        mock_authz.assert_not_called()
+        mock_mutator.assert_not_called()
+
+    def test_finder_exception_temporarily_unavailable_message(self):
+        update = _make_update()
+
+        def boom(*_a, **_k):
+            raise RuntimeError("sheets down")
+
+        self._run_handler(update, finder_side_effect=boom)
+        text = self._sent_text(update)
+        self.assertIn("Временная ошибка", text)
+        self.assertNotIn("RuntimeError", text)
+        self.assertNotIn("sheets down", text)
+
+    def test_missing_business_id_zero_authorization_and_mutation(self):
+        update = _make_update()
+        mock_authz, mock_mutator = self._run_handler(update, finder_return=_OFFER_ROW_MISSING_OWNERSHIP)
+        mock_authz.assert_not_called()
+        mock_mutator.assert_not_called()
+
+    def test_blank_business_id_zero_authorization_and_mutation(self):
+        update = _make_update()
+        mock_authz, mock_mutator = self._run_handler(update, finder_return=_OFFER_ROW_WHITESPACE_OWNERSHIP)
+        mock_authz.assert_not_called()
+        mock_mutator.assert_not_called()
+
+
+class TestOfferNotesAuthorization(OfferNotesMutationTestBase):
+    def test_resource_finance_action_update(self):
+        update = _make_update()
+        mock_authz, _ = self._run_handler(update, finder_return=_OFFER_ROW)
+        _, kwargs = mock_authz.call_args
+        self.assertEqual(kwargs["resource"], "FINANCE")
+        self.assertEqual(kwargs["action"], "UPDATE")
+
+    def test_business_id_comes_only_from_stored_row(self):
+        update = _make_update()
+        mock_authz, _ = self._run_handler(update, finder_return=_OFFER_ROW)
+        _, kwargs = mock_authz.call_args
+        self.assertEqual(kwargs["business_id"], "BIZ-001")
+
+    def test_caller_cannot_spoof_business_id(self):
+        src = inspect.getsource(th.updateoffernotes_cmd)
+        self.assertNotIn('args.get("business_id"', src)
+
+    def test_denial_zero_second_lookup_and_mutation(self):
+        update = _make_update()
+        calls = []
+
+        def finder(*a, **k):
+            calls.append(a)
+            return _OFFER_ROW
+
+        mock_authz, mock_mutator = self._run_handler(
+            update, finder_side_effect=finder, authz_result=_deny_result(),
+        )
+        self.assertEqual(len(calls), 1)
+        mock_mutator.assert_not_called()
+
+    def test_denial_generic_message(self):
+        update = _make_update()
+        self._run_handler(update, finder_return=_OFFER_ROW, authz_result=_deny_result())
+        self.assertEqual(self._sent_text(update), "Запись недоступна или не найдена.")
+
+    def test_infrastructure_failure_zero_mutation(self):
+        update = _make_update()
+        _, mock_mutator = self._run_handler(update, finder_return=_OFFER_ROW, authz_result=_infra_failure_result())
+        mock_mutator.assert_not_called()
+
+    def test_owner_allow_continues_to_mutation(self):
+        update = _make_update()
+        _, mock_mutator = self._run_handler(update, finder_return=_OFFER_ROW, authz_result=_allow_result())
+        mock_mutator.assert_called_once()
+
+
+class TestOfferNotesFreshReread(OfferNotesMutationTestBase):
+    def test_second_lookup_occurs_exactly_twice_total(self):
+        update = _make_update()
+        finder_calls = []
+
+        def finder(offer_id):
+            finder_calls.append(offer_id)
+            return _OFFER_ROW
+
+        self._run_handler(update, finder_side_effect=finder)
+        self.assertEqual(len(finder_calls), 2)
+        self.assertEqual(finder_calls, ["OFR-001", "OFR-001"])
+
+    def test_second_lookup_only_after_allow(self):
+        update = _make_update()
+        finder_calls = []
+
+        def finder(offer_id):
+            finder_calls.append(offer_id)
+            return _OFFER_ROW
+
+        self._run_handler(update, finder_side_effect=finder, authz_result=_deny_result())
+        self.assertEqual(len(finder_calls), 1)
+
+    def test_second_row_missing_zero_mutation(self):
+        update = _make_update()
+        calls = {"n": 0}
+
+        def finder(*_a, **_k):
+            calls["n"] += 1
+            return _OFFER_ROW if calls["n"] == 1 else None
+
+        _, mock_mutator = self._run_handler(update, finder_side_effect=finder)
+        mock_mutator.assert_not_called()
+
+    def test_second_row_missing_ownership_changed_message(self):
+        update = _make_update()
+        calls = {"n": 0}
+
+        def finder(*_a, **_k):
+            calls["n"] += 1
+            return _OFFER_ROW if calls["n"] == 1 else None
+
+        self._run_handler(update, finder_side_effect=finder)
+        self.assertEqual(self._sent_text(update), "Запись изменилась. Повтори команду ещё раз.")
+
+    def test_second_business_id_blank_zero_mutation(self):
+        update = _make_update()
+        calls = {"n": 0}
+
+        def finder(*_a, **_k):
+            calls["n"] += 1
+            return _OFFER_ROW if calls["n"] == 1 else _OFFER_ROW_MISSING_OWNERSHIP
+
+        _, mock_mutator = self._run_handler(update, finder_side_effect=finder)
+        mock_mutator.assert_not_called()
+
+    def test_ownership_changed_zero_mutation(self):
+        update = _make_update()
+        calls = {"n": 0}
+
+        def finder(*_a, **_k):
+            calls["n"] += 1
+            return _OFFER_ROW if calls["n"] == 1 else _OFFER_ROW_OTHER_BIZ
+
+        _, mock_mutator = self._run_handler(update, finder_side_effect=finder)
+        mock_mutator.assert_not_called()
+
+    def test_ownership_changed_message_reveals_no_business_id(self):
+        update = _make_update()
+        calls = {"n": 0}
+
+        def finder(*_a, **_k):
+            calls["n"] += 1
+            return _OFFER_ROW if calls["n"] == 1 else _OFFER_ROW_OTHER_BIZ
+
+        self._run_handler(update, finder_side_effect=finder)
+        text = self._sent_text(update)
+        self.assertEqual(text, "Запись изменилась. Повтори команду ещё раз.")
+        self.assertNotIn("BIZ-001", text)
+        self.assertNotIn("BIZ-002", text)
+
+    def test_unchanged_ownership_mutation_permitted(self):
+        update = _make_update()
+        _, mock_mutator = self._run_handler(update, finder_return=_OFFER_ROW)
+        mock_mutator.assert_called_once()
+
+    def test_no_automatic_reauthorization_on_ownership_change(self):
+        update = _make_update()
+        calls = {"n": 0}
+
+        def finder(*_a, **_k):
+            calls["n"] += 1
+            return _OFFER_ROW if calls["n"] == 1 else _OFFER_ROW_OTHER_BIZ
+
+        mock_authz, _ = self._run_handler(update, finder_side_effect=finder)
+        mock_authz.assert_called_once()
+
+
+class TestOfferNotesMutation(OfferNotesMutationTestBase):
+    def test_mutation_runs_via_asyncio_to_thread(self):
+        update = _make_update()
+        seen_funcs = []
+
+        async def spy_to_thread(func, *args, **kwargs):
+            seen_funcs.append(getattr(func, "__name__", None))
+            if getattr(func, "__name__", None) == "find_commercial_offer_by_id":
+                return _OFFER_ROW
+            return {"ok": True, "changed": True, "code": "", "error": None}
+
+        with patch("business_core.telegram_handlers.asyncio.to_thread", side_effect=spy_to_thread), \
+             patch(_AUTHZ_PATH, new=AsyncMock(return_value=_allow_result())), \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+            _run(th.updateoffernotes_cmd(update, _make_context(_OFFER_ARGS)))
+        self.assertIn("update_commercial_offer_admin_fields", seen_funcs)
+
+    def test_mutation_called_exactly_once(self):
+        update = _make_update()
+        _, mock_mutator = self._run_handler(update, finder_return=_OFFER_ROW)
+        mock_mutator.assert_called_once()
+
+    def test_mutation_called_with_exact_args(self):
+        update = _make_update()
+        _, mock_mutator = self._run_handler(update, finder_return=_OFFER_ROW)
+        mock_mutator.assert_called_once_with("OFR-001", {"Notes": "hello"})
+
+    def test_mutation_exception_no_retry(self):
+        update = _make_update()
+
+        def boom(*_a, **_k):
+            raise RuntimeError("write failed")
+
+        _, mock_mutator = self._run_handler(update, finder_return=_OFFER_ROW, mutator_side_effect=boom)
+        mock_mutator.assert_called_once()
+
+    def test_mutation_exception_no_raw_exception_in_reply(self):
+        update = _make_update()
+
+        def boom(*_a, **_k):
+            raise RuntimeError("write failed")
+
+        self._run_handler(update, finder_return=_OFFER_ROW, mutator_side_effect=boom)
+        text = self._sent_text(update)
+        self.assertNotIn("RuntimeError", text)
+        self.assertNotIn("write failed", text)
+
+    def test_mutation_exception_safe_generic_message(self):
+        update = _make_update()
+
+        def boom(*_a, **_k):
+            raise RuntimeError("write failed")
+
+        self._run_handler(update, finder_return=_OFFER_ROW, mutator_side_effect=boom)
+        self.assertEqual(self._sent_text(update), "❌ Не удалось обновить Notes для Commercial Offer.")
+
+    def test_mutation_exception_fixed_log_literal(self):
+        update = _make_update()
+
+        def boom(*_a, **_k):
+            raise RuntimeError("write failed")
+
+        with patch("business_core.telegram_handlers.log.error") as mock_log_error:
+            self._run_handler(update, finder_return=_OFFER_ROW, mutator_side_effect=boom)
+        mock_log_error.assert_called_once_with("updateoffernotes_cmd mutation infrastructure failure")
+
+    def test_notes_content_absent_from_reply(self):
+        update = _make_update()
+        self._run_handler(update, finder_return=_OFFER_ROW, args=["commercial_offer_id=OFR-001", "notes=SECRET_CONTENT"])
+        self.assertNotIn("SECRET_CONTENT", self._sent_text(update))
+
+    def test_success_reply_only_after_mutation_result(self):
+        update = _make_update()
+        self._run_handler(update, finder_return=_OFFER_ROW, mutator_return={
+            "ok": True, "changed": True, "code": "", "error": None,
+        })
+        self.assertEqual(self._sent_text(update), "✅ Notes для Commercial Offer OFR-001 обновлены.")
+
+    def test_unchanged_result_handled(self):
+        update = _make_update()
+        self._run_handler(update, finder_return=_OFFER_ROW, mutator_return={
+            "ok": True, "changed": False, "code": "", "error": None,
+        })
+        self.assertIn("изменений нет", self._sent_text(update))
+
+    def test_not_found_after_authorization_mapped_to_changed_message(self):
+        update = _make_update()
+        self._run_handler(update, finder_return=_OFFER_ROW, mutator_return={
+            "ok": False, "changed": False, "code": "COMMERCIAL_OFFER_NOT_FOUND", "error": "Commercial Offer 'OFR-001' не найден",
+        })
+        self.assertEqual(self._sent_text(update), "Запись изменилась. Повтори команду ещё раз.")
+
+
+class TestOfferNotesMapper(unittest.TestCase):
+    """Direct unit tests of _offer_notes_message — including the
+    malformed-result robustness requirement from Phase 17E-2A4."""
+
+    def test_changed_success(self):
+        msg = th._offer_notes_message({"ok": True, "changed": True, "code": "", "error": None}, "OFR-001")
+        self.assertEqual(msg, "✅ Notes для Commercial Offer OFR-001 обновлены.")
+
+    def test_unchanged_success(self):
+        msg = th._offer_notes_message({"ok": True, "changed": False, "code": "", "error": None}, "OFR-001")
+        self.assertEqual(msg, "ℹ️ Commercial Offer OFR-001 — изменений нет (значения совпадают).")
+
+    def test_not_found_after_authorization(self):
+        msg = th._offer_notes_message({"ok": False, "changed": False, "code": "COMMERCIAL_OFFER_NOT_FOUND", "error": "x"}, "OFR-001")
+        self.assertEqual(msg, "Запись изменилась. Повтори команду ещё раз.")
+
+    def test_ok_false_empty_code(self):
+        msg = th._offer_notes_message({"ok": False, "changed": False, "code": "", "error": "Infrastructure failure"}, "OFR-001")
+        self.assertEqual(msg, "❌ Не удалось обновить Notes для Commercial Offer.")
+
+    def test_ok_false_unknown_code(self):
+        msg = th._offer_notes_message({"ok": False, "changed": False, "code": "SOME_FUTURE_CODE", "error": "raw domain error"}, "OFR-001")
+        self.assertEqual(msg, "❌ Не удалось обновить Notes для Commercial Offer.")
+        self.assertNotIn("raw domain error", msg)
+        self.assertNotIn("SOME_FUTURE_CODE", msg)
+
+    def test_ok_false_infrastructure_failure_error_never_rendered(self):
+        msg = th._offer_notes_message({"ok": False, "changed": False, "code": "", "error": "Infrastructure failure"}, "OFR-001")
+        self.assertNotIn("Infrastructure failure", msg)
+
+    def test_malformed_empty_dict(self):
+        msg = th._offer_notes_message({}, "OFR-001")
+        self.assertEqual(msg, "❌ Не удалось обновить Notes для Commercial Offer.")
+
+    def test_malformed_ok_only(self):
+        msg = th._offer_notes_message({"ok": True}, "OFR-001")
+        self.assertEqual(msg, "❌ Не удалось обновить Notes для Commercial Offer.")
+
+    def test_malformed_ok_false_only(self):
+        msg = th._offer_notes_message({"ok": False}, "OFR-001")
+        self.assertEqual(msg, "❌ Не удалось обновить Notes для Commercial Offer.")
+
+    def test_malformed_changed_only(self):
+        msg = th._offer_notes_message({"changed": True}, "OFR-001")
+        self.assertEqual(msg, "❌ Не удалось обновить Notes для Commercial Offer.")
+
+    def test_malformed_code_only(self):
+        msg = th._offer_notes_message({"code": "UNKNOWN"}, "OFR-001")
+        self.assertEqual(msg, "❌ Не удалось обновить Notes для Commercial Offer.")
+
+    def test_truthy_string_ok_not_treated_as_true(self):
+        msg = th._offer_notes_message({"ok": "true", "changed": True, "code": "", "error": None}, "OFR-001")
+        self.assertEqual(msg, "❌ Не удалось обновить Notes для Commercial Offer.")
+
+    def test_truthy_int_ok_not_treated_as_true(self):
+        msg = th._offer_notes_message({"ok": 1, "changed": True, "code": "", "error": None}, "OFR-001")
+        self.assertEqual(msg, "❌ Не удалось обновить Notes для Commercial Offer.")
+
+    def test_truthy_int_changed_not_treated_as_true(self):
+        msg = th._offer_notes_message({"ok": True, "changed": 1, "code": "", "error": None}, "OFR-001")
+        self.assertEqual(msg, "❌ Не удалось обновить Notes для Commercial Offer.")
+
+    def test_falsy_string_changed_not_treated_as_false(self):
+        msg = th._offer_notes_message({"ok": True, "changed": "false", "code": "", "error": None}, "OFR-001")
+        self.assertEqual(msg, "❌ Не удалось обновить Notes для Commercial Offer.")
+
+    def test_none_result_does_not_raise(self):
+        msg = th._offer_notes_message(None, "OFR-001")
+        self.assertEqual(msg, "❌ Не удалось обновить Notes для Commercial Offer.")
+
+    def test_string_result_does_not_raise(self):
+        msg = th._offer_notes_message("not a dict", "OFR-001")
+        self.assertEqual(msg, "❌ Не удалось обновить Notes для Commercial Offer.")
+
+    def test_list_result_does_not_raise(self):
+        msg = th._offer_notes_message(["ok", True], "OFR-001")
+        self.assertEqual(msg, "❌ Не удалось обновить Notes для Commercial Offer.")
+
+    def test_integer_result_does_not_raise(self):
+        msg = th._offer_notes_message(42, "OFR-001")
+        self.assertEqual(msg, "❌ Не удалось обновить Notes для Commercial Offer.")
+
+
+class TestOfferNotesIdempotency(OfferNotesMutationTestBase):
+    def test_repeated_identical_notes_produces_unchanged_message(self):
+        update1 = _make_update()
+        self._run_handler(update1, finder_return=_OFFER_ROW, mutator_return={
+            "ok": True, "changed": False, "code": "", "error": None,
+        })
+        self.assertIn("изменений нет", self._sent_text(update1))
+
+    def test_no_automatic_retry_in_handler(self):
+        src = inspect.getsource(th.updateoffernotes_cmd)
+        self.assertNotIn("for _ in range", src)
+        self.assertNotIn("while True", src)
+        self.assertNotIn("retry", src.lower())
+
+
+class TestOfferNotesIsolation(unittest.TestCase):
+    def test_updateoffer_cmd_unchanged_source(self):
+        src = inspect.getsource(th.updateoffer_cmd)
+        self.assertNotIn("_mutate_target_in_thread(", src)
+        self.assertNotIn("_authorize_or_reply(", src)
+        self.assertNotIn("_validate_bc_transport_or_reply(", src)
+
+    def test_updateoffer_not_in_enforcement_map(self):
+        self.assertNotIn("updateoffer", th.COMMAND_ENFORCEMENT_MAP)
+
+    def test_updateoffernotes_does_not_call_updateoffer_cmd(self):
+        src = inspect.getsource(th.updateoffernotes_cmd)
+        self.assertNotIn("updateoffer_cmd(", src)
+
+    def test_updateoffernotes_does_not_call_other_offer_mutators(self):
+        tree = ast.parse(inspect.getsource(th.updateoffernotes_cmd))
+        referenced_names = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
+        for forbidden in (
+            "send_commercial_offer", "accept_commercial_offer", "reject_commercial_offer",
+            "expire_commercial_offer", "cancel_commercial_offer", "archive_commercial_offer",
+            "revise_commercial_offer",
+        ):
+            self.assertNotIn(forbidden, referenced_names)
+
+
+class TestOfferNotesArchitecture(unittest.TestCase):
+    def test_enforcement_map_has_exactly_ten_entries(self):
+        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 10)
+
+    def test_updateoffernotes_metadata_exact(self):
+        self.assertEqual(th.COMMAND_ENFORCEMENT_MAP["updateoffernotes"], {
+            "resource": "FINANCE", "action": "UPDATE", "target_shape": "BUSINESS",
+            "operation_kind": "MUTATION", "allowed_modes": ("NOTES_ONLY",), "requires_fresh_reread": True,
+            "mutation_side_effect_class": "SINGLE_ROW_MUTATION", "idempotency_class": "IDEMPOTENT",
+        })
+
+    def test_registration_line_registered_once(self):
+        with open("business_core/telegram_handlers.py", encoding="utf-8") as f:
+            content = f.read()
+        self.assertEqual(content.count('CommandHandler("updateoffernotes",'), 1)
+
+
+class TestOfferNotesExceptionSecrecy(OfferNotesMutationTestBase):
+    def _assert_no_secrets_logged(self, mock_log_error):
+        for call in mock_log_error.call_args_list:
+            for arg in list(call.args) + list(call.kwargs.values()):
+                text = str(arg)
+                for marker in _ALL_SECRET_MARKERS:
+                    self.assertNotIn(marker, text)
+
+    def test_mutation_exception_no_secrets_in_log_call_args(self):
+        update = _make_update()
+        with patch("business_core.telegram_handlers.log.error") as mock_log_error:
+            self._run_handler(
+                update,
+                args=["commercial_offer_id=OFR-001", f"notes={_SECRET_NOTES_MARKER}"],
+                finder_return={**_OFFER_ROW, "Business ID": _SECRET_BIZ_MARKER},
+                mutator_side_effect=_boom_with_secrets,
+            )
+        mock_log_error.assert_called_once()
+        self._assert_no_secrets_logged(mock_log_error)
+
+    def test_mutation_exception_no_secrets_in_reply(self):
+        update = _make_update()
+        self._run_handler(
+            update,
+            args=["commercial_offer_id=OFR-001", f"notes={_SECRET_NOTES_MARKER}"],
+            finder_return={**_OFFER_ROW, "Business ID": _SECRET_BIZ_MARKER},
+            mutator_side_effect=_boom_with_secrets,
+        )
+        text = self._sent_text(update)
+        for marker in _ALL_SECRET_MARKERS:
+            self.assertNotIn(marker, text)
+        self.assertEqual(text, "❌ Не удалось обновить Notes для Commercial Offer.")
+
+    def test_first_lookup_exception_no_secrets_in_reply(self):
+        update = _make_update()
+        self._run_handler(
+            update, args=["commercial_offer_id=OFR-001", f"notes={_SECRET_NOTES_MARKER}"],
+            finder_side_effect=_boom_with_secrets,
+        )
+        text = self._sent_text(update)
+        for marker in _ALL_SECRET_MARKERS:
+            self.assertNotIn(marker, text)
+        self.assertEqual(text, "Временная ошибка проверки доступа. Попробуйте ещё раз позже.")
+
+    def test_second_lookup_exception_no_secrets_in_reply(self):
+        update = _make_update()
+        calls = {"n": 0}
+
+        def finder(*_a, **_k):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return _OFFER_ROW
+            return _boom_with_secrets()
+
+        self._run_handler(update, finder_side_effect=finder)
+        text = self._sent_text(update)
+        for marker in _ALL_SECRET_MARKERS:
+            self.assertNotIn(marker, text)
+
+
+class TestUpdateOfferNotesEndToEndExceptionSecrecy(unittest.TestCase):
+    def test_notes_write_exception_through_real_chain_no_secrets_in_reply(self):
+        update = _make_update()
+        row = dict(_H1_OFFER_ROW)
+        sheet = MagicMock()
+        sheet.row_values.return_value = list(row.keys())
+        sheet.update_cell.side_effect = _e2e_boom_with_secrets
+
+        with patch("business_core.sheets.find_row_by_id", return_value=(2, row)), \
+             patch("business_core.sheets.get_business_sheet", return_value=sheet), \
+             patch(_AUTHZ_PATH, new=AsyncMock(return_value=_allow_result())), \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+            _run(th.updateoffernotes_cmd(update, _make_context(
+                ["commercial_offer_id=OFR-001", f"notes={_E2E_SECRET_NOTES_MARKER}"]
+            )))
+
+        call = update.message.reply_text.call_args
+        text = call.args[0] if call.args else call.kwargs.get("text", "")
+        for marker in _E2E_ALL_SECRET_MARKERS:
+            self.assertNotIn(marker, text)
+        self.assertNotIn("Infrastructure failure", text)
+        self.assertEqual(text, "❌ Не удалось обновить Notes для Commercial Offer.")
 
 
 if __name__ == "__main__":

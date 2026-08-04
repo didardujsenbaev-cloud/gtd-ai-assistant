@@ -79,6 +79,44 @@ def _assert_only_functions_changed(test_case, path: str, allowed_changed_functio
             f"{path}: unapproved function '{name}' changed — only {sorted(allowed_changed_function_names)} may change this phase",
         )
 
+
+def _assert_only_functions_changed_or_added(
+    test_case, path: str, allowed_changed_function_names: set, allowed_added_function_names: set,
+) -> None:
+    """
+    Phase 17E-2A4: like _assert_only_functions_changed, but also
+    permits a fixed, named set of brand-new top-level functions to
+    exist in the working tree that were absent at HEAD (used when a
+    phase both hardens an existing function AND adds new dedicated-
+    command functions in the same file). No function may be removed.
+    Any function present in both versions and not in
+    allowed_changed_function_names must be byte-identical.
+    """
+    head_src = _git_show_head(path)
+    with open(path, encoding="utf-8") as f:
+        current_src = f.read()
+
+    head_functions = _top_level_function_sources(head_src)
+    current_functions = _top_level_function_sources(current_src)
+
+    removed = set(head_functions.keys()) - set(current_functions.keys())
+    test_case.assertEqual(removed, set(), f"{path}: a top-level function was removed — not permitted by this phase's scope")
+
+    added = set(current_functions.keys()) - set(head_functions.keys())
+    unexpected_added = added - allowed_added_function_names
+    test_case.assertEqual(
+        unexpected_added, set(),
+        f"{path}: unapproved new top-level function(s) {sorted(unexpected_added)} — only {sorted(allowed_added_function_names)} may be added this phase",
+    )
+
+    for name in head_functions:
+        if name in allowed_changed_function_names:
+            continue
+        test_case.assertEqual(
+            head_functions[name], current_functions[name],
+            f"{path}: unapproved function '{name}' changed — only {sorted(allowed_changed_function_names)} may change this phase",
+        )
+
 _ENFORCED_HANDLERS = {
     "doc": "doc_cmd",
     "obligation": "obligation_cmd",
@@ -113,6 +151,11 @@ _EXPECTED_MUTATION_ENTRY = {
         "operation_kind": "MUTATION", "allowed_modes": ("NOTES_ONLY",), "requires_fresh_reread": True,
         "mutation_side_effect_class": "SINGLE_ROW_MUTATION", "idempotency_class": "IDEMPOTENT",
     },
+    "updateoffernotes": {
+        "resource": "FINANCE", "action": "UPDATE", "target_shape": "BUSINESS",
+        "operation_kind": "MUTATION", "allowed_modes": ("NOTES_ONLY",), "requires_fresh_reread": True,
+        "mutation_side_effect_class": "SINGLE_ROW_MUTATION", "idempotency_class": "IDEMPOTENT",
+    },
 }
 
 _NON_ENFORCED_SAMPLE_HANDLERS = [
@@ -130,7 +173,7 @@ _NON_ENFORCED_SAMPLE_HANDLERS = [
 
 
 class TestEnforcementMap(unittest.TestCase):
-    def test_map_keys_exactly_nine_commands(self):
+    def test_map_keys_exactly_ten_commands(self):
         expected_keys = set(_EXPECTED_MAP.keys()) | set(_EXPECTED_MUTATION_ENTRY.keys())
         self.assertEqual(set(th.COMMAND_ENFORCEMENT_MAP.keys()), expected_keys)
 
@@ -144,14 +187,17 @@ class TestEnforcementMap(unittest.TestCase):
             with self.subTest(command=key):
                 self.assertEqual(th.COMMAND_ENFORCEMENT_MAP[key], val)
 
-    def test_no_tenth_command_in_map(self):
-        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 9)
+    def test_no_eleventh_command_in_map(self):
+        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 10)
 
     def test_updatelead_not_in_map(self):
         self.assertNotIn("updatelead", th.COMMAND_ENFORCEMENT_MAP)
 
     def test_updateobligation_not_in_map(self):
         self.assertNotIn("updateobligation", th.COMMAND_ENFORCEMENT_MAP)
+
+    def test_updateoffer_not_in_map(self):
+        self.assertNotIn("updateoffer", th.COMMAND_ENFORCEMENT_MAP)
 
 
 class TestHandlersUseTransportPreflightAndAdapter(unittest.TestCase):
@@ -323,9 +369,10 @@ class TestPhase17E2A4H1OfferHardeningScope(unittest.TestCase):
         )
 
     def test_telegram_handlers_change_confined_to_offer_mapper(self):
-        _assert_only_functions_changed(
+        _assert_only_functions_changed_or_added(
             self, "business_core/telegram_handlers.py",
-            {"_offer_update_message"},
+            allowed_changed_function_names={"register_business_handlers"},
+            allowed_added_function_names={"_offer_notes_message", "updateoffernotes_cmd"},
         )
 
     def test_payment_manager_unchanged(self):
@@ -356,17 +403,18 @@ class TestPhase17E2A4H1OfferHardeningScope(unittest.TestCase):
         )
         self.assertEqual(result.stdout.strip(), "")
 
-    def test_no_updateoffernotes_command(self):
-        self.assertFalse(hasattr(th, "updateoffernotes_cmd"))
-        self.assertNotIn("updateoffernotes", th.COMMAND_ENFORCEMENT_MAP)
+    def test_updateoffernotes_command_exists_and_registered(self):
+        self.assertTrue(hasattr(th, "updateoffernotes_cmd"))
+        self.assertIn("updateoffernotes", th.COMMAND_ENFORCEMENT_MAP)
 
-    def test_enforcement_map_still_nine_entries(self):
-        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 9)
+    def test_enforcement_map_now_ten_entries(self):
+        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 10)
 
     def test_updateoffer_cmd_unchanged(self):
-        _assert_only_functions_changed(
+        _assert_only_functions_changed_or_added(
             self, "business_core/telegram_handlers.py",
-            {"_offer_update_message"},
+            allowed_changed_function_names={"register_business_handlers"},
+            allowed_added_function_names={"_offer_notes_message", "updateoffernotes_cmd"},
         )
         # Redundant with the file-level check above but explicit:
         # updateoffer_cmd itself must be byte-identical to HEAD.

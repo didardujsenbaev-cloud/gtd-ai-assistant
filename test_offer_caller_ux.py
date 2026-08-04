@@ -428,9 +428,9 @@ class TestStatusLabelsAndAmountRendering(unittest.TestCase):
 # ────────────────────────────────────────────────────────────
 
 class TestCommandRegistration(unittest.TestCase):
-    def test_all_11_commands_registered_exactly_once(self):
+    def test_all_12_commands_registered_exactly_once(self):
         src = _TH_PATH.read_text(encoding="utf-8")
-        names = ("newoffer", "offers", "offer", "reviseoffer", "updateoffer", "sendoffer", "acceptoffer", "rejectoffer", "expireoffer", "canceloffer", "archiveoffer")
+        names = ("newoffer", "offers", "offer", "reviseoffer", "updateoffer", "updateoffernotes", "sendoffer", "acceptoffer", "rejectoffer", "expireoffer", "canceloffer", "archiveoffer")
         for name in names:
             self.assertEqual(src.count(f'CommandHandler("{name}"'), 1, f"/{name} must be registered exactly once")
 

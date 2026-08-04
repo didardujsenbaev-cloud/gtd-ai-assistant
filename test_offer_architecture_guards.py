@@ -562,10 +562,10 @@ class TestNoCallerSideOfferPolicy(unittest.TestCase):
 
 class TestOfferCommandRegistration(unittest.TestCase):
 
-    def test_all_11_commands_registered_exactly_once(self):
+    def test_all_12_commands_registered_exactly_once(self):
         path = BUSINESS_CORE / "telegram_handlers.py"
         src = path.read_text(encoding="utf-8")
-        for name in ("newoffer", "offers", "offer", "reviseoffer", "updateoffer", "sendoffer", "acceptoffer", "rejectoffer", "expireoffer", "canceloffer", "archiveoffer"):
+        for name in ("newoffer", "offers", "offer", "reviseoffer", "updateoffer", "updateoffernotes", "sendoffer", "acceptoffer", "rejectoffer", "expireoffer", "canceloffer", "archiveoffer"):
             self.assertEqual(src.count(f'CommandHandler("{name}"'), 1, f"/{name} must be registered exactly once")
 
     def test_milestones_still_registered_exactly_once(self):

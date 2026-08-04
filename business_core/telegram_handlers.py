@@ -93,6 +93,11 @@ COMMAND_ENFORCEMENT_MAP = {
         "operation_kind": "MUTATION", "allowed_modes": ("NOTES_ONLY",), "requires_fresh_reread": True,
         "mutation_side_effect_class": "SINGLE_ROW_MUTATION", "idempotency_class": "IDEMPOTENT",
     },
+    "updateoffernotes": {
+        "resource": "FINANCE", "action": "UPDATE", "target_shape": "BUSINESS",
+        "operation_kind": "MUTATION", "allowed_modes": ("NOTES_ONLY",), "requires_fresh_reread": True,
+        "mutation_side_effect_class": "SINGLE_ROW_MUTATION", "idempotency_class": "IDEMPOTENT",
+    },
 }
 
 _BC_ENFORCEMENT_NOT_FOUND_OR_DENIED_MSG = "Запись недоступна или не найдена."
@@ -12903,6 +12908,126 @@ async def updateoffer_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await _reply(update, "❌ Не удалось обновить Commercial Offer.", parse_mode=None)
 
 
+_UPDATEOFFERNOTES_ALLOWED_KEYS = frozenset({"commercial_offer_id", "notes"})
+
+
+def _offer_notes_message(result, commercial_offer_id: str) -> str:
+    """
+    Dedicated safe mapper for /updateoffernotes (Phase 17E-2A4) —
+    mirrors _obligation_notes_message's/_lead_notes_message's
+    contract exactly. NEVER renders result['error'], str/repr of the
+    result, or the raw result code. business_builder.
+    update_commercial_offer_admin_fields leaves code="" on both
+    success and infrastructure failure (no synthesized UPDATED/
+    UNCHANGED code exists in this chain — see the H1 wrapper
+    correction), so this mapper keys off the ok/changed flags
+    directly rather than a code string, using strict `is True`/
+    `is False` identity checks so a malformed result (truthy
+    non-bool, wrong type, missing keys) can never accidentally
+    satisfy a branch.
+    """
+    if not isinstance(result, dict):
+        return "❌ Не удалось обновить Notes для Commercial Offer."
+
+    if result.get("ok") is True and result.get("changed") is True:
+        return f"✅ Notes для Commercial Offer {commercial_offer_id} обновлены."
+    if result.get("ok") is True and result.get("changed") is False:
+        return f"ℹ️ Commercial Offer {commercial_offer_id} — изменений нет (значения совпадают)."
+    if result.get("ok") is not True and result.get("code") == "COMMERCIAL_OFFER_NOT_FOUND":
+        # Authorization already succeeded against this
+        # commercial_offer_id — a NOT_FOUND surfacing only now means
+        # the record vanished between the mandatory second lookup and
+        # business_builder's own internal lookup (the accepted
+        # residual TOCTOU window), not a pre-authorization
+        # enumeration case.
+        return _BC_ENFORCEMENT_OWNERSHIP_CHANGED_MSG
+
+    return "❌ Не удалось обновить Notes для Commercial Offer."
+
+
+async def updateoffernotes_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /updateoffernotes commercial_offer_id=OFR-001 notes=...
+
+    Phase 17E-2A4: dedicated, fully authorized, single-purpose command
+    — FINANCE/UPDATE, target_shape=BUSINESS, MUTATION,
+    requires_fresh_reread=True. Reuses business_builder.
+    update_commercial_offer_admin_fields() only — never calls
+    updateoffer_cmd, update_commercial_offer_draft(),
+    update_commercial_offer_draft_fields(), or any lifecycle
+    (send/accept/reject/expire/cancel) mutator. /updateoffer itself is
+    unchanged and remains outside COMMAND_ENFORCEMENT_MAP. Exactly
+    {"commercial_offer_id", "notes"} is the only permitted parsed key
+    set — any other key (including positional _posN keys) is rejected
+    before the finder ever runs.
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg(), parse_mode=None)
+        return
+
+    if not await _validate_bc_transport_or_reply(update):
+        return
+
+    raw = " ".join(context.args or [])
+    args = _parse_kv_args(raw)
+
+    if not set(args.keys()) <= _UPDATEOFFERNOTES_ALLOWED_KEYS:
+        await _reply(update, "❌ /updateoffernotes принимает только commercial_offer_id и notes.", parse_mode=None)
+        return
+
+    commercial_offer_id = args.get("commercial_offer_id", "")
+    notes = args.get("notes", "")
+
+    if not commercial_offer_id or not notes:
+        await _reply(
+            update,
+            "❌ Укажи commercial_offer_id и notes.\n\nПример:\n"
+            "`/updateoffernotes commercial_offer_id=OFR-001 notes=...`", parse_mode=None)
+        return
+
+    from business_core.offer_manager import find_commercial_offer_by_id
+    from business_core.business_builder import update_commercial_offer_admin_fields
+
+    try:
+        first_row = await _resolve_target_in_thread(find_commercial_offer_by_id, commercial_offer_id)
+    except Exception:
+        await _reply(update, _BC_ENFORCEMENT_TEMPORARILY_UNAVAILABLE_MSG, parse_mode=None)
+        return
+
+    first_business_id = str((first_row or {}).get("Business ID", "")).strip()
+    if first_row is None or not first_business_id:
+        await _reply(update, _BC_ENFORCEMENT_NOT_FOUND_OR_DENIED_MSG, parse_mode=None)
+        return
+
+    if not await _authorize_or_reply(
+        update, resource="FINANCE", action="UPDATE", business_id=first_business_id,
+    ):
+        return
+
+    try:
+        second_row = await _resolve_target_in_thread(find_commercial_offer_by_id, commercial_offer_id)
+    except Exception:
+        await _reply(update, _BC_ENFORCEMENT_TEMPORARILY_UNAVAILABLE_MSG, parse_mode=None)
+        return
+
+    second_business_id = str((second_row or {}).get("Business ID", "")).strip()
+    if second_row is None or not second_business_id or second_business_id != first_business_id:
+        await _reply(update, _BC_ENFORCEMENT_OWNERSHIP_CHANGED_MSG, parse_mode=None)
+        return
+
+    try:
+        result = await _mutate_target_in_thread(update_commercial_offer_admin_fields, commercial_offer_id, {"Notes": notes})
+    except Exception:
+        # Fixed branch identifier only — no exception interpolation,
+        # no commercial_offer_id, no Business ID, no Notes, no
+        # updates dict.
+        log.error("updateoffernotes_cmd mutation infrastructure failure")
+        await _reply(update, "❌ Не удалось обновить Notes для Commercial Offer.", parse_mode=None)
+        return
+
+    await _reply(update, _offer_notes_message(result, commercial_offer_id), parse_mode=None)
+
+
 async def sendoffer_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     /sendoffer commercial_offer_id=OFR-001 sent_by=...
@@ -16118,6 +16243,7 @@ def register_business_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("offer",            offer_cmd))
     app.add_handler(CommandHandler("reviseoffer",      reviseoffer_cmd))
     app.add_handler(CommandHandler("updateoffer",      updateoffer_cmd))
+    app.add_handler(CommandHandler("updateoffernotes", updateoffernotes_cmd))
     app.add_handler(CommandHandler("sendoffer",        sendoffer_cmd))
     app.add_handler(CommandHandler("acceptoffer",      acceptoffer_cmd))
     app.add_handler(CommandHandler("rejectoffer",      rejectoffer_cmd))
