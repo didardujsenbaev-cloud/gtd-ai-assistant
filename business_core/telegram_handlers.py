@@ -12485,33 +12485,58 @@ def _offer_revision_message(result: dict) -> str:
     return "❌ Не удалось создать revision Commercial Offer."
 
 
-def _offer_update_message(result: dict, offer_id: str) -> str:
-    """Render any business_builder.update_commercial_offer_draft()/
-    update_commercial_offer_admin_fields() result."""
-    code = result.get("code", "")
+def _offer_update_message(result, offer_id: str) -> str:
+    """
+    Render any business_builder.update_commercial_offer_draft()/
+    update_commercial_offer_admin_fields() result.
 
-    if code == "COMMERCIAL_OFFER_UPDATED":
+    Phase 17E-2A4-H1: hardened — never renders result['error'], the
+    raw result, or an unknown code. Success/unchanged messages require
+    result.get('ok') is True (strict identity), since the manager
+    contract leaves code="" on both a genuine no-op and an
+    infrastructure failure — code alone can no longer be trusted to
+    imply success. Every previously error-echoing branch (IMMUTABLE
+    and the validation-code group) now returns a fixed,
+    application-controlled Russian message instead.
+    """
+    if not isinstance(result, dict):
+        return "❌ Не удалось обновить Commercial Offer."
+
+    code = result.get("code", "")
+    ok = result.get("ok")
+
+    if ok is True and code == "COMMERCIAL_OFFER_UPDATED":
         return f"✅ Commercial Offer {offer_id} обновлён."
 
-    if code == "COMMERCIAL_OFFER_UPDATE_UNCHANGED":
+    if ok is True and code == "COMMERCIAL_OFFER_UPDATE_UNCHANGED":
         return f"ℹ️ Commercial Offer {offer_id} — изменений нет (значения совпадают)."
 
     if code == "COMMERCIAL_OFFER_NOT_FOUND":
         return f"❌ Commercial Offer {offer_id} не найден."
 
     if code == "COMMERCIAL_OFFER_IMMUTABLE":
-        return f"❌ {result.get('error') or 'Изменение недоступно — поле неизменяемо или Offer не в статусе draft.'}"
+        return "❌ Изменение недоступно — поле неизменяемо или Offer не в статусе draft."
 
-    if code in (
-        "INVALID_COMMERCIAL_OFFER_AMOUNT", "INVALID_COMMERCIAL_OFFER_AMOUNT_SCALE", "COMMERCIAL_OFFER_AMOUNT_MUST_BE_POSITIVE",
-        "INVALID_COMMERCIAL_OFFER_CURRENCY", "INVALID_COMMERCIAL_OFFER_VALID_UNTIL", "COMMERCIAL_OFFER_VALID_UNTIL_IN_PAST",
-        "COMMERCIAL_OFFER_TITLE_REQUIRED", "COMMERCIAL_OFFER_SCOPE_REQUIRED",
-        "OBJECT_NOT_FOUND", "SERVICE_NOT_FOUND", "ROADMAP_NOT_FOUND", "DOCUMENT_NOT_FOUND", "COMMERCIAL_OFFER_RELATION_MISMATCH",
-    ):
-        return f"❌ {result.get('error') or 'Проверьте параметры обновления.'}"
+    if code in ("INVALID_COMMERCIAL_OFFER_AMOUNT", "INVALID_COMMERCIAL_OFFER_AMOUNT_SCALE", "COMMERCIAL_OFFER_AMOUNT_MUST_BE_POSITIVE"):
+        return "❌ Недопустимая сумма (quoted_amount)."
 
-    log.warning(f"_offer_update_message: unmapped code={code!r} offer_id={offer_id}")
-    return f"❌ Ошибка ({code or 'unknown'}): {result.get('error') or 'см. логи'}"
+    if code == "INVALID_COMMERCIAL_OFFER_CURRENCY":
+        return "❌ Недопустимая валюта (currency)."
+
+    if code in ("INVALID_COMMERCIAL_OFFER_VALID_UNTIL", "COMMERCIAL_OFFER_VALID_UNTIL_IN_PAST"):
+        return "❌ Недопустимая дата действия оферты (valid_until)."
+
+    if code == "COMMERCIAL_OFFER_TITLE_REQUIRED":
+        return "❌ Укажи title."
+
+    if code == "COMMERCIAL_OFFER_SCOPE_REQUIRED":
+        return "❌ Укажи scope."
+
+    if code in ("OBJECT_NOT_FOUND", "SERVICE_NOT_FOUND", "ROADMAP_NOT_FOUND", "DOCUMENT_NOT_FOUND", "COMMERCIAL_OFFER_RELATION_MISMATCH"):
+        return "❌ Указанный объект/услуга/роадмап/документ не найден или не относится к этому бизнесу."
+
+    log.warning("_offer_update_message unmapped safe fallback")
+    return "❌ Не удалось обновить Commercial Offer."
 
 
 def _offer_lifecycle_message(result: dict, offer_id: str, action_label: str) -> str:

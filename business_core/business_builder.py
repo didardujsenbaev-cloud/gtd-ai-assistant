@@ -8959,10 +8959,26 @@ def update_commercial_offer_admin_fields(offer_id: str, updates: dict) -> dict:
         return _offer_result(ok=False, code="COMMERCIAL_OFFER_NOT_FOUND", error=f"Commercial Offer {offer_id} не найден", commercial_offer_id=offer_id)
 
     result = om_update_admin(offer_id, updates)
+    result_is_dict = isinstance(result, dict)
+    ok = result.get("ok") if result_is_dict else False
+    manager_code = (result.get("code") if result_is_dict else "") or ""
+
+    # Phase 17E-2A4-H1: a success/no-op code may only ever be
+    # synthesized when the manager reported ok is True — otherwise an
+    # infrastructure failure (manager code="") would be indistinguishable
+    # from a genuine no-op, since both leave code="" on the manager
+    # side. An existing non-empty manager failure code (NOT_FOUND,
+    # IMMUTABLE, validation codes) is always preserved untouched.
+    if ok is True:
+        code = manager_code or ("COMMERCIAL_OFFER_UPDATED" if result.get("changed") else "COMMERCIAL_OFFER_UPDATE_UNCHANGED")
+    else:
+        code = manager_code
+
     return _offer_result(
-        ok=result["ok"], code=result.get("code") or ("COMMERCIAL_OFFER_UPDATED" if result.get("changed") else "COMMERCIAL_OFFER_UPDATE_UNCHANGED"),
-        error=result.get("error"), commercial_offer_id=offer_id, business_id=offer.get("Business ID", ""),
-        changed=result.get("changed", False), retry_safe=True,
+        ok=(ok is True), code=code,
+        error=(result.get("error") if result_is_dict else None),
+        commercial_offer_id=offer_id, business_id=offer.get("Business ID", ""),
+        changed=(result.get("changed", False) if result_is_dict else False), retry_safe=True,
     )
 
 

@@ -604,5 +604,72 @@ class TestEffectiveExpiration(unittest.TestCase):
         self.assertFalse(bb.is_commercial_offer_effectively_expired(offer, reference_date=date(2026, 1, 1)))
 
 
+# ─────────────────────────────────────────────────────────────
+# Phase 17E-2A4-H1: update_commercial_offer_admin_fields wrapper
+# result-contract correction — proves a success/no-op code is
+# synthesized only when the manager's ok is exactly True, and that
+# an existing non-empty manager failure code is always preserved.
+# ─────────────────────────────────────────────────────────────
+
+class TestUpdateCommercialOfferAdminFieldsWrapper(unittest.TestCase):
+    def _run(self, manager_return):
+        with patch("business_core.offer_manager.find_commercial_offer_by_id", return_value=_SOURCE_OFFER), \
+             patch("business_core.offer_manager.update_commercial_offer_admin_fields", return_value=manager_return):
+            return bb.update_commercial_offer_admin_fields("OFR-001", {"Notes": "x"})
+
+    def test_ok_true_changed_true_synthesizes_updated(self):
+        r = self._run({"ok": True, "changed": True, "code": "", "error": None})
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["code"], "COMMERCIAL_OFFER_UPDATED")
+
+    def test_ok_true_changed_false_synthesizes_unchanged(self):
+        r = self._run({"ok": True, "changed": False, "code": "", "error": None})
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["code"], "COMMERCIAL_OFFER_UPDATE_UNCHANGED")
+
+    def test_ok_false_blank_code_stays_blank(self):
+        r = self._run({"ok": False, "changed": False, "code": "", "error": "Infrastructure failure"})
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["code"], "")
+
+    def test_ok_false_not_found_code_preserved(self):
+        r = self._run({"ok": False, "changed": False, "code": "COMMERCIAL_OFFER_NOT_FOUND", "error": "x"})
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["code"], "COMMERCIAL_OFFER_NOT_FOUND")
+
+    def test_ok_false_immutable_code_preserved(self):
+        r = self._run({"ok": False, "changed": False, "code": "COMMERCIAL_OFFER_IMMUTABLE", "error": "x"})
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["code"], "COMMERCIAL_OFFER_IMMUTABLE")
+
+    def test_ok_false_known_validation_code_preserved(self):
+        r = self._run({"ok": False, "changed": False, "code": "INVALID_COMMERCIAL_OFFER_AMOUNT", "error": "x"})
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["code"], "INVALID_COMMERCIAL_OFFER_AMOUNT")
+
+    def test_missing_ok_key_no_success_synthesis(self):
+        r = self._run({"changed": True, "code": "", "error": None})
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["code"], "")
+
+    def test_non_dict_manager_result_no_exception(self):
+        r = self._run("not a dict")
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["code"], "")
+
+    def test_truthy_non_boolean_ok_no_success_synthesis(self):
+        r = self._run({"ok": "true", "changed": True, "code": "", "error": None})
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["code"], "")
+
+    def test_no_wrapper_output_accepts_ok_false_with_unchanged_code(self):
+        # Explicit regression guard for the exact defect shape: the
+        # wrapper itself must never produce this combination for a
+        # blank manager code, regardless of caller.
+        r = self._run({"ok": False, "changed": False, "code": "", "error": "Infrastructure failure"})
+        self.assertFalse(r["ok"] and r["code"] == "COMMERCIAL_OFFER_UPDATE_UNCHANGED")
+        self.assertNotEqual(r["code"], "COMMERCIAL_OFFER_UPDATE_UNCHANGED")
+
+
 if __name__ == "__main__":
     unittest.main()

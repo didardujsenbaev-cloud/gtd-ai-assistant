@@ -190,6 +190,157 @@ class TestOfferUpdateMessageMapping(unittest.TestCase):
         self.assertNotIn("✅", msg)
 
 
+# ─────────────────────────────────────────────────────────────
+# Phase 17E-2A4-H1: hardened _offer_update_message — proves
+# success/unchanged require ok is True, no raw error/code/Notes is
+# ever rendered, malformed results never raise, and the exact defect
+# shape (ok=False + code=COMMERCIAL_OFFER_UPDATE_UNCHANGED) never
+# produces unchanged-looking UX.
+# ─────────────────────────────────────────────────────────────
+
+_H1_SECRET_NOTES_MARKER = "SECRET_NOTES_MARKER"
+_H1_SECRET_BIZ_MARKER = "BIZ-SECRET"
+_H1_SECRET_ROW_MARKER = "ROW-SECRET"
+_H1_SECRET_API_MARKER = "API-PAYLOAD-SECRET"
+_H1_ALL_SECRET_MARKERS = (_H1_SECRET_NOTES_MARKER, _H1_SECRET_BIZ_MARKER, _H1_SECRET_ROW_MARKER, _H1_SECRET_API_MARKER)
+
+
+class TestOfferUpdateMessageHardening(unittest.TestCase):
+    def test_amount_validation(self):
+        msg = th._offer_update_message({"ok": False, "code": "INVALID_COMMERCIAL_OFFER_AMOUNT", "error": "raw"}, "OFR-001")
+        self.assertEqual(msg, "❌ Недопустимая сумма (quoted_amount).")
+        self.assertNotIn("raw", msg)
+
+    def test_amount_scale_validation(self):
+        msg = th._offer_update_message({"ok": False, "code": "INVALID_COMMERCIAL_OFFER_AMOUNT_SCALE", "error": "raw"}, "OFR-001")
+        self.assertEqual(msg, "❌ Недопустимая сумма (quoted_amount).")
+
+    def test_amount_must_be_positive_validation(self):
+        msg = th._offer_update_message({"ok": False, "code": "COMMERCIAL_OFFER_AMOUNT_MUST_BE_POSITIVE", "error": "raw"}, "OFR-001")
+        self.assertEqual(msg, "❌ Недопустимая сумма (quoted_amount).")
+
+    def test_currency_validation(self):
+        msg = th._offer_update_message({"ok": False, "code": "INVALID_COMMERCIAL_OFFER_CURRENCY", "error": "raw"}, "OFR-001")
+        self.assertEqual(msg, "❌ Недопустимая валюта (currency).")
+
+    def test_valid_until_validation(self):
+        msg = th._offer_update_message({"ok": False, "code": "INVALID_COMMERCIAL_OFFER_VALID_UNTIL", "error": "raw"}, "OFR-001")
+        self.assertEqual(msg, "❌ Недопустимая дата действия оферты (valid_until).")
+
+    def test_valid_until_in_past_validation(self):
+        msg = th._offer_update_message({"ok": False, "code": "COMMERCIAL_OFFER_VALID_UNTIL_IN_PAST", "error": "raw"}, "OFR-001")
+        self.assertEqual(msg, "❌ Недопустимая дата действия оферты (valid_until).")
+
+    def test_title_required(self):
+        msg = th._offer_update_message({"ok": False, "code": "COMMERCIAL_OFFER_TITLE_REQUIRED", "error": "raw"}, "OFR-001")
+        self.assertEqual(msg, "❌ Укажи title.")
+
+    def test_scope_required(self):
+        msg = th._offer_update_message({"ok": False, "code": "COMMERCIAL_OFFER_SCOPE_REQUIRED", "error": "raw"}, "OFR-001")
+        self.assertEqual(msg, "❌ Укажи scope.")
+
+    def test_relation_mismatch_group(self):
+        for code in ("OBJECT_NOT_FOUND", "SERVICE_NOT_FOUND", "ROADMAP_NOT_FOUND", "DOCUMENT_NOT_FOUND", "COMMERCIAL_OFFER_RELATION_MISMATCH"):
+            with self.subTest(code=code):
+                msg = th._offer_update_message({"ok": False, "code": code, "error": "raw"}, "OFR-001")
+                self.assertEqual(msg, "❌ Указанный объект/услуга/роадмап/документ не найден или не относится к этому бизнесу.")
+
+    def test_infrastructure_failure_generic_message(self):
+        msg = th._offer_update_message({"ok": False, "changed": False, "code": "", "error": "Infrastructure failure"}, "OFR-001")
+        self.assertEqual(msg, "❌ Не удалось обновить Commercial Offer.")
+
+    def test_infrastructure_failure_never_unchanged_ui(self):
+        msg = th._offer_update_message({"ok": False, "changed": False, "code": "", "error": "Infrastructure failure"}, "OFR-001")
+        self.assertNotIn("изменений нет", msg)
+        self.assertNotIn("ℹ️", msg)
+
+    def test_ok_false_unchanged_code_never_unchanged_ui(self):
+        # The exact defect shape: even if some future caller ever
+        # produced this combination, the mapper's own ok-gate must
+        # block it independent of the wrapper fix.
+        msg = th._offer_update_message({"ok": False, "changed": False, "code": "COMMERCIAL_OFFER_UPDATE_UNCHANGED", "error": None}, "OFR-001")
+        self.assertNotIn("изменений нет", msg)
+        self.assertEqual(msg, "❌ Не удалось обновить Commercial Offer.")
+
+    def test_unknown_code_generic_message_no_leak(self):
+        msg = th._offer_update_message({"ok": False, "code": "SOME_FUTURE_CODE", "error": "raw domain error text"}, "OFR-001")
+        self.assertEqual(msg, "❌ Не удалось обновить Commercial Offer.")
+        self.assertNotIn("SOME_FUTURE_CODE", msg)
+        self.assertNotIn("raw domain error text", msg)
+
+    def test_infrastructure_failure_string_never_rendered(self):
+        msg = th._offer_update_message({"ok": False, "code": "", "error": "Infrastructure failure"}, "OFR-001")
+        self.assertNotIn("Infrastructure failure", msg)
+
+    def test_secret_markers_never_rendered(self):
+        result = {
+            "ok": False, "code": "SOME_FUTURE_CODE",
+            "error": f"{_H1_SECRET_NOTES_MARKER} {_H1_SECRET_BIZ_MARKER} {_H1_SECRET_ROW_MARKER} {_H1_SECRET_API_MARKER}",
+        }
+        msg = th._offer_update_message(result, "OFR-001")
+        for marker in _H1_ALL_SECRET_MARKERS:
+            self.assertNotIn(marker, msg)
+
+    def test_none_result_does_not_raise(self):
+        msg = th._offer_update_message(None, "OFR-001")
+        self.assertEqual(msg, "❌ Не удалось обновить Commercial Offer.")
+
+    def test_string_result_does_not_raise(self):
+        msg = th._offer_update_message("not a dict", "OFR-001")
+        self.assertEqual(msg, "❌ Не удалось обновить Commercial Offer.")
+
+    def test_list_result_does_not_raise(self):
+        msg = th._offer_update_message(["ok", True], "OFR-001")
+        self.assertEqual(msg, "❌ Не удалось обновить Commercial Offer.")
+
+    def test_integer_result_does_not_raise(self):
+        msg = th._offer_update_message(42, "OFR-001")
+        self.assertEqual(msg, "❌ Не удалось обновить Commercial Offer.")
+
+    def test_empty_dict_does_not_raise(self):
+        msg = th._offer_update_message({}, "OFR-001")
+        self.assertEqual(msg, "❌ Не удалось обновить Commercial Offer.")
+
+    def test_missing_ok_key(self):
+        msg = th._offer_update_message({"code": "COMMERCIAL_OFFER_UPDATED"}, "OFR-001")
+        self.assertEqual(msg, "❌ Не удалось обновить Commercial Offer.")
+
+    def test_missing_code_key(self):
+        msg = th._offer_update_message({"ok": True}, "OFR-001")
+        self.assertEqual(msg, "❌ Не удалось обновить Commercial Offer.")
+
+    def test_truthy_string_ok_not_treated_as_true(self):
+        msg = th._offer_update_message({"ok": "true", "code": "COMMERCIAL_OFFER_UPDATED"}, "OFR-001")
+        self.assertEqual(msg, "❌ Не удалось обновить Commercial Offer.")
+
+    def test_truthy_int_ok_not_treated_as_true(self):
+        msg = th._offer_update_message({"ok": 1, "code": "COMMERCIAL_OFFER_UPDATED"}, "OFR-001")
+        self.assertEqual(msg, "❌ Не удалось обновить Commercial Offer.")
+
+    def test_changed_false_string_not_treated_as_false(self):
+        # "changed" isn't checked by this mapper at all — this proves
+        # ok=True + code=UPDATED still succeeds regardless of a
+        # malformed "changed" value, since the mapper only branches on
+        # ok and code, matching the deployed contract exactly.
+        msg = th._offer_update_message({"ok": True, "changed": "false", "code": "COMMERCIAL_OFFER_UPDATED"}, "OFR-001")
+        self.assertEqual(msg, "✅ Commercial Offer OFR-001 обновлён.")
+
+    def test_fallback_logger_fixed_literal_only(self):
+        with patch("business_core.telegram_handlers.log.warning") as mock_warn:
+            th._offer_update_message({"ok": False, "code": "SOME_FUTURE_CODE", "error": "x"}, "OFR-999")
+        mock_warn.assert_called_once_with("_offer_update_message unmapped safe fallback")
+
+    def test_fallback_logger_no_offer_id_no_code_no_error(self):
+        with patch("business_core.telegram_handlers.log.warning") as mock_warn:
+            th._offer_update_message({"ok": False, "code": "SOME_FUTURE_CODE", "error": _H1_SECRET_NOTES_MARKER}, "OFR-SECRET-999")
+        for call in mock_warn.call_args_list:
+            for arg in list(call.args) + list(call.kwargs.values()):
+                text = str(arg)
+                self.assertNotIn("OFR-SECRET-999", text)
+                self.assertNotIn("SOME_FUTURE_CODE", text)
+                self.assertNotIn(_H1_SECRET_NOTES_MARKER, text)
+
+
 class TestOfferLifecycleMessageMapping(unittest.TestCase):
     def test_sent(self):
         result = {"ok": True, "code": "COMMERCIAL_OFFER_SENT", "error": None, "previous_status": "draft", "final_status": "sent"}

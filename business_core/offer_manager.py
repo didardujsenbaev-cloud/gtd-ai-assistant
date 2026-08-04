@@ -327,8 +327,10 @@ def _find_offer_row(offer_id: str) -> Optional[tuple[int, dict]]:
     try:
         from business_core.sheets import find_row_by_id
         return find_row_by_id("commercial_offers", offer_id)
-    except Exception as exc:
-        log.warning(f"_find_offer_row({offer_id}) error: {exc}")
+    except Exception:
+        # Phase 17E-2A4-H1: fixed literal only — no exception
+        # interpolation, no entity ID, no row content.
+        log.warning("_find_offer_row infrastructure failure")
         return None
 
 
@@ -375,9 +377,14 @@ def update_commercial_offer_admin_fields(offer_id: str, updates: dict) -> dict:
             sheet.update_cell(row_num, idx["Updated At"] + 1, _now_utc_str())
 
         return {"ok": True, "changed": changed, "code": "", "error": None}
-    except Exception as exc:
-        log.error(f"update_commercial_offer_admin_fields({offer_id}) error: {exc}")
-        return {"ok": False, "changed": False, "code": "", "error": str(exc)}
+    except Exception:
+        # Phase 17E-2A4-H1: fixed literal only — no exception
+        # interpolation, no entity ID, no updates dict, no row
+        # content. "error" is likewise sanitized to a fixed safe
+        # string, since business_builder's wrapper and the legacy
+        # Telegram mapper may place this value somewhere reachable.
+        log.error("update_commercial_offer_admin_fields infrastructure failure")
+        return {"ok": False, "changed": False, "code": "", "error": "Infrastructure failure"}
 
 
 def update_commercial_offer_draft_fields(offer_id: str, updates: dict) -> dict:

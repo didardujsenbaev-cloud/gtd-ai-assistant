@@ -2349,5 +2349,90 @@ class TestUpdateLeadNotesEndToEndExceptionSecrecy(unittest.TestCase):
         self.assertEqual(text, "❌ Не удалось обновить Notes для Lead.")
 
 
+# ═════════════════════════════════════════════════════════════
+# Phase 17E-2A4-H1: legacy /updateoffer real-chain regression proof.
+# Unlike the dedicated commands above, /updateoffer has NO
+# transport preflight or authorization gate — this test proves the
+# manager-hardening + wrapper-correction + mapper-correction chain
+# alone (not any enforcement layer) is what prevents the previously
+# live "ℹ️ ...изменений нет..." false-success message and any
+# secret-marker leakage when a Sheets write raises during the
+# legacy command's Notes-mode.
+# ═════════════════════════════════════════════════════════════
+
+_H1_OFFER_ROW = {
+    "Commercial Offer ID": "OFR-001", "Offer Series ID": "OFS-001", "Previous Commercial Offer ID": "",
+    "Version Number": "1", "Business ID": "BIZ-001", "Client ID": "PRS-001", "Object ID": "", "Service ID": "SVC-001",
+    "Roadmap ID": "", "Offer Document ID": "", "Title Snapshot": "T", "Scope Snapshot": "S",
+    "Quoted Amount": "150000.00", "Currency": "KZT", "Valid Until": "2026-12-31", "Status": "draft",
+    "Caller Idempotency Key": "", "Created At": "", "Created By": "", "Updated At": "",
+    "Sent At": "", "Sent By": "", "Accepted At": "", "Accepted By": "",
+    "Rejected At": "", "Rejected By": "", "Rejection Reason": "", "Expired At": "",
+    "Cancelled At": "", "Cancelled By": "", "Cancellation Reason": "", "Archived At": "", "Notes": "",
+}
+
+
+class TestLegacyUpdateOfferNotesModeEndToEndExceptionSecrecy(unittest.TestCase):
+    def test_notes_write_exception_through_real_chain_no_secrets_in_reply(self):
+        update = _make_update()
+        row = dict(_H1_OFFER_ROW)
+        sheet = MagicMock()
+        sheet.row_values.return_value = list(row.keys())
+        sheet.update_cell.side_effect = _e2e_boom_with_secrets
+
+        with patch("business_core.sheets.find_row_by_id", return_value=(2, row)), \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
+             patch("business_core.sheets.get_business_sheet", return_value=sheet):
+            _run(th.updateoffer_cmd(update, _make_context(
+                ["commercial_offer_id=OFR-001", f"notes={_E2E_SECRET_NOTES_MARKER}"]
+            )))
+
+        call = update.message.reply_text.call_args
+        text = call.args[0] if call.args else call.kwargs.get("text", "")
+        for marker in _E2E_ALL_SECRET_MARKERS:
+            self.assertNotIn(marker, text)
+        self.assertNotIn("Infrastructure failure", text)
+        self.assertNotIn("COMMERCIAL_OFFER_UPDATE_UNCHANGED", text)
+        self.assertNotIn("изменений нет", text)
+        self.assertNotIn("ℹ️", text)
+        self.assertEqual(text, "❌ Не удалось обновить Commercial Offer.")
+
+    def test_successful_notes_update_through_real_chain_unaffected(self):
+        update = _make_update()
+        row = dict(_H1_OFFER_ROW)
+        row["Notes"] = "old"
+        sheet = MagicMock()
+        sheet.row_values.return_value = list(row.keys())
+
+        with patch("business_core.sheets.find_row_by_id", return_value=(2, row)), \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
+             patch("business_core.sheets.get_business_sheet", return_value=sheet):
+            _run(th.updateoffer_cmd(update, _make_context(
+                ["commercial_offer_id=OFR-001", "notes=new"]
+            )))
+
+        call = update.message.reply_text.call_args
+        text = call.args[0] if call.args else call.kwargs.get("text", "")
+        self.assertEqual(text, "✅ Commercial Offer OFR-001 обновлён.")
+
+    def test_unchanged_notes_update_through_real_chain_unaffected(self):
+        update = _make_update()
+        row = dict(_H1_OFFER_ROW)
+        row["Notes"] = "same"
+        sheet = MagicMock()
+        sheet.row_values.return_value = list(row.keys())
+
+        with patch("business_core.sheets.find_row_by_id", return_value=(2, row)), \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
+             patch("business_core.sheets.get_business_sheet", return_value=sheet):
+            _run(th.updateoffer_cmd(update, _make_context(
+                ["commercial_offer_id=OFR-001", "notes=same"]
+            )))
+
+        call = update.message.reply_text.call_args
+        text = call.args[0] if call.args else call.kwargs.get("text", "")
+        self.assertEqual(text, "ℹ️ Commercial Offer OFR-001 — изменений нет (значения совпадают).")
+
+
 if __name__ == "__main__":
     unittest.main()
