@@ -312,14 +312,171 @@ class TestDocumentAdminMessageMapping(unittest.TestCase):
         self.assertIn("❌", msg)
 
     def test_unknown_code_safe_fallback(self):
-        """Mirrors the established Task/Organization domain fallback
-        convention: an unmapped code is shown verbatim (it's an internal
-        semantic constant, not a raw exception) alongside a generic
-        error message — never a Python traceback or raw dict."""
+        """Phase 17E-2A5-H1: hardened — an unmapped code no longer
+        renders the code or any manager-supplied error text; it falls
+        to the single fixed generic message."""
         result = {"ok": False, "code": "WEIRD_FUTURE_CODE", "error": "internal detail"}
         msg = th._document_admin_message(result, "DREG-001")
-        self.assertIn("❌", msg)
-        self.assertIn("WEIRD_FUTURE_CODE", msg)
+        self.assertEqual(msg, "❌ Не удалось обновить Document.")
+        self.assertNotIn("WEIRD_FUTURE_CODE", msg)
+        self.assertNotIn("internal detail", msg)
+
+
+_SECRET_NOTES_MARKER = "SECRET_NOTES_MARKER"
+_SECRET_BIZ_MARKER = "BIZ-SECRET"
+_SECRET_OBJECT_MARKER = "OBJECT-SECRET"
+_SECRET_ROW_MARKER = "ROW-SECRET"
+_SECRET_API_MARKER = "API-PAYLOAD-SECRET"
+_ALL_SECRET_MARKERS = (
+    _SECRET_NOTES_MARKER, _SECRET_BIZ_MARKER, _SECRET_OBJECT_MARKER,
+    _SECRET_ROW_MARKER, _SECRET_API_MARKER,
+)
+_GENERIC_FAILURE_MSG = "❌ Не удалось обновить Document."
+
+
+class TestDocumentAdminMessageHardening(unittest.TestCase):
+    """Phase 17E-2A5-H1: comprehensive hardened-mapper battery —
+    proves _document_admin_message type-checks first, requires
+    ok is True (strict identity) for success/no-op UX, uses only
+    fixed text for every known rejection code, never renders manager
+    error text/unknown codes/secret markers, and never raises on
+    malformed input."""
+
+    def test_valid_updated_result(self):
+        msg = th._document_admin_message(
+            {"ok": True, "changed": True, "code": "DOCUMENT_ADMIN_FIELDS_UPDATED", "error": None}, "DREG-001",
+        )
+        self.assertEqual(msg, "✅ Document DREG-001 обновлён.")
+
+    def test_valid_unchanged_result(self):
+        msg = th._document_admin_message(
+            {"ok": True, "changed": False, "code": "DOCUMENT_ADMIN_FIELDS_UNCHANGED", "error": None}, "DREG-001",
+        )
+        self.assertEqual(msg, "ℹ️ Document DREG-001 — изменений нет (значения совпадают).")
+
+    def test_ok_false_with_updated_code_never_success(self):
+        msg = th._document_admin_message(
+            {"ok": False, "changed": False, "code": "DOCUMENT_ADMIN_FIELDS_UPDATED", "error": "Infrastructure failure"}, "DREG-001",
+        )
+        self.assertNotIn("✅", msg)
+        self.assertEqual(msg, _GENERIC_FAILURE_MSG)
+
+    def test_ok_false_with_unchanged_code_never_unchanged_ux(self):
+        msg = th._document_admin_message(
+            {"ok": False, "changed": False, "code": "DOCUMENT_ADMIN_FIELDS_UNCHANGED", "error": "Infrastructure failure"}, "DREG-001",
+        )
+        self.assertNotIn("ℹ️", msg)
+        self.assertNotIn("изменений нет", msg)
+        self.assertEqual(msg, _GENERIC_FAILURE_MSG)
+
+    def test_not_found_fixed_text(self):
+        msg = th._document_admin_message({"ok": False, "code": "DOCUMENT_NOT_FOUND", "error": "x"}, "DREG-404")
+        self.assertEqual(msg, "❌ Document DREG-404 не найден.")
+
+    def test_immutable_field_fixed_text_no_error_render(self):
+        msg = th._document_admin_message(
+            {"ok": False, "code": "DOCUMENT_IMMUTABLE_FIELD_CONFLICT", "error": f"leak-{_SECRET_BIZ_MARKER}"}, "DREG-001",
+        )
+        self.assertEqual(msg, "❌ Указанные поля являются неизменяемой идентичностью Document.")
+        self.assertNotIn(_SECRET_BIZ_MARKER, msg)
+
+    def test_family_immutable_fixed_text(self):
+        msg = th._document_admin_message({"ok": False, "code": "DOCUMENT_FAMILY_FIELD_IMMUTABLE", "error": "x"}, "DREG-001")
+        self.assertEqual(msg, "❌ Document Family ID неизменяем после создания.")
+
+    def test_version_immutable_fixed_text(self):
+        msg = th._document_admin_message({"ok": False, "code": "DOCUMENT_VERSION_FIELD_IMMUTABLE", "error": "x"}, "DREG-001")
+        self.assertEqual(msg, "❌ Version неизменяем после создания.")
+
+    def test_relation_update_restriction_fixed_text(self):
+        msg = th._document_admin_message(
+            {"ok": False, "code": "DOCUMENT_RELATION_UPDATE_REQUIRES_EXPLICIT_ACTION", "error": "x"}, "DREG-001",
+        )
+        self.assertEqual(
+            msg, "❌ Изменение связей (Client/Object/Roadmap/Stage/Template ID) через /updatedoc не поддерживается.",
+        )
+
+    def test_invalid_admin_field_fixed_text_no_error_render(self):
+        msg = th._document_admin_message(
+            {"ok": False, "code": "INVALID_DOCUMENT_ADMIN_FIELD", "error": f"leak-{_SECRET_API_MARKER}"}, "DREG-001",
+        )
+        self.assertEqual(msg, "❌ Недопустимое поле для /updatedoc.")
+        self.assertNotIn(_SECRET_API_MARKER, msg)
+
+    def test_blank_code_fallback(self):
+        msg = th._document_admin_message({"ok": False, "code": "", "error": "Infrastructure failure"}, "DREG-001")
+        self.assertEqual(msg, _GENERIC_FAILURE_MSG)
+
+    def test_unknown_code_fallback(self):
+        msg = th._document_admin_message({"ok": False, "code": "SOME_FUTURE_CODE", "error": "raw detail"}, "DREG-001")
+        self.assertEqual(msg, _GENERIC_FAILURE_MSG)
+        self.assertNotIn("SOME_FUTURE_CODE", msg)
+        self.assertNotIn("raw detail", msg)
+
+    def test_infrastructure_failure_never_rendered(self):
+        msg = th._document_admin_message({"ok": False, "code": "", "error": "Infrastructure failure"}, "DREG-001")
+        self.assertNotIn("Infrastructure failure", msg)
+
+    def test_arbitrary_secret_marker_error_never_rendered(self):
+        for marker in _ALL_SECRET_MARKERS:
+            with self.subTest(marker=marker):
+                msg = th._document_admin_message({"ok": False, "code": "", "error": f"boom {marker}"}, "DREG-001")
+                self.assertNotIn(marker, msg)
+                self.assertEqual(msg, _GENERIC_FAILURE_MSG)
+
+    def test_empty_dict(self):
+        msg = th._document_admin_message({}, "DREG-001")
+        self.assertEqual(msg, _GENERIC_FAILURE_MSG)
+
+    def test_partial_dict_ok_only(self):
+        msg = th._document_admin_message({"ok": True}, "DREG-001")
+        self.assertEqual(msg, _GENERIC_FAILURE_MSG)
+
+    def test_partial_dict_code_only(self):
+        msg = th._document_admin_message({"code": "DOCUMENT_ADMIN_FIELDS_UPDATED"}, "DREG-001")
+        self.assertEqual(msg, _GENERIC_FAILURE_MSG)
+
+    def test_none_result_does_not_raise(self):
+        msg = th._document_admin_message(None, "DREG-001")
+        self.assertEqual(msg, _GENERIC_FAILURE_MSG)
+
+    def test_string_result_does_not_raise(self):
+        msg = th._document_admin_message("not a dict", "DREG-001")
+        self.assertEqual(msg, _GENERIC_FAILURE_MSG)
+
+    def test_list_result_does_not_raise(self):
+        msg = th._document_admin_message(["ok", True], "DREG-001")
+        self.assertEqual(msg, _GENERIC_FAILURE_MSG)
+
+    def test_integer_result_does_not_raise(self):
+        msg = th._document_admin_message(42, "DREG-001")
+        self.assertEqual(msg, _GENERIC_FAILURE_MSG)
+
+    def test_truthy_string_ok_not_treated_as_true(self):
+        msg = th._document_admin_message(
+            {"ok": "true", "changed": True, "code": "DOCUMENT_ADMIN_FIELDS_UPDATED", "error": None}, "DREG-001",
+        )
+        self.assertEqual(msg, _GENERIC_FAILURE_MSG)
+
+    def test_truthy_int_ok_not_treated_as_true(self):
+        msg = th._document_admin_message(
+            {"ok": 1, "changed": True, "code": "DOCUMENT_ADMIN_FIELDS_UPDATED", "error": None}, "DREG-001",
+        )
+        self.assertEqual(msg, _GENERIC_FAILURE_MSG)
+
+    def test_fallback_log_is_fixed_literal(self):
+        with patch("business_core.telegram_handlers.log.warning") as mock_log_warning:
+            th._document_admin_message({"ok": False, "code": "UNMAPPED_XYZ", "error": f"leak-{_SECRET_ROW_MARKER}"}, "DREG-001")
+        mock_log_warning.assert_called_once_with("_document_admin_message unmapped safe fallback")
+        for call in mock_log_warning.call_args_list:
+            for arg in list(call.args) + list(call.kwargs.values()):
+                self.assertNotIn(_SECRET_ROW_MARKER, str(arg))
+                self.assertNotIn("UNMAPPED_XYZ", str(arg))
+
+    def test_known_branches_do_not_log(self):
+        with patch("business_core.telegram_handlers.log.warning") as mock_log_warning:
+            th._document_admin_message({"ok": True, "changed": True, "code": "DOCUMENT_ADMIN_FIELDS_UPDATED", "error": None}, "DREG-001")
+        mock_log_warning.assert_not_called()
 
 
 # ────────────────────────────────────────────────────────────

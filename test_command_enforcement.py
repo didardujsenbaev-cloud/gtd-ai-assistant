@@ -357,9 +357,11 @@ class TestNoCacheNoBypassNoUnrelatedFileChange(unittest.TestCase):
 
 class TestPhase17E2A4H1OfferHardeningScope(unittest.TestCase):
     def test_business_builder_change_confined_to_offer_wrapper(self):
+        # Phase 17E-2A5-H1 additionally approves update_document_admin_fields
+        # (malformed-manager-result hardening) in this same file.
         _assert_only_functions_changed(
             self, "business_core/business_builder.py",
-            {"update_commercial_offer_admin_fields"},
+            {"update_commercial_offer_admin_fields", "update_document_admin_fields"},
         )
 
     def test_offer_manager_change_confined_to_two_exception_sites(self):
@@ -369,9 +371,11 @@ class TestPhase17E2A4H1OfferHardeningScope(unittest.TestCase):
         )
 
     def test_telegram_handlers_change_confined_to_offer_mapper(self):
+        # Phase 17E-2A5-H1 additionally approves _document_admin_message
+        # (legacy mapper safety correction) in this same file.
         _assert_only_functions_changed_or_added(
             self, "business_core/telegram_handlers.py",
-            allowed_changed_function_names={"register_business_handlers"},
+            allowed_changed_function_names={"register_business_handlers", "_document_admin_message"},
             allowed_added_function_names={"_offer_notes_message", "updateoffernotes_cmd"},
         )
 
@@ -396,12 +400,13 @@ class TestPhase17E2A4H1OfferHardeningScope(unittest.TestCase):
         )
         self.assertEqual(result.stdout.strip(), "")
 
-    def test_document_manager_unchanged(self):
-        result = subprocess.run(
-            ["git", "diff", "--name-only", "HEAD", "--", "business_core/document_manager.py"],
-            capture_output=True, text=True, cwd=".",
+    def test_document_manager_change_confined_to_two_exception_sites(self):
+        # Phase 17E-2A5-H1: _find_document_row and
+        # update_document_admin_fields exception-logging hardening only.
+        _assert_only_functions_changed(
+            self, "business_core/document_manager.py",
+            {"_find_document_row", "update_document_admin_fields"},
         )
-        self.assertEqual(result.stdout.strip(), "")
 
     def test_updateoffernotes_command_exists_and_registered(self):
         self.assertTrue(hasattr(th, "updateoffernotes_cmd"))
@@ -411,9 +416,11 @@ class TestPhase17E2A4H1OfferHardeningScope(unittest.TestCase):
         self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 10)
 
     def test_updateoffer_cmd_unchanged(self):
+        # Phase 17E-2A5-H1 additionally approves _document_admin_message
+        # (legacy mapper safety correction) in this same file.
         _assert_only_functions_changed_or_added(
             self, "business_core/telegram_handlers.py",
-            allowed_changed_function_names={"register_business_handlers"},
+            allowed_changed_function_names={"register_business_handlers", "_document_admin_message"},
             allowed_added_function_names={"_offer_notes_message", "updateoffernotes_cmd"},
         )
         # Redundant with the file-level check above but explicit:

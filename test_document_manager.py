@@ -266,6 +266,98 @@ class TestUpdateDocumentAdminFields(unittest.TestCase):
         sheet.update_cell.assert_not_called()
 
 
+_SECRET_NOTES_MARKER = "SECRET_NOTES_MARKER"
+_SECRET_BIZ_MARKER = "BIZ-SECRET"
+_SECRET_OBJECT_MARKER = "OBJECT-SECRET"
+_SECRET_ROW_MARKER = "ROW-SECRET"
+_SECRET_API_MARKER = "API-PAYLOAD-SECRET"
+_ALL_SECRET_MARKERS = (
+    _SECRET_NOTES_MARKER, _SECRET_BIZ_MARKER, _SECRET_OBJECT_MARKER,
+    _SECRET_ROW_MARKER, _SECRET_API_MARKER,
+)
+
+
+def _boom_with_secrets(*_a, **_k):
+    raise RuntimeError(
+        f"synthetic failure containing {_SECRET_NOTES_MARKER} and {_SECRET_BIZ_MARKER} "
+        f"and {_SECRET_OBJECT_MARKER} and {_SECRET_ROW_MARKER} and {_SECRET_API_MARKER}"
+    )
+
+
+class TestDocumentManagerExceptionSecrecy(unittest.TestCase):
+    """Phase 17E-2A5-H1: proves the two hardened exception sites in
+    document_manager.py never leak exception text, document_id,
+    Business ID, Object ID, Notes, or row/API payload content into
+    logs or the returned structured result."""
+
+    def _assert_no_secrets_logged(self, mock_log):
+        for call in mock_log.call_args_list:
+            for arg in list(call.args) + list(call.kwargs.values()):
+                text = str(arg)
+                for marker in _ALL_SECRET_MARKERS:
+                    self.assertNotIn(marker, text)
+
+    def test_find_document_row_exception_fixed_log_literal(self):
+        dm = _fresh_dm()
+        with patch("business_core.sheets.get_business_sheet", side_effect=_boom_with_secrets), \
+             patch("business_core.document_manager.log.warning") as mock_log_warning:
+            result = dm._find_document_row(f"DREG-{_SECRET_ROW_MARKER}")
+        self.assertIsNone(result)
+        mock_log_warning.assert_called_once_with("_find_document_row infrastructure failure")
+        self._assert_no_secrets_logged(mock_log_warning)
+
+    def test_notes_update_cell_exception_fixed_log_and_sanitized_result(self):
+        dm = _fresh_dm()
+        sheet = _make_sheet(DOC_HEADERS, list(DOC_ROW))
+        sheet.update_cell.side_effect = _boom_with_secrets
+        with patch("business_core.sheets.get_business_sheet", return_value=sheet), \
+             patch("business_core.document_manager.log.error") as mock_log_error:
+            result = dm.update_document_admin_fields(
+                "DREG-001", {"Notes": f"new-{_SECRET_NOTES_MARKER}"},
+            )
+        mock_log_error.assert_called_once_with("update_document_admin_fields infrastructure failure")
+        self._assert_no_secrets_logged(mock_log_error)
+        self.assertEqual(result, {
+            "ok": False, "changed": False, "updated_fields": (), "code": "", "error": "Infrastructure failure",
+        })
+
+    def test_updated_at_update_cell_exception_fixed_log_and_sanitized_result(self):
+        dm = _fresh_dm()
+        sheet = _make_sheet(DOC_HEADERS, list(DOC_ROW))
+
+        idx = {h: i for i, h in enumerate(DOC_HEADERS)}
+        updated_at_col = idx["Updated At"] + 1
+
+        def update_cell(row, col, value):
+            if col == updated_at_col:
+                _boom_with_secrets()
+
+        sheet.update_cell.side_effect = update_cell
+        with patch("business_core.sheets.get_business_sheet", return_value=sheet), \
+             patch("business_core.document_manager.log.error") as mock_log_error:
+            result = dm.update_document_admin_fields("DREG-001", {"Document Name": "New Name"})
+        mock_log_error.assert_called_once_with("update_document_admin_fields infrastructure failure")
+        self._assert_no_secrets_logged(mock_log_error)
+        self.assertEqual(result, {
+            "ok": False, "changed": False, "updated_fields": (), "code": "", "error": "Infrastructure failure",
+        })
+
+    def test_manager_exception_result_shape_permits_sanitized_internal_value(self):
+        """The sanitized 'Infrastructure failure' string is permitted
+        INSIDE the manager's own returned result — it is never logged,
+        and (per business_builder/mapper hardening in this same phase)
+        never rendered to Telegram. This test only proves the manager's
+        own contract, not downstream rendering."""
+        dm = _fresh_dm()
+        sheet = _make_sheet(DOC_HEADERS, list(DOC_ROW))
+        sheet.update_cell.side_effect = RuntimeError("boom")
+        with patch("business_core.sheets.get_business_sheet", return_value=sheet), \
+             patch("business_core.document_manager.log.error"):
+            result = dm.update_document_admin_fields("DREG-001", {"Notes": "x"})
+        self.assertEqual(result["error"], "Infrastructure failure")
+        self.assertEqual(set(result.keys()), {"ok", "changed", "updated_fields", "code", "error"})
+
+
 class TestUpdateDocumentStatus(unittest.TestCase):
 
     def test_status_change(self):

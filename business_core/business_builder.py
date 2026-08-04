@@ -4767,10 +4767,12 @@ def update_document_admin_fields(document_id: str, updates: dict) -> dict:
         return _document_result(ok=False, code="DOCUMENT_NOT_FOUND", error=f"Document {document_id} не найден", document_id=document_id)
 
     result = _low_level_update(document_id, updates)
+    if not isinstance(result, dict):
+        result = {}
     return _document_result(
-        ok=result["ok"], code=result.get("code", ""), error=result.get("error"),
+        ok=result.get("ok") is True, code=result.get("code") or "", error=result.get("error"),
         document_id=document_id, business_id=document.get("business_id", ""),
-        changed=result.get("changed", False), retry_safe=True,
+        changed=result.get("changed") is True, retry_safe=True,
     )
 
 

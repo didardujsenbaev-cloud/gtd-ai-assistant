@@ -74,8 +74,8 @@ def _find_document_row(document_id: str) -> Optional[tuple[int, dict]]:
         row = sheet.row_values(cell.row)
         v = read_row_by_headers(headers, row, _DOCUMENT_FIELDS)
         return (cell.row, v)
-    except Exception as exc:
-        log.warning(f"_find_document_row({document_id}) error: {exc}")
+    except Exception:
+        log.warning("_find_document_row infrastructure failure")
         return None
 
 
@@ -428,9 +428,9 @@ def update_document_admin_fields(document_id: str, updates: dict) -> dict:
             "code": "DOCUMENT_ADMIN_FIELDS_UPDATED" if changed else "DOCUMENT_ADMIN_FIELDS_UNCHANGED",
             "error": None,
         }
-    except Exception as exc:
-        log.error(f"update_document_admin_fields({document_id}) error: {exc}")
-        return {"ok": False, "changed": False, "updated_fields": (), "code": "", "error": str(exc)}
+    except Exception:
+        log.error("update_document_admin_fields infrastructure failure")
+        return {"ok": False, "changed": False, "updated_fields": (), "code": "", "error": "Infrastructure failure"}
 
 
 # ─────────────────────────────────────────────────────────────

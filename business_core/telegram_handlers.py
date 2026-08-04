@@ -4156,20 +4156,33 @@ def _document_creation_message(result: dict, *, document_name: str = "", file_na
 
 
 def _document_admin_message(result: dict, document_id: str) -> str:
-    """Render any business_builder.update_document_admin_fields() result."""
-    code = result.get("code", "")
+    """
+    Render any business_builder.update_document_admin_fields() result.
 
-    if code == "DOCUMENT_ADMIN_FIELDS_UPDATED":
+    Phase 17E-2A5-H1: hardened — type-checks before any `.get()`,
+    requires `ok is True` (strict identity) for success/unchanged UX
+    in addition to the matching code, and never renders
+    result['error'], a raw result, or an unmapped code. Every known
+    rejection code maps to a fixed, application-controlled Russian
+    message — no manager-supplied text is ever interpolated.
+    """
+    if not isinstance(result, dict):
+        return "❌ Не удалось обновить Document."
+
+    code = result.get("code", "")
+    ok = result.get("ok") is True
+
+    if ok and code == "DOCUMENT_ADMIN_FIELDS_UPDATED":
         return f"✅ Document {document_id} обновлён."
 
-    if code == "DOCUMENT_ADMIN_FIELDS_UNCHANGED":
+    if ok and code == "DOCUMENT_ADMIN_FIELDS_UNCHANGED":
         return f"ℹ️ Document {document_id} — изменений нет (значения совпадают)."
 
     if code == "DOCUMENT_NOT_FOUND":
         return f"❌ Document {document_id} не найден."
 
     if code == "DOCUMENT_IMMUTABLE_FIELD_CONFLICT":
-        return f"❌ Указанные поля являются неизменяемой идентичностью Document: {result.get('error') or ''}"
+        return "❌ Указанные поля являются неизменяемой идентичностью Document."
 
     if code == "DOCUMENT_VERSION_FIELD_IMMUTABLE":
         return "❌ Version неизменяем после создания."
@@ -4181,10 +4194,10 @@ def _document_admin_message(result: dict, document_id: str) -> str:
         return "❌ Изменение связей (Client/Object/Roadmap/Stage/Template ID) через /updatedoc не поддерживается."
 
     if code == "INVALID_DOCUMENT_ADMIN_FIELD":
-        return f"❌ Недопустимое поле для /updatedoc: {result.get('error') or ''}"
+        return "❌ Недопустимое поле для /updatedoc."
 
-    log.warning(f"_document_admin_message: unmapped code={code!r} document_id={document_id}")
-    return f"❌ Ошибка ({code or 'unknown'}): {result.get('error') or 'см. логи'}"
+    log.warning("_document_admin_message unmapped safe fallback")
+    return "❌ Не удалось обновить Document."
 
 
 def _document_transition_message(result: dict, document_id: str) -> str:

@@ -3228,5 +3228,103 @@ class TestUpdateOfferNotesEndToEndExceptionSecrecy(unittest.TestCase):
         self.assertEqual(text, "❌ Не удалось обновить Notes для Commercial Offer.")
 
 
+# ═════════════════════════════════════════════════════════════
+# Phase 17E-2A5-H1: legacy /updatedoc real-chain regression proof.
+# Like the legacy /updateoffer proof above, /updatedoc has no
+# transport preflight or authorization gate — this proves the
+# manager-hardening + wrapper-correction + mapper-correction chain
+# alone (not any enforcement layer) prevents raw exception text /
+# manager error text / secret markers from reaching Telegram when a
+# Sheets write raises during the legacy command's Notes-mode, and
+# that it never produces a false success/no-op message either.
+# ═════════════════════════════════════════════════════════════
+
+_H1_DOCUMENT_ROW = {
+    "Document ID": "DREG-001", "Document Family ID": "DFAM-001", "Version": "1",
+    "Business ID": "BIZ-001", "Client ID": "PRS-001", "Object ID": "OBJ-001", "Roadmap ID": "", "Stage ID": "",
+    "Document Template ID": "", "Document Name": "old-name", "Status": "uploaded",
+    "Drive File ID": "FILE1", "Drive File URL": "https://drive.google.com/file/d/FILE1/view",
+    "File Name": "passport.pdf", "Mime Type": "application/pdf",
+    "Uploaded At": "", "Uploaded By": "",
+    "Reviewed At": "", "Reviewed By": "", "Rejection Reason": "",
+    "Notes": "old", "Created At": "", "Updated At": "",
+    "Archived At": "", "Archived By": "", "Archive Reason": "", "Previous Status": "",
+}
+
+
+class TestLegacyUpdateDocNotesModeEndToEndExceptionSecrecy(unittest.TestCase):
+    def test_notes_write_exception_through_real_chain_no_secrets_in_reply(self):
+        update = _make_update()
+        row = dict(_H1_DOCUMENT_ROW)
+        sheet = MagicMock()
+        cell = MagicMock()
+        cell.row = 2
+        sheet.find.return_value = cell
+        headers = list(row.keys())
+        sheet.row_values.side_effect = lambda r: headers if r == 1 else list(row.values())
+        sheet.update_cell.side_effect = _e2e_boom_with_secrets
+
+        with patch("business_core.sheets.find_row_by_id", return_value=(2, row)), \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
+             patch("business_core.sheets.get_business_sheet", return_value=sheet):
+            _run(th.updatedoc_cmd(update, _make_context(
+                ["document_id=DREG-001", f"notes={_E2E_SECRET_NOTES_MARKER}"]
+            )))
+
+        call = update.message.reply_text.call_args
+        text = call.args[0] if call.args else call.kwargs.get("text", "")
+        for marker in _E2E_ALL_SECRET_MARKERS:
+            self.assertNotIn(marker, text)
+        self.assertNotIn("Infrastructure failure", text)
+        self.assertNotIn("✅", text)
+        self.assertNotIn("изменений нет", text)
+        self.assertNotIn("ℹ️", text)
+        self.assertEqual(text, "❌ Не удалось обновить Document.")
+
+    def test_successful_notes_update_through_real_chain_unaffected(self):
+        update = _make_update()
+        row = dict(_H1_DOCUMENT_ROW)
+        row["Notes"] = "old"
+        sheet = MagicMock()
+        cell = MagicMock()
+        cell.row = 2
+        sheet.find.return_value = cell
+        headers = list(row.keys())
+        sheet.row_values.side_effect = lambda r: headers if r == 1 else list(row.values())
+
+        with patch("business_core.sheets.find_row_by_id", return_value=(2, row)), \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
+             patch("business_core.sheets.get_business_sheet", return_value=sheet):
+            _run(th.updatedoc_cmd(update, _make_context(
+                ["document_id=DREG-001", "notes=new"]
+            )))
+
+        call = update.message.reply_text.call_args
+        text = call.args[0] if call.args else call.kwargs.get("text", "")
+        self.assertEqual(text, "✅ Document DREG-001 обновлён.")
+
+    def test_unchanged_notes_update_through_real_chain_unaffected(self):
+        update = _make_update()
+        row = dict(_H1_DOCUMENT_ROW)
+        row["Notes"] = "same"
+        sheet = MagicMock()
+        cell = MagicMock()
+        cell.row = 2
+        sheet.find.return_value = cell
+        headers = list(row.keys())
+        sheet.row_values.side_effect = lambda r: headers if r == 1 else list(row.values())
+
+        with patch("business_core.sheets.find_row_by_id", return_value=(2, row)), \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
+             patch("business_core.sheets.get_business_sheet", return_value=sheet):
+            _run(th.updatedoc_cmd(update, _make_context(
+                ["document_id=DREG-001", "notes=same"]
+            )))
+
+        call = update.message.reply_text.call_args
+        text = call.args[0] if call.args else call.kwargs.get("text", "")
+        self.assertEqual(text, "ℹ️ Document DREG-001 — изменений нет (значения совпадают).")
+
+
 if __name__ == "__main__":
     unittest.main()

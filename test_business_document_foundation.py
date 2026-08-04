@@ -306,6 +306,115 @@ class TestUpdateDocumentAdminFieldsOrchestration(unittest.TestCase):
         self.assertEqual(result["business_id"], "BIZ-001")
 
 
+class TestUpdateDocumentAdminFieldsWrapperMalformedResultHardening(unittest.TestCase):
+    """Phase 17E-2A5-H1: truth-table proof that the wrapper never
+    raises on a malformed document_manager result, never synthesizes
+    a new success code, and preserves the manager's own deterministic
+    codes exactly."""
+
+    _DOC = {"document_id": "DREG-001", "business_id": "BIZ-001"}
+
+    def _call(self, low_level_return):
+        with patch("business_core.document_manager.find_document_by_id", return_value=self._DOC), \
+             patch("business_core.document_manager.update_document_admin_fields", return_value=low_level_return):
+            return bb.update_document_admin_fields("DREG-001", {"Document Name": "New"})
+
+    def test_1_valid_success_dict(self):
+        result = self._call({"ok": True, "changed": True, "code": "DOCUMENT_ADMIN_FIELDS_UPDATED", "error": None})
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["changed"])
+        self.assertEqual(result["code"], "DOCUMENT_ADMIN_FIELDS_UPDATED")
+
+    def test_2_valid_unchanged_dict(self):
+        result = self._call({"ok": True, "changed": False, "code": "DOCUMENT_ADMIN_FIELDS_UNCHANGED", "error": None})
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["changed"])
+        self.assertEqual(result["code"], "DOCUMENT_ADMIN_FIELDS_UNCHANGED")
+
+    def test_3_exception_dict_ok_false_blank_code(self):
+        result = self._call({"ok": False, "changed": False, "updated_fields": (), "code": "", "error": "Infrastructure failure"})
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["changed"])
+        self.assertEqual(result["code"], "")
+
+    def test_4_document_not_found_code(self):
+        result = self._call({"ok": False, "changed": False, "code": "DOCUMENT_NOT_FOUND", "error": "x"})
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "DOCUMENT_NOT_FOUND")
+
+    def test_5_immutable_failure_code(self):
+        result = self._call({"ok": False, "changed": False, "code": "DOCUMENT_IMMUTABLE_FIELD_CONFLICT", "error": "x"})
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "DOCUMENT_IMMUTABLE_FIELD_CONFLICT")
+
+    def test_6_known_validation_failure_code(self):
+        result = self._call({"ok": False, "changed": False, "code": "INVALID_DOCUMENT_ADMIN_FIELD", "error": "x"})
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "INVALID_DOCUMENT_ADMIN_FIELD")
+
+    def test_7_dict_missing_ok(self):
+        result = self._call({"changed": True, "code": "DOCUMENT_ADMIN_FIELDS_UPDATED"})
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "DOCUMENT_ADMIN_FIELDS_UPDATED")
+
+    def test_8_empty_dict(self):
+        result = self._call({})
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["changed"])
+        self.assertEqual(result["code"], "")
+
+    def test_9_non_dict_none(self):
+        result = self._call(None)
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["changed"])
+        self.assertEqual(result["code"], "")
+
+    def test_10_non_dict_string(self):
+        result = self._call("not a dict")
+        self.assertFalse(result["ok"])
+
+    def test_10_non_dict_list(self):
+        result = self._call(["ok", True])
+        self.assertFalse(result["ok"])
+
+    def test_10_non_dict_integer(self):
+        result = self._call(42)
+        self.assertFalse(result["ok"])
+
+    def test_11_truthy_non_boolean_ok(self):
+        result = self._call({"ok": "true", "changed": True, "code": "DOCUMENT_ADMIN_FIELDS_UPDATED", "error": None})
+        self.assertIs(result["ok"], False)
+
+    def test_12_truthy_non_boolean_changed(self):
+        result = self._call({"ok": True, "changed": 1, "code": "DOCUMENT_ADMIN_FIELDS_UPDATED", "error": None})
+        self.assertIs(result["changed"], False)
+
+    def test_malformed_output_never_raises(self):
+        for bad in (None, "x", [], 0, {}, {"ok": object()}):
+            try:
+                self._call(bad)
+            except Exception as exc:  # noqa: BLE001
+                self.fail(f"wrapper raised on malformed input {bad!r}: {exc!r}")
+
+    def test_no_code_synthesis_on_failure(self):
+        result = self._call({"ok": False, "changed": False, "code": "", "error": "Infrastructure failure"})
+        self.assertNotIn(result["code"], ("DOCUMENT_ADMIN_FIELDS_UPDATED", "DOCUMENT_ADMIN_FIELDS_UNCHANGED"))
+
+    def test_retry_safe_remains_true(self):
+        result = self._call({"ok": False, "changed": False, "code": "", "error": "Infrastructure failure"})
+        self.assertTrue(result["retry_safe"])
+
+    def test_output_keys_unchanged(self):
+        result = self._call({"ok": True, "changed": True, "code": "DOCUMENT_ADMIN_FIELDS_UPDATED", "error": None})
+        self.assertIn("ok", result)
+        self.assertIn("code", result)
+        self.assertIn("error", result)
+        self.assertIn("document_id", result)
+        self.assertIn("business_id", result)
+        self.assertIn("changed", result)
+        self.assertIn("retry_safe", result)
+
+
 class TestTransitionDocumentStatus(unittest.TestCase):
 
     def _doc(self, status):
