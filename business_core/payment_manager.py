@@ -702,15 +702,23 @@ def find_payment_transaction_by_id(transaction_id: str) -> Optional[dict]:
     return {f: v.get(f, "") for f in _TRANSACTION_FIELDS}
 
 
-def _list_transactions_raw() -> list[dict]:
+def _load_transactions_raw_strict() -> list[dict]:
+    """
+    Canonical Transaction Registry read (Phase 17E-2A6-H0).
+
+    Raises on infrastructure failure — never converts a failed read
+    into an empty list. Returns [] only when the read itself
+    succeeded and there are genuinely zero data rows. This is the
+    sole implementation of the header-resolution/row-conversion
+    logic; both _list_transactions_raw (legacy, swallowing) and
+    list_payment_transactions_strict (fail-closed, for financial
+    mutation callers only) delegate here so the two public shapes
+    can never drift apart.
+    """
     from business_core.sheets import get_business_sheet, get_header_index_map
 
-    try:
-        sheet = get_business_sheet("payment_transactions")
-        all_values = sheet.get_all_values()
-    except Exception as exc:
-        log.warning(f"_list_transactions_raw() error: {exc}")
-        return []
+    sheet = get_business_sheet("payment_transactions")
+    all_values = sheet.get_all_values()
     if len(all_values) < 2:
         return []
 
@@ -727,14 +735,49 @@ def _list_transactions_raw() -> list[dict]:
     ]
 
 
-def list_payment_transactions(payment_obligation_id: str = "", status: str = "") -> list[dict]:
-    """Read-only, simple filter. No business policy hidden here."""
-    rows = _list_transactions_raw()
+def _list_transactions_raw() -> list[dict]:
+    try:
+        return _load_transactions_raw_strict()
+    except Exception:
+        log.warning("_list_transactions_raw infrastructure failure")
+        return []
+
+
+def _filter_transactions(rows: list[dict], payment_obligation_id: str = "", status: str = "") -> list[dict]:
+    """Shared filter semantics for both the legacy and strict list
+    functions — never touches I/O, so it cannot itself raise on
+    infrastructure failure."""
     if payment_obligation_id:
         rows = [r for r in rows if r["Payment Obligation ID"] == payment_obligation_id]
     if status:
         rows = [r for r in rows if r["Status"] == status]
     return rows
+
+
+def list_payment_transactions(payment_obligation_id: str = "", status: str = "") -> list[dict]:
+    """Read-only, simple filter. No business policy hidden here.
+    Unchanged public contract: returns [] on infrastructure failure,
+    for read/report/idempotency callers."""
+    rows = _list_transactions_raw()
+    return _filter_transactions(rows, payment_obligation_id, status)
+
+
+def list_payment_transactions_strict(payment_obligation_id: str = "", status: str = "") -> list[dict]:
+    """
+    Phase 17E-2A6-H0: fail-closed variant of list_payment_transactions
+    — for financial-mutation callers only (confirm_payment_transaction's
+    overpayment precheck, _synchronize_payment_obligation_after_
+    transaction_change). Raises on infrastructure failure instead of
+    silently returning []; a caller MUST NOT treat an exception from
+    this function as "no transactions" — a read failure and a
+    genuinely empty ledger are structurally distinguishable states.
+    Uses the exact same header resolution, row conversion, and filter
+    semantics as list_payment_transactions (shared via
+    _load_transactions_raw_strict/_filter_transactions), so successful
+    output is always identical between the two.
+    """
+    rows = _load_transactions_raw_strict()
+    return _filter_transactions(rows, payment_obligation_id, status)
 
 
 def find_transactions_by_external_id(business_id: str, external_transaction_id: str) -> list[dict]:

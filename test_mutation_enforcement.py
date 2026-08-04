@@ -4157,5 +4157,140 @@ class TestUpdateDocumentNotesEndToEndExceptionSecrecy(unittest.TestCase):
         self.assertEqual(text, "❌ Не удалось обновить Notes для Document.")
 
 
+# ═════════════════════════════════════════════════════════════
+# Phase 17E-2A6-H0: /confirmpayment real-chain regression proof.
+# Legacy /confirmpayment has no transport preflight or authorization
+# (unchanged, out of scope) — this proves the strict ledger-read
+# contract alone prevents the confirmed silent-financial-corruption
+# defect: a Sheets read failure during the overpayment precheck must
+# fail closed before any Transaction or Obligation write, with zero
+# secret-marker leakage.
+# ═════════════════════════════════════════════════════════════
+
+_LEDGER_SECRET_MARKER = "LEDGER-SECRET"
+_TRANSACTION_SECRET_MARKER = "TRANSACTION-SECRET"
+_OBLIGATION_SECRET_MARKER = "OBLIGATION-SECRET"
+_BALANCE_SECRET_MARKER = "BALANCE-SECRET"
+_H0_API_PAYLOAD_MARKER = "API-PAYLOAD-SECRET"
+_ALL_H0_SECRET_MARKERS = (
+    _LEDGER_SECRET_MARKER, _TRANSACTION_SECRET_MARKER, _OBLIGATION_SECRET_MARKER,
+    _BALANCE_SECRET_MARKER, _H0_API_PAYLOAD_MARKER,
+)
+
+
+def _h0_boom_with_secrets(*_a, **_k):
+    raise RuntimeError(
+        f"synthetic Sheets outage containing {_LEDGER_SECRET_MARKER} and {_TRANSACTION_SECRET_MARKER} "
+        f"and {_OBLIGATION_SECRET_MARKER} and {_BALANCE_SECRET_MARKER} and {_H0_API_PAYLOAD_MARKER}"
+    )
+
+
+class TestConfirmPaymentLedgerReadFailureRealChain(unittest.TestCase):
+    def test_ledger_read_exception_through_real_chain_fails_closed(self):
+        update = _make_update()
+        txn_row = {
+            "Payment Transaction ID": "PTXN-001", "Business ID": "BIZ-001", "Payment Obligation ID": "POB-001",
+            "Client ID": "PRS-001", "Amount": "700.00", "Currency": "KZT", "Payment Date": "2026-01-01",
+            "Payment Method": "", "External Transaction ID": "", "Caller Idempotency Key": "",
+            "Evidence Document ID": "", "Status": "pending", "Reversal Reason": "",
+            "Confirmed At": "", "Confirmed By": "", "Reversed At": "", "Reversed By": "",
+            "Created At": "", "Created By": "", "Updated At": "", "Notes": "",
+        }
+        obligation_row = {
+            "Payment Obligation ID": "POB-001", "Business ID": "BIZ-001", "Client ID": "PRS-001",
+            "Object ID": "", "Service ID": "", "Roadmap ID": "", "Stage ID": "",
+            "Commercial Milestone Template ID": "", "Caller Idempotency Key": "",
+            "Title Snapshot": "T", "Description Snapshot": "", "Obligation Amount": "1000.00", "Currency": "KZT",
+            "Due Date": "", "Status": "partially_paid", "Paid Amount": f"400.00 {_OBLIGATION_SECRET_MARKER}",
+            "Remaining Amount": "600.00",
+            "Created At": "", "Created By": "", "Issued At": "", "Paid At": "", "Cancelled At": "",
+            "Updated At": "", "Notes": "",
+        }
+
+        def find_row_side_effect(registry, record_id):
+            if registry == "payment_transactions":
+                return (2, dict(txn_row))
+            if registry == "payment_obligations":
+                return (3, dict(obligation_row))
+            return None
+
+        with patch("business_core.sheets.find_row_by_id", side_effect=find_row_side_effect), \
+             patch("business_core.sheets.get_business_sheet", side_effect=_h0_boom_with_secrets), \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
+             patch("business_core.payment_manager.update_payment_transaction_status") as mock_txn_write, \
+             patch("business_core.payment_manager.update_payment_obligation_balance") as mock_obligation_write, \
+             patch("business_core.telegram_handlers.log.error") as mock_log_error:
+            _run(th.confirmpayment_cmd(update, _make_context(
+                ["payment_transaction_id=PTXN-001", "confirmed_by=owner"]
+            )))
+
+        call = update.message.reply_text.call_args
+        text = call.args[0] if call.args else call.kwargs.get("text", "")
+        self.assertEqual(text, "❌ Не удалось проверить историю платежей.")
+        for marker in _ALL_H0_SECRET_MARKERS:
+            self.assertNotIn(marker, text)
+        self.assertNotIn("Infrastructure failure", text)
+        self.assertNotIn("✅", text)
+        mock_txn_write.assert_not_called()
+        mock_obligation_write.assert_not_called()
+        mock_log_error.assert_not_called()
+
+    def test_successful_confirmation_through_real_chain_unaffected(self):
+        update = _make_update()
+        txn_row = {
+            "Payment Transaction ID": "PTXN-001", "Business ID": "BIZ-001", "Payment Obligation ID": "POB-001",
+            "Client ID": "PRS-001", "Amount": "100.00", "Currency": "KZT", "Payment Date": "2026-01-01",
+            "Payment Method": "", "External Transaction ID": "", "Caller Idempotency Key": "",
+            "Evidence Document ID": "", "Status": "pending", "Reversal Reason": "",
+            "Confirmed At": "", "Confirmed By": "", "Reversed At": "", "Reversed By": "",
+            "Created At": "", "Created By": "", "Updated At": "", "Notes": "",
+        }
+        obligation_row = {
+            "Payment Obligation ID": "POB-001", "Business ID": "BIZ-001", "Client ID": "PRS-001",
+            "Object ID": "", "Service ID": "", "Roadmap ID": "", "Stage ID": "",
+            "Commercial Milestone Template ID": "", "Caller Idempotency Key": "",
+            "Title Snapshot": "T", "Description Snapshot": "", "Obligation Amount": "1000.00", "Currency": "KZT",
+            "Due Date": "", "Status": "issued", "Paid Amount": "0.00", "Remaining Amount": "1000.00",
+            "Created At": "", "Created By": "", "Issued At": "", "Paid At": "", "Cancelled At": "",
+            "Updated At": "", "Notes": "",
+        }
+
+        empty_txn_sheet = MagicMock()
+        empty_txn_sheet.get_all_values.return_value = [list(txn_row.keys())]
+
+        def get_business_sheet_side_effect(registry):
+            if registry == "payment_transactions":
+                return empty_txn_sheet
+            raise AssertionError(f"unexpected sheet read for {registry}")
+
+        find_calls = {"n": 0}
+
+        def find_row_side_effect(registry, record_id):
+            if registry == "payment_transactions":
+                find_calls["n"] += 1
+                row = dict(txn_row)
+                if find_calls["n"] > 1:
+                    row["Status"] = "confirmed"
+                return (2, row)
+            if registry == "payment_obligations":
+                return (3, dict(obligation_row))
+            return None
+
+        with patch("business_core.sheets.find_row_by_id", side_effect=find_row_side_effect), \
+             patch("business_core.sheets.get_business_sheet", side_effect=get_business_sheet_side_effect), \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
+             patch("business_core.payment_manager.update_payment_transaction_status",
+                   return_value={"ok": True, "changed": True, "code": "", "error": None}), \
+             patch("business_core.business_builder._synchronize_payment_obligation_after_transaction_change",
+                   return_value={"ok": True, "paid_amount": "100.00", "remaining_amount": "900.00", "status": "partially_paid"}):
+            _run(th.confirmpayment_cmd(update, _make_context(
+                ["payment_transaction_id=PTXN-001", "confirmed_by=owner"]
+            )))
+
+        call = update.message.reply_text.call_args
+        text = call.args[0] if call.args else call.kwargs.get("text", "")
+        self.assertIn("✅", text)
+
+
 if __name__ == "__main__":
     unittest.main()

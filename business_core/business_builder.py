@@ -7070,14 +7070,23 @@ def _synchronize_payment_obligation_after_transaction_change(payment_obligation_
     reversal).
     """
     from business_core.payment_manager import (
-        find_payment_obligation_by_id, list_payment_transactions, update_payment_obligation_balance,
+        find_payment_obligation_by_id, list_payment_transactions_strict, update_payment_obligation_balance,
     )
 
     obligation = find_payment_obligation_by_id(payment_obligation_id)
     if obligation is None:
         return {"ok": False, "code": "PAYMENT_OBLIGATION_NOT_FOUND", "error": f"Payment Obligation {payment_obligation_id} не найден"}
 
-    transactions = list_payment_transactions(payment_obligation_id=payment_obligation_id)
+    try:
+        transactions = list_payment_transactions_strict(payment_obligation_id=payment_obligation_id)
+    except Exception:
+        # Phase 17E-2A6-H0: a failed ledger read must never be
+        # converted to a computed balance from [] — that would
+        # silently overwrite a correct Paid Amount/Status with zeroed
+        # values that then pass post-write verification. Return
+        # before any balance computation or Obligation write.
+        return {"ok": False, "code": "PAYMENT_LEDGER_READ_FAILED", "error": "Infrastructure failure"}
+
     balance = _compute_payment_balance(obligation.get("Obligation Amount", "0"), transactions)
     if not balance["ok"]:
         return balance
@@ -7842,7 +7851,7 @@ def confirm_payment_transaction(payment_transaction_id: str, confirmed_by: str) 
     status from the full Transaction ledger.
     """
     from business_core.payment_manager import (
-        find_payment_transaction_by_id, find_payment_obligation_by_id, list_payment_transactions,
+        find_payment_transaction_by_id, find_payment_obligation_by_id,
         update_payment_transaction_status,
     )
 
@@ -7885,8 +7894,24 @@ def confirm_payment_transaction(payment_transaction_id: str, confirmed_by: str) 
             payment_transaction_id=payment_transaction_id, business_id=business_id, payment_obligation_id=obligation_id,
         )
 
+    from business_core.payment_manager import list_payment_transactions_strict
+
+    try:
+        ledger = list_payment_transactions_strict(payment_obligation_id=obligation_id)
+    except Exception:
+        # Phase 17E-2A6-H0: a failed ledger read must never be
+        # silently treated as "no other transactions" — that would
+        # artificially inflate the remaining balance and could let a
+        # real overpayment through. Fail closed before any write.
+        return _payment_result(
+            ok=False, code="PAYMENT_LEDGER_READ_FAILED", error="Infrastructure failure",
+            payment_transaction_id=payment_transaction_id, business_id=business_id, payment_obligation_id=obligation_id,
+            previous_status=previous_status, requested_status="confirmed", final_status=previous_status,
+            changed=False, retry_safe=True,
+        )
+
     other_transactions = [
-        t for t in list_payment_transactions(payment_obligation_id=obligation_id)
+        t for t in ledger
         if t.get("Payment Transaction ID", "") != payment_transaction_id
     ]
     balance_before = _compute_payment_balance(obligation.get("Obligation Amount", "0"), other_transactions)

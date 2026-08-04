@@ -11570,6 +11570,9 @@ def _payment_transaction_confirmation_message(result: dict, transaction_id: str)
             "Требуется ручная проверка.",
         ])
 
+    if code == "PAYMENT_LEDGER_READ_FAILED":
+        return "❌ Не удалось проверить историю платежей."
+
     log.warning(f"_payment_transaction_confirmation_message: unmapped code={code!r} transaction_id={transaction_id}")
     return f"❌ Ошибка ({code or 'unknown'}): {result.get('error') or 'см. логи'}"
 

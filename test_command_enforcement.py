@@ -367,9 +367,16 @@ class TestPhase17E2A4H1OfferHardeningScope(unittest.TestCase):
     def test_business_builder_change_confined_to_offer_wrapper(self):
         # Phase 17E-2A5-H1 additionally approves update_document_admin_fields
         # (malformed-manager-result hardening) in this same file.
+        # Phase 17E-2A6-H0 additionally approves confirm_payment_transaction
+        # and _synchronize_payment_obligation_after_transaction_change
+        # (strict ledger-read fail-closed contract). reverse_payment_transaction
+        # is NOT in this set — it required no change.
         _assert_only_functions_changed(
             self, "business_core/business_builder.py",
-            {"update_commercial_offer_admin_fields", "update_document_admin_fields"},
+            {
+                "update_commercial_offer_admin_fields", "update_document_admin_fields",
+                "confirm_payment_transaction", "_synchronize_payment_obligation_after_transaction_change",
+            },
         )
 
     def test_offer_manager_change_confined_to_two_exception_sites(self):
@@ -383,21 +390,75 @@ class TestPhase17E2A4H1OfferHardeningScope(unittest.TestCase):
         # (legacy mapper safety correction) in this same file.
         # Phase 17E-2A5 additionally approves adding
         # _document_notes_message and updatedocnotes_cmd.
+        # Phase 17E-2A6-H0 additionally approves
+        # _payment_transaction_confirmation_message (new
+        # PAYMENT_LEDGER_READ_FAILED branch only).
         _assert_only_functions_changed_or_added(
             self, "business_core/telegram_handlers.py",
-            allowed_changed_function_names={"register_business_handlers", "_document_admin_message"},
+            allowed_changed_function_names={
+                "register_business_handlers", "_document_admin_message",
+                "_payment_transaction_confirmation_message",
+            },
             allowed_added_function_names={
                 "_offer_notes_message", "updateoffernotes_cmd",
                 "_document_notes_message", "updatedocnotes_cmd",
             },
         )
 
-    def test_payment_manager_unchanged(self):
-        result = subprocess.run(
-            ["git", "diff", "--name-only", "HEAD", "--", "business_core/payment_manager.py"],
-            capture_output=True, text=True, cwd=".",
+    def test_payment_manager_change_confined_to_strict_ledger_read_contract(self):
+        # Phase 17E-2A6-H0: _list_transactions_raw hardened (fixed
+        # literal log); new _load_transactions_raw_strict,
+        # list_payment_transactions_strict, _filter_transactions
+        # added. No other payment_manager.py function may change.
+        _assert_only_functions_changed_or_added(
+            self, "business_core/payment_manager.py",
+            allowed_changed_function_names={"_list_transactions_raw", "list_payment_transactions"},
+            allowed_added_function_names={
+                "_load_transactions_raw_strict", "list_payment_transactions_strict", "_filter_transactions",
+            },
         )
-        self.assertEqual(result.stdout.strip(), "")
+
+    def test_payment_lifecycle_functions_unchanged(self):
+        # Explicit byte-identity confirmation for every Payment
+        # function this phase must NOT touch.
+        head_src = _git_show_head("business_core/payment_manager.py")
+        head_functions = _top_level_function_sources(head_src)
+        with open("business_core/payment_manager.py", encoding="utf-8") as f:
+            current_functions = _top_level_function_sources(f.read())
+        for name in (
+            "update_payment_transaction_status", "_find_transaction_row",
+            "update_payment_obligation_balance", "_find_obligation_row",
+            "update_payment_transaction_admin_fields", "update_payment_obligation_admin_fields",
+            "update_payment_obligation_status", "create_payment_transaction", "create_payment_obligation",
+            "create_commercial_milestone_template",
+        ):
+            self.assertEqual(head_functions[name], current_functions[name], f"{name} must be unchanged in Phase 17E-2A6-H0")
+
+    def test_payment_business_builder_lifecycle_functions_unchanged(self):
+        head_src = _git_show_head("business_core/business_builder.py")
+        head_functions = _top_level_function_sources(head_src)
+        with open("business_core/business_builder.py", encoding="utf-8") as f:
+            current_functions = _top_level_function_sources(f.read())
+        for name in ("reverse_payment_transaction", "fail_payment_transaction", "_payment_result", "_compute_payment_balance"):
+            self.assertEqual(head_functions[name], current_functions[name], f"{name} must be unchanged in Phase 17E-2A6-H0")
+
+    def test_payment_mappers_and_handlers_unchanged(self):
+        head_src = _git_show_head("business_core/telegram_handlers.py")
+        head_functions = _top_level_function_sources(head_src)
+        with open("business_core/telegram_handlers.py", encoding="utf-8") as f:
+            current_functions = _top_level_function_sources(f.read())
+        for name in (
+            "_payment_transaction_reversal_message", "_payment_transaction_failure_message",
+            "confirmpayment_cmd", "reversepayment_cmd", "failpayment_cmd",
+            "payments_cmd", "obligation_cmd",
+        ):
+            self.assertEqual(head_functions[name], current_functions[name], f"{name} must be unchanged in Phase 17E-2A6-H0")
+
+    def test_payment_ledger_read_failed_code_added_no_twelfth_map_entry(self):
+        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 11)
+        self.assertNotIn("confirmpayment", th.COMMAND_ENFORCEMENT_MAP)
+        self.assertNotIn("reversepayment", th.COMMAND_ENFORCEMENT_MAP)
+        self.assertNotIn("failpayment", th.COMMAND_ENFORCEMENT_MAP)
 
     def test_interaction_manager_unchanged(self):
         result = subprocess.run(
@@ -430,9 +491,15 @@ class TestPhase17E2A4H1OfferHardeningScope(unittest.TestCase):
         # (legacy mapper safety correction) in this same file.
         # Phase 17E-2A5 additionally approves adding
         # _document_notes_message and updatedocnotes_cmd.
+        # Phase 17E-2A6-H0 additionally approves
+        # _payment_transaction_confirmation_message (new
+        # PAYMENT_LEDGER_READ_FAILED branch only).
         _assert_only_functions_changed_or_added(
             self, "business_core/telegram_handlers.py",
-            allowed_changed_function_names={"register_business_handlers", "_document_admin_message"},
+            allowed_changed_function_names={
+                "register_business_handlers", "_document_admin_message",
+                "_payment_transaction_confirmation_message",
+            },
             allowed_added_function_names={
                 "_offer_notes_message", "updateoffernotes_cmd",
                 "_document_notes_message", "updatedocnotes_cmd",

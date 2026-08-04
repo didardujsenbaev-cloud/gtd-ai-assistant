@@ -454,5 +454,143 @@ class TestUpdatePaymentObligationAdminFieldsExceptionSecrecy(unittest.TestCase):
         self.assertEqual(result["code"], "INVALID_PAYMENT_OBLIGATION_STATUS")
 
 
+_SECRET_LEDGER_MARKER = "LEDGER-SECRET"
+_SECRET_TRANSACTION_MARKER = "TRANSACTION-SECRET"
+_SECRET_OBLIGATION_MARKER = "OBLIGATION-SECRET"
+_SECRET_BALANCE_MARKER = "BALANCE-SECRET"
+_ALL_LEDGER_SECRET_MARKERS = (
+    _SECRET_LEDGER_MARKER, _SECRET_TRANSACTION_MARKER, _SECRET_OBLIGATION_MARKER,
+    _SECRET_BALANCE_MARKER, _SECRET_API_MARKER,
+)
+
+
+def _boom_with_ledger_secrets(*_a, **_k):
+    raise RuntimeError(
+        f"synthetic failure containing {_SECRET_LEDGER_MARKER} and {_SECRET_TRANSACTION_MARKER} "
+        f"and {_SECRET_OBLIGATION_MARKER} and {_SECRET_BALANCE_MARKER} and {_SECRET_API_MARKER}"
+    )
+
+
+class TestStrictTransactionLedgerRead(unittest.TestCase):
+    """Phase 17E-2A6-H0: proves the strict/legacy split — a successful
+    empty ledger and an infrastructure failure are structurally
+    distinguishable, and both public functions share exactly one
+    parsing implementation (_load_transactions_raw_strict)."""
+
+    def test_successful_empty_ledger_returns_empty_list(self):
+        pm = _fresh_pm()
+        sheet = MagicMock()
+        sheet.get_all_values.return_value = [TRANSACTION_HEADERS]
+        with patch("business_core.sheets.get_business_sheet", return_value=sheet):
+            self.assertEqual(pm._load_transactions_raw_strict(), [])
+            self.assertEqual(pm.list_payment_transactions_strict(), [])
+
+    def test_successful_non_empty_ledger_matches_legacy_output(self):
+        pm = _fresh_pm()
+        sheet = _make_sheet(TRANSACTION_HEADERS, [TRANSACTION_ROW])
+        with patch("business_core.sheets.get_business_sheet", return_value=sheet):
+            strict_rows = pm.list_payment_transactions_strict()
+        sheet2 = _make_sheet(TRANSACTION_HEADERS, [TRANSACTION_ROW])
+        with patch("business_core.sheets.get_business_sheet", return_value=sheet2):
+            legacy_rows = pm.list_payment_transactions()
+        self.assertEqual(strict_rows, legacy_rows)
+        self.assertEqual(len(strict_rows), 1)
+
+    def test_obligation_filter_matches_legacy_semantics(self):
+        pm = _fresh_pm()
+        other_row = list(TRANSACTION_ROW)
+        other_row[TRANSACTION_HEADERS.index("Payment Obligation ID")] = "POB-999"
+        sheet = _make_sheet(TRANSACTION_HEADERS, [TRANSACTION_ROW, other_row])
+        with patch("business_core.sheets.get_business_sheet", return_value=sheet):
+            strict = pm.list_payment_transactions_strict(payment_obligation_id="POB-001")
+        sheet2 = _make_sheet(TRANSACTION_HEADERS, [TRANSACTION_ROW, other_row])
+        with patch("business_core.sheets.get_business_sheet", return_value=sheet2):
+            legacy = pm.list_payment_transactions(payment_obligation_id="POB-001")
+        self.assertEqual(strict, legacy)
+        self.assertEqual(len(strict), 1)
+
+    def test_status_filter_matches_legacy_semantics(self):
+        pm = _fresh_pm()
+        other_row = list(TRANSACTION_ROW)
+        other_row[TRANSACTION_HEADERS.index("Status")] = "confirmed"
+        sheet = _make_sheet(TRANSACTION_HEADERS, [TRANSACTION_ROW, other_row])
+        with patch("business_core.sheets.get_business_sheet", return_value=sheet):
+            strict = pm.list_payment_transactions_strict(status="pending")
+        sheet2 = _make_sheet(TRANSACTION_HEADERS, [TRANSACTION_ROW, other_row])
+        with patch("business_core.sheets.get_business_sheet", return_value=sheet2):
+            legacy = pm.list_payment_transactions(status="pending")
+        self.assertEqual(strict, legacy)
+        self.assertEqual(len(strict), 1)
+
+    def test_combined_filters_match_legacy_semantics(self):
+        pm = _fresh_pm()
+        other_row = list(TRANSACTION_ROW)
+        other_row[TRANSACTION_HEADERS.index("Status")] = "confirmed"
+        sheet = _make_sheet(TRANSACTION_HEADERS, [TRANSACTION_ROW, other_row])
+        with patch("business_core.sheets.get_business_sheet", return_value=sheet):
+            strict = pm.list_payment_transactions_strict(payment_obligation_id="POB-001", status="pending")
+        sheet2 = _make_sheet(TRANSACTION_HEADERS, [TRANSACTION_ROW, other_row])
+        with patch("business_core.sheets.get_business_sheet", return_value=sheet2):
+            legacy = pm.list_payment_transactions(payment_obligation_id="POB-001", status="pending")
+        self.assertEqual(strict, legacy)
+        self.assertEqual(len(strict), 1)
+
+    def test_strict_helper_propagates_infrastructure_exception(self):
+        pm = _fresh_pm()
+        with patch("business_core.sheets.get_business_sheet", side_effect=_boom_with_ledger_secrets):
+            with self.assertRaises(RuntimeError):
+                pm._load_transactions_raw_strict()
+            with self.assertRaises(RuntimeError):
+                pm.list_payment_transactions_strict()
+
+    def test_exception_becomes_empty_list_only_through_legacy_function(self):
+        pm = _fresh_pm()
+        with patch("business_core.sheets.get_business_sheet", side_effect=_boom_with_ledger_secrets):
+            self.assertEqual(pm.list_payment_transactions(), [])
+            with self.assertRaises(RuntimeError):
+                pm.list_payment_transactions_strict()
+
+    def test_legacy_fallback_log_is_fixed_literal(self):
+        pm = _fresh_pm()
+        with patch("business_core.sheets.get_business_sheet", side_effect=_boom_with_ledger_secrets), \
+             patch("business_core.payment_manager.log.warning") as mock_warn:
+            result = pm._list_transactions_raw()
+        self.assertEqual(result, [])
+        mock_warn.assert_called_once_with("_list_transactions_raw infrastructure failure")
+
+    def test_no_secret_marker_in_logger_arguments(self):
+        pm = _fresh_pm()
+        with patch("business_core.sheets.get_business_sheet", side_effect=_boom_with_ledger_secrets), \
+             patch("business_core.payment_manager.log.warning") as mock_warn:
+            pm._list_transactions_raw()
+        for call in mock_warn.call_args_list:
+            for arg in list(call.args) + list(call.kwargs.values()):
+                text = str(arg)
+                for marker in _ALL_LEDGER_SECRET_MARKERS:
+                    self.assertNotIn(marker, text)
+
+    def test_strict_loader_does_not_log(self):
+        """The strict loader itself must not log-and-rethrow — only
+        the legacy swallow path logs, avoiding duplicate logging."""
+        pm = _fresh_pm()
+        with patch("business_core.sheets.get_business_sheet", side_effect=_boom_with_ledger_secrets), \
+             patch("business_core.payment_manager.log.warning") as mock_warn, \
+             patch("business_core.payment_manager.log.error") as mock_error:
+            with self.assertRaises(RuntimeError):
+                pm._load_transactions_raw_strict()
+        mock_warn.assert_not_called()
+        mock_error.assert_not_called()
+
+    def test_strict_and_legacy_successful_outputs_identical(self):
+        pm = _fresh_pm()
+        sheet_a = _make_sheet(TRANSACTION_HEADERS, [TRANSACTION_ROW])
+        with patch("business_core.sheets.get_business_sheet", return_value=sheet_a):
+            a = pm.list_payment_transactions_strict(payment_obligation_id="POB-001")
+        sheet_b = _make_sheet(TRANSACTION_HEADERS, [TRANSACTION_ROW])
+        with patch("business_core.sheets.get_business_sheet", return_value=sheet_b):
+            b = pm.list_payment_transactions(payment_obligation_id="POB-001")
+        self.assertEqual(a, b)
+
+
 if __name__ == "__main__":
     unittest.main()

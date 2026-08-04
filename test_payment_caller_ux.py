@@ -313,6 +313,27 @@ class TestPaymentTransactionConfirmationMessageMapping(unittest.TestCase):
         msg = th._payment_transaction_confirmation_message({"ok": False, "code": "PAYMENT_OBLIGATION_POST_WRITE_VERIFICATION_FAILED", "error": "x"}, "PTXN-001")
         self.assertNotIn("✅", msg)
 
+    def test_ledger_read_failed_fixed_message(self):
+        msg = th._payment_transaction_confirmation_message(
+            {"ok": False, "code": "PAYMENT_LEDGER_READ_FAILED", "error": "Infrastructure failure"}, "PTXN-001",
+        )
+        self.assertEqual(msg, "❌ Не удалось проверить историю платежей.")
+
+    def test_ledger_read_failed_no_error_or_amounts_rendered(self):
+        msg = th._payment_transaction_confirmation_message(
+            {
+                "ok": False, "code": "PAYMENT_LEDGER_READ_FAILED", "error": "Infrastructure failure LEDGER-SECRET",
+                "amount": "999999.00 BALANCE-SECRET", "remaining_amount": "1.00 BALANCE-SECRET",
+            },
+            "PTXN-001",
+        )
+        self.assertNotIn("Infrastructure failure", msg)
+        self.assertNotIn("LEDGER-SECRET", msg)
+        self.assertNotIn("BALANCE-SECRET", msg)
+        self.assertNotIn("999999.00", msg)
+        self.assertNotIn("✅", msg)
+        self.assertNotIn("ℹ️", msg)
+
 
 class TestPaymentTransactionReversalMessageMapping(unittest.TestCase):
     def test_reversed_success(self):

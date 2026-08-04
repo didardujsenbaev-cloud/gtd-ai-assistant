@@ -605,7 +605,7 @@ class TestConfirmPaymentTransaction(unittest.TestCase):
     def test_successful_confirmation(self):
         with patch("business_core.payment_manager.find_payment_transaction_by_id", return_value=self._txn("pending")), \
              patch("business_core.payment_manager.find_payment_obligation_by_id", return_value=_OBLIGATION_FOR_TXN), \
-             patch("business_core.payment_manager.list_payment_transactions", return_value=[]), \
+             patch("business_core.payment_manager.list_payment_transactions_strict", return_value=[]), \
              patch("business_core.payment_manager.update_payment_transaction_status",
                    return_value={"ok": True, "changed": True, "code": "", "error": None}), \
              patch.object(bb, "_synchronize_payment_obligation_after_transaction_change",
@@ -621,10 +621,59 @@ class TestConfirmPaymentTransaction(unittest.TestCase):
         other_txn = {"Payment Transaction ID": "PTXN-OTHER", "Status": "confirmed", "Amount": "150000.00"}
         with patch("business_core.payment_manager.find_payment_transaction_by_id", return_value=self._txn("pending", amount="10.00")), \
              patch("business_core.payment_manager.find_payment_obligation_by_id", return_value=_OBLIGATION_FOR_TXN), \
-             patch("business_core.payment_manager.list_payment_transactions", return_value=[other_txn]):
+             patch("business_core.payment_manager.list_payment_transactions_strict", return_value=[other_txn]):
             r = bb.confirm_payment_transaction("PTXN-001", "dida")
         self.assertFalse(r["ok"])
         self.assertEqual(r["code"], "PAYMENT_TRANSACTION_OVERPAYMENT_BLOCKED")
+
+    def test_ledger_read_failure_before_write_fails_closed(self):
+        """Phase 17E-2A6-H0: proves the confirmed corruption case —
+        a real overpayment (700 against a true remaining of 600, i.e.
+        an existing 400 confirmed against a 1000 obligation) must
+        never be silently permitted just because the ledger read
+        failed. Reproduces the exact reported reproduction scenario."""
+        obligation = {
+            "Payment Obligation ID": "POB-001", "Business ID": "BIZ-001", "Client ID": "PRS-001",
+            "Currency": "KZT", "Obligation Amount": "1000.00",
+        }
+        existing_confirmed = {"Payment Transaction ID": "PTXN-OTHER", "Status": "confirmed", "Amount": "400.00"}
+        with patch("business_core.payment_manager.find_payment_transaction_by_id", return_value=self._txn("pending", amount="700.00")), \
+             patch("business_core.payment_manager.find_payment_obligation_by_id", return_value=obligation), \
+             patch("business_core.payment_manager.list_payment_transactions_strict", return_value=[existing_confirmed]) as mock_strict:
+            r_success = bb.confirm_payment_transaction("PTXN-001", "dida")
+        self.assertEqual(mock_strict.call_count, 1)
+        self.assertFalse(r_success["ok"])
+        self.assertEqual(r_success["code"], "PAYMENT_TRANSACTION_OVERPAYMENT_BLOCKED")
+
+        with patch("business_core.payment_manager.find_payment_transaction_by_id", return_value=self._txn("pending", amount="700.00")), \
+             patch("business_core.payment_manager.find_payment_obligation_by_id", return_value=obligation), \
+             patch("business_core.payment_manager.list_payment_transactions_strict", side_effect=RuntimeError("boom")), \
+             patch("business_core.payment_manager.update_payment_transaction_status") as mock_write:
+            r_failure = bb.confirm_payment_transaction("PTXN-001", "dida")
+        self.assertFalse(r_failure["ok"])
+        self.assertEqual(r_failure["code"], "PAYMENT_LEDGER_READ_FAILED")
+        self.assertNotEqual(r_failure["code"], "PAYMENT_TRANSACTION_CONFIRMED")
+        mock_write.assert_not_called()
+
+    def test_ledger_read_failure_before_write_result_shape(self):
+        with patch("business_core.payment_manager.find_payment_transaction_by_id", return_value=self._txn("pending")), \
+             patch("business_core.payment_manager.find_payment_obligation_by_id", return_value=_OBLIGATION_FOR_TXN), \
+             patch("business_core.payment_manager.list_payment_transactions_strict", side_effect=RuntimeError("boom LEDGER-SECRET")), \
+             patch("business_core.payment_manager.update_payment_transaction_status") as mock_write, \
+             patch.object(bb, "_synchronize_payment_obligation_after_transaction_change") as mock_sync:
+            r = bb.confirm_payment_transaction("PTXN-001", "dida")
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["code"], "PAYMENT_LEDGER_READ_FAILED")
+        self.assertFalse(r["changed"])
+        self.assertTrue(r["retry_safe"])
+        self.assertEqual(r["previous_status"], "pending")
+        self.assertEqual(r["final_status"], "pending")
+        self.assertEqual(r["error"], "Infrastructure failure")
+        self.assertNotIn("LEDGER-SECRET", r["error"])
+        self.assertEqual(r["amount"], "")
+        self.assertEqual(r["remaining_amount"], "")
+        mock_write.assert_not_called()
+        mock_sync.assert_not_called()
 
 
 class TestReversePaymentTransaction(unittest.TestCase):
@@ -710,7 +759,7 @@ class TestSynchronizePaymentObligation(unittest.TestCase):
     def test_zero_paid_stays_issued(self):
         obligation = {"Payment Obligation ID": "POB-001", "Obligation Amount": "150000.00", "Status": "issued", "Paid At": ""}
         with patch("business_core.payment_manager.find_payment_obligation_by_id", side_effect=[obligation, {**obligation, "Paid Amount": "0.00", "Remaining Amount": "150000.00"}]), \
-             patch("business_core.payment_manager.list_payment_transactions", return_value=[]), \
+             patch("business_core.payment_manager.list_payment_transactions_strict", return_value=[]), \
              patch("business_core.payment_manager.update_payment_obligation_balance",
                    return_value={"ok": True, "changed": True, "code": "", "error": None}):
             r = bb._synchronize_payment_obligation_after_transaction_change("POB-001")
@@ -722,7 +771,7 @@ class TestSynchronizePaymentObligation(unittest.TestCase):
         verify = {**obligation, "Paid Amount": "50000.00", "Remaining Amount": "100000.00", "Status": "partially_paid"}
         txns = [{"Status": "confirmed", "Amount": "50000.00"}]
         with patch("business_core.payment_manager.find_payment_obligation_by_id", side_effect=[obligation, verify]), \
-             patch("business_core.payment_manager.list_payment_transactions", return_value=txns), \
+             patch("business_core.payment_manager.list_payment_transactions_strict", return_value=txns), \
              patch("business_core.payment_manager.update_payment_obligation_balance",
                    return_value={"ok": True, "changed": True, "code": "", "error": None}):
             r = bb._synchronize_payment_obligation_after_transaction_change("POB-001")
@@ -734,7 +783,7 @@ class TestSynchronizePaymentObligation(unittest.TestCase):
         verify = {**obligation, "Paid Amount": "150000.00", "Remaining Amount": "0.00", "Status": "paid"}
         txns = [{"Status": "confirmed", "Amount": "150000.00"}]
         with patch("business_core.payment_manager.find_payment_obligation_by_id", side_effect=[obligation, verify]), \
-             patch("business_core.payment_manager.list_payment_transactions", return_value=txns), \
+             patch("business_core.payment_manager.list_payment_transactions_strict", return_value=txns), \
              patch("business_core.payment_manager.update_payment_obligation_balance",
                    return_value={"ok": True, "changed": True, "code": "", "error": None}):
             r = bb._synchronize_payment_obligation_after_transaction_change("POB-001")
@@ -745,7 +794,7 @@ class TestSynchronizePaymentObligation(unittest.TestCase):
         obligation = {"Payment Obligation ID": "POB-001", "Obligation Amount": "150000.00", "Status": "paid", "Paid At": "2026-01-01 00:00:00 UTC"}
         verify = {**obligation, "Paid Amount": "0.00", "Remaining Amount": "150000.00", "Status": "issued"}
         with patch("business_core.payment_manager.find_payment_obligation_by_id", side_effect=[obligation, verify]), \
-             patch("business_core.payment_manager.list_payment_transactions", return_value=[]), \
+             patch("business_core.payment_manager.list_payment_transactions_strict", return_value=[]), \
              patch("business_core.payment_manager.update_payment_obligation_balance") as mock_update:
             mock_update.return_value = {"ok": True, "changed": True, "code": "", "error": None}
             r = bb._synchronize_payment_obligation_after_transaction_change("POB-001")
@@ -757,7 +806,7 @@ class TestSynchronizePaymentObligation(unittest.TestCase):
         obligation = {"Payment Obligation ID": "POB-001", "Obligation Amount": "150000.00", "Status": "cancelled", "Paid At": ""}
         verify = {**obligation, "Paid Amount": "0.00", "Remaining Amount": "150000.00", "Status": "cancelled"}
         with patch("business_core.payment_manager.find_payment_obligation_by_id", side_effect=[obligation, verify]), \
-             patch("business_core.payment_manager.list_payment_transactions", return_value=[]), \
+             patch("business_core.payment_manager.list_payment_transactions_strict", return_value=[]), \
              patch("business_core.payment_manager.update_payment_obligation_balance",
                    return_value={"ok": True, "changed": False, "code": "", "error": None}):
             r = bb._synchronize_payment_obligation_after_transaction_change("POB-001")
@@ -769,12 +818,96 @@ class TestSynchronizePaymentObligation(unittest.TestCase):
         stale_verify = {**obligation, "Paid Amount": "0.00", "Remaining Amount": "150000.00", "Status": "issued"}
         txns = [{"Status": "confirmed", "Amount": "50000.00"}]
         with patch("business_core.payment_manager.find_payment_obligation_by_id", side_effect=[obligation, stale_verify]), \
-             patch("business_core.payment_manager.list_payment_transactions", return_value=txns), \
+             patch("business_core.payment_manager.list_payment_transactions_strict", return_value=txns), \
              patch("business_core.payment_manager.update_payment_obligation_balance",
                    return_value={"ok": True, "changed": True, "code": "", "error": None}):
             r = bb._synchronize_payment_obligation_after_transaction_change("POB-001")
         self.assertFalse(r["ok"])
         self.assertEqual(r["code"], "PAYMENT_OBLIGATION_POST_WRITE_VERIFICATION_FAILED")
+
+    def test_ledger_read_failure_fails_closed_before_balance_computation(self):
+        """Phase 17E-2A6-H0: reproduces the confirmed corruption case —
+        a real Paid Amount/Status must never be overwritten with a
+        zeroed value computed from a failed-and-silently-empty ledger
+        read."""
+        obligation = {"Payment Obligation ID": "POB-001", "Obligation Amount": "1000.00", "Status": "partially_paid", "Paid At": ""}
+        with patch("business_core.payment_manager.find_payment_obligation_by_id", return_value=obligation), \
+             patch("business_core.payment_manager.list_payment_transactions_strict", side_effect=RuntimeError("boom OBLIGATION-SECRET BALANCE-SECRET")), \
+             patch("business_core.business_builder._compute_payment_balance") as mock_compute, \
+             patch("business_core.payment_manager.update_payment_obligation_balance") as mock_update:
+            r = bb._synchronize_payment_obligation_after_transaction_change("POB-001")
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["code"], "PAYMENT_LEDGER_READ_FAILED")
+        self.assertEqual(r["error"], "Infrastructure failure")
+        self.assertNotIn("OBLIGATION-SECRET", r["error"])
+        self.assertNotIn("BALANCE-SECRET", r["error"])
+        mock_compute.assert_not_called()
+        mock_update.assert_not_called()
+
+    def test_ledger_read_failure_distinct_from_successful_empty_ledger(self):
+        obligation = {"Payment Obligation ID": "POB-001", "Obligation Amount": "150000.00", "Status": "issued", "Paid At": ""}
+        with patch("business_core.payment_manager.find_payment_obligation_by_id", side_effect=[obligation, {**obligation, "Paid Amount": "0.00", "Remaining Amount": "150000.00"}]), \
+             patch("business_core.payment_manager.list_payment_transactions_strict", return_value=[]), \
+             patch("business_core.payment_manager.update_payment_obligation_balance",
+                   return_value={"ok": True, "changed": True, "code": "", "error": None}):
+            r_empty = bb._synchronize_payment_obligation_after_transaction_change("POB-001")
+        with patch("business_core.payment_manager.find_payment_obligation_by_id", return_value=obligation), \
+             patch("business_core.payment_manager.list_payment_transactions_strict", side_effect=RuntimeError("boom")):
+            r_failure = bb._synchronize_payment_obligation_after_transaction_change("POB-001")
+        self.assertTrue(r_empty["ok"])
+        self.assertFalse(r_failure["ok"])
+        self.assertNotEqual(r_empty.get("code", ""), r_failure["code"])
+        self.assertEqual(r_failure["code"], "PAYMENT_LEDGER_READ_FAILED")
+
+
+class TestConfirmReversePartialState(unittest.TestCase):
+    """Phase 17E-2A6-H0: proves the outer confirm/reverse contract
+    when the Transaction write already succeeded but synchronization
+    fails due to a ledger-read failure — the existing partial-success
+    code is preserved unchanged, no rollback and no automatic retry
+    are claimed."""
+
+    def test_confirm_transaction_written_sync_ledger_read_failed(self):
+        original = {"Payment Transaction ID": "PTXN-001", "Business ID": "BIZ-001", "Payment Obligation ID": "POB-001", "Amount": "50000.00", "Currency": "KZT", "Status": "pending"}
+        confirmed_row = {**original, "Status": "confirmed"}
+        with patch("business_core.payment_manager.find_payment_transaction_by_id", side_effect=[original, confirmed_row]), \
+             patch("business_core.payment_manager.find_payment_obligation_by_id", return_value=_OBLIGATION_FOR_TXN), \
+             patch("business_core.payment_manager.list_payment_transactions_strict", return_value=[]), \
+             patch("business_core.payment_manager.update_payment_transaction_status",
+                   return_value={"ok": True, "changed": True, "code": "", "error": None}), \
+             patch.object(bb, "_synchronize_payment_obligation_after_transaction_change",
+                          return_value={"ok": False, "code": "PAYMENT_LEDGER_READ_FAILED", "error": "Infrastructure failure"}), \
+             patch("business_core.payment_manager.update_payment_obligation_balance") as mock_obligation_write:
+            r = bb.confirm_payment_transaction("PTXN-001", "dida")
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["code"], "PAYMENT_OBLIGATION_POST_WRITE_VERIFICATION_FAILED")
+        self.assertFalse(r["retry_safe"])
+        self.assertEqual(r["final_status"], "confirmed")
+        self.assertTrue(r["changed"])
+        # "Infrastructure failure" is the sanitized internal marker —
+        # permitted inside this result field (per Phase 17E-2A5-H1's
+        # established convention), never rendered by the Telegram
+        # mapper for this code. What must never appear is the raw
+        # exception text this phase's sanitization replaces.
+        self.assertNotIn("boom", r["error"])
+        mock_obligation_write.assert_not_called()
+
+    def test_reverse_transaction_written_sync_ledger_read_failed(self):
+        original = {"Payment Transaction ID": "PTXN-001", "Business ID": "BIZ-001", "Payment Obligation ID": "POB-001", "Amount": "50000.00", "Currency": "KZT", "Payment Date": "2026-01-01", "Status": "confirmed"}
+        reversed_row = {**original, "Status": "reversed"}
+        with patch("business_core.payment_manager.find_payment_transaction_by_id", side_effect=[original, reversed_row]), \
+             patch("business_core.payment_manager.update_payment_transaction_status",
+                   return_value={"ok": True, "changed": True, "code": "", "error": None}), \
+             patch.object(bb, "_synchronize_payment_obligation_after_transaction_change",
+                          return_value={"ok": False, "code": "PAYMENT_LEDGER_READ_FAILED", "error": "Infrastructure failure"}), \
+             patch("business_core.payment_manager.update_payment_obligation_balance") as mock_obligation_write:
+            r = bb.reverse_payment_transaction("PTXN-001", "client requested refund", "dida")
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["code"], "PAYMENT_OBLIGATION_POST_WRITE_VERIFICATION_FAILED")
+        self.assertFalse(r["retry_safe"])
+        self.assertEqual(r["final_status"], "reversed")
+        self.assertTrue(r["changed"])
+        mock_obligation_write.assert_not_called()
 
 
 if __name__ == "__main__":
