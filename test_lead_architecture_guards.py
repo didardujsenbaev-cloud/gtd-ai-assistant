@@ -589,10 +589,10 @@ class TestNoCallerSideLeadPolicy(unittest.TestCase):
 
 class TestLeadCommandRegistration(unittest.TestCase):
 
-    def test_all_10_commands_registered_exactly_once(self):
+    def test_all_11_commands_registered_exactly_once(self):
         path = BUSINESS_CORE / "telegram_handlers.py"
         src = path.read_text(encoding="utf-8")
-        for name in ("newlead", "leads", "lead", "updatelead", "contactlead", "qualifylead", "unqualifylead", "loselead", "convertlead", "archivelead"):
+        for name in ("newlead", "leads", "lead", "updatelead", "updateleadnotes", "contactlead", "qualifylead", "unqualifylead", "loselead", "convertlead", "archivelead"):
             self.assertEqual(src.count(f'CommandHandler("{name}"'), 1, f"/{name} must be registered exactly once")
 
     def test_milestones_still_registered_exactly_once(self):

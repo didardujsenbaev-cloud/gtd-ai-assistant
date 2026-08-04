@@ -390,9 +390,9 @@ class TestStatusLabels(unittest.TestCase):
 # ────────────────────────────────────────────────────────────
 
 class TestCommandRegistration(unittest.TestCase):
-    def test_all_10_commands_registered_exactly_once(self):
+    def test_all_11_commands_registered_exactly_once(self):
         src = _TH_PATH.read_text(encoding="utf-8")
-        names = ("newlead", "leads", "lead", "updatelead", "contactlead", "qualifylead", "unqualifylead", "loselead", "convertlead", "archivelead")
+        names = ("newlead", "leads", "lead", "updatelead", "updateleadnotes", "contactlead", "qualifylead", "unqualifylead", "loselead", "convertlead", "archivelead")
         for name in names:
             self.assertEqual(src.count(f'CommandHandler("{name}"'), 1, f"/{name} must be registered exactly once")
 
@@ -403,7 +403,7 @@ class TestCommandRegistration(unittest.TestCase):
         counts: dict[str, int] = {}
         for name in all_registered:
             counts[name] = counts.get(name, 0) + 1
-        lead_names = {"newlead", "leads", "lead", "updatelead", "contactlead", "qualifylead", "unqualifylead", "loselead", "convertlead", "archivelead"}
+        lead_names = {"newlead", "leads", "lead", "updatelead", "updateleadnotes", "contactlead", "qualifylead", "unqualifylead", "loselead", "convertlead", "archivelead"}
         for name in lead_names:
             self.assertEqual(counts.get(name, 0), 1, f"/{name} must appear exactly once")
 

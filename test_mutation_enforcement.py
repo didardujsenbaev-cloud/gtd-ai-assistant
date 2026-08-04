@@ -22,6 +22,7 @@ not just presence.
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import inspect
 import unittest
@@ -649,8 +650,8 @@ _OTHER_MUTATION_CANDIDATE_HANDLERS = [
 
 
 class TestArchitecture(unittest.TestCase):
-    def test_enforcement_map_has_exactly_seven_entries(self):
-        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 7)
+    def test_enforcement_map_has_exactly_eight_entries(self):
+        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 8)
 
     def test_six_phase_17e1_entries_unchanged(self):
         expected_six = {
@@ -751,6 +752,733 @@ class TestArchitecture(unittest.TestCase):
         with open("business_core/telegram_handlers.py", encoding="utf-8") as f:
             content = f.read()
         self.assertEqual(content.count('CommandHandler("updateinteractionnotes", updateinteractionnotes_cmd)'), 1)
+
+
+# ═════════════════════════════════════════════════════════════
+# Phase 17E-2A2: /updateleadnotes — dedicated, single-purpose
+# mutation command. Reuses the same top-level helpers above
+# (_run, _make_update, _allow_result, _deny_result,
+# _infra_failure_result) but has its own row fixtures, finder/
+# mutator paths, and allowed-key isolation tests, since this
+# command additionally enforces an exact parsed-key set that
+# /updateinteractionnotes never needed (it only ever accepted
+# interaction_id/notes to begin with).
+# ═════════════════════════════════════════════════════════════
+
+_LEAD_ROW = {
+    "Lead ID": "LED-001", "Business ID": "BIZ-001", "Status": "new",
+    "Contact Name Snapshot": "", "Phone Snapshot": "", "WhatsApp Snapshot": "", "Email Snapshot": "",
+    "Company Snapshot": "", "Service ID": "", "Source": "", "Channel ID": "",
+    "Qualification Notes": "", "Disposition Reason": "", "Expected Value": "", "Currency": "",
+    "Next Follow-up At": "", "Last Contacted At": "", "Assigned Person ID": "",
+    "Caller Idempotency Key": "", "Created At": "2026-01-01T00:00:00Z", "Created By": "",
+    "Updated At": "", "Notes": "",
+}
+_LEAD_ROW_OTHER_BIZ = {**_LEAD_ROW, "Business ID": "BIZ-002"}
+_LEAD_ROW_MISSING_OWNERSHIP = {**_LEAD_ROW, "Business ID": ""}
+_LEAD_ROW_WHITESPACE_OWNERSHIP = {**_LEAD_ROW, "Business ID": "   "}
+
+_LEAD_FINDER_PATH = "business_core.lead_manager.find_lead_by_id"
+_LEAD_MUTATOR_PATH = "business_core.business_builder.update_lead_admin_fields"
+
+_LEAD_ID_ARG = "lead_id=LED-001"
+_LEAD_NOTES_ARG = "notes=hello"
+_LEAD_ARGS = [_LEAD_ID_ARG, _LEAD_NOTES_ARG]
+
+
+class LeadNotesMutationTestBase(unittest.TestCase):
+    def _run_handler(self, update, args=None, *, finder_side_effect=None, finder_return=None,
+                      authz_result=None, mutator_return=None, mutator_side_effect=None):
+        patches = []
+        if finder_side_effect is not None:
+            patches.append(patch(_LEAD_FINDER_PATH, side_effect=finder_side_effect))
+        else:
+            patches.append(patch(_LEAD_FINDER_PATH, return_value=finder_return))
+
+        mock_authz = AsyncMock(return_value=authz_result if authz_result is not None else _allow_result())
+        patches.append(patch(_AUTHZ_PATH, new=mock_authz))
+
+        if mutator_side_effect is not None:
+            mock_mutator = MagicMock(side_effect=mutator_side_effect)
+        else:
+            mock_mutator = MagicMock(return_value=mutator_return if mutator_return is not None else
+                                      {"ok": True, "code": "LEAD_UPDATED", "error": None,
+                                       "lead_id": "LED-001", "business_id": "BIZ-001", "changed": True})
+        patches.append(patch(_LEAD_MUTATOR_PATH, new=mock_mutator))
+
+        ctx = _make_context(args if args is not None else _LEAD_ARGS)
+        with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+            for p in patches:
+                p.start()
+            try:
+                _run(th.updateleadnotes_cmd(update, ctx))
+            finally:
+                for p in reversed(patches):
+                    p.stop()
+        return mock_authz, mock_mutator
+
+    def _sent_text(self, update) -> str:
+        call = update.message.reply_text.call_args
+        return call.args[0] if call.args else call.kwargs.get("text", "")
+
+
+class TestLeadNotesTransport(LeadNotesMutationTestBase):
+    def test_group_zero_finder_and_mutation(self):
+        update = _make_update(chat_type="group")
+        with patch(_LEAD_FINDER_PATH) as mock_finder, patch(_LEAD_MUTATOR_PATH) as mock_mutator, \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+            _run(th.updateleadnotes_cmd(update, _make_context(_LEAD_ARGS)))
+        mock_finder.assert_not_called()
+        mock_mutator.assert_not_called()
+
+    def test_supergroup_zero_finder_and_mutation(self):
+        update = _make_update(chat_type="supergroup")
+        with patch(_LEAD_FINDER_PATH) as mock_finder, patch(_LEAD_MUTATOR_PATH) as mock_mutator, \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+            _run(th.updateleadnotes_cmd(update, _make_context(_LEAD_ARGS)))
+        mock_finder.assert_not_called()
+        mock_mutator.assert_not_called()
+
+    def test_channel_zero_finder_and_mutation(self):
+        update = _make_update(chat_type="channel")
+        with patch(_LEAD_FINDER_PATH) as mock_finder, patch(_LEAD_MUTATOR_PATH) as mock_mutator, \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+            _run(th.updateleadnotes_cmd(update, _make_context(_LEAD_ARGS)))
+        mock_finder.assert_not_called()
+        mock_mutator.assert_not_called()
+
+    def test_malformed_update_zero_finder_and_mutation(self):
+        update = SimpleNamespace()
+        with patch(_LEAD_FINDER_PATH) as mock_finder, patch(_LEAD_MUTATOR_PATH) as mock_mutator, \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+            _run(th.updateleadnotes_cmd(update, _make_context(_LEAD_ARGS)))
+        mock_finder.assert_not_called()
+        mock_mutator.assert_not_called()
+
+    def test_missing_effective_user_zero_finder_and_mutation(self):
+        update = _make_update(user_id=None)
+        with patch(_LEAD_FINDER_PATH) as mock_finder, patch(_LEAD_MUTATOR_PATH) as mock_mutator, \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+            _run(th.updateleadnotes_cmd(update, _make_context(_LEAD_ARGS)))
+        mock_finder.assert_not_called()
+        mock_mutator.assert_not_called()
+
+    def test_missing_user_id_zero_finder_and_mutation(self):
+        update = _make_update()
+        update.effective_user = SimpleNamespace(id=None)
+        with patch(_LEAD_FINDER_PATH) as mock_finder, patch(_LEAD_MUTATOR_PATH) as mock_mutator, \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+            _run(th.updateleadnotes_cmd(update, _make_context(_LEAD_ARGS)))
+        mock_finder.assert_not_called()
+        mock_mutator.assert_not_called()
+
+
+class TestLeadNotesArguments(LeadNotesMutationTestBase):
+    def test_missing_lead_id_zero_finder_and_mutation(self):
+        update = _make_update()
+        with patch(_LEAD_FINDER_PATH) as mock_finder, patch(_LEAD_MUTATOR_PATH) as mock_mutator, \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+            _run(th.updateleadnotes_cmd(update, _make_context([_LEAD_NOTES_ARG])))
+        mock_finder.assert_not_called()
+        mock_mutator.assert_not_called()
+
+    def test_missing_notes_zero_finder_and_mutation(self):
+        update = _make_update()
+        with patch(_LEAD_FINDER_PATH) as mock_finder, patch(_LEAD_MUTATOR_PATH) as mock_mutator, \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+            _run(th.updateleadnotes_cmd(update, _make_context([_LEAD_ID_ARG])))
+        mock_finder.assert_not_called()
+        mock_mutator.assert_not_called()
+
+    def test_positional_target_rejected(self):
+        update = _make_update()
+        with patch(_LEAD_FINDER_PATH) as mock_finder, patch(_LEAD_MUTATOR_PATH) as mock_mutator, \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+            _run(th.updateleadnotes_cmd(update, _make_context(["LED-001", _LEAD_NOTES_ARG])))
+        mock_finder.assert_not_called()
+        mock_mutator.assert_not_called()
+
+    def test_unknown_key_rejected(self):
+        update = _make_update()
+        with patch(_LEAD_FINDER_PATH) as mock_finder, patch(_LEAD_MUTATOR_PATH) as mock_mutator, \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+            _run(th.updateleadnotes_cmd(update, _make_context([_LEAD_ID_ARG, _LEAD_NOTES_ARG, "foo=bar"])))
+        mock_finder.assert_not_called()
+        mock_mutator.assert_not_called()
+
+    def test_business_id_key_rejected(self):
+        update = _make_update()
+        with patch(_LEAD_FINDER_PATH) as mock_finder, patch(_LEAD_MUTATOR_PATH) as mock_mutator, \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+            _run(th.updateleadnotes_cmd(update, _make_context([_LEAD_ID_ARG, _LEAD_NOTES_ARG, "business_id=BIZ-001"])))
+        mock_finder.assert_not_called()
+        mock_mutator.assert_not_called()
+
+    def test_status_key_rejected(self):
+        update = _make_update()
+        with patch(_LEAD_FINDER_PATH) as mock_finder, patch(_LEAD_MUTATOR_PATH) as mock_mutator, \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+            _run(th.updateleadnotes_cmd(update, _make_context([_LEAD_ID_ARG, _LEAD_NOTES_ARG, "status=new"])))
+        mock_finder.assert_not_called()
+        mock_mutator.assert_not_called()
+
+    def test_assigned_person_id_key_rejected(self):
+        update = _make_update()
+        with patch(_LEAD_FINDER_PATH) as mock_finder, patch(_LEAD_MUTATOR_PATH) as mock_mutator, \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+            _run(th.updateleadnotes_cmd(update, _make_context([_LEAD_ID_ARG, _LEAD_NOTES_ARG, "assigned_person_id=PRS-001"])))
+        mock_finder.assert_not_called()
+        mock_mutator.assert_not_called()
+
+    def test_expected_value_key_rejected(self):
+        update = _make_update()
+        with patch(_LEAD_FINDER_PATH) as mock_finder, patch(_LEAD_MUTATOR_PATH) as mock_mutator, \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+            _run(th.updateleadnotes_cmd(update, _make_context([_LEAD_ID_ARG, _LEAD_NOTES_ARG, "expected_value=1000"])))
+        mock_finder.assert_not_called()
+        mock_mutator.assert_not_called()
+
+    def test_unknown_key_usage_message(self):
+        update = _make_update()
+        with patch(_LEAD_FINDER_PATH), patch(_LEAD_MUTATOR_PATH), \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+            _run(th.updateleadnotes_cmd(update, _make_context([_LEAD_ID_ARG, _LEAD_NOTES_ARG, "status=new"])))
+        call = update.message.reply_text.call_args
+        text = call.args[0] if call.args else call.kwargs.get("text", "")
+        self.assertEqual(text, "❌ /updateleadnotes принимает только lead_id и notes.")
+
+    def test_valid_key_set_continues(self):
+        update = _make_update()
+        _, mock_mutator = self._run_handler(update, finder_return=_LEAD_ROW)
+        mock_mutator.assert_called_once()
+
+
+class TestLeadNotesFirstLookup(LeadNotesMutationTestBase):
+    def test_finder_runs_via_asyncio_to_thread(self):
+        update = _make_update()
+        recorded = []
+
+        async def fake_to_thread(func, *args, **kwargs):
+            recorded.append((getattr(func, "__name__", None), args))
+            if len(recorded) == 1:
+                return _LEAD_ROW
+            return {"ok": True, "code": "LEAD_UPDATED", "error": None, "changed": True}
+
+        with patch("business_core.telegram_handlers.asyncio.to_thread", side_effect=fake_to_thread), \
+             patch(_AUTHZ_PATH, new=AsyncMock(return_value=_allow_result())), \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+            _run(th.updateleadnotes_cmd(update, _make_context(_LEAD_ARGS)))
+        self.assertIn("LED-001", recorded[0][1])
+
+    def test_finder_none_zero_authorization_and_mutation(self):
+        update = _make_update()
+        mock_authz, mock_mutator = self._run_handler(update, finder_return=None)
+        mock_authz.assert_not_called()
+        mock_mutator.assert_not_called()
+
+    def test_finder_none_generic_message(self):
+        update = _make_update()
+        self._run_handler(update, finder_return=None)
+        self.assertEqual(self._sent_text(update), "Запись недоступна или не найдена.")
+
+    def test_finder_exception_zero_authorization_and_mutation(self):
+        update = _make_update()
+
+        def boom(*_a, **_k):
+            raise RuntimeError("sheets down")
+
+        mock_authz, mock_mutator = self._run_handler(update, finder_side_effect=boom)
+        mock_authz.assert_not_called()
+        mock_mutator.assert_not_called()
+
+    def test_finder_exception_temporarily_unavailable_message(self):
+        update = _make_update()
+
+        def boom(*_a, **_k):
+            raise RuntimeError("sheets down")
+
+        self._run_handler(update, finder_side_effect=boom)
+        text = self._sent_text(update)
+        self.assertIn("Временная ошибка", text)
+        self.assertNotIn("RuntimeError", text)
+        self.assertNotIn("sheets down", text)
+
+    def test_missing_business_id_zero_authorization_and_mutation(self):
+        update = _make_update()
+        mock_authz, mock_mutator = self._run_handler(update, finder_return=_LEAD_ROW_MISSING_OWNERSHIP)
+        mock_authz.assert_not_called()
+        mock_mutator.assert_not_called()
+
+    def test_blank_business_id_zero_authorization_and_mutation(self):
+        update = _make_update()
+        mock_authz, mock_mutator = self._run_handler(update, finder_return=_LEAD_ROW_WHITESPACE_OWNERSHIP)
+        mock_authz.assert_not_called()
+        mock_mutator.assert_not_called()
+
+
+class TestLeadNotesAuthorization(LeadNotesMutationTestBase):
+    def test_resource_finance_action_update(self):
+        update = _make_update()
+        mock_authz, _ = self._run_handler(update, finder_return=_LEAD_ROW)
+        _, kwargs = mock_authz.call_args
+        self.assertEqual(kwargs["resource"], "FINANCE")
+        self.assertEqual(kwargs["action"], "UPDATE")
+
+    def test_business_id_comes_only_from_stored_row(self):
+        update = _make_update()
+        mock_authz, _ = self._run_handler(update, finder_return=_LEAD_ROW)
+        _, kwargs = mock_authz.call_args
+        self.assertEqual(kwargs["business_id"], "BIZ-001")
+
+    def test_caller_cannot_spoof_business_id(self):
+        # business_id is a forbidden parsed key (rejected in
+        # TestLeadNotesArguments); this proves the handler source
+        # itself never reads a caller-supplied business_id anywhere.
+        src = inspect.getsource(th.updateleadnotes_cmd)
+        self.assertNotIn('args.get("business_id"', src)
+
+    def test_denial_zero_second_lookup_and_mutation(self):
+        update = _make_update()
+        calls = []
+
+        def finder(*a, **k):
+            calls.append(a)
+            return _LEAD_ROW
+
+        mock_authz, mock_mutator = self._run_handler(
+            update, finder_side_effect=finder, authz_result=_deny_result(),
+        )
+        self.assertEqual(len(calls), 1)
+        mock_mutator.assert_not_called()
+
+    def test_denial_generic_message(self):
+        update = _make_update()
+        self._run_handler(update, finder_return=_LEAD_ROW, authz_result=_deny_result())
+        self.assertEqual(self._sent_text(update), "Запись недоступна или не найдена.")
+
+    def test_infrastructure_failure_zero_mutation(self):
+        update = _make_update()
+        _, mock_mutator = self._run_handler(update, finder_return=_LEAD_ROW, authz_result=_infra_failure_result())
+        mock_mutator.assert_not_called()
+
+    def test_owner_allow_continues_to_mutation(self):
+        update = _make_update()
+        _, mock_mutator = self._run_handler(update, finder_return=_LEAD_ROW, authz_result=_allow_result())
+        mock_mutator.assert_called_once()
+
+
+class TestLeadNotesFreshReread(LeadNotesMutationTestBase):
+    def test_second_lookup_occurs_exactly_twice_total(self):
+        update = _make_update()
+        finder_calls = []
+
+        def finder(lead_id):
+            finder_calls.append(lead_id)
+            return _LEAD_ROW
+
+        self._run_handler(update, finder_side_effect=finder)
+        self.assertEqual(len(finder_calls), 2)
+        self.assertEqual(finder_calls, ["LED-001", "LED-001"])
+
+    def test_second_lookup_only_after_allow(self):
+        update = _make_update()
+        finder_calls = []
+
+        def finder(lead_id):
+            finder_calls.append(lead_id)
+            return _LEAD_ROW
+
+        self._run_handler(update, finder_side_effect=finder, authz_result=_deny_result())
+        self.assertEqual(len(finder_calls), 1)
+
+    def test_second_row_missing_zero_mutation(self):
+        update = _make_update()
+        calls = {"n": 0}
+
+        def finder(*_a, **_k):
+            calls["n"] += 1
+            return _LEAD_ROW if calls["n"] == 1 else None
+
+        _, mock_mutator = self._run_handler(update, finder_side_effect=finder)
+        mock_mutator.assert_not_called()
+
+    def test_second_row_missing_ownership_changed_message(self):
+        update = _make_update()
+        calls = {"n": 0}
+
+        def finder(*_a, **_k):
+            calls["n"] += 1
+            return _LEAD_ROW if calls["n"] == 1 else None
+
+        self._run_handler(update, finder_side_effect=finder)
+        self.assertEqual(self._sent_text(update), "Запись изменилась. Повтори команду ещё раз.")
+
+    def test_second_business_id_blank_zero_mutation(self):
+        update = _make_update()
+        calls = {"n": 0}
+
+        def finder(*_a, **_k):
+            calls["n"] += 1
+            return _LEAD_ROW if calls["n"] == 1 else _LEAD_ROW_MISSING_OWNERSHIP
+
+        _, mock_mutator = self._run_handler(update, finder_side_effect=finder)
+        mock_mutator.assert_not_called()
+
+    def test_ownership_changed_zero_mutation(self):
+        update = _make_update()
+        calls = {"n": 0}
+
+        def finder(*_a, **_k):
+            calls["n"] += 1
+            return _LEAD_ROW if calls["n"] == 1 else _LEAD_ROW_OTHER_BIZ
+
+        _, mock_mutator = self._run_handler(update, finder_side_effect=finder)
+        mock_mutator.assert_not_called()
+
+    def test_ownership_changed_message_reveals_no_business_id(self):
+        update = _make_update()
+        calls = {"n": 0}
+
+        def finder(*_a, **_k):
+            calls["n"] += 1
+            return _LEAD_ROW if calls["n"] == 1 else _LEAD_ROW_OTHER_BIZ
+
+        self._run_handler(update, finder_side_effect=finder)
+        text = self._sent_text(update)
+        self.assertEqual(text, "Запись изменилась. Повтори команду ещё раз.")
+        self.assertNotIn("BIZ-001", text)
+        self.assertNotIn("BIZ-002", text)
+
+    def test_unchanged_ownership_mutation_permitted(self):
+        update = _make_update()
+        _, mock_mutator = self._run_handler(update, finder_return=_LEAD_ROW)
+        mock_mutator.assert_called_once()
+
+    def test_no_automatic_reauthorization_on_ownership_change(self):
+        update = _make_update()
+        calls = {"n": 0}
+
+        def finder(*_a, **_k):
+            calls["n"] += 1
+            return _LEAD_ROW if calls["n"] == 1 else _LEAD_ROW_OTHER_BIZ
+
+        mock_authz, _ = self._run_handler(update, finder_side_effect=finder)
+        mock_authz.assert_called_once()
+
+
+class TestLeadNotesMutation(LeadNotesMutationTestBase):
+    def test_mutation_runs_via_asyncio_to_thread(self):
+        update = _make_update()
+        seen_funcs = []
+
+        async def spy_to_thread(func, *args, **kwargs):
+            seen_funcs.append(getattr(func, "__name__", None))
+            if getattr(func, "__name__", None) == "find_lead_by_id":
+                return _LEAD_ROW
+            return {"ok": True, "code": "LEAD_UPDATED", "error": None, "changed": True}
+
+        with patch("business_core.telegram_handlers.asyncio.to_thread", side_effect=spy_to_thread), \
+             patch(_AUTHZ_PATH, new=AsyncMock(return_value=_allow_result())), \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+            _run(th.updateleadnotes_cmd(update, _make_context(_LEAD_ARGS)))
+        self.assertIn("update_lead_admin_fields", seen_funcs)
+
+    def test_mutation_called_exactly_once(self):
+        update = _make_update()
+        _, mock_mutator = self._run_handler(update, finder_return=_LEAD_ROW)
+        mock_mutator.assert_called_once()
+
+    def test_mutation_called_with_exact_args(self):
+        update = _make_update()
+        _, mock_mutator = self._run_handler(update, finder_return=_LEAD_ROW)
+        mock_mutator.assert_called_once_with("LED-001", {"Notes": "hello"})
+
+    def test_mutation_exception_no_retry(self):
+        update = _make_update()
+
+        def boom(*_a, **_k):
+            raise RuntimeError("write failed")
+
+        _, mock_mutator = self._run_handler(update, finder_return=_LEAD_ROW, mutator_side_effect=boom)
+        mock_mutator.assert_called_once()
+
+    def test_mutation_exception_no_raw_exception_in_reply(self):
+        update = _make_update()
+
+        def boom(*_a, **_k):
+            raise RuntimeError("write failed")
+
+        self._run_handler(update, finder_return=_LEAD_ROW, mutator_side_effect=boom)
+        text = self._sent_text(update)
+        self.assertNotIn("RuntimeError", text)
+        self.assertNotIn("write failed", text)
+
+    def test_mutation_exception_safe_generic_message(self):
+        update = _make_update()
+
+        def boom(*_a, **_k):
+            raise RuntimeError("write failed")
+
+        self._run_handler(update, finder_return=_LEAD_ROW, mutator_side_effect=boom)
+        self.assertEqual(self._sent_text(update), "❌ Не удалось обновить Notes для Lead.")
+
+    def test_notes_content_absent_from_reply(self):
+        update = _make_update()
+        self._run_handler(update, finder_return=_LEAD_ROW, args=["lead_id=LED-001", "notes=SECRET_CONTENT"])
+        self.assertNotIn("SECRET_CONTENT", self._sent_text(update))
+
+    def test_success_reply_only_after_mutation_result(self):
+        update = _make_update()
+        self._run_handler(update, finder_return=_LEAD_ROW, mutator_return={
+            "ok": True, "code": "LEAD_UPDATED", "error": None, "changed": True,
+        })
+        self.assertEqual(self._sent_text(update), "✅ Notes для Lead LED-001 обновлены.")
+
+    def test_unchanged_result_handled(self):
+        update = _make_update()
+        self._run_handler(update, finder_return=_LEAD_ROW, mutator_return={
+            "ok": True, "code": "LEAD_UPDATE_UNCHANGED", "error": None, "changed": False,
+        })
+        self.assertIn("изменений нет", self._sent_text(update))
+
+    def test_not_found_after_authorization_mapped_to_changed_message(self):
+        update = _make_update()
+        self._run_handler(update, finder_return=_LEAD_ROW, mutator_return={
+            "ok": False, "code": "LEAD_NOT_FOUND", "error": "Lead LED-001 не найден",
+        })
+        self.assertEqual(self._sent_text(update), "Запись изменилась. Повтори команду ещё раз.")
+
+    def test_unknown_result_code_generic_message_no_code_leaked(self):
+        update = _make_update()
+        self._run_handler(update, finder_return=_LEAD_ROW, mutator_return={
+            "ok": False, "code": "LEAD_IMMUTABLE", "error": "Поле Status является неизменяемым фактом Lead",
+        })
+        text = self._sent_text(update)
+        self.assertEqual(text, "❌ Не удалось обновить Notes для Lead.")
+        self.assertNotIn("LEAD_IMMUTABLE", text)
+        self.assertNotIn("Status", text)
+        self.assertNotIn("неизменяемым", text)
+
+    def test_raw_error_never_rendered(self):
+        update = _make_update()
+        self._run_handler(update, finder_return=_LEAD_ROW, mutator_return={
+            "ok": False, "code": "SOME_FUTURE_CODE", "error": "raw domain error text should never appear",
+        })
+        text = self._sent_text(update)
+        self.assertNotIn("raw domain error text should never appear", text)
+
+
+# ─────────────────────────────────────────────────────────────
+# Phase 17E-2A2-R1: exception-secrecy correction — proves every
+# exception path in updateleadnotes_cmd logs nothing sensitive and
+# replies with only the fixed safe message. A synthetic exception
+# message carries three secret markers; none may appear in the
+# Telegram reply, or in any logger call's positional/keyword
+# arguments. These markers are deliberately never asserted via a
+# failure-message string that would print them to test output —
+# assertNotIn's own failure message only echoes the haystack
+# (log call args / reply text), not the needle, so no extra care is
+# needed beyond not calling print()/repr() on the marker itself
+# anywhere in this test.
+# ─────────────────────────────────────────────────────────────
+
+_SECRET_NOTES_MARKER = "SECRET_NOTES_MARKER"
+_SECRET_BIZ_MARKER = "BIZ-SECRET"
+_SECRET_ROW_MARKER = "ROW-SECRET"
+_ALL_SECRET_MARKERS = (_SECRET_NOTES_MARKER, _SECRET_BIZ_MARKER, _SECRET_ROW_MARKER)
+
+
+def _boom_with_secrets(*_a, **_k):
+    raise RuntimeError(
+        f"synthetic failure containing {_SECRET_NOTES_MARKER} and {_SECRET_BIZ_MARKER} and {_SECRET_ROW_MARKER}"
+    )
+
+
+class TestLeadNotesExceptionSecrecy(LeadNotesMutationTestBase):
+    def _assert_no_secrets_logged(self, mock_log_error):
+        for call in mock_log_error.call_args_list:
+            for arg in list(call.args) + list(call.kwargs.values()):
+                text = str(arg)
+                for marker in _ALL_SECRET_MARKERS:
+                    self.assertNotIn(marker, text)
+
+    def test_mutation_exception_no_secrets_in_log_call_args(self):
+        update = _make_update()
+        with patch("business_core.telegram_handlers.log.error") as mock_log_error:
+            self._run_handler(
+                update,
+                args=["lead_id=LED-001", f"notes={_SECRET_NOTES_MARKER}"],
+                finder_return={**_LEAD_ROW, "Business ID": _SECRET_BIZ_MARKER},
+                mutator_side_effect=_boom_with_secrets,
+            )
+        mock_log_error.assert_called_once()
+        self._assert_no_secrets_logged(mock_log_error)
+
+    def test_mutation_exception_log_call_is_fixed_string(self):
+        update = _make_update()
+        with patch("business_core.telegram_handlers.log.error") as mock_log_error:
+            self._run_handler(update, finder_return=_LEAD_ROW, mutator_side_effect=_boom_with_secrets)
+        mock_log_error.assert_called_once_with("updateleadnotes_cmd mutation infrastructure failure")
+
+    def test_mutation_exception_no_secrets_in_reply(self):
+        update = _make_update()
+        self._run_handler(
+            update,
+            args=["lead_id=LED-001", f"notes={_SECRET_NOTES_MARKER}"],
+            finder_return={**_LEAD_ROW, "Business ID": _SECRET_BIZ_MARKER},
+            mutator_side_effect=_boom_with_secrets,
+        )
+        text = self._sent_text(update)
+        for marker in _ALL_SECRET_MARKERS:
+            self.assertNotIn(marker, text)
+        self.assertEqual(text, "❌ Не удалось обновить Notes для Lead.")
+
+    def test_first_lookup_exception_no_log_call_at_all(self):
+        # First-lookup exception path logs nothing today — confirmed
+        # here so a future regression that adds unsafe logging would
+        # be caught, without this phase adding new logging itself.
+        update = _make_update()
+        with patch("business_core.telegram_handlers.log.error") as mock_log_error, \
+             patch("business_core.telegram_handlers.log.warning") as mock_log_warning:
+            self._run_handler(
+                update, args=[f"lead_id=LED-001", f"notes={_SECRET_NOTES_MARKER}"],
+                finder_side_effect=_boom_with_secrets,
+            )
+        mock_log_error.assert_not_called()
+        mock_log_warning.assert_not_called()
+
+    def test_first_lookup_exception_no_secrets_in_reply(self):
+        update = _make_update()
+        self._run_handler(
+            update, args=["lead_id=LED-001", f"notes={_SECRET_NOTES_MARKER}"],
+            finder_side_effect=_boom_with_secrets,
+        )
+        text = self._sent_text(update)
+        for marker in _ALL_SECRET_MARKERS:
+            self.assertNotIn(marker, text)
+        self.assertEqual(text, "Временная ошибка проверки доступа. Попробуйте ещё раз позже.")
+
+    def test_second_lookup_exception_no_log_call_at_all(self):
+        update = _make_update()
+        calls = {"n": 0}
+
+        def finder(*_a, **_k):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return _LEAD_ROW
+            return _boom_with_secrets()
+
+        with patch("business_core.telegram_handlers.log.error") as mock_log_error, \
+             patch("business_core.telegram_handlers.log.warning") as mock_log_warning:
+            self._run_handler(update, finder_side_effect=finder)
+        mock_log_error.assert_not_called()
+        mock_log_warning.assert_not_called()
+
+    def test_second_lookup_exception_no_secrets_in_reply(self):
+        update = _make_update()
+        calls = {"n": 0}
+
+        def finder(*_a, **_k):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return _LEAD_ROW
+            return _boom_with_secrets()
+
+        self._run_handler(update, finder_side_effect=finder)
+        text = self._sent_text(update)
+        for marker in _ALL_SECRET_MARKERS:
+            self.assertNotIn(marker, text)
+        self.assertEqual(text, "Временная ошибка проверки доступа. Попробуйте ещё раз позже.")
+
+    def test_mutation_exception_log_message_contains_no_exc_info_flag(self):
+        # exc_info/traceback attachment is deliberately avoided since a
+        # traceback could indirectly surface request payload content —
+        # confirmed by inspecting the handler source directly.
+        src = inspect.getsource(th.updateleadnotes_cmd)
+        self.assertNotIn("log.exception(", src)
+        self.assertNotIn("exc_info=True", src)
+
+
+class TestLeadNotesIdempotency(LeadNotesMutationTestBase):
+    def test_repeated_identical_notes_produces_unchanged_code(self):
+        update1 = _make_update()
+        self._run_handler(update1, finder_return=_LEAD_ROW, mutator_return={
+            "ok": True, "code": "LEAD_UPDATE_UNCHANGED", "error": None, "changed": False,
+        })
+        self.assertIn("изменений нет", self._sent_text(update1))
+
+    def test_no_automatic_retry_in_handler(self):
+        src = inspect.getsource(th.updateleadnotes_cmd)
+        self.assertNotIn("for _ in range", src)
+        self.assertNotIn("while True", src)
+        self.assertNotIn("retry", src.lower())
+
+
+class TestLeadNotesIsolation(unittest.TestCase):
+    def test_updatelead_cmd_unchanged_source_hash(self):
+        # updatelead_cmd itself must not reference the new mapper/
+        # helper flow at all — it is untouched by this phase.
+        src = inspect.getsource(th.updatelead_cmd)
+        self.assertNotIn("_mutate_target_in_thread(", src)
+        self.assertNotIn("_authorize_or_reply(", src)
+        self.assertNotIn("_validate_bc_transport_or_reply(", src)
+
+    def test_updatelead_not_in_enforcement_map(self):
+        self.assertNotIn("updatelead", th.COMMAND_ENFORCEMENT_MAP)
+
+    def test_updateleadnotes_does_not_call_updatelead_cmd(self):
+        src = inspect.getsource(th.updateleadnotes_cmd)
+        self.assertNotIn("updatelead_cmd(", src)
+
+    def test_updateleadnotes_does_not_call_update_lead(self):
+        # AST-level check (not substring) so the docstring's own prose
+        # describing what is NOT called can't produce a false positive.
+        tree = ast.parse(inspect.getsource(th.updateleadnotes_cmd))
+        called_names = {
+            n.func.id for n in ast.walk(tree)
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+        }
+        referenced_names = {
+            n.id for n in ast.walk(tree) if isinstance(n, ast.Name)
+        }
+        self.assertNotIn("update_lead", called_names)
+        self.assertNotIn("update_lead", referenced_names)
+
+    def test_updateleadnotes_does_not_call_update_lead_active_fields(self):
+        tree = ast.parse(inspect.getsource(th.updateleadnotes_cmd))
+        referenced_names = {
+            n.id for n in ast.walk(tree) if isinstance(n, ast.Name)
+        }
+        self.assertNotIn("update_lead_active_fields", referenced_names)
+
+
+class TestLeadNotesArchitecture(unittest.TestCase):
+    def test_enforcement_map_has_exactly_eight_entries(self):
+        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 8)
+
+    def test_updateleadnotes_metadata_exact(self):
+        self.assertEqual(th.COMMAND_ENFORCEMENT_MAP["updateleadnotes"], {
+            "resource": "FINANCE", "action": "UPDATE", "target_shape": "BUSINESS",
+            "operation_kind": "MUTATION", "allowed_modes": ("NOTES_ONLY",), "requires_fresh_reread": True,
+            "mutation_side_effect_class": "SINGLE_ROW_MUTATION", "idempotency_class": "IDEMPOTENT",
+        })
+
+    def test_only_interaction_and_lead_notes_use_mutate_helper(self):
+        src_interaction = inspect.getsource(th.updateinteractionnotes_cmd)
+        src_lead_notes = inspect.getsource(th.updateleadnotes_cmd)
+        self.assertIn("_mutate_target_in_thread(", src_interaction)
+        self.assertIn("_mutate_target_in_thread(", src_lead_notes)
+        for name in _OTHER_ENFORCED_HANDLERS + _OTHER_MUTATION_CANDIDATE_HANDLERS:
+            if not hasattr(th, name):
+                continue
+            with self.subTest(handler=name):
+                other_src = inspect.getsource(getattr(th, name))
+                self.assertNotIn("_mutate_target_in_thread(", other_src)
+
+    def test_registration_line_unchanged(self):
+        with open("business_core/telegram_handlers.py", encoding="utf-8") as f:
+            content = f.read()
+        self.assertEqual(content.count('CommandHandler("updateleadnotes",'), 1)
 
 
 if __name__ == "__main__":

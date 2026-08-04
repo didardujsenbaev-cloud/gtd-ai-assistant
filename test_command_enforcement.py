@@ -8,9 +8,11 @@ Pure inventory/architecture tests — no domain behavior is exercised
 here (that belongs to test_business_core_read_enforcement.py and
 test_mutation_enforcement.py). These tests prove the STRUCTURE of the
 enforcement rollout: the six Phase 17E-1 read commands remain
-unchanged, exactly one Phase 17E-2A mutation command
-(updateinteractionnotes) was added, no other command changed, no
-resource substitution, no bypass parameter, no cache,
+unchanged, the Phase 17E-2A mutation command (updateinteractionnotes)
+and the Phase 17E-2A2 dedicated command (updateleadnotes) were added,
+no other command changed — in particular /updatelead and
+/updateobligation remain entirely outside this map — no resource
+substitution, no bypass parameter, no cache,
 GTD/telegram_bot.py/authorization.py untouched.
 """
 
@@ -46,6 +48,11 @@ _EXPECTED_MUTATION_ENTRY = {
         "operation_kind": "MUTATION", "requires_fresh_reread": True,
         "mutation_side_effect_class": "SINGLE_ROW_MUTATION", "idempotency_class": "IDEMPOTENT",
     },
+    "updateleadnotes": {
+        "resource": "FINANCE", "action": "UPDATE", "target_shape": "BUSINESS",
+        "operation_kind": "MUTATION", "allowed_modes": ("NOTES_ONLY",), "requires_fresh_reread": True,
+        "mutation_side_effect_class": "SINGLE_ROW_MUTATION", "idempotency_class": "IDEMPOTENT",
+    },
 }
 
 _NON_ENFORCED_SAMPLE_HANDLERS = [
@@ -63,7 +70,7 @@ _NON_ENFORCED_SAMPLE_HANDLERS = [
 
 
 class TestEnforcementMap(unittest.TestCase):
-    def test_map_keys_exactly_seven_commands(self):
+    def test_map_keys_exactly_eight_commands(self):
         expected_keys = set(_EXPECTED_MAP.keys()) | set(_EXPECTED_MUTATION_ENTRY.keys())
         self.assertEqual(set(th.COMMAND_ENFORCEMENT_MAP.keys()), expected_keys)
 
@@ -72,11 +79,19 @@ class TestEnforcementMap(unittest.TestCase):
             with self.subTest(command=key):
                 self.assertEqual(th.COMMAND_ENFORCEMENT_MAP[key], val)
 
-    def test_mutation_entry_exact(self):
-        self.assertEqual(th.COMMAND_ENFORCEMENT_MAP["updateinteractionnotes"], _EXPECTED_MUTATION_ENTRY["updateinteractionnotes"])
+    def test_mutation_entries_exact(self):
+        for key, val in _EXPECTED_MUTATION_ENTRY.items():
+            with self.subTest(command=key):
+                self.assertEqual(th.COMMAND_ENFORCEMENT_MAP[key], val)
 
-    def test_no_eighth_command_in_map(self):
-        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 7)
+    def test_no_ninth_command_in_map(self):
+        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 8)
+
+    def test_updatelead_not_in_map(self):
+        self.assertNotIn("updatelead", th.COMMAND_ENFORCEMENT_MAP)
+
+    def test_updateobligation_not_in_map(self):
+        self.assertNotIn("updateobligation", th.COMMAND_ENFORCEMENT_MAP)
 
 
 class TestHandlersUseTransportPreflightAndAdapter(unittest.TestCase):

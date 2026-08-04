@@ -83,6 +83,11 @@ COMMAND_ENFORCEMENT_MAP = {
         "operation_kind": "MUTATION", "requires_fresh_reread": True,
         "mutation_side_effect_class": "SINGLE_ROW_MUTATION", "idempotency_class": "IDEMPOTENT",
     },
+    "updateleadnotes": {
+        "resource": "FINANCE", "action": "UPDATE", "target_shape": "BUSINESS",
+        "operation_kind": "MUTATION", "allowed_modes": ("NOTES_ONLY",), "requires_fresh_reread": True,
+        "mutation_side_effect_class": "SINGLE_ROW_MUTATION", "idempotency_class": "IDEMPOTENT",
+    },
 }
 
 _BC_ENFORCEMENT_NOT_FOUND_OR_DENIED_MSG = "Запись недоступна или не найдена."
@@ -13514,6 +13519,119 @@ async def updatelead_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await _reply(update, "❌ Не удалось обновить Lead.", parse_mode=None)
 
 
+_UPDATELEADNOTES_ALLOWED_KEYS = frozenset({"lead_id", "notes"})
+
+
+def _lead_notes_message(result: dict, lead_id: str) -> str:
+    """
+    Dedicated safe mapper for /updateleadnotes (Phase 17E-2A2) — unlike
+    _lead_update_message, this NEVER renders result['error'], str/repr
+    of the result, or the raw result code in any branch, since this
+    command reaches business_builder.update_lead_admin_fields() only
+    with {"Notes": ...} and must not leak domain error internals for
+    codes that should be structurally unreachable here.
+    """
+    code = result.get("code", "")
+
+    if code == "LEAD_UPDATED":
+        return f"✅ Notes для Lead {lead_id} обновлены."
+    if code == "LEAD_UPDATE_UNCHANGED":
+        return f"ℹ️ Lead {lead_id} — изменений нет (значения совпадают)."
+    if code == "LEAD_NOT_FOUND":
+        # Authorization already succeeded against this lead_id — a
+        # NOT_FOUND surfacing only now means the record vanished
+        # between the mandatory second lookup and the mutator's own
+        # internal lookup (the accepted residual TOCTOU window), not a
+        # pre-authorization enumeration case.
+        return _BC_ENFORCEMENT_OWNERSHIP_CHANGED_MSG
+
+    log.warning(f"_lead_notes_message: unmapped code={code!r} lead_id={lead_id}")
+    return "❌ Не удалось обновить Notes для Lead."
+
+
+async def updateleadnotes_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /updateleadnotes lead_id=LED-001 notes=...
+
+    Phase 17E-2A2: dedicated, fully authorized, single-purpose command
+    — FINANCE/UPDATE, target_shape=BUSINESS, MUTATION,
+    requires_fresh_reread=True. Reuses business_builder.
+    update_lead_admin_fields() only — never calls updatelead_cmd,
+    business_builder.update_lead(), or update_lead_active_fields().
+    /updatelead itself is unchanged and remains outside
+    COMMAND_ENFORCEMENT_MAP. Exactly {"lead_id", "notes"} is the only
+    permitted parsed key set — any other key (including positional
+    _posN keys) is rejected before the finder ever runs.
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg(), parse_mode=None)
+        return
+
+    if not await _validate_bc_transport_or_reply(update):
+        return
+
+    raw = " ".join(context.args or [])
+    args = _parse_kv_args(raw)
+
+    if not set(args.keys()) <= _UPDATELEADNOTES_ALLOWED_KEYS:
+        await _reply(update, "❌ /updateleadnotes принимает только lead_id и notes.", parse_mode=None)
+        return
+
+    lead_id = args.get("lead_id", "")
+    notes = args.get("notes", "")
+
+    if not lead_id or not notes:
+        await _reply(
+            update,
+            "❌ Укажи lead_id и notes.\n\nПример:\n"
+            "`/updateleadnotes lead_id=LED-001 notes=...`", parse_mode=None)
+        return
+
+    from business_core.lead_manager import find_lead_by_id
+    from business_core.business_builder import update_lead_admin_fields
+
+    try:
+        first_row = await _resolve_target_in_thread(find_lead_by_id, lead_id)
+    except Exception:
+        await _reply(update, _BC_ENFORCEMENT_TEMPORARILY_UNAVAILABLE_MSG, parse_mode=None)
+        return
+
+    first_business_id = str((first_row or {}).get("Business ID", "")).strip()
+    if first_row is None or not first_business_id:
+        await _reply(update, _BC_ENFORCEMENT_NOT_FOUND_OR_DENIED_MSG, parse_mode=None)
+        return
+
+    if not await _authorize_or_reply(
+        update, resource="FINANCE", action="UPDATE", business_id=first_business_id,
+    ):
+        return
+
+    try:
+        second_row = await _resolve_target_in_thread(find_lead_by_id, lead_id)
+    except Exception:
+        await _reply(update, _BC_ENFORCEMENT_TEMPORARILY_UNAVAILABLE_MSG, parse_mode=None)
+        return
+
+    second_business_id = str((second_row or {}).get("Business ID", "")).strip()
+    if second_row is None or not second_business_id or second_business_id != first_business_id:
+        await _reply(update, _BC_ENFORCEMENT_OWNERSHIP_CHANGED_MSG, parse_mode=None)
+        return
+
+    try:
+        result = await _mutate_target_in_thread(update_lead_admin_fields, lead_id, {"Notes": notes})
+    except Exception:
+        # Fixed branch identifier only — no exception interpolation, no
+        # exc_info/traceback attachment, no Notes/updates/row/Business
+        # ID/lead_id. The raw exception (e.g. a Sheets API error) could
+        # theoretically echo request payload content, so nothing about
+        # it is logged.
+        log.error("updateleadnotes_cmd mutation infrastructure failure")
+        await _reply(update, "❌ Не удалось обновить Notes для Lead.", parse_mode=None)
+        return
+
+    await _reply(update, _lead_notes_message(result, lead_id), parse_mode=None)
+
+
 async def contactlead_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     /contactlead lead_id=LED-001 [last_contacted_at=...]
@@ -15849,6 +15967,7 @@ def register_business_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("leads",            leads_cmd))
     app.add_handler(CommandHandler("lead",             lead_cmd))
     app.add_handler(CommandHandler("updatelead",       updatelead_cmd))
+    app.add_handler(CommandHandler("updateleadnotes",  updateleadnotes_cmd))
     app.add_handler(CommandHandler("contactlead",      contactlead_cmd))
     app.add_handler(CommandHandler("qualifylead",      qualifylead_cmd))
     app.add_handler(CommandHandler("unqualifylead",    unqualifylead_cmd))
