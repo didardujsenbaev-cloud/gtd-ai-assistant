@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import sys
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, AsyncMock, patch
 
 DOC_HEADERS = [
@@ -264,6 +265,14 @@ def _upd(text: str):
     update.message.text = text
     update.message.reply_text = AsyncMock()
     update.effective_user = MagicMock(username="dida", id=123)
+    # Phase 17E-1: doc_cmd now runs a transport preflight before
+    # anything else, requiring a real private-chat shape — a bare
+    # MagicMock() auto-attribute is truthy and not "private", so it
+    # must be set explicitly for these fixtures to still exercise the
+    # command's real behavior instead of being rejected at preflight.
+    # Harmless for the /registerdoc ConversationHandler tests sharing
+    # this same helper, since that flow performs no transport check.
+    update.effective_chat = SimpleNamespace(type="private")
     return update
 
 
@@ -567,18 +576,34 @@ class TestRegisterDocConfirm(unittest.TestCase):
         self.assertEqual(len(sheet._appended), 1)
 
 
+def _allow_result_for_doc():
+    return {"ok": True, "allowed": True, "code": "TELEGRAM_ACCESS_ALLOWED", "retry_safe": True,
+            "authorization_result": {"ok": True, "allowed": True, "code": "ACCESS_ALLOWED"}}
+
+
 class TestDocCmd(unittest.TestCase):
     def test_read_by_document_id(self):
         th = _fresh_th()
+        # Phase 17E-1: DOCUMENT is an object-addressable resource — the
+        # frozen Phase 17C structural contract requires both business_id
+        # AND object_id, so a fixture representing an authorizable
+        # document must have a real Object ID (unlike the original
+        # fixture, which left it blank — that field wasn't required by
+        # DOCUMENT_REGISTRY_REQUIRED_ARGS at *creation* time, but a
+        # document with no Object ID cannot be authorized for /doc under
+        # the approved DOCUMENT resource rule, and is correctly treated
+        # as inaccessible rather than as a defect in doc_cmd).
         row = dict(zip(DOC_HEADERS,
-            ["DREG-001", "DFAM-001", "1", "BIZ-001", "", "", "RM-001", "STAGE-001",
+            ["DREG-001", "DFAM-001", "1", "BIZ-001", "", "OBJ-001", "RM-001", "STAGE-001",
              "", "Техпаспорт", "uploaded", "abc123", "url", "passport.pdf",
              "application/pdf", "2026-01-01", "dida", "", "", "", "", "", ""]))
         update, context = _upd("/doc document_id=DREG-001"), _ctx(args=["document_id=DREG-001"])
 
         async def run():
             with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
-                 patch("business_core.sheets.find_row_by_id", return_value=(2, row)):
+                 patch("business_core.sheets.find_row_by_id", return_value=(2, row)), \
+                 patch("business_core.telegram_authorization.authorize_telegram_business_core_request",
+                       new=AsyncMock(return_value=_allow_result_for_doc())):
                 await th.doc_cmd(update, context)
 
         asyncio.run(run())
@@ -587,6 +612,10 @@ class TestDocCmd(unittest.TestCase):
         self.assertIn("Техпаспорт", msg)
 
     def test_not_found(self):
+        """Phase 17E-1: a not-found record now renders the shared
+        anti-enumeration text — identical to a denied-but-existing
+        record — rather than an entity-specific "не найден" message,
+        so a caller cannot distinguish nonexistence from denial."""
         th = _fresh_th()
         update, context = _upd("/doc document_id=DREG-999"), _ctx(args=["document_id=DREG-999"])
 
@@ -597,7 +626,7 @@ class TestDocCmd(unittest.TestCase):
 
         asyncio.run(run())
         msg = update.message.reply_text.call_args[0][0]
-        self.assertIn("не найден", msg)
+        self.assertEqual(msg, "Запись недоступна или не найдена.")
 
 
 def _scope_result(exists, items=(), has_configuration_errors=False):

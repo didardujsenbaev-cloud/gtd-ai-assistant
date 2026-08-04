@@ -507,12 +507,69 @@ class TestNoCallerSideIdGenerationOrRelationPolicy(unittest.TestCase):
             self.assertNotIn("trash_file(", body)
 
 
+def _th_function_node(fn_name: str) -> ast.AST:
+    src = (BUSINESS_CORE / "telegram_handlers.py").read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == fn_name:
+            return node
+    raise AssertionError(f"function {fn_name} not found")
+
+
 class TestDocCommandExactIdOnly(unittest.TestCase):
 
-    def test_doc_cmd_uses_document_manager_find_by_id(self):
+    def test_doc_cmd_resolves_find_document_by_id_through_thread_offload(self):
+        """
+        Phase 17E-1 semantic replacement for the pre-17E-1 literal-
+        substring check "find_document_by_id(" — that assumption
+        represented a direct synchronous call, which is now obsolete:
+        the approved architecture passes the finder BY REFERENCE into
+        _resolve_target_in_thread(finder, record_id) so the blocking
+        Sheets-backed call runs via asyncio.to_thread. This proves the
+        real intent the old check stood in for: the correct finder
+        function object and the correct record-ID variable are passed
+        to the thread-offload helper, the handler never calls the
+        finder directly/synchronously, and the finder is never called
+        anywhere outside that one helper call.
+        """
+        node = _th_function_node("doc_cmd")
+
+        offload_calls = []
+        direct_calls = []
+        for n in ast.walk(node):
+            if isinstance(n, ast.Call):
+                func = n.func
+                if isinstance(func, ast.Name) and func.id == "_resolve_target_in_thread":
+                    offload_calls.append(n)
+                elif isinstance(func, ast.Name) and func.id == "find_document_by_id":
+                    direct_calls.append(n)
+
+        self.assertEqual(len(offload_calls), 1, "doc_cmd must resolve its target through exactly one _resolve_target_in_thread call")
+        call = offload_calls[0]
+        self.assertEqual(len(call.args), 2)
+        finder_arg, id_arg = call.args
+        self.assertIsInstance(finder_arg, ast.Name, "the finder must be passed by reference (a bare name), not called")
+        self.assertEqual(finder_arg.id, "find_document_by_id")
+        self.assertIsInstance(id_arg, ast.Name)
+        self.assertEqual(id_arg.id, "document_id")
+
+        # find_document_by_id must never be called directly/synchronously
+        # anywhere in doc_cmd — its only appearance as a callee must be
+        # the import statement and the by-reference argument above.
+        self.assertEqual(direct_calls, [], "find_document_by_id must never be called directly — only passed by reference to _resolve_target_in_thread")
+
         body = _th_function_body("doc_cmd")
-        self.assertIn("find_document_by_id(", body)
         self.assertNotIn("sheets.find_row_by_id", body)
+
+    def test_doc_cmd_authorizes_only_after_row_resolved(self):
+        """Semantic ordering guard: the _authorize_or_reply call must
+        appear lexically after the _resolve_target_in_thread call in
+        doc_cmd's source — authorization must never precede having a
+        resolved row to derive ownership from."""
+        body = _th_function_body("doc_cmd")
+        offload_pos = body.index("_resolve_target_in_thread(")
+        authz_pos = body.index("_authorize_or_reply(")
+        self.assertLess(offload_pos, authz_pos, "_resolve_target_in_thread must run before _authorize_or_reply")
 
     def test_doc_cmd_has_no_fuzzy_or_listing_fallback(self):
         body = _th_function_body("doc_cmd")

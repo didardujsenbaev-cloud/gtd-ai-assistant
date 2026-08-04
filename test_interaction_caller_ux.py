@@ -22,6 +22,7 @@ import asyncio
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, AsyncMock, patch
 
 WORKSPACE = Path(__file__).parent
@@ -35,6 +36,13 @@ def _upd(text: str):
     update.message.text = text
     update.message.reply_text = AsyncMock()
     update.effective_user = MagicMock(username="dida", id=123)
+    # Phase 17E-1: interaction_cmd now runs a transport preflight
+    # before anything else, requiring a real private-chat shape — a
+    # bare MagicMock() auto-attribute is truthy and not "private", so
+    # it must be set explicitly for these fixtures to still exercise
+    # the command's real behavior instead of being rejected at
+    # preflight.
+    update.effective_chat = SimpleNamespace(type="private")
     return update
 
 
@@ -413,10 +421,13 @@ class TestReadCommandsReturnSafeEmptyState(unittest.TestCase):
         self.assertIn("ℹ️", _sent_text(update))
 
     def test_interaction_not_found(self):
+        """Phase 17E-1: not-found now renders the shared anti-
+        enumeration text (identical to a denied-but-existing record),
+        not an entity-specific "не найден" message."""
         update, context = _cmd("/interaction interaction_id=ACT-999")
         with patch("business_core.interaction_manager.find_interaction_by_id", return_value=None):
             _run(th.interaction_cmd(update, context))
-        self.assertIn("❌", _sent_text(update))
+        self.assertEqual(_sent_text(update), "Запись недоступна или не найдена.")
 
     def test_interactions_excludes_archived_by_default(self):
         update, context = _cmd("/interactions")

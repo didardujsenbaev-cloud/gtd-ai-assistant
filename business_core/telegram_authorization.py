@@ -130,6 +130,62 @@ def _base_transport_fields(chat_ctx: dict, telegram_user_id=None, telegram_actor
 
 
 # ─────────────────────────────────────────────────────────────
+# Phase 17E-1: public, synchronous, read-free transport preflight.
+#
+# Reuses the exact same private helpers the two async adapters above
+# already use — never duplicates their branching logic. Answers ONLY
+# "is this a well-formed private-chat request with a resolvable
+# Telegram User ID" — nothing about Business Core identity or
+# authorization. Performs zero Google Sheets reads, zero
+# identity-registry reads, zero Authorization Domain calls, zero
+# asyncio.to_thread (there is nothing to offload — no I/O happens
+# here), zero writes, zero caching. Callers (Telegram command
+# handlers) use this to reject group/malformed/userless requests
+# BEFORE any exact-ID Sheets lookup runs — see Phase 17E-A2.
+# ─────────────────────────────────────────────────────────────
+
+def validate_telegram_business_core_transport(update) -> dict:
+    """
+    Synchronous. valid=True means only: the Update shape is
+    acceptable, effective_chat resolves, the chat type is private,
+    effective_user resolves, and effective_user.id exists. It does
+    NOT mean the Telegram user has a registered Business Core
+    identity, an active Employee, or any authorization — those are
+    only ever determined by authorize_telegram_business_core_request's
+    own Sheets-backed authorize_business_core_access call.
+    """
+    chat_ctx = _resolve_chat_context(update)
+    if not chat_ctx["ok"]:
+        return {
+            "ok": False, "valid": False, "code": chat_ctx["code"], "error": None, "retry_safe": False,
+            "telegram_user_id": None, "chat_type": None, "is_private_chat": False,
+            "user_message_key": None,
+        }
+    if not chat_ctx["is_private_chat"]:
+        return {
+            "ok": True, "valid": False, "code": "PRIVATE_CHAT_REQUIRED", "error": None, "retry_safe": True,
+            "telegram_user_id": None, "chat_type": chat_ctx["chat_type"], "is_private_chat": False,
+            "user_message_key": "private_chat_required",
+        }
+
+    user_ctx = _resolve_telegram_user_id(update)
+    if not user_ctx["ok"]:
+        ok = user_ctx["code"] == "TELEGRAM_USER_NOT_FOUND"
+        return {
+            "ok": ok, "valid": False, "code": user_ctx["code"], "error": None, "retry_safe": ok,
+            "telegram_user_id": None, "chat_type": chat_ctx["chat_type"], "is_private_chat": True,
+            "user_message_key": "identity_not_recognized" if ok else None,
+        }
+
+    return {
+        "ok": True, "valid": True, "code": None, "error": None, "retry_safe": True,
+        "telegram_user_id": str(user_ctx["telegram_user_id"]),
+        "chat_type": chat_ctx["chat_type"], "is_private_chat": True,
+        "user_message_key": None,
+    }
+
+
+# ─────────────────────────────────────────────────────────────
 # A. Authorization adapter
 # ─────────────────────────────────────────────────────────────
 

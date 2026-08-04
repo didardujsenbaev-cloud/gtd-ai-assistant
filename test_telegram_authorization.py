@@ -487,5 +487,127 @@ class TestThreadOffload(AsyncTestCase):
         self.assertGreater(ticks, 3, "event loop appears blocked during the offloaded domain call")
 
 
+# ─────────────────────────────────────────────────────────────
+# Phase 17E-1: validate_telegram_business_core_transport (public,
+# synchronous, read-free preflight)
+# ─────────────────────────────────────────────────────────────
+
+class TestValidateTelegramBusinessCoreTransport(unittest.TestCase):
+    def test_valid_private_update(self):
+        r = _ta().validate_telegram_business_core_transport(_update(user_id=570004109))
+        self.assertTrue(r["ok"])
+        self.assertTrue(r["valid"])
+        self.assertIsNone(r["code"])
+        self.assertEqual(r["telegram_user_id"], "570004109")
+        self.assertEqual(r["chat_type"], "private")
+        self.assertTrue(r["is_private_chat"])
+
+    def test_group(self):
+        r = _ta().validate_telegram_business_core_transport(_update(chat_type="group"))
+        self.assertTrue(r["ok"])
+        self.assertFalse(r["valid"])
+        self.assertEqual(r["code"], "PRIVATE_CHAT_REQUIRED")
+        self.assertTrue(r["retry_safe"])
+
+    def test_supergroup(self):
+        r = _ta().validate_telegram_business_core_transport(_update(chat_type="supergroup"))
+        self.assertEqual(r["code"], "PRIVATE_CHAT_REQUIRED")
+
+    def test_channel(self):
+        r = _ta().validate_telegram_business_core_transport(_update(chat_type="channel"))
+        self.assertEqual(r["code"], "PRIVATE_CHAT_REQUIRED")
+
+    def test_update_none(self):
+        r = _ta().validate_telegram_business_core_transport(None)
+        self.assertFalse(r["ok"])
+        self.assertFalse(r["valid"])
+        self.assertEqual(r["code"], "INVALID_TELEGRAM_UPDATE")
+        self.assertFalse(r["retry_safe"])
+
+    def test_missing_effective_chat_attribute(self):
+        r = _ta().validate_telegram_business_core_transport(SimpleNamespace())
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["code"], "INVALID_TELEGRAM_UPDATE")
+
+    def test_effective_chat_none(self):
+        r = _ta().validate_telegram_business_core_transport(SimpleNamespace(effective_chat=None))
+        self.assertTrue(r["ok"])
+        self.assertFalse(r["valid"])
+        self.assertEqual(r["code"], "PRIVATE_CHAT_REQUIRED")
+
+    def test_missing_chat_type(self):
+        upd = SimpleNamespace(effective_chat=SimpleNamespace(type=None))
+        r = _ta().validate_telegram_business_core_transport(upd)
+        self.assertEqual(r["code"], "PRIVATE_CHAT_REQUIRED")
+
+    def test_missing_effective_user_attribute(self):
+        r = _ta().validate_telegram_business_core_transport(_update_no_user_attr())
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["code"], "INVALID_TELEGRAM_UPDATE")
+
+    def test_effective_user_none(self):
+        upd = _update(has_user=False)
+        upd.effective_user = None
+        r = _ta().validate_telegram_business_core_transport(upd)
+        self.assertTrue(r["ok"])
+        self.assertFalse(r["valid"])
+        self.assertEqual(r["code"], "TELEGRAM_USER_NOT_FOUND")
+
+    def test_missing_user_id(self):
+        upd = SimpleNamespace(effective_chat=SimpleNamespace(type="private"), effective_user=SimpleNamespace(id=None))
+        r = _ta().validate_telegram_business_core_transport(upd)
+        self.assertEqual(r["code"], "TELEGRAM_USER_NOT_FOUND")
+
+    def test_username_first_name_last_name_ignored(self):
+        upd = SimpleNamespace(
+            effective_chat=SimpleNamespace(type="private"),
+            effective_user=SimpleNamespace(id=570004109, username="spoofed", first_name="Fake", last_name="Name"),
+        )
+        r = _ta().validate_telegram_business_core_transport(upd)
+        self.assertTrue(r["valid"])
+        self.assertEqual(r["telegram_user_id"], "570004109")
+
+    def test_zero_authorization_domain_calls(self):
+        with patch("business_core.telegram_authorization.authorize_business_core_access") as mock_domain:
+            _ta().validate_telegram_business_core_transport(_update())
+        mock_domain.assert_not_called()
+
+    def test_zero_access_summary_calls(self):
+        with patch("business_core.telegram_authorization.get_business_core_access_summary") as mock_summary:
+            _ta().validate_telegram_business_core_transport(_update())
+        mock_summary.assert_not_called()
+
+    def test_zero_asyncio_to_thread_calls(self):
+        with patch("business_core.telegram_authorization.asyncio.to_thread") as mock_to_thread:
+            _ta().validate_telegram_business_core_transport(_update())
+        mock_to_thread.assert_not_called()
+
+    def test_no_sheets_or_identity_manager_reference(self):
+        import ast
+        import inspect
+        tree = ast.parse(inspect.getsource(_ta().validate_telegram_business_core_transport))
+        imported = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
+        self.assertNotIn("read_business_sheet", imported)
+        self.assertNotIn("find_row_by_id", imported)
+
+    def test_no_write_reference(self):
+        import inspect
+        src = inspect.getsource(_ta().validate_telegram_business_core_transport)
+        for forbidden in ("append_business_row", "update_business_row", "create_pending_employee"):
+            self.assertNotIn(forbidden, src)
+
+    def test_no_cache(self):
+        import inspect
+        src = inspect.getsource(_ta().validate_telegram_business_core_transport)
+        for forbidden in ("lru_cache", "cache_clear", "_CACHE", "TTLCache"):
+            self.assertNotIn(forbidden, src)
+
+    def test_reuses_private_helpers_not_duplicated(self):
+        import inspect
+        src = inspect.getsource(_ta().validate_telegram_business_core_transport)
+        self.assertIn("_resolve_chat_context(", src)
+        self.assertIn("_resolve_telegram_user_id(", src)
+
+
 if __name__ == "__main__":
     unittest.main()

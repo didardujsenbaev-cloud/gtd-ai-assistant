@@ -23,6 +23,7 @@ Business Core — Telegram handlers.
 
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 import logging
@@ -59,6 +60,105 @@ EO_FIELD, EO_VALUE, EO_CONFIRM = range(40, 43)
 RD_CONFIRM = 60
 # Phase 15B
 UD_FILE, UD_DETAILS, UD_CONFIRM = range(70, 73)
+
+
+# ─────────────────────────────────────────────────────────────
+# Phase 17E-1: Targeted Read Enforcement.
+#
+# Exactly six simple, single-target, read-only commands are enforced
+# in this phase — no other command gains an authorization gate. This
+# map is an auditable inventory (used by tests), never a dispatch
+# mechanism — each handler below calls the helpers explicitly by name.
+# ─────────────────────────────────────────────────────────────
+
+COMMAND_ENFORCEMENT_MAP = {
+    "doc":         {"resource": "DOCUMENT", "action": "READ", "target_shape": "BUSINESS_AND_OBJECT"},
+    "obligation":  {"resource": "FINANCE",  "action": "READ", "target_shape": "BUSINESS"},
+    "payment":     {"resource": "FINANCE",  "action": "READ", "target_shape": "BUSINESS"},
+    "offer":       {"resource": "FINANCE",  "action": "READ", "target_shape": "BUSINESS"},
+    "lead":        {"resource": "FINANCE",  "action": "READ", "target_shape": "BUSINESS"},
+    "interaction": {"resource": "CLIENT",   "action": "READ", "target_shape": "BUSINESS"},
+}
+
+_BC_ENFORCEMENT_NOT_FOUND_OR_DENIED_MSG = "Запись недоступна или не найдена."
+_BC_ENFORCEMENT_TEMPORARILY_UNAVAILABLE_MSG = "Временная ошибка проверки доступа. Попробуйте ещё раз позже."
+
+
+async def _validate_bc_transport_or_reply(update: Update) -> bool:
+    """
+    Calls the public, synchronous, read-free
+    validate_telegram_business_core_transport(). On valid=True, sends
+    nothing and returns True. On valid=False, sends the one
+    appropriate safe reply and returns False — except for the
+    pathological INVALID_TELEGRAM_UPDATE case, where no safe reply
+    target can be assumed to exist, so this silently returns False
+    without raising.
+
+    IMPORTANT: TELEGRAM_USER_NOT_FOUND at this stage means only that
+    Telegram's own user context is unavailable on this update — it is
+    NOT a confirmed statement that the Telegram user lacks a
+    registered Business Core identity (that determination belongs
+    solely to authorize_business_core_access, later, over Sheets).
+    """
+    from business_core.telegram_authorization import validate_telegram_business_core_transport, USER_MESSAGES
+
+    result = validate_telegram_business_core_transport(update)
+    if result["valid"]:
+        return True
+
+    if result["code"] == "INVALID_TELEGRAM_UPDATE":
+        return False
+
+    key = result.get("user_message_key")
+    if key:
+        await _reply(update, USER_MESSAGES[key], parse_mode=None)
+    return False
+
+
+async def _resolve_target_in_thread(finder, record_id: str):
+    """Moves a synchronous find_*_by_id call off the event loop.
+    Returns the row dict or None. Renders nothing, authorizes nothing,
+    mutates nothing. Does not catch exceptions — each caller wraps
+    this in its own explicit try/except (Phase 17E-A2 correction:
+    the old shared per-handler outer try/except must not be relied
+    upon for this, since it could emit a stale/different message)."""
+    return await asyncio.to_thread(finder, record_id)
+
+
+async def _authorize_or_reply(
+    update: Update,
+    *,
+    resource: str,
+    action: str,
+    business_id: str,
+    object_id: str = "",
+) -> bool:
+    """
+    Calls the FULL authorize_telegram_business_core_request (never the
+    transport-only preflight) — this independently re-validates
+    transport as defense in depth, regardless of whether
+    _validate_bc_transport_or_reply already ran for this update. No
+    bypass flag exists or may be added.
+
+    On allowed=True: sends nothing, returns True.
+    On expected denial or not-found-equivalent: sends the fixed
+    anti-enumeration text, returns False.
+    On authorization infrastructure failure: sends the temporarily-
+    unavailable text, returns False.
+    Never renders a record field. Never mutates.
+    """
+    from business_core.telegram_authorization import authorize_telegram_business_core_request
+
+    result = await authorize_telegram_business_core_request(
+        update, resource=resource, action=action, business_id=business_id, object_id=object_id,
+    )
+    if result["allowed"]:
+        return True
+    if not result["ok"]:
+        await _reply(update, _BC_ENFORCEMENT_TEMPORARILY_UNAVAILABLE_MSG, parse_mode=None)
+        return False
+    await _reply(update, _BC_ENFORCEMENT_NOT_FOUND_OR_DENIED_MSG, parse_mode=None)
+    return False
 
 
 # ─────────────────────────────────────────────────────────────
@@ -4349,6 +4449,9 @@ async def doc_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await _reply(update, _bc_disabled_msg())
         return
 
+    if not await _validate_bc_transport_or_reply(update):
+        return
+
     raw = " ".join(context.args or [])
     kv = _parse_kv_args(raw)
     document_id = kv.get("document_id") or kv.get("_pos0", "")
@@ -4362,9 +4465,18 @@ async def doc_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         # sole document_registry read owner — never a raw Sheets read,
         # never fuzzy matching.
         from business_core.document_manager import find_document_by_id
-        doc = find_document_by_id(document_id)
-        if doc is None:
-            await _reply(update, f"❌ Документ {document_id} не найден.")
+        try:
+            doc = await _resolve_target_in_thread(find_document_by_id, document_id)
+        except Exception:
+            await _reply(update, _BC_ENFORCEMENT_TEMPORARILY_UNAVAILABLE_MSG, parse_mode=None)
+            return
+        if doc is None or not doc.get("business_id") or not doc.get("object_id"):
+            await _reply(update, _BC_ENFORCEMENT_NOT_FOUND_OR_DENIED_MSG, parse_mode=None)
+            return
+        if not await _authorize_or_reply(
+            update, resource="DOCUMENT", action="READ",
+            business_id=doc["business_id"], object_id=doc["object_id"],
+        ):
             return
         lines = [
             f"📄 Документ {doc.get('document_id', '')}",
@@ -11673,6 +11785,9 @@ async def obligation_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await _reply(update, _bc_disabled_msg(), parse_mode=None)
         return
 
+    if not await _validate_bc_transport_or_reply(update):
+        return
+
     raw = " ".join(context.args or [])
     args = _parse_kv_args(raw)
     obligation_id = args.get("payment_obligation_id") or args.get("_pos0", "")
@@ -11684,9 +11799,17 @@ async def obligation_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     try:
         from business_core.payment_manager import find_payment_obligation_by_id, list_payment_transactions
 
-        obligation = find_payment_obligation_by_id(obligation_id)
-        if obligation is None:
-            await _reply(update, f"❌ Payment Obligation {obligation_id} не найден.", parse_mode=None)
+        try:
+            obligation = await _resolve_target_in_thread(find_payment_obligation_by_id, obligation_id)
+        except Exception:
+            await _reply(update, _BC_ENFORCEMENT_TEMPORARILY_UNAVAILABLE_MSG, parse_mode=None)
+            return
+        if obligation is None or not obligation.get("Business ID"):
+            await _reply(update, _BC_ENFORCEMENT_NOT_FOUND_OR_DENIED_MSG, parse_mode=None)
+            return
+        if not await _authorize_or_reply(
+            update, resource="FINANCE", action="READ", business_id=obligation["Business ID"],
+        ):
             return
 
         transactions = list_payment_transactions(payment_obligation_id=obligation_id)
@@ -11893,6 +12016,9 @@ async def payment_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await _reply(update, _bc_disabled_msg(), parse_mode=None)
         return
 
+    if not await _validate_bc_transport_or_reply(update):
+        return
+
     raw = " ".join(context.args or [])
     args = _parse_kv_args(raw)
     transaction_id = args.get("payment_transaction_id") or args.get("_pos0", "")
@@ -11904,9 +12030,17 @@ async def payment_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     try:
         from business_core.payment_manager import find_payment_transaction_by_id
 
-        txn = find_payment_transaction_by_id(transaction_id)
-        if txn is None:
-            await _reply(update, f"❌ Payment {transaction_id} не найден.", parse_mode=None)
+        try:
+            txn = await _resolve_target_in_thread(find_payment_transaction_by_id, transaction_id)
+        except Exception:
+            await _reply(update, _BC_ENFORCEMENT_TEMPORARILY_UNAVAILABLE_MSG, parse_mode=None)
+            return
+        if txn is None or not txn.get("Business ID"):
+            await _reply(update, _BC_ENFORCEMENT_NOT_FOUND_OR_DENIED_MSG, parse_mode=None)
+            return
+        if not await _authorize_or_reply(
+            update, resource="FINANCE", action="READ", business_id=txn["Business ID"],
+        ):
             return
 
         lines = [
@@ -12425,6 +12559,9 @@ async def offer_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await _reply(update, _bc_disabled_msg(), parse_mode=None)
         return
 
+    if not await _validate_bc_transport_or_reply(update):
+        return
+
     raw = " ".join(context.args or [])
     args = _parse_kv_args(raw)
     offer_id = args.get("commercial_offer_id") or args.get("_pos0", "")
@@ -12437,9 +12574,17 @@ async def offer_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         from business_core.offer_manager import find_commercial_offer_by_id, list_commercial_offers_by_series
         from business_core.business_builder import is_commercial_offer_effectively_expired
 
-        offer = find_commercial_offer_by_id(offer_id)
-        if offer is None:
-            await _reply(update, f"❌ Commercial Offer {offer_id} не найден.", parse_mode=None)
+        try:
+            offer = await _resolve_target_in_thread(find_commercial_offer_by_id, offer_id)
+        except Exception:
+            await _reply(update, _BC_ENFORCEMENT_TEMPORARILY_UNAVAILABLE_MSG, parse_mode=None)
+            return
+        if offer is None or not offer.get("Business ID"):
+            await _reply(update, _BC_ENFORCEMENT_NOT_FOUND_OR_DENIED_MSG, parse_mode=None)
+            return
+        if not await _authorize_or_reply(
+            update, resource="FINANCE", action="READ", business_id=offer["Business ID"],
+        ):
             return
 
         scope = offer.get("Scope Snapshot", "")
@@ -13235,6 +13380,9 @@ async def lead_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await _reply(update, _bc_disabled_msg(), parse_mode=None)
         return
 
+    if not await _validate_bc_transport_or_reply(update):
+        return
+
     raw = " ".join(context.args or [])
     args = _parse_kv_args(raw)
     lead_id = args.get("lead_id") or args.get("_pos0", "")
@@ -13246,9 +13394,17 @@ async def lead_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         from business_core.lead_manager import find_lead_by_id
 
-        lead = find_lead_by_id(lead_id)
-        if lead is None:
-            await _reply(update, f"❌ Lead {lead_id} не найден.", parse_mode=None)
+        try:
+            lead = await _resolve_target_in_thread(find_lead_by_id, lead_id)
+        except Exception:
+            await _reply(update, _BC_ENFORCEMENT_TEMPORARILY_UNAVAILABLE_MSG, parse_mode=None)
+            return
+        if lead is None or not lead.get("Business ID"):
+            await _reply(update, _BC_ENFORCEMENT_NOT_FOUND_OR_DENIED_MSG, parse_mode=None)
+            return
+        if not await _authorize_or_reply(
+            update, resource="FINANCE", action="READ", business_id=lead["Business ID"],
+        ):
             return
 
         lines = [
@@ -13862,6 +14018,9 @@ async def interaction_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await _reply(update, _bc_disabled_msg(), parse_mode=None)
         return
 
+    if not await _validate_bc_transport_or_reply(update):
+        return
+
     raw = " ".join(context.args or [])
     args = _parse_kv_args(raw)
     interaction_id = args.get("interaction_id") or args.get("_pos0", "")
@@ -13873,9 +14032,17 @@ async def interaction_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     try:
         from business_core.interaction_manager import find_interaction_by_id
 
-        interaction = find_interaction_by_id(interaction_id)
-        if interaction is None:
-            await _reply(update, f"❌ Interaction {interaction_id} не найден.", parse_mode=None)
+        try:
+            interaction = await _resolve_target_in_thread(find_interaction_by_id, interaction_id)
+        except Exception:
+            await _reply(update, _BC_ENFORCEMENT_TEMPORARILY_UNAVAILABLE_MSG, parse_mode=None)
+            return
+        if interaction is None or not interaction.get("Business ID"):
+            await _reply(update, _BC_ENFORCEMENT_NOT_FOUND_OR_DENIED_MSG, parse_mode=None)
+            return
+        if not await _authorize_or_reply(
+            update, resource="CLIENT", action="READ", business_id=interaction["Business ID"],
+        ):
             return
 
         lines = [

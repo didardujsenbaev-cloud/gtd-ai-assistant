@@ -267,6 +267,10 @@ _IDENTITY_DOMAIN_TEST_FILES = frozenset({
     # BEFORE any test logic was written, per the same precedent.
     "test_telegram_authorization.py",
     "test_bcaccess_telegram.py",
+    # Phase 17E-1: Targeted Read Enforcement test files, registered
+    # BEFORE any test logic was written, per the same precedent.
+    "test_command_enforcement.py",
+    "test_business_core_read_enforcement.py",
 })
 
 _HARD_SOCKET_BLOCK_TEST_FILES = (

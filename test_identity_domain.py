@@ -749,16 +749,112 @@ class TestArchitectureGuards(unittest.TestCase):
         self.assertNotIn("authorize_business_core_access(", bc_access_src)
         self.assertNotIn("authorize_telegram_business_core_request(", bc_access_src)
 
-        forbidden = ("authorize_telegram_business_core_request", "get_telegram_business_core_access_summary")
+        self.assertEqual(source.count('CommandHandler("bcaccess"'), 1)
+
+    def test_telegram_adapter_callers_are_exactly_the_two_authorized_paths(self):
+        """
+        Phase 17E-1 durable replacement for the Phase-17D-era assumption
+        that ONLY bc_access may call a Telegram authorization adapter
+        function. That assumption is now correctly superseded: Phase
+        17E-1 approved a SECOND caller, _authorize_or_reply(), used by
+        the six enforced read commands. This test encodes the new,
+        durable invariant instead of a live git-diff or a single-caller
+        assumption:
+
+          1. bc_access()          -> get_telegram_business_core_access_summary() only
+          2. _authorize_or_reply() -> authorize_telegram_business_core_request() only
+
+        No other function anywhere in telegram_handlers.py may reference
+        either adapter function — in particular, none of the six
+        enforced handlers may call authorize_telegram_business_core_request
+        or get_telegram_business_core_access_summary directly; they may
+        only call _validate_bc_transport_or_reply,
+        _resolve_target_in_thread, and _authorize_or_reply.
+        """
+        import ast
+
+        with open("business_core/telegram_handlers.py", encoding="utf-8") as f:
+            source = f.read()
+        tree = ast.parse(source)
+
+        summary_adapter = "get_telegram_business_core_access_summary"
+        request_adapter = "authorize_telegram_business_core_request"
+
+        summary_callers = []
+        request_callers = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.AsyncFunctionDef):
+                func_src = ast.get_source_segment(source, node) or ""
+                if f"{summary_adapter}(" in func_src:
+                    summary_callers.append(node.name)
+                if f"{request_adapter}(" in func_src:
+                    request_callers.append(node.name)
+
+        self.assertEqual(summary_callers, ["bc_access"],
+                          f"get_telegram_business_core_access_summary must be called only by bc_access; found: {summary_callers}")
+        self.assertEqual(request_callers, ["_authorize_or_reply"],
+                          f"authorize_telegram_business_core_request must be called only by _authorize_or_reply; found: {request_callers}")
+
+    def test_enforced_handlers_use_only_the_three_helpers(self):
+        """The six enforced read commands may call only the three
+        Phase 17E-1 handler helpers — never an adapter function
+        directly, never identity_manager, never business_core.sheets,
+        never a raw authorization.py function."""
+        import ast
+
+        from business_core import telegram_handlers as th
+
+        with open("business_core/telegram_handlers.py", encoding="utf-8") as f:
+            source = f.read()
+
+        enforced = ("doc_cmd", "obligation_cmd", "payment_cmd", "offer_cmd", "lead_cmd", "interaction_cmd")
+        forbidden_direct_calls = (
+            "authorize_telegram_business_core_request(",
+            "get_telegram_business_core_access_summary(",
+            "authorize_business_core_access(",
+            "get_business_core_access_summary(",
+        )
+        for name in enforced:
+            with self.subTest(handler=name):
+                func_src = inspect.getsource(getattr(th, name))
+                for forbidden in forbidden_direct_calls:
+                    self.assertNotIn(forbidden, func_src)
+                self.assertIn("_validate_bc_transport_or_reply(update)", func_src)
+                self.assertIn("_resolve_target_in_thread(", func_src)
+                self.assertIn("_authorize_or_reply(", func_src)
+
+    def test_request_adapter_not_called_by_conversation_or_callback_handlers(self):
+        """The request adapter must never be called by a
+        ConversationHandler state function or a CallbackQueryHandler
+        callback — enforcement in Phase 17E-1 is scoped to exactly the
+        six plain CommandHandler read commands."""
+        import ast
+
+        with open("business_core/telegram_handlers.py", encoding="utf-8") as f:
+            source = f.read()
+        tree = ast.parse(source)
+
+        conversation_state_names = {
+            "newbiz_start", "newbiz_name", "newbiz_cities", "newbiz_priority", "newbiz_confirm", "newbiz_cancel",
+            "newclient_start", "newclient_name", "newclient_phone", "newclient_type", "newclient_biz", "newclient_confirm", "newclient_cancel",
+            "editclient_start", "editclient_field", "editclient_value", "editclient_confirm", "editclient_cancel",
+            "editobject_start", "editobject_field", "editobject_value", "editobject_confirm", "editobject_cancel",
+            "registerdoc_start", "registerdoc_confirm", "registerdoc_cancel",
+            "uploaddoc_start", "uploaddoc_receive_file", "uploaddoc_receive_details", "uploaddoc_confirm", "uploaddoc_cancel",
+            "newroadmap_start", "newroadmap_business", "newroadmap_client", "newroadmap_service",
+            "newroadmap_city", "newroadmap_days", "newroadmap_confirm", "newroadmap_cancel",
+        }
+        callback_names = {"bc_ctx_callback"}
+
+        request_adapter = "authorize_telegram_business_core_request("
+        summary_adapter = "get_telegram_business_core_access_summary("
         offenders = []
         for node in ast.walk(tree):
-            if isinstance(node, ast.AsyncFunctionDef) and node.name != "bc_access":
+            if isinstance(node, ast.AsyncFunctionDef) and node.name in (conversation_state_names | callback_names):
                 func_src = ast.get_source_segment(source, node) or ""
-                if any(name in func_src for name in forbidden):
+                if request_adapter in func_src or summary_adapter in func_src:
                     offenders.append(node.name)
-        self.assertEqual(offenders, [], f"unexpected adapter usage in: {offenders}")
-
-        self.assertEqual(source.count('CommandHandler("bcaccess"'), 1)
+        self.assertEqual(offenders, [], f"unexpected adapter usage in conversation/callback handler(s): {offenders}")
 
     def test_gtd_files_untouched(self):
         import subprocess

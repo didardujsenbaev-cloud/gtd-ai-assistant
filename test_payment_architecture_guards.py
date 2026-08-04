@@ -454,13 +454,17 @@ class TestPaymentCommandsCallOnlyCanonicalOrchestration(unittest.TestCase):
             self.assertIn(call, body, f"{fn_name} must call business_builder.{call.rstrip('(')}")
 
     def test_read_commands_call_exact_payment_manager_helpers_only(self):
+        # obligation_cmd/payment_cmd are enforced (Phase 17E-1): their
+        # finder is now passed BY REFERENCE into _resolve_target_in_thread
+        # rather than called directly, so a literal "helper(" substring
+        # check no longer applies to them — see the dedicated semantic
+        # test below. The remaining, unenforced commands still call
+        # their manager helper directly and keep the literal check.
         expectations = {
             "paymenttemplates_cmd": "list_commercial_milestone_templates(",
             "paymenttemplate_cmd": "find_commercial_milestone_template_by_id(",
             "obligations_cmd": "list_payment_obligations(",
-            "obligation_cmd": "find_payment_obligation_by_id(",
             "payments_cmd": "list_payment_transactions(",
-            "payment_cmd": "find_payment_transaction_by_id(",
         }
         for fn_name, call in expectations.items():
             body = _th_function_body(fn_name)
@@ -470,6 +474,52 @@ class TestPaymentCommandsCallOnlyCanonicalOrchestration(unittest.TestCase):
                 "confirm_payment_transaction(", "reverse_payment_transaction(", "fail_payment_transaction(",
             ):
                 self.assertNotIn(forbidden, body, f"{fn_name} is read-only and must not call {forbidden.rstrip('(')}")
+
+    def test_obligation_and_payment_resolve_finder_through_thread_offload(self):
+        """
+        Phase 17E-1 semantic replacement for the pre-17E-1 literal
+        "find_payment_obligation_by_id("/"find_payment_transaction_by_id("
+        substring checks. Those represented a direct synchronous call,
+        now obsolete: the approved architecture passes the finder BY
+        REFERENCE into _resolve_target_in_thread(finder, record_id).
+        Proves: the correct finder object and record-ID variable are
+        forwarded, the handler never calls the finder directly, the
+        finder is never called outside that one helper call, and
+        authorization only runs after the row is resolved.
+        """
+        expectations = {
+            "obligation_cmd": ("find_payment_obligation_by_id", "obligation_id"),
+            "payment_cmd": ("find_payment_transaction_by_id", "transaction_id"),
+        }
+        src = (BUSINESS_CORE / "telegram_handlers.py").read_text(encoding="utf-8")
+        tree = ast.parse(src)
+        nodes_by_name = {n.name: n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+
+        for fn_name, (finder_name, id_var) in expectations.items():
+            with self.subTest(handler=fn_name):
+                node = nodes_by_name[fn_name]
+                offload_calls, direct_calls = [], []
+                for n in ast.walk(node):
+                    if isinstance(n, ast.Call) and isinstance(n.func, ast.Name):
+                        if n.func.id == "_resolve_target_in_thread":
+                            offload_calls.append(n)
+                        elif n.func.id == finder_name:
+                            direct_calls.append(n)
+
+                self.assertEqual(len(offload_calls), 1)
+                call = offload_calls[0]
+                self.assertEqual(len(call.args), 2)
+                finder_arg, id_arg = call.args
+                self.assertIsInstance(finder_arg, ast.Name)
+                self.assertEqual(finder_arg.id, finder_name)
+                self.assertIsInstance(id_arg, ast.Name)
+                self.assertEqual(id_arg.id, id_var)
+                self.assertEqual(direct_calls, [], f"{finder_name} must never be called directly in {fn_name}")
+
+                body = _th_function_body(fn_name)
+                offload_pos = body.index("_resolve_target_in_thread(")
+                authz_pos = body.index("_authorize_or_reply(")
+                self.assertLess(offload_pos, authz_pos)
 
 
 class TestNoCallerSidePaymentPolicy(unittest.TestCase):

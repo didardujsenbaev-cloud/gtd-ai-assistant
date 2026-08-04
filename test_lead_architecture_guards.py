@@ -472,9 +472,13 @@ class TestLeadCommandsCallOnlyCanonicalOrchestration(unittest.TestCase):
             self.assertIn(call, body, f"{fn_name} must call business_builder.{call.rstrip('(')}")
 
     def test_read_commands_call_exact_lead_manager_helpers_only(self):
+        # lead_cmd is enforced (Phase 17E-1): its finder is passed BY
+        # REFERENCE into _resolve_target_in_thread rather than called
+        # directly, so the literal substring check no longer applies —
+        # see the dedicated semantic test below. leads_cmd (unenforced,
+        # targetless list) still calls its manager helper directly.
         expectations = {
             "leads_cmd": "list_leads(",
-            "lead_cmd": "find_lead_by_id(",
         }
         for fn_name, call in expectations.items():
             body = _th_function_body(fn_name)
@@ -484,6 +488,42 @@ class TestLeadCommandsCallOnlyCanonicalOrchestration(unittest.TestCase):
                 "lose_lead(", "convert_lead(", "archive_lead(", "update_lead(",
             ):
                 self.assertNotIn(forbidden, body, f"{fn_name} is read-only and must not call {forbidden.rstrip('(')}")
+
+    def test_lead_cmd_resolves_finder_through_thread_offload(self):
+        """
+        Phase 17E-1 semantic replacement for the pre-17E-1 literal
+        "find_lead_by_id(" substring check. Proves: the correct finder
+        object and record-ID variable are forwarded to
+        _resolve_target_in_thread, the handler never calls the finder
+        directly, and authorization only runs after the row is
+        resolved.
+        """
+        src = (BUSINESS_CORE / "telegram_handlers.py").read_text(encoding="utf-8")
+        tree = ast.parse(src)
+        node = next(n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == "lead_cmd")
+
+        offload_calls, direct_calls = [], []
+        for n in ast.walk(node):
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name):
+                if n.func.id == "_resolve_target_in_thread":
+                    offload_calls.append(n)
+                elif n.func.id == "find_lead_by_id":
+                    direct_calls.append(n)
+
+        self.assertEqual(len(offload_calls), 1)
+        call = offload_calls[0]
+        self.assertEqual(len(call.args), 2)
+        finder_arg, id_arg = call.args
+        self.assertIsInstance(finder_arg, ast.Name)
+        self.assertEqual(finder_arg.id, "find_lead_by_id")
+        self.assertIsInstance(id_arg, ast.Name)
+        self.assertEqual(id_arg.id, "lead_id")
+        self.assertEqual(direct_calls, [])
+
+        body = _th_function_body("lead_cmd")
+        offload_pos = body.index("_resolve_target_in_thread(")
+        authz_pos = body.index("_authorize_or_reply(")
+        self.assertLess(offload_pos, authz_pos)
 
 
 class TestNoCallerSideLeadPolicy(unittest.TestCase):
