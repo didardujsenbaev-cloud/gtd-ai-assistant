@@ -325,5 +325,134 @@ class TestNoHardDelete(unittest.TestCase):
         self.assertEqual(names, [])
 
 
+# ─────────────────────────────────────────────────────────────
+# Phase 17E-2A3-H1: manager-level exception logging secrecy.
+# Proves _find_obligation_row and
+# update_payment_obligation_admin_fields log only a fixed literal
+# on infrastructure exceptions — no raw exception text, no entity
+# ID, no updates dict, no row content — and that the returned
+# "error" string is likewise a fixed safe value, not str(exc).
+# ─────────────────────────────────────────────────────────────
+
+_SECRET_NOTES_MARKER = "SECRET_NOTES_MARKER"
+_SECRET_BIZ_MARKER = "BIZ-SECRET"
+_SECRET_ROW_MARKER = "ROW-SECRET"
+_SECRET_API_MARKER = "API-PAYLOAD-SECRET"
+_ALL_SECRET_MARKERS = (_SECRET_NOTES_MARKER, _SECRET_BIZ_MARKER, _SECRET_ROW_MARKER, _SECRET_API_MARKER)
+
+
+def _boom_with_secrets(*_a, **_k):
+    raise RuntimeError(
+        f"synthetic failure containing {_SECRET_NOTES_MARKER} and {_SECRET_BIZ_MARKER} "
+        f"and {_SECRET_ROW_MARKER} and {_SECRET_API_MARKER}"
+    )
+
+
+class TestFindObligationRowExceptionSecrecy(unittest.TestCase):
+    def test_no_secrets_in_log_call_args(self):
+        pm = _fresh_pm()
+        with patch("business_core.sheets.find_row_by_id", side_effect=_boom_with_secrets), \
+             patch("business_core.payment_manager.log.warning") as mock_warn:
+            result = pm._find_obligation_row("POB-001")
+        self.assertIsNone(result)
+        mock_warn.assert_called_once()
+        for call in mock_warn.call_args_list:
+            for arg in list(call.args) + list(call.kwargs.values()):
+                text = str(arg)
+                for marker in _ALL_SECRET_MARKERS:
+                    self.assertNotIn(marker, text)
+
+    def test_log_call_is_fixed_string(self):
+        pm = _fresh_pm()
+        with patch("business_core.sheets.find_row_by_id", side_effect=_boom_with_secrets), \
+             patch("business_core.payment_manager.log.warning") as mock_warn:
+            pm._find_obligation_row("POB-001")
+        mock_warn.assert_called_once_with("_find_obligation_row infrastructure failure")
+
+
+class TestUpdatePaymentObligationAdminFieldsExceptionSecrecy(unittest.TestCase):
+    def _row(self):
+        return dict(zip(OBLIGATION_HEADERS, OBLIGATION_ROW))
+
+    def test_notes_write_exception_no_secrets_in_log(self):
+        pm = _fresh_pm()
+        sheet = MagicMock()
+        sheet.row_values.return_value = OBLIGATION_HEADERS
+        sheet.update_cell.side_effect = _boom_with_secrets
+        with patch("business_core.sheets.find_row_by_id", return_value=(2, self._row())), \
+             patch("business_core.sheets.get_business_sheet", return_value=sheet), \
+             patch("business_core.payment_manager.log.error") as mock_error:
+            result = pm.update_payment_obligation_admin_fields("POB-001", {"Notes": _SECRET_NOTES_MARKER})
+        self.assertFalse(result["ok"])
+        mock_error.assert_called_once_with("update_payment_obligation_admin_fields infrastructure failure")
+        for call in mock_error.call_args_list:
+            for arg in list(call.args) + list(call.kwargs.values()):
+                text = str(arg)
+                for marker in _ALL_SECRET_MARKERS:
+                    self.assertNotIn(marker, text)
+
+    def test_notes_write_exception_error_field_is_fixed_safe_string(self):
+        pm = _fresh_pm()
+        sheet = MagicMock()
+        sheet.row_values.return_value = OBLIGATION_HEADERS
+        sheet.update_cell.side_effect = _boom_with_secrets
+        with patch("business_core.sheets.find_row_by_id", return_value=(2, self._row())), \
+             patch("business_core.sheets.get_business_sheet", return_value=sheet):
+            result = pm.update_payment_obligation_admin_fields("POB-001", {"Notes": _SECRET_NOTES_MARKER})
+        self.assertEqual(result["error"], "Infrastructure failure")
+        for marker in _ALL_SECRET_MARKERS:
+            self.assertNotIn(marker, result["error"])
+
+    def test_updated_at_write_exception_no_secrets_in_log(self):
+        pm = _fresh_pm()
+        row = self._row()
+        row["Notes"] = "old-value"
+        sheet = MagicMock()
+        sheet.row_values.return_value = OBLIGATION_HEADERS
+
+        def update_cell_side_effect(row_num, col, value):
+            if col == OBLIGATION_HEADERS.index("Updated At") + 1:
+                _boom_with_secrets()
+
+        sheet.update_cell.side_effect = update_cell_side_effect
+        with patch("business_core.sheets.find_row_by_id", return_value=(2, row)), \
+             patch("business_core.sheets.get_business_sheet", return_value=sheet), \
+             patch("business_core.payment_manager.log.error") as mock_error:
+            result = pm.update_payment_obligation_admin_fields("POB-001", {"Notes": "new-value"})
+        self.assertFalse(result["ok"])
+        mock_error.assert_called_once_with("update_payment_obligation_admin_fields infrastructure failure")
+
+    def test_success_result_unaffected(self):
+        pm = _fresh_pm()
+        row = self._row()
+        row["Notes"] = "old"
+        sheet = MagicMock()
+        sheet.row_values.return_value = OBLIGATION_HEADERS
+        with patch("business_core.sheets.find_row_by_id", return_value=(2, row)), \
+             patch("business_core.sheets.get_business_sheet", return_value=sheet):
+            result = pm.update_payment_obligation_admin_fields("POB-001", {"Notes": "new"})
+        self.assertEqual(result, {"ok": True, "changed": True, "code": "", "error": None})
+
+    def test_unchanged_result_unaffected(self):
+        pm = _fresh_pm()
+        row = self._row()
+        row["Notes"] = "same"
+        sheet = MagicMock()
+        sheet.row_values.return_value = OBLIGATION_HEADERS
+        with patch("business_core.sheets.find_row_by_id", return_value=(2, row)), \
+             patch("business_core.sheets.get_business_sheet", return_value=sheet):
+            result = pm.update_payment_obligation_admin_fields("POB-001", {"Notes": "same"})
+        self.assertEqual(result, {"ok": True, "changed": False, "code": "", "error": None})
+        sheet.update_cell.assert_not_called()
+
+    def test_validation_result_codes_unaffected(self):
+        # Regression guard: non-exception validation-rejection paths
+        # are untouched by this hardening.
+        pm = _fresh_pm()
+        result = pm.update_payment_obligation_admin_fields("POB-001", {"Status": "issued"})
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "INVALID_PAYMENT_OBLIGATION_STATUS")
+
+
 if __name__ == "__main__":
     unittest.main()

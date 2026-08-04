@@ -590,18 +590,22 @@ class TestMutation(MutationTestBase):
         self.assertIn("изменений нет", self._sent_text(update))
 
     def test_not_found_result_handled(self):
+        # Phase 17E-2A3-H1-R1: INTERACTION_NOT_FOUND after authorization
+        # maps to the shared ownership-changed message, not a generic
+        # "not found" text — see _interaction_notes_message's docstring.
         update = _make_update()
         self._run_handler(update, finder_return=_ROW, mutator_return={
             "ok": False, "code": "INTERACTION_NOT_FOUND", "error": "Interaction ACT-001 не найден",
         })
-        self.assertIn("не найден", self._sent_text(update))
+        self.assertEqual(self._sent_text(update), "Запись изменилась. Повтори команду ещё раз.")
 
     def test_too_long_result_handled(self):
         update = _make_update()
         self._run_handler(update, finder_return=_ROW, mutator_return={
             "ok": False, "code": "INTERACTION_NOTES_TOO_LONG", "error": "notes превышает 2000 символов",
         })
-        self.assertIn("превышает", self._sent_text(update))
+        self.assertEqual(self._sent_text(update), "❌ Notes превышают допустимую длину.")
+        self.assertNotIn("2000", self._sent_text(update))
 
     def test_fallback_result_code_handled_safely(self):
         update = _make_update()
@@ -1479,6 +1483,105 @@ class TestLeadNotesArchitecture(unittest.TestCase):
         with open("business_core/telegram_handlers.py", encoding="utf-8") as f:
             content = f.read()
         self.assertEqual(content.count('CommandHandler("updateleadnotes",'), 1)
+
+
+# ═════════════════════════════════════════════════════════════
+# Phase 17E-2A3-H1: end-to-end regression proof for the deployed
+# dedicated commands, through the REAL business_builder + manager
+# chain (only the Google Sheets primitives are mocked) — proving
+# the manager-level logging hardening actually closes the leak at
+# the full-command level, not just at the manager-function level in
+# isolation. Before this hardening, a Sheets write exception would
+# have propagated str(exc) into result["error"], which each
+# command's code-synthesis fallback (business_builder's
+# `code=write_result.get("code") or "..._IMMUTABLE"`) could route
+# into a mapper branch that renders result["error"] to Telegram.
+# ═════════════════════════════════════════════════════════════
+
+_E2E_SECRET_NOTES_MARKER = "SECRET_NOTES_MARKER"
+_E2E_SECRET_BIZ_MARKER = "BIZ-SECRET"
+_E2E_SECRET_ROW_MARKER = "ROW-SECRET"
+_E2E_SECRET_API_MARKER = "API-PAYLOAD-SECRET"
+_E2E_ALL_SECRET_MARKERS = (
+    _E2E_SECRET_NOTES_MARKER, _E2E_SECRET_BIZ_MARKER, _E2E_SECRET_ROW_MARKER, _E2E_SECRET_API_MARKER,
+)
+
+
+def _e2e_boom_with_secrets(*_a, **_k):
+    raise RuntimeError(
+        f"synthetic failure containing {_E2E_SECRET_NOTES_MARKER} and {_E2E_SECRET_BIZ_MARKER} "
+        f"and {_E2E_SECRET_ROW_MARKER} and {_E2E_SECRET_API_MARKER}"
+    )
+
+
+class TestUpdateInteractionNotesEndToEndExceptionSecrecy(unittest.TestCase):
+    def test_notes_write_exception_through_real_chain_no_secrets_in_reply(self):
+        update = _make_update()
+        row = {
+            "Interaction ID": "ACT-001", "Business ID": "BIZ-001", "Caller Idempotency Key": "",
+            "Interaction Type": "call", "Direction": "outbound", "Channel ID": "", "Occurred At": "",
+            "Summary": "s", "Outcome": "", "Lead ID": "", "Client ID": "PRS-1", "Commercial Offer ID": "",
+            "Assigned Person ID": "", "External Reference": "", "Status": "active",
+            "Created At": "", "Created By": "", "Updated At": "", "Archived At": "", "Notes": "",
+        }
+        sheet = MagicMock()
+        sheet.row_values.return_value = list(row.keys())
+        sheet.update_cell.side_effect = _e2e_boom_with_secrets
+
+        with patch("business_core.sheets.find_row_by_id", return_value=(2, row)), \
+             patch("business_core.sheets.get_business_sheet", return_value=sheet), \
+             patch(_AUTHZ_PATH, new=AsyncMock(return_value=_allow_result())), \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+            _run(th.updateinteractionnotes_cmd(update, _make_context(
+                ["interaction_id=ACT-001", f"notes={_E2E_SECRET_NOTES_MARKER}"]
+            )))
+
+        call = update.message.reply_text.call_args
+        text = call.args[0] if call.args else call.kwargs.get("text", "")
+        for marker in _E2E_ALL_SECRET_MARKERS:
+            self.assertNotIn(marker, text)
+        self.assertNotIn("Infrastructure failure", text)
+        # Real chain: business_builder.update_interaction_notes synthesizes
+        # code="INTERACTION_IMMUTABLE" on ok=False with a blank manager
+        # code. Phase 17E-2A3-H1-R1: _interaction_notes_message no
+        # longer has a dedicated INTERACTION_IMMUTABLE branch that
+        # renders result["error"] — it falls to the fully generic fixed
+        # message, so neither the raw exception NOR the sanitized
+        # "Infrastructure failure" placeholder ever reaches Telegram.
+        self.assertEqual(text, "❌ Не удалось обновить Notes для Interaction.")
+
+
+class TestUpdateLeadNotesEndToEndExceptionSecrecy(unittest.TestCase):
+    def test_notes_write_exception_through_real_chain_no_secrets_in_reply(self):
+        update = _make_update()
+        row = {
+            "Lead ID": "LED-001", "Business ID": "BIZ-001", "Status": "new",
+            "Contact Name Snapshot": "", "Phone Snapshot": "", "WhatsApp Snapshot": "", "Email Snapshot": "",
+            "Company Snapshot": "", "Service ID": "", "Source": "", "Channel ID": "",
+            "Qualification Notes": "", "Disposition Reason": "", "Expected Value": "", "Currency": "",
+            "Next Follow-up At": "", "Last Contacted At": "", "Assigned Person ID": "",
+            "Caller Idempotency Key": "", "Created At": "", "Created By": "", "Updated At": "", "Notes": "",
+        }
+        sheet = MagicMock()
+        sheet.row_values.return_value = list(row.keys())
+        sheet.update_cell.side_effect = _e2e_boom_with_secrets
+
+        with patch("business_core.sheets.find_row_by_id", return_value=(2, row)), \
+             patch("business_core.sheets.get_business_sheet", return_value=sheet), \
+             patch(_AUTHZ_PATH, new=AsyncMock(return_value=_allow_result())), \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+            _run(th.updateleadnotes_cmd(update, _make_context(
+                ["lead_id=LED-001", f"notes={_E2E_SECRET_NOTES_MARKER}"]
+            )))
+
+        call = update.message.reply_text.call_args
+        text = call.args[0] if call.args else call.kwargs.get("text", "")
+        for marker in _E2E_ALL_SECRET_MARKERS:
+            self.assertNotIn(marker, text)
+        # _lead_notes_message (the dedicated mapper) never checks
+        # LEAD_IMMUTABLE at all, so even the synthesized code from
+        # business_builder falls through to the fully generic message.
+        self.assertEqual(text, "❌ Не удалось обновить Notes для Lead.")
 
 
 if __name__ == "__main__":

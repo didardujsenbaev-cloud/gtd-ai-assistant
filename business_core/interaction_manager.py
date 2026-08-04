@@ -228,8 +228,12 @@ def _find_interaction_row(interaction_id: str) -> Optional[tuple[int, dict]]:
     try:
         from business_core.sheets import find_row_by_id
         return find_row_by_id("interaction_log", interaction_id)
-    except Exception as exc:
-        log.warning(f"_find_interaction_row({interaction_id}) error: {exc}")
+    except Exception:
+        # Phase 17E-2A3-H1: fixed literal only — no exception
+        # interpolation, no entity ID, no row content. The underlying
+        # exception (e.g. a Sheets API error) could theoretically echo
+        # request payload content, so nothing about it is logged.
+        log.warning("_find_interaction_row infrastructure failure")
         return None
 
 
@@ -277,9 +281,15 @@ def update_interaction_admin_fields(interaction_id: str, updates: dict) -> dict:
             sheet.update_cell(row_num, idx["Updated At"] + 1, _now_utc_str())
 
         return {"ok": True, "changed": changed, "code": "", "error": None}
-    except Exception as exc:
-        log.error(f"update_interaction_admin_fields({interaction_id}) error: {exc}")
-        return {"ok": False, "changed": False, "code": "", "error": str(exc)}
+    except Exception:
+        # Phase 17E-2A3-H1: fixed literal only — no exception
+        # interpolation, no entity ID, no updates dict, no row
+        # content. "error" is likewise sanitized to a fixed safe
+        # string, since callers (including business_builder.
+        # update_interaction_notes' code-synthesis fallback) may
+        # place this value where a Telegram mapper renders it.
+        log.error("update_interaction_admin_fields infrastructure failure")
+        return {"ok": False, "changed": False, "code": "", "error": "Infrastructure failure"}
 
 
 def update_interaction_status(interaction_id: str, status: str, *, archived_at: str = "") -> dict:

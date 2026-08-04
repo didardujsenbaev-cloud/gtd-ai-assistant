@@ -265,13 +265,54 @@ class TestInteractionNotesMessageMapping(unittest.TestCase):
         self.assertIn("ℹ️", msg)
 
     def test_not_found(self):
+        # Phase 17E-2A3-H1-R1: INTERACTION_NOT_FOUND after
+        # authorization succeeded means the record vanished between
+        # the handler's second lookup and business_builder's own
+        # internal lookup (residual TOCTOU) — maps to the shared
+        # ownership-changed message, not a generic ❌ failure.
         msg = th._interaction_notes_message({"ok": False, "code": "INTERACTION_NOT_FOUND", "error": None}, "ACT-999")
-        self.assertIn("❌", msg)
+        self.assertEqual(msg, "Запись изменилась. Повтори команду ещё раз.")
 
     def test_immutable(self):
+        # Phase 17E-2A3-H1-R1: INTERACTION_IMMUTABLE is structurally
+        # unreachable from update_interaction_notes() except via
+        # business_builder's exception-synthesis fallback, so it is no
+        # longer given its own message — it falls to the fully generic
+        # fixed failure text and never renders result["error"].
         msg = th._interaction_notes_message({"ok": False, "code": "INTERACTION_IMMUTABLE", "error": "x"}, "ACT-001")
-        self.assertIn("❌", msg)
+        self.assertEqual(msg, "❌ Не удалось обновить Notes для Interaction.")
         self.assertNotIn("✅", msg)
+
+    def test_immutable_never_renders_raw_error(self):
+        msg = th._interaction_notes_message(
+            {"ok": False, "code": "INTERACTION_IMMUTABLE", "error": "Infrastructure failure"}, "ACT-001",
+        )
+        self.assertEqual(msg, "❌ Не удалось обновить Notes для Interaction.")
+        self.assertNotIn("Infrastructure failure", msg)
+
+    def test_unknown_code_never_renders_raw_error(self):
+        msg = th._interaction_notes_message(
+            {"ok": False, "code": "SOME_FUTURE_CODE", "error": "raw domain error text should never appear"}, "ACT-001",
+        )
+        self.assertEqual(msg, "❌ Не удалось обновить Notes для Interaction.")
+        self.assertNotIn("raw domain error text should never appear", msg)
+
+    def test_empty_code_never_renders_raw_error(self):
+        msg = th._interaction_notes_message(
+            {"ok": False, "code": "", "error": "Infrastructure failure"}, "ACT-001",
+        )
+        self.assertEqual(msg, "❌ Не удалось обновить Notes для Interaction.")
+
+    def test_missing_code_never_renders_raw_error(self):
+        msg = th._interaction_notes_message({"ok": False, "error": "Infrastructure failure"}, "ACT-001")
+        self.assertEqual(msg, "❌ Не удалось обновить Notes для Interaction.")
+
+    def test_too_long_uses_fixed_message_not_raw_error(self):
+        msg = th._interaction_notes_message(
+            {"ok": False, "code": "INTERACTION_NOTES_TOO_LONG", "error": "notes превышает 5000 символов"}, "ACT-001",
+        )
+        self.assertEqual(msg, "❌ Notes превышают допустимую длину.")
+        self.assertNotIn("5000", msg)
 
     def test_never_echoes_notes_content(self):
         result = {"ok": True, "code": "INTERACTION_NOTES_UPDATED", "error": None}

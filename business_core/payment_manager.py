@@ -511,8 +511,10 @@ def _find_obligation_row(obligation_id: str) -> Optional[tuple[int, dict]]:
     try:
         from business_core.sheets import find_row_by_id
         return find_row_by_id("payment_obligations", obligation_id)
-    except Exception as exc:
-        log.warning(f"_find_obligation_row({obligation_id}) error: {exc}")
+    except Exception:
+        # Phase 17E-2A3-H1: fixed literal only — no exception
+        # interpolation, no entity ID, no row content.
+        log.warning("_find_obligation_row infrastructure failure")
         return None
 
 
@@ -565,9 +567,14 @@ def update_payment_obligation_admin_fields(obligation_id: str, updates: dict) ->
             sheet.update_cell(row_num, idx["Updated At"] + 1, _now_utc_str())
 
         return {"ok": True, "changed": changed, "code": "", "error": None}
-    except Exception as exc:
-        log.error(f"update_payment_obligation_admin_fields({obligation_id}) error: {exc}")
-        return {"ok": False, "changed": False, "code": "", "error": str(exc)}
+    except Exception:
+        # Phase 17E-2A3-H1: fixed literal only — no exception
+        # interpolation, no entity ID, no updates dict, no row
+        # content. "error" is likewise sanitized to a fixed safe
+        # string, since /updateobligation's legacy fallback mapper
+        # renders this value to Telegram for unmapped codes.
+        log.error("update_payment_obligation_admin_fields infrastructure failure")
+        return {"ok": False, "changed": False, "code": "", "error": "Infrastructure failure"}
 
 
 def update_payment_obligation_status(

@@ -14009,27 +14009,41 @@ def _interaction_archive_message(result: dict, interaction_id: str) -> str:
 
 
 def _interaction_notes_message(result: dict, interaction_id: str) -> str:
-    """Render any business_builder.update_interaction_notes() result.
-    Notes content is never echoed back, regardless of outcome."""
+    """
+    Dedicated safe mapper for /updateinteractionnotes (Phase
+    17E-2A3-H1-R1) — mirrors _lead_notes_message's contract exactly.
+    This NEVER renders result['error'], str/repr of the result, or
+    the raw result code in any branch. update_interaction_notes()
+    only ever passes {"Notes": ...} to the low-level admin-field
+    mutator, so INTERACTION_IMMUTABLE is structurally unreachable
+    here except via business_builder's exception-synthesis fallback
+    (code=write_result.get("code") or "INTERACTION_IMMUTABLE" when
+    the manager's own exception handler returns code="") — rendering
+    result['error'] for that branch would have surfaced the now-fixed-
+    but-still-internal "Infrastructure failure" string, or worse, a
+    future raw value, directly to the caller. INTERACTION_NOTES_TOO_LONG
+    is a genuinely reachable, fully deterministic validation code (from
+    _validate_interaction_notes's fixed-length check), so it keeps its
+    own message — but as a hardcoded literal, not result['error'].
+    """
     code = result.get("code", "")
 
     if code == "INTERACTION_NOTES_UPDATED":
         return f"✅ Notes для Interaction {interaction_id} обновлены."
-
     if code == "INTERACTION_NOTES_UNCHANGED":
         return f"ℹ️ Interaction {interaction_id} — изменений нет (значения совпадают)."
-
     if code == "INTERACTION_NOT_FOUND":
-        return f"❌ Interaction {interaction_id} не найден."
-
-    if code == "INTERACTION_IMMUTABLE":
-        return f"❌ {result.get('error') or 'Изменение недоступно — только Notes могут быть изменены.'}"
-
+        # Authorization already succeeded against this interaction_id —
+        # a NOT_FOUND surfacing only now means the record vanished
+        # between the mandatory second lookup and business_builder's
+        # own internal lookup (the accepted residual TOCTOU window),
+        # not a pre-authorization enumeration case.
+        return _BC_ENFORCEMENT_OWNERSHIP_CHANGED_MSG
     if code == "INTERACTION_NOTES_TOO_LONG":
-        return f"❌ {result.get('error') or 'Notes превышают допустимую длину.'}"
+        return "❌ Notes превышают допустимую длину."
 
     log.warning(f"_interaction_notes_message: unmapped code={code!r} interaction_id={interaction_id}")
-    return f"❌ Ошибка ({code or 'unknown'}): {result.get('error') or 'см. логи'}"
+    return "❌ Не удалось обновить Notes для Interaction."
 
 
 async def newinteraction_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
