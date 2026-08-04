@@ -271,6 +271,9 @@ _IDENTITY_DOMAIN_TEST_FILES = frozenset({
     # BEFORE any test logic was written, per the same precedent.
     "test_command_enforcement.py",
     "test_business_core_read_enforcement.py",
+    # Phase 17E-2A: Targeted Mutation Enforcement test file, registered
+    # BEFORE any test logic was written, per the same precedent.
+    "test_mutation_enforcement.py",
 })
 
 _HARD_SOCKET_BLOCK_TEST_FILES = (

@@ -1,15 +1,17 @@
 """
-Phase 17E-1: Command Enforcement architecture guards.
+Phase 17E-1 / 17E-2A: Command Enforcement architecture guards.
 
 Registered in conftest.py's hard socket-block set BEFORE this test
 logic was written, per the PRS-003/Phase-17B-IR1 precedent.
 
 Pure inventory/architecture tests — no domain behavior is exercised
-here (that belongs to test_business_core_read_enforcement.py). These
-tests prove the STRUCTURE of the enforcement rollout: exactly six
-commands are gated, no other command changed, no resource
-substitution, no bypass parameter, no cache, GTD/telegram_bot.py/
-authorization.py untouched.
+here (that belongs to test_business_core_read_enforcement.py and
+test_mutation_enforcement.py). These tests prove the STRUCTURE of the
+enforcement rollout: the six Phase 17E-1 read commands remain
+unchanged, exactly one Phase 17E-2A mutation command
+(updateinteractionnotes) was added, no other command changed, no
+resource substitution, no bypass parameter, no cache,
+GTD/telegram_bot.py/authorization.py untouched.
 """
 
 from __future__ import annotations
@@ -38,6 +40,14 @@ _EXPECTED_MAP = {
     "interaction": {"resource": "CLIENT",   "action": "READ", "target_shape": "BUSINESS"},
 }
 
+_EXPECTED_MUTATION_ENTRY = {
+    "updateinteractionnotes": {
+        "resource": "CLIENT", "action": "UPDATE", "target_shape": "BUSINESS",
+        "operation_kind": "MUTATION", "requires_fresh_reread": True,
+        "mutation_side_effect_class": "SINGLE_ROW_MUTATION", "idempotency_class": "IDEMPOTENT",
+    },
+}
+
 _NON_ENFORCED_SAMPLE_HANDLERS = [
     "objects_cmd", "services_cmd", "service_detail_cmd", "roadmaps_cmd" if hasattr(th, "roadmaps_cmd") else "show_roadmaps",
     "show_clients", "finddocs_cmd", "bc_status", "bc_access", "version_cmd",
@@ -45,18 +55,28 @@ _NON_ENFORCED_SAMPLE_HANDLERS = [
     "newobject_cmd", "startroadmap_cmd", "updatestage_cmd",
     "archivedoc_cmd", "archiveoffer_cmd", "archivelead_cmd", "archiveinteraction_cmd",
     "assignrole_cmd",
+    # Phase 17E-2 candidate mutation commands explicitly deferred —
+    # must NOT have gained transport/authorization in this phase.
+    "updatedoc_cmd", "updateobligation_cmd", "updateoffer_cmd", "updatelead_cmd",
+    "confirmpayment_cmd", "reversepayment_cmd", "sendoffer_cmd", "acceptoffer_cmd", "convertlead_cmd",
 ]
 
 
 class TestEnforcementMap(unittest.TestCase):
-    def test_map_keys_exactly_six_commands(self):
-        self.assertEqual(set(th.COMMAND_ENFORCEMENT_MAP.keys()), set(_EXPECTED_MAP.keys()))
+    def test_map_keys_exactly_seven_commands(self):
+        expected_keys = set(_EXPECTED_MAP.keys()) | set(_EXPECTED_MUTATION_ENTRY.keys())
+        self.assertEqual(set(th.COMMAND_ENFORCEMENT_MAP.keys()), expected_keys)
 
-    def test_map_values_exact(self):
-        self.assertEqual(th.COMMAND_ENFORCEMENT_MAP, _EXPECTED_MAP)
+    def test_six_read_command_values_exact(self):
+        for key, val in _EXPECTED_MAP.items():
+            with self.subTest(command=key):
+                self.assertEqual(th.COMMAND_ENFORCEMENT_MAP[key], val)
 
-    def test_no_seventh_command_in_map(self):
-        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 6)
+    def test_mutation_entry_exact(self):
+        self.assertEqual(th.COMMAND_ENFORCEMENT_MAP["updateinteractionnotes"], _EXPECTED_MUTATION_ENTRY["updateinteractionnotes"])
+
+    def test_no_eighth_command_in_map(self):
+        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 7)
 
 
 class TestHandlersUseTransportPreflightAndAdapter(unittest.TestCase):

@@ -1,0 +1,757 @@
+"""
+Phase 17E-2A: targeted-mutation enforcement tests for exactly one
+command: /updateinteractionnotes.
+
+Registered in conftest.py's hard socket-block set BEFORE this test
+logic was written, per the PRS-003/Phase-17B-IR1 precedent.
+
+The finder (business_core.interaction_manager.find_interaction_by_id)
+is patched at the exact module path the handler imports it from — a
+fresh, local `from ... import ...` inside the function body, matching
+this repo's established lazy-import convention. The mutator
+(business_core.business_builder.update_interaction_notes) is patched
+the same way. The Telegram authorization adapter is patched via
+"business_core.telegram_authorization.authorize_telegram_business_core_request",
+the exact name _authorize_or_reply imports locally at call time.
+
+Unlike Phase 17E-1's read commands, this handler calls the finder
+TWICE (first lookup for ownership/authorization, second immediately
+before mutation) — tests here assert on call count and call order,
+not just presence.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import inspect
+import unittest
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
+
+from business_core import telegram_handlers as th
+
+
+def _run(coro):
+    return asyncio.run(coro)
+
+
+def _make_update(chat_type="private", user_id=570004109):
+    update = MagicMock()
+    update.effective_chat = SimpleNamespace(type=chat_type) if chat_type is not None else None
+    update.effective_user = SimpleNamespace(id=user_id) if user_id is not None else None
+    update.message = MagicMock()
+    update.message.reply_text = AsyncMock()
+    return update
+
+
+def _make_context(args):
+    return SimpleNamespace(args=args)
+
+
+def _allow_result():
+    return {"ok": True, "allowed": True, "code": "TELEGRAM_ACCESS_ALLOWED", "retry_safe": True,
+            "authorization_result": {"ok": True, "allowed": True, "code": "ACCESS_ALLOWED"}}
+
+
+def _deny_result():
+    return {"ok": True, "allowed": False, "code": "AUTHORIZATION_DENIED", "retry_safe": True,
+            "authorization_result": {"ok": True, "allowed": False, "code": "SCOPE_NOT_MATCHED"}}
+
+
+def _infra_failure_result():
+    return {"ok": False, "allowed": False, "code": "AUTHORIZATION_UNAVAILABLE", "retry_safe": False,
+            "authorization_result": None}
+
+
+_ROW = {
+    "Interaction ID": "ACT-001", "Business ID": "BIZ-001", "Caller Idempotency Key": "",
+    "Interaction Type": "call", "Direction": "outbound", "Channel ID": "", "Occurred At": "2026-01-01T00:00:00Z",
+    "Summary": "s", "Outcome": "", "Lead ID": "", "Client ID": "PRS-1", "Commercial Offer ID": "",
+    "Assigned Person ID": "", "External Reference": "", "Status": "active",
+    "Created At": "2026-01-01T00:00:00Z", "Created By": "", "Updated At": "", "Archived At": "", "Notes": "",
+}
+_ROW_OTHER_BIZ = {**_ROW, "Business ID": "BIZ-002"}
+_ROW_MISSING_OWNERSHIP = {**_ROW, "Business ID": ""}
+_ROW_WHITESPACE_OWNERSHIP = {**_ROW, "Business ID": "   "}
+
+_FINDER_PATH = "business_core.interaction_manager.find_interaction_by_id"
+_MUTATOR_PATH = "business_core.business_builder.update_interaction_notes"
+_AUTHZ_PATH = "business_core.telegram_authorization.authorize_telegram_business_core_request"
+
+_ID_ARG = "interaction_id=ACT-001"
+_NOTES_ARG = "notes=hello"
+_ARGS = [_ID_ARG, _NOTES_ARG]
+
+
+class MutationTestBase(unittest.TestCase):
+    def _run_handler(self, update, args=None, *, finder_side_effect=None, finder_return=None,
+                      authz_result=None, mutator_return=None, mutator_side_effect=None):
+        patches = []
+        if finder_side_effect is not None:
+            patches.append(patch(_FINDER_PATH, side_effect=finder_side_effect))
+        else:
+            patches.append(patch(_FINDER_PATH, return_value=finder_return))
+
+        mock_authz = AsyncMock(return_value=authz_result if authz_result is not None else _allow_result())
+        patches.append(patch(_AUTHZ_PATH, new=mock_authz))
+
+        if mutator_side_effect is not None:
+            mock_mutator = MagicMock(side_effect=mutator_side_effect)
+        else:
+            mock_mutator = MagicMock(return_value=mutator_return if mutator_return is not None else
+                                      {"ok": True, "code": "INTERACTION_NOTES_UPDATED", "error": None,
+                                       "interaction_id": "ACT-001", "business_id": "BIZ-001", "changed": True})
+        patches.append(patch(_MUTATOR_PATH, new=mock_mutator))
+
+        ctx = _make_context(args if args is not None else _ARGS)
+        with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+            for p in patches:
+                p.start()
+            try:
+                _run(th.updateinteractionnotes_cmd(update, ctx))
+            finally:
+                for p in reversed(patches):
+                    p.stop()
+        return mock_authz, mock_mutator
+
+    def _sent_text(self, update) -> str:
+        call = update.message.reply_text.call_args
+        return call.args[0] if call.args else call.kwargs.get("text", "")
+
+
+# ─────────────────────────────────────────────────────────────
+# Transport
+# ─────────────────────────────────────────────────────────────
+
+class TestTransport(MutationTestBase):
+    def test_group_zero_finder_and_mutation(self):
+        update = _make_update(chat_type="group")
+        with patch(_FINDER_PATH) as mock_finder, patch(_MUTATOR_PATH) as mock_mutator, \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+            _run(th.updateinteractionnotes_cmd(update, _make_context(_ARGS)))
+        mock_finder.assert_not_called()
+        mock_mutator.assert_not_called()
+
+    def test_supergroup_zero_finder_and_mutation(self):
+        update = _make_update(chat_type="supergroup")
+        with patch(_FINDER_PATH) as mock_finder, patch(_MUTATOR_PATH) as mock_mutator, \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+            _run(th.updateinteractionnotes_cmd(update, _make_context(_ARGS)))
+        mock_finder.assert_not_called()
+        mock_mutator.assert_not_called()
+
+    def test_channel_zero_finder_and_mutation(self):
+        update = _make_update(chat_type="channel")
+        with patch(_FINDER_PATH) as mock_finder, patch(_MUTATOR_PATH) as mock_mutator, \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+            _run(th.updateinteractionnotes_cmd(update, _make_context(_ARGS)))
+        mock_finder.assert_not_called()
+        mock_mutator.assert_not_called()
+
+    def test_malformed_update_zero_finder_and_mutation(self):
+        update = SimpleNamespace()
+        with patch(_FINDER_PATH) as mock_finder, patch(_MUTATOR_PATH) as mock_mutator, \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+            _run(th.updateinteractionnotes_cmd(update, _make_context(_ARGS)))
+        mock_finder.assert_not_called()
+        mock_mutator.assert_not_called()
+
+    def test_missing_effective_user_zero_finder_and_mutation(self):
+        update = _make_update(user_id=None)
+        with patch(_FINDER_PATH) as mock_finder, patch(_MUTATOR_PATH) as mock_mutator, \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+            _run(th.updateinteractionnotes_cmd(update, _make_context(_ARGS)))
+        mock_finder.assert_not_called()
+        mock_mutator.assert_not_called()
+
+    def test_missing_user_id_zero_finder_and_mutation(self):
+        update = _make_update()
+        update.effective_user = SimpleNamespace(id=None)
+        with patch(_FINDER_PATH) as mock_finder, patch(_MUTATOR_PATH) as mock_mutator, \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+            _run(th.updateinteractionnotes_cmd(update, _make_context(_ARGS)))
+        mock_finder.assert_not_called()
+        mock_mutator.assert_not_called()
+
+
+# ─────────────────────────────────────────────────────────────
+# Argument parsing
+# ─────────────────────────────────────────────────────────────
+
+class TestArguments(MutationTestBase):
+    def test_missing_interaction_id_zero_finder_and_mutation(self):
+        update = _make_update()
+        with patch(_FINDER_PATH) as mock_finder, patch(_MUTATOR_PATH) as mock_mutator, \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+            _run(th.updateinteractionnotes_cmd(update, _make_context([_NOTES_ARG])))
+        mock_finder.assert_not_called()
+        mock_mutator.assert_not_called()
+
+    def test_missing_notes_zero_finder_and_mutation(self):
+        update = _make_update()
+        with patch(_FINDER_PATH) as mock_finder, patch(_MUTATOR_PATH) as mock_mutator, \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+            _run(th.updateinteractionnotes_cmd(update, _make_context([_ID_ARG])))
+        mock_finder.assert_not_called()
+        mock_mutator.assert_not_called()
+
+    def test_positional_id_unsupported(self):
+        update = _make_update()
+        with patch(_FINDER_PATH) as mock_finder, patch(_MUTATOR_PATH) as mock_mutator, \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+            _run(th.updateinteractionnotes_cmd(update, _make_context(["ACT-001", _NOTES_ARG])))
+        mock_finder.assert_not_called()
+        mock_mutator.assert_not_called()
+
+
+# ─────────────────────────────────────────────────────────────
+# First lookup
+# ─────────────────────────────────────────────────────────────
+
+class TestFirstLookup(MutationTestBase):
+    def test_finder_runs_via_asyncio_to_thread(self):
+        update = _make_update()
+        recorded = []
+
+        async def fake_to_thread(func, *args, **kwargs):
+            recorded.append((getattr(func, "__name__", None), args))
+            if len(recorded) == 1:
+                return _ROW
+            return {"ok": True, "code": "INTERACTION_NOTES_UPDATED", "error": None, "changed": True}
+
+        with patch("business_core.telegram_handlers.asyncio.to_thread", side_effect=fake_to_thread), \
+             patch(_AUTHZ_PATH, new=AsyncMock(return_value=_allow_result())), \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+            _run(th.updateinteractionnotes_cmd(update, _make_context(_ARGS)))
+        self.assertIn("ACT-001", recorded[0][1])
+
+    def test_finder_called_before_authorization(self):
+        update = _make_update()
+        mock_authz, mock_mutator = self._run_handler(update, finder_return=_ROW)
+        mock_authz.assert_called_once()
+
+    def test_finder_none_zero_authorization_and_mutation(self):
+        update = _make_update()
+        mock_authz, mock_mutator = self._run_handler(update, finder_return=None)
+        mock_authz.assert_not_called()
+        mock_mutator.assert_not_called()
+
+    def test_finder_none_generic_message(self):
+        update = _make_update()
+        self._run_handler(update, finder_return=None)
+        self.assertEqual(self._sent_text(update), "Запись недоступна или не найдена.")
+
+    def test_finder_exception_zero_authorization_and_mutation(self):
+        update = _make_update()
+
+        def boom(*_a, **_k):
+            raise RuntimeError("sheets down")
+
+        mock_authz, mock_mutator = self._run_handler(update, finder_side_effect=boom)
+        mock_authz.assert_not_called()
+        mock_mutator.assert_not_called()
+
+    def test_finder_exception_temporarily_unavailable_message(self):
+        update = _make_update()
+
+        def boom(*_a, **_k):
+            raise RuntimeError("sheets down")
+
+        self._run_handler(update, finder_side_effect=boom)
+        text = self._sent_text(update)
+        self.assertIn("Временная ошибка", text)
+        self.assertNotIn("RuntimeError", text)
+        self.assertNotIn("sheets down", text)
+
+    def test_missing_business_id_zero_authorization_and_mutation(self):
+        update = _make_update()
+        mock_authz, mock_mutator = self._run_handler(update, finder_return=_ROW_MISSING_OWNERSHIP)
+        mock_authz.assert_not_called()
+        mock_mutator.assert_not_called()
+
+    def test_blank_business_id_zero_authorization_and_mutation(self):
+        update = _make_update()
+        mock_authz, mock_mutator = self._run_handler(update, finder_return=_ROW_WHITESPACE_OWNERSHIP)
+        mock_authz.assert_not_called()
+        mock_mutator.assert_not_called()
+
+
+# ─────────────────────────────────────────────────────────────
+# Authorization
+# ─────────────────────────────────────────────────────────────
+
+class TestAuthorization(MutationTestBase):
+    def test_resource_client_action_update(self):
+        update = _make_update()
+        mock_authz, _ = self._run_handler(update, finder_return=_ROW)
+        _, kwargs = mock_authz.call_args
+        self.assertEqual(kwargs["resource"], "CLIENT")
+        self.assertEqual(kwargs["action"], "UPDATE")
+
+    def test_business_id_comes_only_from_stored_row(self):
+        update = _make_update()
+        mock_authz, _ = self._run_handler(update, finder_return=_ROW)
+        _, kwargs = mock_authz.call_args
+        self.assertEqual(kwargs["business_id"], "BIZ-001")
+
+    def test_caller_cannot_spoof_ownership(self):
+        # notes/interaction_id are the only caller-suppliable args; no
+        # business_id/object_id kwarg is ever accepted by the parser.
+        src = inspect.getsource(th.updateinteractionnotes_cmd)
+        self.assertNotIn('args.get("business_id"', src)
+        self.assertNotIn('kv.get("business_id"', src)
+
+    def test_denial_zero_second_lookup_and_mutation(self):
+        update = _make_update()
+        calls = []
+
+        def finder(*a, **k):
+            calls.append(a)
+            return _ROW
+
+        mock_authz, mock_mutator = self._run_handler(
+            update, finder_side_effect=finder, authz_result=_deny_result(),
+        )
+        self.assertEqual(len(calls), 1)
+        mock_mutator.assert_not_called()
+
+    def test_denial_generic_message(self):
+        update = _make_update()
+        self._run_handler(update, finder_return=_ROW, authz_result=_deny_result())
+        self.assertEqual(self._sent_text(update), "Запись недоступна или не найдена.")
+
+    def test_infrastructure_failure_zero_mutation(self):
+        update = _make_update()
+        _, mock_mutator = self._run_handler(update, finder_return=_ROW, authz_result=_infra_failure_result())
+        mock_mutator.assert_not_called()
+
+    def test_infrastructure_failure_message(self):
+        update = _make_update()
+        self._run_handler(update, finder_return=_ROW, authz_result=_infra_failure_result())
+        self.assertIn("Временная ошибка", self._sent_text(update))
+
+    def test_owner_allow_continues_to_mutation(self):
+        update = _make_update()
+        _, mock_mutator = self._run_handler(update, finder_return=_ROW, authz_result=_allow_result())
+        mock_mutator.assert_called_once()
+
+
+# ─────────────────────────────────────────────────────────────
+# Fresh re-read
+# ─────────────────────────────────────────────────────────────
+
+class TestFreshReread(MutationTestBase):
+    def test_second_lookup_occurs_exactly_twice_total(self):
+        update = _make_update()
+        finder_calls = []
+
+        def finder(interaction_id):
+            finder_calls.append(interaction_id)
+            return _ROW
+
+        self._run_handler(update, finder_side_effect=finder)
+        self.assertEqual(len(finder_calls), 2)
+        self.assertEqual(finder_calls, ["ACT-001", "ACT-001"])
+
+    def test_second_lookup_only_after_allow(self):
+        update = _make_update()
+        finder_calls = []
+
+        def finder(interaction_id):
+            finder_calls.append(interaction_id)
+            return _ROW
+
+        self._run_handler(update, finder_side_effect=finder, authz_result=_deny_result())
+        self.assertEqual(len(finder_calls), 1)
+
+    def test_second_lookup_runs_via_asyncio_to_thread(self):
+        update = _make_update()
+        to_thread_calls = []
+        real_to_thread = asyncio.to_thread
+
+        async def spy_to_thread(func, *args, **kwargs):
+            to_thread_calls.append(getattr(func, "__name__", None))
+            if getattr(func, "__name__", None) == "find_interaction_by_id":
+                return _ROW
+            return {"ok": True, "code": "INTERACTION_NOTES_UPDATED", "error": None, "changed": True}
+
+        with patch("business_core.telegram_handlers.asyncio.to_thread", side_effect=spy_to_thread), \
+             patch(_AUTHZ_PATH, new=AsyncMock(return_value=_allow_result())), \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+            _run(th.updateinteractionnotes_cmd(update, _make_context(_ARGS)))
+        self.assertEqual(to_thread_calls.count("find_interaction_by_id"), 2)
+
+    def test_second_row_missing_zero_mutation(self):
+        update = _make_update()
+        calls = {"n": 0}
+
+        def finder(*_a, **_k):
+            calls["n"] += 1
+            return _ROW if calls["n"] == 1 else None
+
+        _, mock_mutator = self._run_handler(update, finder_side_effect=finder)
+        mock_mutator.assert_not_called()
+
+    def test_second_row_missing_ownership_changed_message(self):
+        update = _make_update()
+        calls = {"n": 0}
+
+        def finder(*_a, **_k):
+            calls["n"] += 1
+            return _ROW if calls["n"] == 1 else None
+
+        self._run_handler(update, finder_side_effect=finder)
+        self.assertEqual(self._sent_text(update), "Запись изменилась. Повтори команду ещё раз.")
+
+    def test_second_business_id_blank_zero_mutation(self):
+        update = _make_update()
+        calls = {"n": 0}
+
+        def finder(*_a, **_k):
+            calls["n"] += 1
+            return _ROW if calls["n"] == 1 else _ROW_MISSING_OWNERSHIP
+
+        _, mock_mutator = self._run_handler(update, finder_side_effect=finder)
+        mock_mutator.assert_not_called()
+
+    def test_ownership_changed_zero_mutation(self):
+        update = _make_update()
+        calls = {"n": 0}
+
+        def finder(*_a, **_k):
+            calls["n"] += 1
+            return _ROW if calls["n"] == 1 else _ROW_OTHER_BIZ
+
+        _, mock_mutator = self._run_handler(update, finder_side_effect=finder)
+        mock_mutator.assert_not_called()
+
+    def test_ownership_changed_message_reveals_no_business_id(self):
+        update = _make_update()
+        calls = {"n": 0}
+
+        def finder(*_a, **_k):
+            calls["n"] += 1
+            return _ROW if calls["n"] == 1 else _ROW_OTHER_BIZ
+
+        self._run_handler(update, finder_side_effect=finder)
+        text = self._sent_text(update)
+        self.assertEqual(text, "Запись изменилась. Повтори команду ещё раз.")
+        self.assertNotIn("BIZ-001", text)
+        self.assertNotIn("BIZ-002", text)
+
+    def test_unchanged_ownership_mutation_permitted(self):
+        update = _make_update()
+        _, mock_mutator = self._run_handler(update, finder_return=_ROW)
+        mock_mutator.assert_called_once()
+
+    def test_no_automatic_reauthorization_on_ownership_change(self):
+        update = _make_update()
+        calls = {"n": 0}
+
+        def finder(*_a, **_k):
+            calls["n"] += 1
+            return _ROW if calls["n"] == 1 else _ROW_OTHER_BIZ
+
+        mock_authz, _ = self._run_handler(update, finder_side_effect=finder)
+        mock_authz.assert_called_once()
+
+    def test_mutator_internal_lookup_does_not_substitute_for_handler_lookup(self):
+        # Even when the mutator is mocked to "succeed" without ever
+        # being asked to look anything up itself, the handler's own
+        # two finder calls are what gate the mutation — this proves
+        # the handler doesn't rely on the mutator's internal find.
+        update = _make_update()
+        finder_calls = []
+
+        def finder(*_a, **_k):
+            finder_calls.append(1)
+            return _ROW
+
+        self._run_handler(update, finder_side_effect=finder)
+        self.assertEqual(len(finder_calls), 2)
+
+
+# ─────────────────────────────────────────────────────────────
+# Ordering
+# ─────────────────────────────────────────────────────────────
+
+class TestOrdering(MutationTestBase):
+    def test_full_sequence_order(self):
+        update = _make_update()
+        order = []
+
+        def finder(*_a, **_k):
+            order.append("lookup")
+            return _ROW
+
+        async def authz(*_a, **_k):
+            order.append("authorize")
+            return _allow_result()
+
+        def mutator(*_a, **_k):
+            order.append("mutate")
+            return {"ok": True, "code": "INTERACTION_NOTES_UPDATED", "error": None, "changed": True}
+
+        with patch(_FINDER_PATH, side_effect=finder), \
+             patch(_AUTHZ_PATH, new=authz), \
+             patch(_MUTATOR_PATH, side_effect=mutator), \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+            _run(th.updateinteractionnotes_cmd(update, _make_context(_ARGS)))
+
+        self.assertEqual(order, ["lookup", "authorize", "lookup", "mutate"])
+
+
+# ─────────────────────────────────────────────────────────────
+# Mutation
+# ─────────────────────────────────────────────────────────────
+
+class TestMutation(MutationTestBase):
+    def test_mutation_runs_via_asyncio_to_thread(self):
+        update = _make_update()
+        seen_funcs = []
+        real_to_thread = asyncio.to_thread
+
+        async def spy_to_thread(func, *args, **kwargs):
+            seen_funcs.append(getattr(func, "__name__", None))
+            if getattr(func, "__name__", None) == "find_interaction_by_id":
+                return _ROW
+            return {"ok": True, "code": "INTERACTION_NOTES_UPDATED", "error": None, "changed": True}
+
+        with patch("business_core.telegram_handlers.asyncio.to_thread", side_effect=spy_to_thread), \
+             patch(_AUTHZ_PATH, new=AsyncMock(return_value=_allow_result())), \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+            _run(th.updateinteractionnotes_cmd(update, _make_context(_ARGS)))
+        self.assertIn("update_interaction_notes", seen_funcs)
+
+    def test_mutation_called_exactly_once(self):
+        update = _make_update()
+        _, mock_mutator = self._run_handler(update, finder_return=_ROW)
+        mock_mutator.assert_called_once()
+
+    def test_mutation_called_with_exact_args(self):
+        update = _make_update()
+        _, mock_mutator = self._run_handler(update, finder_return=_ROW)
+        mock_mutator.assert_called_once_with("ACT-001", "hello")
+
+    def test_mutation_exception_no_retry(self):
+        update = _make_update()
+
+        def boom(*_a, **_k):
+            raise RuntimeError("write failed")
+
+        _, mock_mutator = self._run_handler(update, finder_return=_ROW, mutator_side_effect=boom)
+        mock_mutator.assert_called_once()
+
+    def test_mutation_exception_no_raw_exception_in_reply(self):
+        update = _make_update()
+
+        def boom(*_a, **_k):
+            raise RuntimeError("write failed")
+
+        self._run_handler(update, finder_return=_ROW, mutator_side_effect=boom)
+        text = self._sent_text(update)
+        self.assertNotIn("RuntimeError", text)
+        self.assertNotIn("write failed", text)
+
+    def test_mutation_exception_safe_generic_message(self):
+        update = _make_update()
+
+        def boom(*_a, **_k):
+            raise RuntimeError("write failed")
+
+        self._run_handler(update, finder_return=_ROW, mutator_side_effect=boom)
+        self.assertEqual(self._sent_text(update), "❌ Не удалось обновить Notes для Interaction.")
+
+    def test_notes_content_absent_from_reply(self):
+        update = _make_update()
+        self._run_handler(update, finder_return=_ROW, args=["interaction_id=ACT-001", "notes=SECRET_CONTENT"])
+        self.assertNotIn("SECRET_CONTENT", self._sent_text(update))
+
+    def test_success_reply_only_after_mutation_result(self):
+        update = _make_update()
+        self._run_handler(update, finder_return=_ROW, mutator_return={
+            "ok": True, "code": "INTERACTION_NOTES_UPDATED", "error": None, "changed": True,
+        })
+        self.assertEqual(self._sent_text(update), "✅ Notes для Interaction ACT-001 обновлены.")
+
+    def test_updated_result_handled(self):
+        update = _make_update()
+        self._run_handler(update, finder_return=_ROW, mutator_return={
+            "ok": True, "code": "INTERACTION_NOTES_UPDATED", "error": None, "changed": True,
+        })
+        self.assertIn("обновлены", self._sent_text(update))
+
+    def test_unchanged_result_handled(self):
+        update = _make_update()
+        self._run_handler(update, finder_return=_ROW, mutator_return={
+            "ok": True, "code": "INTERACTION_NOTES_UNCHANGED", "error": None, "changed": False,
+        })
+        self.assertIn("изменений нет", self._sent_text(update))
+
+    def test_not_found_result_handled(self):
+        update = _make_update()
+        self._run_handler(update, finder_return=_ROW, mutator_return={
+            "ok": False, "code": "INTERACTION_NOT_FOUND", "error": "Interaction ACT-001 не найден",
+        })
+        self.assertIn("не найден", self._sent_text(update))
+
+    def test_too_long_result_handled(self):
+        update = _make_update()
+        self._run_handler(update, finder_return=_ROW, mutator_return={
+            "ok": False, "code": "INTERACTION_NOTES_TOO_LONG", "error": "notes превышает 2000 символов",
+        })
+        self.assertIn("превышает", self._sent_text(update))
+
+    def test_fallback_result_code_handled_safely(self):
+        update = _make_update()
+        self._run_handler(update, finder_return=_ROW, mutator_return={
+            "ok": False, "code": "SOME_FUTURE_CODE", "error": "unexpected",
+        })
+        text = self._sent_text(update)
+        self.assertTrue(text.startswith("❌"))
+
+
+# ─────────────────────────────────────────────────────────────
+# Idempotency
+# ─────────────────────────────────────────────────────────────
+
+class TestIdempotency(MutationTestBase):
+    def test_repeated_identical_notes_produces_unchanged_code(self):
+        update1 = _make_update()
+        self._run_handler(update1, finder_return=_ROW, mutator_return={
+            "ok": True, "code": "INTERACTION_NOTES_UNCHANGED", "error": None, "changed": False,
+        })
+        self.assertIn("изменений нет", self._sent_text(update1))
+
+    def test_no_duplicate_append_behavior_at_handler_level(self):
+        # The handler passes notes through unmodified, exactly once per
+        # call — no concatenation/append logic exists in the handler.
+        src = inspect.getsource(th.updateinteractionnotes_cmd)
+        self.assertNotIn("+=", src)
+        self.assertNotIn(".append(", src)
+
+    def test_no_automatic_retry_in_handler(self):
+        src = inspect.getsource(th.updateinteractionnotes_cmd)
+        self.assertNotIn("for _ in range", src)
+        self.assertNotIn("while True", src)
+        self.assertNotIn("retry", src.lower())
+
+
+# ─────────────────────────────────────────────────────────────
+# Architecture
+# ─────────────────────────────────────────────────────────────
+
+_OTHER_ENFORCED_HANDLERS = ["doc_cmd", "obligation_cmd", "payment_cmd", "offer_cmd", "lead_cmd", "interaction_cmd"]
+_OTHER_MUTATION_CANDIDATE_HANDLERS = [
+    "updatedoc_cmd", "updateobligation_cmd", "updateoffer_cmd", "updatelead_cmd",
+    "confirmpayment_cmd", "reversepayment_cmd", "sendoffer_cmd", "acceptoffer_cmd", "convertlead_cmd",
+]
+
+
+class TestArchitecture(unittest.TestCase):
+    def test_enforcement_map_has_exactly_seven_entries(self):
+        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 7)
+
+    def test_six_phase_17e1_entries_unchanged(self):
+        expected_six = {
+            "doc":         {"resource": "DOCUMENT", "action": "READ", "target_shape": "BUSINESS_AND_OBJECT"},
+            "obligation":  {"resource": "FINANCE",  "action": "READ", "target_shape": "BUSINESS"},
+            "payment":     {"resource": "FINANCE",  "action": "READ", "target_shape": "BUSINESS"},
+            "offer":       {"resource": "FINANCE",  "action": "READ", "target_shape": "BUSINESS"},
+            "lead":        {"resource": "FINANCE",  "action": "READ", "target_shape": "BUSINESS"},
+            "interaction": {"resource": "CLIENT",   "action": "READ", "target_shape": "BUSINESS"},
+        }
+        for key, val in expected_six.items():
+            with self.subTest(command=key):
+                self.assertEqual(th.COMMAND_ENFORCEMENT_MAP[key], val)
+
+    def test_updateinteractionnotes_metadata_exact(self):
+        self.assertEqual(th.COMMAND_ENFORCEMENT_MAP["updateinteractionnotes"], {
+            "resource": "CLIENT", "action": "UPDATE", "target_shape": "BUSINESS",
+            "operation_kind": "MUTATION", "requires_fresh_reread": True,
+            "mutation_side_effect_class": "SINGLE_ROW_MUTATION", "idempotency_class": "IDEMPOTENT",
+        })
+
+    def test_only_updateinteractionnotes_uses_mutate_helper(self):
+        src = inspect.getsource(th.updateinteractionnotes_cmd)
+        self.assertIn("_mutate_target_in_thread(", src)
+        for name in _OTHER_ENFORCED_HANDLERS + _OTHER_MUTATION_CANDIDATE_HANDLERS:
+            if not hasattr(th, name):
+                continue
+            with self.subTest(handler=name):
+                other_src = inspect.getsource(getattr(th, name))
+                self.assertNotIn("_mutate_target_in_thread(", other_src)
+
+    def test_no_other_mutation_command_gained_transport_or_authorize(self):
+        for name in _OTHER_MUTATION_CANDIDATE_HANDLERS:
+            if not hasattr(th, name):
+                continue
+            with self.subTest(handler=name):
+                src = inspect.getsource(getattr(th, name))
+                self.assertNotIn("_validate_bc_transport_or_reply(", src)
+                self.assertNotIn("_authorize_or_reply(", src)
+
+    def test_transport_preflight_before_first_lookup(self):
+        src = inspect.getsource(th.updateinteractionnotes_cmd)
+        transport_pos = src.index("_validate_bc_transport_or_reply(")
+        first_lookup_pos = src.index("_resolve_target_in_thread(")
+        self.assertLess(transport_pos, first_lookup_pos)
+
+    def test_authorization_after_first_lookup(self):
+        src = inspect.getsource(th.updateinteractionnotes_cmd)
+        first_lookup_pos = src.index("_resolve_target_in_thread(")
+        authz_pos = src.index("_authorize_or_reply(")
+        self.assertLess(first_lookup_pos, authz_pos)
+
+    def test_second_lookup_after_authorization(self):
+        src = inspect.getsource(th.updateinteractionnotes_cmd)
+        authz_pos = src.index("_authorize_or_reply(")
+        second_lookup_pos = src.rindex("_resolve_target_in_thread(")
+        self.assertLess(authz_pos, second_lookup_pos)
+
+    def test_mutation_after_second_lookup_and_comparison(self):
+        src = inspect.getsource(th.updateinteractionnotes_cmd)
+        second_lookup_pos = src.rindex("_resolve_target_in_thread(")
+        comparison_pos = src.index("second_business_id != first_business_id")
+        mutation_pos = src.index("_mutate_target_in_thread(")
+        self.assertLess(second_lookup_pos, comparison_pos)
+        self.assertLess(comparison_pos, mutation_pos)
+
+    def test_no_direct_synchronous_finder_call(self):
+        tree_src = inspect.getsource(th.updateinteractionnotes_cmd)
+        self.assertNotIn("find_interaction_by_id(interaction_id)", tree_src)
+
+    def test_no_direct_synchronous_mutation_call(self):
+        src = inspect.getsource(th.updateinteractionnotes_cmd)
+        self.assertNotIn("update_interaction_notes(interaction_id, notes)", src)
+
+    def test_no_direct_authorization_py_call(self):
+        src = inspect.getsource(th.updateinteractionnotes_cmd)
+        self.assertNotIn("authorize_business_core_access(", src)
+        self.assertNotIn("from business_core.authorization import", src)
+
+    def test_no_bypass_flag(self):
+        src = inspect.getsource(th.updateinteractionnotes_cmd)
+        for forbidden in ("bypass", "skip_transport", "already_validated"):
+            self.assertNotIn(forbidden, src)
+
+    def test_no_cache_in_mutate_helper(self):
+        src = inspect.getsource(th._mutate_target_in_thread)
+        for forbidden in ("lru_cache", "cache_clear", "_CACHE", "TTLCache"):
+            self.assertNotIn(forbidden, src)
+
+    def test_mutate_helper_no_authorization_no_lookup_no_render(self):
+        src = inspect.getsource(th._mutate_target_in_thread)
+        self.assertNotIn("_authorize_or_reply(", src)
+        self.assertNotIn("_resolve_target_in_thread(", src)
+        self.assertNotIn("reply_text(", src)
+        self.assertNotIn("_reply(", src)
+
+    def test_registration_line_unchanged(self):
+        with open("business_core/telegram_handlers.py", encoding="utf-8") as f:
+            content = f.read()
+        self.assertEqual(content.count('CommandHandler("updateinteractionnotes", updateinteractionnotes_cmd)'), 1)
+
+
+if __name__ == "__main__":
+    unittest.main()

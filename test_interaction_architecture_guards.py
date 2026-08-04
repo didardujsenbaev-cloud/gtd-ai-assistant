@@ -410,11 +410,37 @@ class TestInteractionCommandsCallOnlyCanonicalOrchestration(unittest.TestCase):
         expectations = {
             "newinteraction_cmd": "create_interaction(",
             "archiveinteraction_cmd": "archive_interaction(",
-            "updateinteractionnotes_cmd": "update_interaction_notes(",
         }
         for fn_name, call in expectations.items():
             body = _th_function_body(fn_name)
             self.assertIn(call, body, f"{fn_name} must call business_builder.{call.rstrip('(')}")
+
+    def test_updateinteractionnotes_calls_business_builder_mutator_through_thread_offload(self):
+        """
+        Phase 17E-2A semantic replacement for the literal
+        "update_interaction_notes(" substring check — the mutator is
+        now passed BY REFERENCE into _mutate_target_in_thread (mirrors
+        the Phase 17E-1 finder-by-reference pattern), so the direct-
+        call substring no longer appears in the handler body.
+        """
+        src = (BUSINESS_CORE / "telegram_handlers.py").read_text(encoding="utf-8")
+        tree = ast.parse(src)
+        node = next(n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == "updateinteractionnotes_cmd")
+
+        offload_calls, direct_calls = [], []
+        for n in ast.walk(node):
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name):
+                if n.func.id == "_mutate_target_in_thread":
+                    offload_calls.append(n)
+                elif n.func.id == "update_interaction_notes":
+                    direct_calls.append(n)
+
+        self.assertEqual(len(offload_calls), 1)
+        call = offload_calls[0]
+        mutator_arg = call.args[0]
+        self.assertIsInstance(mutator_arg, ast.Name)
+        self.assertEqual(mutator_arg.id, "update_interaction_notes")
+        self.assertEqual(direct_calls, [])
 
     def test_read_commands_call_exact_interaction_manager_helpers_only(self):
         # interaction_cmd is enforced (Phase 17E-1): its finder is
@@ -594,9 +620,14 @@ class TestInteractionParserValidationOrdering(unittest.TestCase):
         self.assertLess(validation_idx, orchestration_idx)
 
     def test_updateinteractionnotes_validates_before_orchestration(self):
+        # Phase 17E-2A: the mutator is invoked by reference through
+        # _mutate_target_in_thread rather than called directly — see
+        # test_updateinteractionnotes_calls_business_builder_mutator_through_thread_offload
+        # for the AST-level proof that update_interaction_notes is the
+        # exact function passed.
         body = _th_function_body("updateinteractionnotes_cmd")
         validation_idx = body.index("if not interaction_id or not notes")
-        orchestration_idx = body.index("update_interaction_notes(")
+        orchestration_idx = body.index("_mutate_target_in_thread(")
         self.assertLess(validation_idx, orchestration_idx)
 
 

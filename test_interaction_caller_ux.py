@@ -339,6 +339,17 @@ class TestParserValidationOrdering(unittest.TestCase):
             _run(th.updateinteractionnotes_cmd(update2, context2))
         mock_notes2.assert_not_called()
 
+    def test_updateinteractionnotes_not_found_or_denied_anti_enumeration(self):
+        # Phase 17E-2A: with a valid interaction_id+notes but no
+        # matching row, the command now fails closed with the shared
+        # anti-enumeration message instead of reaching the mutator.
+        update, context = _cmd("/updateinteractionnotes interaction_id=ACT-999 notes=hi")
+        with patch("business_core.interaction_manager.find_interaction_by_id", return_value=None), \
+             patch("business_core.business_builder.update_interaction_notes") as mock_notes:
+            _run(th.updateinteractionnotes_cmd(update, context))
+        mock_notes.assert_not_called()
+        self.assertEqual(_sent_text(update), "Запись недоступна или не найдена.")
+
 
 class TestCanonicalBoundaries(unittest.TestCase):
     def test_newinteraction_calls_business_builder_only(self):
@@ -359,8 +370,18 @@ class TestCanonicalBoundaries(unittest.TestCase):
         mock_archive.assert_called_once()
 
     def test_updateinteractionnotes_calls_business_builder_only(self):
+        # Phase 17E-2A: this command now runs transport preflight, a
+        # first ownership lookup, full authorization, and a mandatory
+        # second ownership lookup before ever reaching the mutator —
+        # all four must be mocked for the allow-path to be exercised.
         update, context = _cmd("/updateinteractionnotes interaction_id=ACT-001 notes=hi")
-        with patch("business_core.business_builder.update_interaction_notes",
+        row = {"Interaction ID": "ACT-001", "Business ID": "BIZ-001"}
+        allow_result = {"ok": True, "allowed": True, "code": "TELEGRAM_ACCESS_ALLOWED", "retry_safe": True,
+                         "authorization_result": {"ok": True, "allowed": True, "code": "ACCESS_ALLOWED"}}
+        with patch("business_core.interaction_manager.find_interaction_by_id", return_value=row), \
+             patch("business_core.telegram_authorization.authorize_telegram_business_core_request",
+                   new=AsyncMock(return_value=allow_result)), \
+             patch("business_core.business_builder.update_interaction_notes",
                    return_value={"ok": True, "code": "INTERACTION_NOTES_UPDATED", "error": None}) as mock_notes:
             _run(th.updateinteractionnotes_cmd(update, context))
         mock_notes.assert_called_once()

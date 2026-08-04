@@ -78,6 +78,11 @@ COMMAND_ENFORCEMENT_MAP = {
     "offer":       {"resource": "FINANCE",  "action": "READ", "target_shape": "BUSINESS"},
     "lead":        {"resource": "FINANCE",  "action": "READ", "target_shape": "BUSINESS"},
     "interaction": {"resource": "CLIENT",   "action": "READ", "target_shape": "BUSINESS"},
+    "updateinteractionnotes": {
+        "resource": "CLIENT", "action": "UPDATE", "target_shape": "BUSINESS",
+        "operation_kind": "MUTATION", "requires_fresh_reread": True,
+        "mutation_side_effect_class": "SINGLE_ROW_MUTATION", "idempotency_class": "IDEMPOTENT",
+    },
 }
 
 _BC_ENFORCEMENT_NOT_FOUND_OR_DENIED_MSG = "Запись недоступна или не найдена."
@@ -159,6 +164,18 @@ async def _authorize_or_reply(
         return False
     await _reply(update, _BC_ENFORCEMENT_NOT_FOUND_OR_DENIED_MSG, parse_mode=None)
     return False
+
+
+_BC_ENFORCEMENT_OWNERSHIP_CHANGED_MSG = "Запись изменилась. Повтори команду ещё раз."
+
+
+async def _mutate_target_in_thread(mutator, *args, **kwargs):
+    """Moves a synchronous mutation call off the event loop. Returns
+    the mutator's result unchanged. Performs no authorization, no
+    target lookup, no retry, no rendering, and does not catch
+    exceptions — the caller wraps this in its own explicit
+    try/except (Phase 17E-2A)."""
+    return await asyncio.to_thread(mutator, *args, **kwargs)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -14109,9 +14126,20 @@ async def updateinteractionnotes_cmd(update: Update, context: ContextTypes.DEFAU
     Notes-only admin update, allowed in both active and archived
     states. No Interaction fact may be changed through this command.
     Notes content is never echoed back in the reply.
+
+    Phase 17E-2A: CLIENT/UPDATE, target_shape=BUSINESS, MUTATION,
+    requires_fresh_reread=True. Ownership is resolved twice — once
+    before authorization, once immediately before mutation — and the
+    two must match exactly, or the write is refused (fail closed). The
+    mutator's own internal lookup does not substitute for this
+    handler-level check, since it cannot prove the write still targets
+    the ownership that was authorized.
     """
     if not _is_bc_enabled():
         await _reply(update, _bc_disabled_msg(), parse_mode=None)
+        return
+
+    if not await _validate_bc_transport_or_reply(update):
         return
 
     raw = " ".join(context.args or [])
@@ -14126,14 +14154,44 @@ async def updateinteractionnotes_cmd(update: Update, context: ContextTypes.DEFAU
             "`/updateinteractionnotes interaction_id=ACT-001 notes=...`", parse_mode=None)
         return
 
-    try:
-        from business_core.business_builder import update_interaction_notes
+    from business_core.interaction_manager import find_interaction_by_id
+    from business_core.business_builder import update_interaction_notes
 
-        result = update_interaction_notes(interaction_id, notes)
-        await _reply(update, _interaction_notes_message(result, interaction_id), parse_mode=None)
+    try:
+        first_row = await _resolve_target_in_thread(find_interaction_by_id, interaction_id)
+    except Exception:
+        await _reply(update, _BC_ENFORCEMENT_TEMPORARILY_UNAVAILABLE_MSG, parse_mode=None)
+        return
+
+    first_business_id = str((first_row or {}).get("Business ID", "")).strip()
+    if first_row is None or not first_business_id:
+        await _reply(update, _BC_ENFORCEMENT_NOT_FOUND_OR_DENIED_MSG, parse_mode=None)
+        return
+
+    if not await _authorize_or_reply(
+        update, resource="CLIENT", action="UPDATE", business_id=first_business_id,
+    ):
+        return
+
+    try:
+        second_row = await _resolve_target_in_thread(find_interaction_by_id, interaction_id)
+    except Exception:
+        await _reply(update, _BC_ENFORCEMENT_TEMPORARILY_UNAVAILABLE_MSG, parse_mode=None)
+        return
+
+    second_business_id = str((second_row or {}).get("Business ID", "")).strip()
+    if second_row is None or not second_business_id or second_business_id != first_business_id:
+        await _reply(update, _BC_ENFORCEMENT_OWNERSHIP_CHANGED_MSG, parse_mode=None)
+        return
+
+    try:
+        result = await _mutate_target_in_thread(update_interaction_notes, interaction_id, notes)
     except Exception as e:
-        log.error(f"updateinteractionnotes_cmd error: {e}")
+        log.error(f"updateinteractionnotes_cmd mutation error: {e}")
         await _reply(update, "❌ Не удалось обновить Notes для Interaction.", parse_mode=None)
+        return
+
+    await _reply(update, _interaction_notes_message(result, interaction_id), parse_mode=None)
 
 
 async def milestones_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
