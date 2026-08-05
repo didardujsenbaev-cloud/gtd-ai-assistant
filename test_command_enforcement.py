@@ -387,11 +387,15 @@ class TestPhase17E2A4H1OfferHardeningScope(unittest.TestCase):
         # transaction_change is NOT touched this phase (unchanged since
         # H0) — confirmed separately by
         # test_payment_business_builder_lifecycle_functions_unchanged.
+        # unassign_task is the only approved business_builder function
+        # change; all other module constructs are protected by dedicated
+        # architecture guards.
         _assert_only_functions_changed(
             self, "business_core/business_builder.py",
             {
                 "update_commercial_offer_admin_fields", "update_document_admin_fields",
                 "confirm_payment_transaction", "reverse_payment_transaction", "fail_payment_transaction",
+                "unassign_task",
             },
         )
 

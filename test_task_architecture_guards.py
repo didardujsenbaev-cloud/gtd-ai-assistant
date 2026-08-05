@@ -397,5 +397,371 @@ class TestTaskCallerTestsHaveHardSocketBlock(unittest.TestCase):
             self.assertIn(filename, conftest_src)
 
 
+# ─────────────────────────────────────────────────────────────
+# Phase 18A.4-H0: unassign_task partial-state hardening guards.
+# ─────────────────────────────────────────────────────────────
+
+def _bb_function_body(fn_name: str) -> str:
+    path = BUSINESS_CORE / "business_builder.py"
+    src = path.read_text(encoding="utf-8")
+    start = src.index(f"def {fn_name}(")
+    end = src.index("\ndef ", start + 10)
+    return src[start:end]
+
+
+class TestUnassignTaskPartialStateHardening(unittest.TestCase):
+
+    def test_only_unassign_task_changed_in_business_builder(self):
+        """Confined-diff guard: every business_builder.py line the
+        working tree adds relative to HEAD must fall strictly inside
+        unassign_task's own body — no other Task (or non-Task) function
+        in this file may differ."""
+        import subprocess
+        diff = subprocess.run(
+            ["git", "diff", "--unified=0", "HEAD", "--", "business_core/business_builder.py"],
+            cwd=WORKSPACE, capture_output=True, text=True, check=True,
+        ).stdout
+        if not diff:
+            self.skipTest("no working-tree diff against HEAD for business_builder.py")
+        body = _bb_function_body("unassign_task")
+        body_lines = {line for line in body.splitlines() if line.strip()}
+        for line in diff.splitlines():
+            if not line.startswith("+") or line.startswith("+++"):
+                continue
+            content = line[1:]
+            if not content.strip():
+                continue
+            self.assertIn(
+                content, body_lines,
+                f"business_builder.py added line falls outside unassign_task: {content!r}",
+            )
+
+    def test_task_manager_unchanged(self):
+        import subprocess
+        diff = subprocess.run(
+            ["git", "diff", "--name-only", "HEAD", "--", "business_core/task_manager.py"],
+            cwd=WORKSPACE, capture_output=True, text=True, check=True,
+        ).stdout
+        self.assertEqual(diff.strip(), "")
+
+    def test_telegram_handlers_unchanged(self):
+        import subprocess
+        diff = subprocess.run(
+            ["git", "diff", "--name-only", "HEAD", "--", "business_core/telegram_handlers.py"],
+            cwd=WORKSPACE, capture_output=True, text=True, check=True,
+        ).stdout
+        self.assertEqual(diff.strip(), "")
+
+    def test_authorization_unchanged(self):
+        import subprocess
+        diff = subprocess.run(
+            ["git", "diff", "--name-only", "HEAD", "--", "business_core/authorization.py"],
+            cwd=WORKSPACE, capture_output=True, text=True, check=True,
+        ).stdout
+        self.assertEqual(diff.strip(), "")
+
+    def test_command_enforcement_map_still_size_14_and_no_task_entry(self):
+        import business_core.telegram_handlers as th
+        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 14)
+        for name, spec in th.COMMAND_ENFORCEMENT_MAP.items():
+            self.assertNotEqual(spec.get("resource"), "TASK", f"{name} must not be wired to resource=TASK")
+
+    def test_unassigntask_command_not_newly_authorized(self):
+        import business_core.telegram_handlers as th
+        self.assertNotIn("unassigntask", th.COMMAND_ENFORCEMENT_MAP)
+
+    def test_mapper_unchanged(self):
+        path = BUSINESS_CORE / "telegram_handlers.py"
+        src = path.read_text(encoding="utf-8")
+        start = src.index("def _task_assignment_message(")
+        end = src.index("\ndef ", start + 10)
+        body = src[start:end]
+        self.assertIn("result.get('error') or 'см. логи'", body)
+
+    def test_write_order_assignment_end_then_cache_clear(self):
+        body = _bb_function_body("unassign_task")
+        self.assertLess(body.index("end_task_assignment("), body.index("update_task_assignment_cache("))
+
+    def test_cache_result_ok_is_explicitly_checked(self):
+        body = _bb_function_body("unassign_task")
+        self.assertIn('cache_result.get("ok", False)', body)
+
+    def test_partial_state_code_exists(self):
+        body = _bb_function_body("unassign_task")
+        self.assertIn("TASK_UNASSIGNMENT_PARTIAL_FAILURE", body)
+
+    def test_partial_state_retry_safe_is_explicitly_false(self):
+        body = _bb_function_body("unassign_task")
+        partial_start = body.index("TASK_UNASSIGNMENT_PARTIAL_FAILURE")
+        partial_block = body[partial_start:partial_start + 500]
+        self.assertIn("retry_safe=False", partial_block)
+
+    def test_no_raw_cache_error_copied_into_result(self):
+        body = _bb_function_body("unassign_task")
+        code_lines = [line for line in body.splitlines() if line.strip() and not line.strip().startswith("#")]
+        code_only = "\n".join(code_lines)
+        self.assertNotIn("error=cache_result", code_only)
+        self.assertNotIn('cache_result.get("error")', code_only)
+        self.assertNotIn('cache_result["error"]', code_only)
+
+    def test_no_retry_construct_added(self):
+        body = _bb_function_body("unassign_task")
+        for forbidden in ("while True", "for attempt", "range(3)", "retry_count"):
+            self.assertNotIn(forbidden, body)
+
+    def test_no_direct_telegram_reply_logic(self):
+        body = _bb_function_body("unassign_task")
+        for forbidden in ("update.message.reply", "_reply(", "await "):
+            self.assertNotIn(forbidden, body)
+
+    def test_no_new_direct_sheets_write_introduced(self):
+        body = _bb_function_body("unassign_task")
+        for forbidden in ("update_cell(", "append_business_row(", "batch_append_business_rows("):
+            self.assertNotIn(forbidden, body)
+
+
+# ─────────────────────────────────────────────────────────────
+# business_builder.py comprehensive top-level construct guard.
+#
+# Complements TestPhase17E2A4H1OfferHardeningScope in
+# test_command_enforcement.py (a function-level allowlist covering
+# only function bodies) with source-identity protection for every
+# other top-level construct in business_builder.py — imports, module-
+# level assignments/annotated-assignments, and classes — none of
+# which the function-level guard inspects. Together the two guards
+# prove the entire module is unchanged except for one approved
+# function.
+# ─────────────────────────────────────────────────────────────
+
+_BUSINESS_BUILDER_APPROVED_TO_DIFFER = frozenset({"function:unassign_task"})
+
+_BUSINESS_BUILDER_KNOWN_BENIGN_TOP_LEVEL_NODE_TYPES = (ast.Expr, ast.Pass)
+
+
+def _business_builder_target_names(target) -> list[str]:
+    if isinstance(target, ast.Name):
+        return [target.id]
+    if isinstance(target, (ast.Tuple, ast.List)):
+        names: list[str] = []
+        for elt in target.elts:
+            names.extend(_business_builder_target_names(elt))
+        return names
+    if isinstance(target, ast.Starred):
+        return _business_builder_target_names(target.value)
+    return [f"<non_name_target:{ast.dump(target)}>"]
+
+
+def _business_builder_top_level_constructs(src: str) -> dict:
+    """Maps a deterministic construct identifier -> exact source text
+    for every top-level Import/ImportFrom/FunctionDef/AsyncFunctionDef/
+    ClassDef/Assign/AnnAssign in a module, sliced by lineno/end_lineno.
+    Raises ValueError if two constructs resolve to the same identifier
+    — silently overwriting one would hide a real defect instead of
+    surfacing it as a guard failure."""
+    tree = ast.parse(src)
+    lines = src.splitlines(keepends=True)
+    out: dict[str, str] = {}
+
+    def _add(key: str, node) -> None:
+        if key in out:
+            raise ValueError(f"duplicate top-level construct identifier: {key!r} (line {node.lineno})")
+        out[key] = "".join(lines[node.lineno - 1:node.end_lineno])
+
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef):
+            _add(f"function:{node.name}", node)
+        elif isinstance(node, ast.AsyncFunctionDef):
+            _add(f"async_function:{node.name}", node)
+        elif isinstance(node, ast.ClassDef):
+            _add(f"class:{node.name}", node)
+        elif isinstance(node, ast.Assign):
+            names = []
+            for t in node.targets:
+                names.extend(_business_builder_target_names(t))
+            _add("assignment:" + ",".join(sorted(names)), node)
+        elif isinstance(node, ast.AnnAssign):
+            names = _business_builder_target_names(node.target)
+            _add("annassign:" + ",".join(sorted(names)), node)
+        elif isinstance(node, ast.Import):
+            parts = sorted(a.name + (f" as {a.asname}" if a.asname else "") for a in node.names)
+            _add("import:" + ",".join(parts), node)
+        elif isinstance(node, ast.ImportFrom):
+            parts = sorted(a.name + (f" as {a.asname}" if a.asname else "") for a in node.names)
+            module = ("." * (node.level or 0)) + (node.module or "")
+            _add(f"import_from:{module}:" + ",".join(parts), node)
+        # Everything else (module docstring Expr, bare Pass, etc.) is
+        # intentionally not construct-identified here — it is still
+        # proven accounted-for by
+        # test_exhaustive_top_level_node_coverage below, which fails
+        # explicitly if any top-level node type is neither one of the
+        # categories handled above nor an explicitly known-benign type.
+    return out
+
+
+def _git_show_head_business_builder_py() -> str:
+    import subprocess
+    result = subprocess.run(
+        ["git", "show", "HEAD:business_core/business_builder.py"],
+        cwd=WORKSPACE, capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        raise AssertionError(f"git show HEAD:business_core/business_builder.py failed: {result.stderr}")
+    return result.stdout
+
+
+class TestBusinessBuilderTopLevelConstructGuard(unittest.TestCase):
+
+    def test_only_approved_construct_differs(self):
+        head_src = _git_show_head_business_builder_py()
+        current_src = (BUSINESS_CORE / "business_builder.py").read_text(encoding="utf-8")
+
+        head = _business_builder_top_level_constructs(head_src)
+        current = _business_builder_top_level_constructs(current_src)
+
+        removed = set(head) - set(current)
+        added = set(current) - set(head)
+        self.assertEqual(removed, set(), f"business_builder.py: construct(s) removed: {sorted(removed)}")
+        self.assertEqual(added, set(), f"business_builder.py: unexpected new construct(s): {sorted(added)}")
+
+        for key in head:
+            if key in _BUSINESS_BUILDER_APPROVED_TO_DIFFER:
+                continue
+            self.assertEqual(
+                head[key], current[key],
+                f"business_builder.py: unapproved construct changed: {key!r} — only "
+                f"{sorted(_BUSINESS_BUILDER_APPROVED_TO_DIFFER)} may differ this phase",
+            )
+
+    def test_unassign_task_construct_present_in_both_versions(self):
+        head_src = _git_show_head_business_builder_py()
+        current_src = (BUSINESS_CORE / "business_builder.py").read_text(encoding="utf-8")
+        head = _business_builder_top_level_constructs(head_src)
+        current = _business_builder_top_level_constructs(current_src)
+        self.assertIn("function:unassign_task", head)
+        self.assertIn("function:unassign_task", current)
+
+    def test_exhaustive_top_level_node_coverage(self):
+        head_src = _git_show_head_business_builder_py()
+        tree = ast.parse(head_src)
+        constructs = _business_builder_top_level_constructs(head_src)
+        accounted_count = 0
+        unaccounted_types = []
+        for node in tree.body:
+            if isinstance(node, (
+                ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef,
+                ast.Assign, ast.AnnAssign, ast.Import, ast.ImportFrom,
+            )):
+                accounted_count += 1
+            elif isinstance(node, _BUSINESS_BUILDER_KNOWN_BENIGN_TOP_LEVEL_NODE_TYPES):
+                continue
+            else:
+                unaccounted_types.append(type(node).__name__)
+        self.assertEqual(unaccounted_types, [], f"business_builder.py has unprotected top-level node type(s): {unaccounted_types}")
+        self.assertEqual(accounted_count, len(constructs))
+
+    def test_no_duplicate_construct_identifiers_in_real_source(self):
+        # _business_builder_top_level_constructs() itself raises
+        # ValueError on a duplicate — this proves the real HEAD source
+        # does not already contain one (a raise here would fail the
+        # test with a traceback, which is the desired explicit signal).
+        head_src = _git_show_head_business_builder_py()
+        _business_builder_top_level_constructs(head_src)
+
+
+class TestBusinessBuilderConstructGuardHelperUnit(unittest.TestCase):
+    """Synthetic negative tests for
+    _business_builder_top_level_constructs() and its identity-
+    comparison usage — proves the guard actually detects each
+    mutation class, using only in-memory source strings. Never reads
+    or writes business_builder.py on disk."""
+
+    _BASELINE = (
+        "import os\n"
+        "from collections import OrderedDict\n"
+        "\n"
+        "CONST_A = 1\n"
+        "\n"
+        "class Foo:\n"
+        "    pass\n"
+        "\n"
+        "def unassign_task(x):\n"
+        "    return x\n"
+        "\n"
+        "def other_function(y):\n"
+        "    return y\n"
+    )
+
+    def _diff(self, modified_src: str, approved=frozenset({"function:unassign_task"})):
+        head = _business_builder_top_level_constructs(self._BASELINE)
+        current = _business_builder_top_level_constructs(modified_src)
+        removed = set(head) - set(current)
+        added = set(current) - set(head)
+        changed = {
+            key for key in head
+            if key in current and key not in approved and head[key] != current[key]
+        }
+        return removed, added, changed
+
+    def test_unrelated_function_change_detected(self):
+        modified = self._BASELINE.replace("return y", "return y + 1")
+        removed, added, changed = self._diff(modified)
+        self.assertIn("function:other_function", changed)
+
+    def test_module_constant_change_detected(self):
+        modified = self._BASELINE.replace("CONST_A = 1", "CONST_A = 2")
+        removed, added, changed = self._diff(modified)
+        self.assertIn("assignment:CONST_A", changed)
+
+    def test_import_change_detected(self):
+        modified = self._BASELINE.replace("import os", "import sys")
+        removed, added, changed = self._diff(modified)
+        self.assertIn("import:os", removed)
+        self.assertIn("import:sys", added)
+
+    def test_class_change_detected(self):
+        modified = self._BASELINE.replace("class Foo:\n    pass", "class Foo:\n    x = 1")
+        removed, added, changed = self._diff(modified)
+        self.assertIn("class:Foo", changed)
+
+    def test_removal_detected(self):
+        modified = self._BASELINE.replace("\ndef other_function(y):\n    return y\n", "\n")
+        removed, added, changed = self._diff(modified)
+        self.assertIn("function:other_function", removed)
+
+    def test_unexpected_new_function_detected(self):
+        modified = self._BASELINE + "\ndef sneaky():\n    pass\n"
+        removed, added, changed = self._diff(modified)
+        self.assertIn("function:sneaky", added)
+
+    def test_rename_detected_as_removal_plus_addition(self):
+        modified = self._BASELINE.replace("def other_function(y):", "def renamed_function(y):")
+        removed, added, changed = self._diff(modified)
+        self.assertIn("function:other_function", removed)
+        self.assertIn("function:renamed_function", added)
+
+    def test_unassign_task_change_is_permitted(self):
+        modified = self._BASELINE.replace(
+            "def unassign_task(x):\n    return x", "def unassign_task(x):\n    return x + 1",
+        )
+        removed, added, changed = self._diff(modified)
+        self.assertEqual(removed, set())
+        self.assertEqual(added, set())
+        self.assertNotIn("function:unassign_task", changed)
+
+    def test_second_approved_looking_task_function_rejected(self):
+        modified = self._BASELINE + "\ndef assign_task(z):\n    return z\n"
+        removed, added, changed = self._diff(modified)
+        # A brand-new Task-named function is an unapproved addition —
+        # never silently allowed through name-pattern matching. The
+        # real guard test asserts added == set() unconditionally, so
+        # this addition would fail it regardless of the name chosen.
+        self.assertIn("function:assign_task", added)
+
+    def test_duplicate_construct_identifier_fails_explicitly(self):
+        duplicate_src = self._BASELINE + "\nCONST_A = 3\n"
+        with self.assertRaises(ValueError):
+            _business_builder_top_level_constructs(duplicate_src)
+
+
 if __name__ == "__main__":
     unittest.main()

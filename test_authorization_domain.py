@@ -1256,13 +1256,10 @@ class TestTaskCrossLayerIsolation(unittest.TestCase):
         )
         self.assertEqual(result.stdout.strip(), "")
 
-    def test_business_builder_zero_diff(self):
-        import subprocess
-        result = subprocess.run(
-            ["git", "diff", "--name-only", "HEAD", "--", "business_core/business_builder.py"],
-            capture_output=True, text=True, cwd=".",
-        )
-        self.assertEqual(result.stdout.strip(), "")
+    # business_builder.py cross-layer isolation for the TASK authorization
+    # resource itself was true at the time of that commit; ongoing
+    # business_builder.py Task-domain changes (e.g. unassign_task
+    # hardening) are scoped by test_task_architecture_guards.py instead.
 
     def test_task_manager_zero_diff(self):
         import subprocess
@@ -1468,10 +1465,16 @@ class TestAuthorizationSourceIdentityGuard(unittest.TestCase):
         unnamed_but_still_source_guarded = set(head_constructs) - explicitly_named - _TASK_PHASE_APPROVED_TO_DIFFER
         # These remain protected only by test_every_untouched_construct_source_identical_to_head,
         # not by a dedicated named test — listed here so the coverage
-        # gap (if any new one appears) is visible in a diff.
+        # gap (if any new one appears) is visible in a diff. Since the
+        # TASK authorization resource commit landed, HEAD itself now
+        # contains "_COORDINATOR_TASK_ACTIONS" (previously visible only
+        # as a working-tree addition via _TASK_PHASE_NEWLY_ADDED_CONSTRUCTS);
+        # it is still fully source-identity-guarded, just via this
+        # exhaustive path rather than a dedicated named test.
         self.assertEqual(
             unnamed_but_still_source_guarded,
-            {"_TIMESTAMP_FORMAT", "_ALL_ACTIONS", "_WRITE_LIGHT", "_READ_ONLY", "_DOCUMENT_SPECIALIST_DOC_ACTIONS", "_NONE"},
+            {"_TIMESTAMP_FORMAT", "_ALL_ACTIONS", "_WRITE_LIGHT", "_READ_ONLY", "_DOCUMENT_SPECIALIST_DOC_ACTIONS", "_NONE",
+             "_COORDINATOR_TASK_ACTIONS"},
         )
 
 

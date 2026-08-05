@@ -4368,19 +4368,30 @@ def unassign_task(task_id: str) -> dict:
         find_task_by_id, list_task_assignments_for_task, end_task_assignment, update_task_assignment_cache,
     )
 
+    def _unassign_result(*, cache_changed: bool = False, partial_state: bool = False,
+                          manual_review_required: bool = False, **kwargs) -> dict:
+        # Phase 18A.4-H0: local wrapper only — keeps every unassign_task
+        # result branch shaped consistently (cache_changed/partial_state/
+        # manual_review_required always present) without widening the
+        # shared _task_result() contract used by every other Task
+        # orchestration function.
+        result = _task_result(**kwargs)
+        result.update(cache_changed=cache_changed, partial_state=partial_state, manual_review_required=manual_review_required)
+        return result
+
     if not task_id:
-        return _task_result(ok=False, code="TASK_NOT_FOUND", error="task_id обязателен")
+        return _unassign_result(ok=False, code="TASK_NOT_FOUND", error="task_id обязателен")
 
     task = find_task_by_id(task_id)
     if task is None:
-        return _task_result(ok=False, code="TASK_NOT_FOUND", error=f"Task {task_id} не найден", task_id=task_id)
+        return _unassign_result(ok=False, code="TASK_NOT_FOUND", error=f"Task {task_id} не найден", task_id=task_id)
 
     business_id = task.get("business_id", "")
 
     active_assignments = list_task_assignments_for_task(task_id, status="active")
     if len(active_assignments) > 1:
         conflicting_ids = tuple(a.get("task_assignment_id", "") for a in active_assignments)
-        return _task_result(
+        return _unassign_result(
             ok=False, code="MULTIPLE_ACTIVE_TASK_ASSIGNMENTS_INTEGRITY_ERROR",
             error=f"Найдено {len(active_assignments)} активных Task Assignment для {task_id}: {conflicting_ids}",
             task_id=task_id, business_id=business_id,
@@ -4388,24 +4399,42 @@ def unassign_task(task_id: str) -> dict:
         )
 
     if not active_assignments:
-        return _task_result(ok=True, code="TASK_UNASSIGNED", error=None, task_id=task_id, business_id=business_id, retry_safe=True)
+        return _unassign_result(ok=True, code="TASK_UNASSIGNED", error=None, task_id=task_id, business_id=business_id, retry_safe=True)
 
     current = active_assignments[0]
     end_result = end_task_assignment(current.get("task_assignment_id", ""))
     if not end_result["ok"]:
-        return _task_result(
+        return _unassign_result(
             ok=False, code="", error=end_result.get("error"),
             task_id=task_id, business_id=business_id,
             previous_assignment_id=current.get("task_assignment_id", ""), retry_safe=True,
         )
 
     cache_result = update_task_assignment_cache(task_id, "", "")
+    if not cache_result.get("ok", False):
+        # The active Task Assignment was already ended (a committed,
+        # non-reversible write) but clearing the Task's assignment
+        # cache failed — the Task row may still carry stale
+        # Responsible Role ID / Assignee Person ID values. This is a
+        # genuine partial-state outcome, never a clean success. The
+        # low-level cache_result["error"] stays internal-only: never
+        # forward it into a public/mapper-facing field.
+        return _unassign_result(
+            ok=False, code="TASK_UNASSIGNMENT_PARTIAL_FAILURE",
+            error="TASK_ASSIGNMENT_CACHE_CLEAR_FAILED",
+            task_id=task_id, business_id=business_id,
+            changed=True, assignment_changed=True,
+            previous_assignment_id=current.get("task_assignment_id", ""),
+            retry_safe=False,
+            cache_changed=False, partial_state=True, manual_review_required=True,
+        )
 
-    return _task_result(
+    return _unassign_result(
         ok=True, code="TASK_UNASSIGNED", error=None,
         task_id=task_id, business_id=business_id,
-        assignment_changed=cache_result.get("changed", False),
+        changed=True, assignment_changed=True,
         previous_assignment_id=current.get("task_assignment_id", ""), retry_safe=True,
+        cache_changed=cache_result.get("changed", False), partial_state=False, manual_review_required=False,
     )
 
 

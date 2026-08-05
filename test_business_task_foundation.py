@@ -666,11 +666,18 @@ class TestAssignTaskCurrentRowInvariant(unittest.TestCase):
 
 class TestUnassignTask(unittest.TestCase):
 
+    def test_blank_task_id(self):
+        result = unassign_task("")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "TASK_NOT_FOUND")
+        self.assertTrue(result["retry_safe"])
+
     def test_task_not_found(self):
         with patch("business_core.task_manager.find_task_by_id", return_value=None):
             result = unassign_task("TSK-999")
         self.assertFalse(result["ok"])
         self.assertEqual(result["code"], "TASK_NOT_FOUND")
+        self.assertTrue(result["retry_safe"])
 
     def test_zero_active_is_noop_success(self):
         with patch("business_core.task_manager.find_task_by_id", return_value=dict(ACTIVE_TASK)), \
@@ -678,6 +685,12 @@ class TestUnassignTask(unittest.TestCase):
             result = unassign_task("TSK-001")
         self.assertTrue(result["ok"])
         self.assertEqual(result["code"], "TASK_UNASSIGNED")
+        self.assertFalse(result["changed"])
+        self.assertFalse(result["assignment_changed"])
+        self.assertFalse(result["cache_changed"])
+        self.assertFalse(result["partial_state"])
+        self.assertFalse(result["manual_review_required"])
+        self.assertTrue(result["retry_safe"])
 
     def test_one_active_ends_and_clears_cache(self):
         current = {"task_assignment_id": "TAS-050", "responsible_role_id": "ROLE-001", "assignee_person_id": "", "status": "active"}
@@ -690,6 +703,12 @@ class TestUnassignTask(unittest.TestCase):
         self.assertEqual(result["code"], "TASK_UNASSIGNED")
         mock_end.assert_called_once_with("TAS-050")
         mock_cache.assert_called_once_with("TSK-001", "", "")
+        self.assertTrue(result["changed"])
+        self.assertTrue(result["assignment_changed"])
+        self.assertTrue(result["cache_changed"])
+        self.assertFalse(result["partial_state"])
+        self.assertFalse(result["manual_review_required"])
+        self.assertTrue(result["retry_safe"])
 
     def test_multiple_active_block(self):
         dup1 = {"task_assignment_id": "TAS-A", "status": "active"}
@@ -699,6 +718,111 @@ class TestUnassignTask(unittest.TestCase):
             result = unassign_task("TSK-001")
         self.assertFalse(result["ok"])
         self.assertEqual(result["code"], "MULTIPLE_ACTIVE_TASK_ASSIGNMENTS_INTEGRITY_ERROR")
+
+    def test_assignment_end_failure_cache_never_called_and_no_partial_state(self):
+        current = {"task_assignment_id": "TAS-050", "responsible_role_id": "ROLE-001", "assignee_person_id": "", "status": "active"}
+        with patch("business_core.task_manager.find_task_by_id", return_value=dict(ACTIVE_TASK)), \
+             patch("business_core.task_manager.list_task_assignments_for_task", return_value=[current]), \
+             patch("business_core.task_manager.end_task_assignment", return_value={"ok": False, "changed": False, "code": "", "error": "ASSIGNMENT-SECRET-end-failure"}) as mock_end, \
+             patch("business_core.task_manager.update_task_assignment_cache") as mock_cache:
+            result = unassign_task("TSK-001")
+        mock_end.assert_called_once_with("TAS-050")
+        mock_cache.assert_not_called()
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["changed"])
+        self.assertFalse(result["partial_state"])
+        self.assertFalse(result["manual_review_required"])
+
+    def test_cache_clear_failure_after_assignment_end_is_partial_state_not_success(self):
+        current = {"task_assignment_id": "TAS-050", "responsible_role_id": "ROLE-001", "assignee_person_id": "", "status": "active"}
+        with patch("business_core.task_manager.find_task_by_id", return_value=dict(ACTIVE_TASK)), \
+             patch("business_core.task_manager.list_task_assignments_for_task", return_value=[current]), \
+             patch("business_core.task_manager.end_task_assignment", return_value={"ok": True, "changed": True, "code": "", "error": None}) as mock_end, \
+             patch("business_core.task_manager.update_task_assignment_cache", return_value={"ok": False, "changed": False, "code": "", "error": "CACHE-SECRET-write-failure"}) as mock_cache:
+            result = unassign_task("TSK-001")
+        mock_end.assert_called_once_with("TAS-050")
+        mock_cache.assert_called_once_with("TSK-001", "", "")
+        self.assertFalse(result["ok"])
+        self.assertNotEqual(result["code"], "TASK_UNASSIGNED")
+        self.assertEqual(result["code"], "TASK_UNASSIGNMENT_PARTIAL_FAILURE")
+        self.assertTrue(result["changed"])
+        self.assertTrue(result["assignment_changed"])
+        self.assertFalse(result["cache_changed"])
+        self.assertTrue(result["partial_state"])
+        self.assertTrue(result["manual_review_required"])
+        self.assertFalse(result["retry_safe"])
+        self.assertEqual(result["previous_assignment_id"], "TAS-050")
+
+    def test_cache_clear_exception_converted_by_low_level_helper_is_also_partial_state(self):
+        """update_task_assignment_cache already converts an internal
+        exception into ok=False/error=str(exc) before returning — this
+        proves unassign_task treats that exact shape identically to an
+        explicit ok=False, with no special-casing of exception origin."""
+        current = {"task_assignment_id": "TAS-050", "responsible_role_id": "ROLE-001", "assignee_person_id": "", "status": "active"}
+        with patch("business_core.task_manager.find_task_by_id", return_value=dict(ACTIVE_TASK)), \
+             patch("business_core.task_manager.list_task_assignments_for_task", return_value=[current]), \
+             patch("business_core.task_manager.end_task_assignment", return_value={"ok": True, "changed": True, "code": "", "error": None}), \
+             patch("business_core.task_manager.update_task_assignment_cache", return_value={"ok": False, "changed": False, "code": "", "error": "API-PAYLOAD-SECRET: boom"}):
+            result = unassign_task("TSK-001")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "TASK_UNASSIGNMENT_PARTIAL_FAILURE")
+        self.assertTrue(result["partial_state"])
+
+    def test_sequential_retry_after_partial_state_remains_noop_and_does_not_repair_cache(self):
+        """Documents residual behavior (not a fix): once the active Task
+        Assignment has ended, a repeated unassign_task call sees zero
+        active assignments and takes the no-op branch — it never re-runs
+        update_task_assignment_cache and therefore never repairs a Task
+        row left with stale cache fields after a partial failure."""
+        with patch("business_core.task_manager.find_task_by_id", return_value=dict(ACTIVE_TASK)), \
+             patch("business_core.task_manager.list_task_assignments_for_task", return_value=[]), \
+             patch("business_core.task_manager.update_task_assignment_cache") as mock_cache:
+            result = unassign_task("TSK-001")
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["code"], "TASK_UNASSIGNED")
+        self.assertFalse(result["partial_state"])
+        mock_cache.assert_not_called()
+
+    def test_no_retry_loop_single_call_each(self):
+        current = {"task_assignment_id": "TAS-050", "responsible_role_id": "ROLE-001", "assignee_person_id": "", "status": "active"}
+        with patch("business_core.task_manager.find_task_by_id", return_value=dict(ACTIVE_TASK)), \
+             patch("business_core.task_manager.list_task_assignments_for_task", return_value=[current]), \
+             patch("business_core.task_manager.end_task_assignment", return_value={"ok": False, "changed": False, "code": "", "error": "boom"}) as mock_end, \
+             patch("business_core.task_manager.update_task_assignment_cache") as mock_cache:
+            unassign_task("TSK-001")
+        self.assertEqual(mock_end.call_count, 1)
+        self.assertEqual(mock_cache.call_count, 0)
+
+    def test_cache_clear_never_called_before_assignment_end(self):
+        current = {"task_assignment_id": "TAS-050", "responsible_role_id": "ROLE-001", "assignee_person_id": "", "status": "active"}
+        call_order = []
+
+        def _record_end(*args, **kwargs):
+            call_order.append("end")
+            return {"ok": True, "changed": True, "code": "", "error": None}
+
+        def _record_cache(*args, **kwargs):
+            call_order.append("cache")
+            return {"ok": True, "changed": True, "code": "", "error": None}
+
+        with patch("business_core.task_manager.find_task_by_id", return_value=dict(ACTIVE_TASK)), \
+             patch("business_core.task_manager.list_task_assignments_for_task", return_value=[current]), \
+             patch("business_core.task_manager.end_task_assignment", side_effect=_record_end), \
+             patch("business_core.task_manager.update_task_assignment_cache", side_effect=_record_cache):
+            unassign_task("TSK-001")
+        self.assertEqual(call_order, ["end", "cache"])
+
+    def test_partial_failure_fields_contain_no_raw_exception_markers(self):
+        current = {"task_assignment_id": "TAS-050", "responsible_role_id": "ROLE-001", "assignee_person_id": "", "status": "active"}
+        markers = ("TASK-SECRET", "ASSIGNMENT-SECRET", "CACHE-SECRET", "API-PAYLOAD-SECRET")
+        with patch("business_core.task_manager.find_task_by_id", return_value=dict(ACTIVE_TASK)), \
+             patch("business_core.task_manager.list_task_assignments_for_task", return_value=[current]), \
+             patch("business_core.task_manager.end_task_assignment", return_value={"ok": True, "changed": True, "code": "", "error": None}), \
+             patch("business_core.task_manager.update_task_assignment_cache", return_value={"ok": False, "changed": False, "code": "", "error": "CACHE-SECRET TASK-SECRET ASSIGNMENT-SECRET API-PAYLOAD-SECRET"}):
+            result = unassign_task("TSK-001")
+        for marker in markers:
+            self.assertNotIn(marker, result["code"] or "")
+            self.assertNotIn(marker, result["error"] or "")
 
 
 # ─────────────────────────────────────────────────────────────
