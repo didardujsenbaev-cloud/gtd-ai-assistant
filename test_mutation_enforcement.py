@@ -643,6 +643,147 @@ class TestIdempotency(MutationTestBase):
 
 
 # ─────────────────────────────────────────────────────────────
+# Phase 17E-2A7-H1: exception-logging secrecy hardening.
+# updateinteractionnotes_cmd was the one command found (Phase
+# 17E-2A7's read-only audit) still using a dynamic f-string
+# exception log (`log.error(f"...{e}")`) on its mutation boundary —
+# every other dedicated mutation command already used a fixed
+# literal. This class proves the fix: the mutation-exception
+# boundary now logs a fixed literal only, with zero dynamic content
+# (no interaction_id, no Business ID, no Notes, no actor identity,
+# no raw exception text), the mutation is attempted exactly once
+# with no retry, and the existing fixed user reply is unchanged.
+# ─────────────────────────────────────────────────────────────
+
+_INTERACTIONNOTES_SECRET_MARKERS = (
+    "INTERACTION-SECRET", "BUSINESS-SECRET", "NOTES-SECRET", "ACTOR-SECRET", "API-PAYLOAD-SECRET",
+)
+
+
+def _interactionnotes_boom_with_secrets(*_a, **_k):
+    raise RuntimeError(
+        "synthetic failure containing " + " and ".join(_INTERACTIONNOTES_SECRET_MARKERS)
+    )
+
+
+class TestExceptionSecrecy(MutationTestBase):
+    def test_mutation_exception_fixed_log_literal(self):
+        update = _make_update()
+        with patch("business_core.telegram_handlers.log.error") as mock_log_error:
+            _, mock_mutator = self._run_handler(
+                update, finder_return=_ROW, mutator_side_effect=_interactionnotes_boom_with_secrets,
+            )
+        mock_log_error.assert_called_once_with("updateinteractionnotes_cmd mutation infrastructure failure")
+        mock_mutator.assert_called_once()
+
+    def test_mutation_exception_no_secrets_in_log_call_args(self):
+        update = _make_update()
+        with patch("business_core.telegram_handlers.log.error") as mock_log_error:
+            self._run_handler(
+                update,
+                args=["interaction_id=ACT-001", f"notes={_INTERACTIONNOTES_SECRET_MARKERS[2]}"],
+                finder_return={**_ROW, "Business ID": _INTERACTIONNOTES_SECRET_MARKERS[1]},
+                mutator_side_effect=_interactionnotes_boom_with_secrets,
+            )
+        mock_log_error.assert_called_once()
+        for call in mock_log_error.call_args_list:
+            for arg in list(call.args) + list(call.kwargs.values()):
+                text = str(arg)
+                for marker in _INTERACTIONNOTES_SECRET_MARKERS:
+                    self.assertNotIn(marker, text)
+
+    def test_mutation_exception_no_secrets_in_reply(self):
+        update = _make_update()
+        self._run_handler(
+            update,
+            args=["interaction_id=ACT-001", f"notes={_INTERACTIONNOTES_SECRET_MARKERS[2]}"],
+            finder_return={**_ROW, "Business ID": _INTERACTIONNOTES_SECRET_MARKERS[1]},
+            mutator_side_effect=_interactionnotes_boom_with_secrets,
+        )
+        text = self._sent_text(update)
+        for marker in _INTERACTIONNOTES_SECRET_MARKERS:
+            self.assertNotIn(marker, text)
+        self.assertEqual(text, "❌ Не удалось обновить Notes для Interaction.")
+
+    def test_mutation_exception_no_raw_exception_text_in_reply(self):
+        update = _make_update()
+        self._run_handler(update, finder_return=_ROW, mutator_side_effect=_interactionnotes_boom_with_secrets)
+        text = self._sent_text(update)
+        self.assertNotIn("RuntimeError", text)
+        self.assertNotIn("synthetic failure", text)
+
+    def test_mutation_attempted_exactly_once_no_retry(self):
+        update = _make_update()
+        _, mock_mutator = self._run_handler(
+            update, finder_return=_ROW, mutator_side_effect=_interactionnotes_boom_with_secrets,
+        )
+        mock_mutator.assert_called_once()
+
+    def test_handler_source_contains_no_dynamic_exception_logging(self):
+        """
+        AST-scoped (not whole-file substring) proof that
+        updateinteractionnotes_cmd's own log.error() calls never take
+        an f-string, str(exc)/repr(exc) argument, or exc_info kwarg —
+        matches the equivalent guard already used for the other
+        dedicated mutation commands. Function-source-scoped rather
+        than a raw substring search, so a comment or docstring
+        mentioning these terms cannot trip a false positive.
+        """
+        tree = ast.parse(inspect.getsource(th.updateinteractionnotes_cmd))
+        func_node = tree.body[0]
+        self.assertIsInstance(func_node, (ast.FunctionDef, ast.AsyncFunctionDef))
+
+        for node in ast.walk(func_node):
+            if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                    and isinstance(node.func.value, ast.Name) and node.func.value.id == "log"):
+                continue
+            self.assertNotEqual(node.func.attr, "exception", "log.exception(...) must not be used")
+            if node.func.attr == "error":
+                for arg in node.args:
+                    self.assertNotIsInstance(arg, ast.JoinedStr, "log.error() must not take an f-string argument")
+                    if isinstance(arg, ast.Call) and isinstance(arg.func, ast.Name):
+                        self.assertNotIn(arg.func.id, ("str", "repr", "format"), f"log.error() must not wrap the exception in {arg.func.id}(...)")
+                for kw in node.keywords:
+                    self.assertNotEqual(kw.arg, "exc_info", "log.error() must not pass exc_info")
+
+
+class TestOtherSevenMutationHandlersRemainSafe(unittest.TestCase):
+    """
+    Phase 17E-2A7-H1 §4/§7: read-only audit proving the other seven
+    already-authorized mutation handlers contain no equivalent
+    dynamic exception-logging leak, and were not touched by this
+    phase's fix.
+    """
+    _OTHER_SEVEN = (
+        "updateleadnotes_cmd", "updateobligationnotes_cmd", "updateoffernotes_cmd", "updatedocnotes_cmd",
+        "failpayment_cmd", "confirmpayment_cmd", "reversepayment_cmd",
+    )
+
+    def test_no_dynamic_exception_logging_in_other_seven(self):
+        import ast as _ast
+        with open("business_core/telegram_handlers.py", encoding="utf-8") as f:
+            src = f.read()
+        tree = _ast.parse(src)
+        nodes_by_name = {n.name: n for n in _ast.walk(tree) if isinstance(n, (_ast.FunctionDef, _ast.AsyncFunctionDef))}
+
+        for name in self._OTHER_SEVEN:
+            with self.subTest(handler=name):
+                func_node = nodes_by_name[name]
+                for node in _ast.walk(func_node):
+                    if not (isinstance(node, _ast.Call) and isinstance(node.func, _ast.Attribute)
+                            and isinstance(node.func.value, _ast.Name) and node.func.value.id == "log"):
+                        continue
+                    self.assertNotEqual(node.func.attr, "exception")
+                    if node.func.attr == "error":
+                        for arg in node.args:
+                            self.assertNotIsInstance(arg, _ast.JoinedStr)
+                            if isinstance(arg, _ast.Call) and isinstance(arg.func, _ast.Name):
+                                self.assertNotIn(arg.func.id, ("str", "repr", "format"))
+                        for kw in node.keywords:
+                            self.assertNotEqual(kw.arg, "exc_info")
+
+
+# ─────────────────────────────────────────────────────────────
 # Architecture
 # ─────────────────────────────────────────────────────────────
 

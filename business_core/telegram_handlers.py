@@ -14989,8 +14989,11 @@ async def updateinteractionnotes_cmd(update: Update, context: ContextTypes.DEFAU
 
     try:
         result = await _mutate_target_in_thread(update_interaction_notes, interaction_id, notes)
-    except Exception as e:
-        log.error(f"updateinteractionnotes_cmd mutation error: {e}")
+    except Exception:
+        # Phase 17E-2A7-H1: fixed literal only — no exception
+        # interpolation, no interaction_id, no Business ID, no Notes,
+        # no actor identity.
+        log.error("updateinteractionnotes_cmd mutation infrastructure failure")
         await _reply(update, "❌ Не удалось обновить Notes для Interaction.", parse_mode=None)
         return
 

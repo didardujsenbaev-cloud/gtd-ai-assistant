@@ -426,7 +426,7 @@ class TestPhase17E2A4H1OfferHardeningScope(unittest.TestCase):
                 "register_business_handlers", "_document_admin_message",
                 "_payment_transaction_confirmation_message",
                 "_payment_transaction_reversal_message", "_payment_transaction_failure_message",
-                "confirmpayment_cmd", "reversepayment_cmd", "failpayment_cmd",
+                "confirmpayment_cmd", "reversepayment_cmd", "failpayment_cmd", "updateinteractionnotes_cmd",
             },
             allowed_added_function_names={
                 "_offer_notes_message", "updateoffernotes_cmd",
@@ -560,7 +560,7 @@ class TestPhase17E2A4H1OfferHardeningScope(unittest.TestCase):
                 "register_business_handlers", "_document_admin_message",
                 "_payment_transaction_confirmation_message",
                 "_payment_transaction_reversal_message", "_payment_transaction_failure_message",
-                "confirmpayment_cmd", "reversepayment_cmd", "failpayment_cmd",
+                "confirmpayment_cmd", "reversepayment_cmd", "failpayment_cmd", "updateinteractionnotes_cmd",
             },
             allowed_added_function_names={
                 "_offer_notes_message", "updateoffernotes_cmd",
