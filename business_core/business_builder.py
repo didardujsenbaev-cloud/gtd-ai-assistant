@@ -7940,7 +7940,10 @@ def confirm_payment_transaction(payment_transaction_id: str, confirmed_by: str) 
 
     now = _now_utc_str()
     write_result = update_payment_transaction_status(payment_transaction_id, "confirmed", confirmed_at=now, confirmed_by=confirmed_by)
-    if not write_result["ok"]:
+    if not isinstance(write_result, dict):
+        write_result = {}
+    write_ok = write_result.get("ok") is True
+    if not write_ok:
         return _payment_result(
             ok=False, code="PAYMENT_PERSISTENCE_FAILED", error=write_result.get("error"),
             payment_transaction_id=payment_transaction_id, business_id=business_id, payment_obligation_id=obligation_id,
@@ -7957,7 +7960,10 @@ def confirm_payment_transaction(payment_transaction_id: str, confirmed_by: str) 
         )
 
     sync_result = _synchronize_payment_obligation_after_transaction_change(obligation_id)
-    if not sync_result["ok"]:
+    if not isinstance(sync_result, dict):
+        sync_result = {}
+    sync_ok = sync_result.get("ok") is True
+    if not sync_ok:
         return _payment_result(
             ok=False, code="PAYMENT_OBLIGATION_POST_WRITE_VERIFICATION_FAILED",
             error=f"Transaction подтверждён, но синхронизация баланса Obligation не удалась: {sync_result.get('error')}",
@@ -7970,7 +7976,7 @@ def confirm_payment_transaction(payment_transaction_id: str, confirmed_by: str) 
         ok=True, code="PAYMENT_TRANSACTION_CONFIRMED", error=None,
         payment_transaction_id=payment_transaction_id, business_id=business_id, payment_obligation_id=obligation_id,
         amount=txn.get("Amount", ""), currency=txn.get("Currency", ""),
-        paid_amount=sync_result["paid_amount"], remaining_amount=sync_result["remaining_amount"],
+        paid_amount=sync_result.get("paid_amount", ""), remaining_amount=sync_result.get("remaining_amount", ""),
         previous_status=previous_status, requested_status="confirmed", final_status="confirmed",
         changed=True, confirmed=True, retry_safe=True,
     )
@@ -8028,7 +8034,10 @@ def reverse_payment_transaction(payment_transaction_id: str, reversal_reason: st
     write_result = update_payment_transaction_status(
         payment_transaction_id, "reversed", reversed_at=now, reversed_by=reversed_by, reversal_reason=reversal_reason,
     )
-    if not write_result["ok"]:
+    if not isinstance(write_result, dict):
+        write_result = {}
+    write_ok = write_result.get("ok") is True
+    if not write_ok:
         return _payment_result(
             ok=False, code="PAYMENT_PERSISTENCE_FAILED", error=write_result.get("error"),
             payment_transaction_id=payment_transaction_id, business_id=business_id, payment_obligation_id=obligation_id,
@@ -8056,7 +8065,10 @@ def reverse_payment_transaction(payment_transaction_id: str, reversal_reason: st
         )
 
     sync_result = _synchronize_payment_obligation_after_transaction_change(obligation_id)
-    if not sync_result["ok"]:
+    if not isinstance(sync_result, dict):
+        sync_result = {}
+    sync_ok = sync_result.get("ok") is True
+    if not sync_ok:
         return _payment_result(
             ok=False, code="PAYMENT_OBLIGATION_POST_WRITE_VERIFICATION_FAILED",
             error=f"Transaction реверснут, но синхронизация баланса Obligation не удалась: {sync_result.get('error')}",
@@ -8069,7 +8081,7 @@ def reverse_payment_transaction(payment_transaction_id: str, reversal_reason: st
         ok=True, code="PAYMENT_TRANSACTION_REVERSED", error=None,
         payment_transaction_id=payment_transaction_id, business_id=business_id, payment_obligation_id=obligation_id,
         amount=txn.get("Amount", ""), currency=txn.get("Currency", ""),
-        paid_amount=sync_result["paid_amount"], remaining_amount=sync_result["remaining_amount"],
+        paid_amount=sync_result.get("paid_amount", ""), remaining_amount=sync_result.get("remaining_amount", ""),
         previous_status=previous_status, requested_status="reversed", final_status="reversed",
         changed=True, reversed=True, retry_safe=True,
     )
@@ -8107,14 +8119,17 @@ def fail_payment_transaction(payment_transaction_id: str) -> dict:
         )
 
     write_result = update_payment_transaction_status(payment_transaction_id, "failed")
-    if not write_result["ok"]:
+    if not isinstance(write_result, dict):
+        write_result = {}
+    write_ok = write_result.get("ok") is True
+    if not write_ok:
         return _payment_result(
             ok=False, code="PAYMENT_PERSISTENCE_FAILED", error=write_result.get("error"),
             payment_transaction_id=payment_transaction_id, business_id=business_id, payment_obligation_id=obligation_id,
             previous_status=previous_status, requested_status="failed", final_status=previous_status,
         )
 
-    changed = write_result["changed"]
+    changed = write_result.get("changed") is True
     return _payment_result(
         ok=True, code="PAYMENT_TRANSACTION_FAILED", error=None,
         payment_transaction_id=payment_transaction_id, business_id=business_id, payment_obligation_id=obligation_id,

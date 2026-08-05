@@ -680,9 +680,12 @@ def update_payment_obligation_balance(
             sheet.update_cell(row_num, idx["Updated At"] + 1, _now_utc_str())
 
         return {"ok": True, "changed": changed, "code": "", "error": None}
-    except Exception as exc:
-        log.error(f"update_payment_obligation_balance({obligation_id}) error: {exc}")
-        return {"ok": False, "changed": False, "code": "", "error": str(exc)}
+    except Exception:
+        # Phase 17E-2A6-H1: fixed literal only — no exception
+        # interpolation, no obligation ID, no status/paid/remaining/
+        # paid-at values, no row content.
+        log.error("update_payment_obligation_balance infrastructure failure")
+        return {"ok": False, "changed": False, "code": "", "error": "Infrastructure failure"}
 
 
 # ─────────────────────────────────────────────────────────────
@@ -892,8 +895,10 @@ def _find_transaction_row(transaction_id: str) -> Optional[tuple[int, dict]]:
     try:
         from business_core.sheets import find_row_by_id
         return find_row_by_id("payment_transactions", transaction_id)
-    except Exception as exc:
-        log.warning(f"_find_transaction_row({transaction_id}) error: {exc}")
+    except Exception:
+        # Phase 17E-2A6-H1: fixed literal only — no exception
+        # interpolation, no entity ID, no row content.
+        log.warning("_find_transaction_row infrastructure failure")
         return None
 
 
@@ -1016,6 +1021,9 @@ def update_payment_transaction_status(
             sheet.update_cell(row_num, idx["Updated At"] + 1, _now_utc_str())
 
         return {"ok": True, "changed": changed, "code": "", "error": None}
-    except Exception as exc:
-        log.error(f"update_payment_transaction_status({transaction_id}) error: {exc}")
-        return {"ok": False, "changed": False, "code": "", "error": str(exc)}
+    except Exception:
+        # Phase 17E-2A6-H1: fixed literal only — no exception
+        # interpolation, no transaction ID, no requested status, no
+        # confirmation/reversal metadata, no row content.
+        log.error("update_payment_transaction_status infrastructure failure")
+        return {"ok": False, "changed": False, "code": "", "error": "Infrastructure failure"}

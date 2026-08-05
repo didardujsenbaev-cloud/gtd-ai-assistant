@@ -11521,10 +11521,27 @@ def _payment_transaction_creation_message(result: dict) -> str:
 
 
 def _payment_transaction_confirmation_message(result: dict, transaction_id: str) -> str:
-    """Render any business_builder.confirm_payment_transaction() result."""
-    code = result.get("code", "")
+    """
+    Render any business_builder.confirm_payment_transaction() result.
 
-    if code == "PAYMENT_TRANSACTION_CONFIRMED":
+    Phase 17E-2A6-H1: hardened — type-checks before any `.get()`,
+    requires `ok is True` (strict identity) for success/unchanged UX
+    in addition to the matching code, and never renders
+    result['error']/raw exception text/unknown codes. Every known
+    rejection code maps to a fixed, application-controlled message.
+    Business-visible amount/remaining values in the
+    OVERPAYMENT_BLOCKED branch are wrapper-generated business data
+    (never manager error payload) and are preserved.
+    """
+    if not isinstance(result, dict):
+        return "❌ Не удалось подтвердить Payment."
+
+    code = result.get("code", "")
+    ok = result.get("ok") is True
+    changed_true = result.get("changed") is True
+    changed_false = result.get("changed") is False
+
+    if ok and changed_true and code == "PAYMENT_TRANSACTION_CONFIRMED":
         return "\n".join([
             "✅ Payment подтверждён",
             f"PTXN ID: {transaction_id}",
@@ -11532,14 +11549,14 @@ def _payment_transaction_confirmation_message(result: dict, transaction_id: str)
             f"Остаток (Obligation): {_format_payment_amount(result.get('remaining_amount', ''), result.get('currency', ''))}",
         ])
 
-    if code == "PAYMENT_TRANSACTION_CONFIRMATION_UNCHANGED":
+    if ok and changed_false and code == "PAYMENT_TRANSACTION_CONFIRMATION_UNCHANGED":
         return f"ℹ️ Payment {transaction_id} уже подтверждён — изменений нет."
 
     if code == "PAYMENT_TRANSACTION_NOT_FOUND":
         return f"❌ Payment {transaction_id} не найден."
 
     if code == "INVALID_PAYMENT_TRANSACTION_TRANSITION":
-        return f"❌ {result.get('error') or 'Подтверждение возможно только из статуса pending.'}"
+        return "❌ Подтверждение возможно только из статуса pending."
 
     if code == "PAYMENT_TRANSACTION_CONFIRMATION_METADATA_REQUIRED":
         return "❌ Укажи confirmed_by."
@@ -11573,16 +11590,28 @@ def _payment_transaction_confirmation_message(result: dict, transaction_id: str)
     if code == "PAYMENT_LEDGER_READ_FAILED":
         return "❌ Не удалось проверить историю платежей."
 
-    log.warning(f"_payment_transaction_confirmation_message: unmapped code={code!r} transaction_id={transaction_id}")
-    return f"❌ Ошибка ({code or 'unknown'}): {result.get('error') or 'см. логи'}"
+    log.warning("_payment_transaction_confirmation_message unmapped safe fallback")
+    return "❌ Не удалось подтвердить Payment."
 
 
 def _payment_transaction_reversal_message(result: dict, transaction_id: str) -> str:
-    """Render any business_builder.reverse_payment_transaction() result.
-    Never echoes reversal_reason back verbatim (ADR-022 §22/Phase 39C §22)."""
-    code = result.get("code", "")
+    """
+    Render any business_builder.reverse_payment_transaction() result.
+    Never echoes reversal_reason back verbatim (ADR-022 §22/Phase 39C
+    §22).
 
-    if code == "PAYMENT_TRANSACTION_REVERSED":
+    Phase 17E-2A6-H1: hardened — same contract as
+    _payment_transaction_confirmation_message.
+    """
+    if not isinstance(result, dict):
+        return "❌ Не удалось реверснуть Payment."
+
+    code = result.get("code", "")
+    ok = result.get("ok") is True
+    changed_true = result.get("changed") is True
+    changed_false = result.get("changed") is False
+
+    if ok and changed_true and code == "PAYMENT_TRANSACTION_REVERSED":
         return "\n".join([
             "✅ Payment реверснут",
             f"PTXN ID: {transaction_id}",
@@ -11590,14 +11619,14 @@ def _payment_transaction_reversal_message(result: dict, transaction_id: str) -> 
             f"Остаток (Obligation): {_format_payment_amount(result.get('remaining_amount', ''), result.get('currency', ''))}",
         ])
 
-    if code == "PAYMENT_TRANSACTION_REVERSAL_UNCHANGED":
+    if ok and changed_false and code == "PAYMENT_TRANSACTION_REVERSAL_UNCHANGED":
         return f"ℹ️ Payment {transaction_id} уже реверснут — изменений нет."
 
     if code == "PAYMENT_TRANSACTION_NOT_FOUND":
         return f"❌ Payment {transaction_id} не найден."
 
     if code == "INVALID_PAYMENT_TRANSACTION_TRANSITION":
-        return f"❌ {result.get('error') or 'Реверс возможен только из статуса confirmed.'}"
+        return "❌ Реверс возможен только из статуса confirmed."
 
     if code == "PAYMENT_TRANSACTION_REVERSAL_REASON_REQUIRED":
         return "❌ Укажи reversal_reason и reversed_by."
@@ -11617,31 +11646,46 @@ def _payment_transaction_reversal_message(result: dict, transaction_id: str) -> 
             "Требуется ручная проверка.",
         ])
 
-    log.warning(f"_payment_transaction_reversal_message: unmapped code={code!r} transaction_id={transaction_id}")
-    return f"❌ Ошибка ({code or 'unknown'}): {result.get('error') or 'см. логи'}"
+    log.warning("_payment_transaction_reversal_message unmapped safe fallback")
+    return "❌ Не удалось реверснуть Payment."
 
 
 def _payment_transaction_failure_message(result: dict, transaction_id: str) -> str:
-    """Render any business_builder.fail_payment_transaction() result."""
+    """
+    Render any business_builder.fail_payment_transaction() result.
+
+    Phase 17E-2A6-H1: hardened — same contract as the confirmation/
+    reversal mappers. Success requires ok is True and changed is
+    True; unchanged (already-failed) requires ok is True and changed
+    is False — a malformed or contradictory combination can never
+    produce success-looking UX.
+    """
+    if not isinstance(result, dict):
+        return "❌ Не удалось обновить статус Payment."
+
     code = result.get("code", "")
-    previous_status = result.get("previous_status", "")
+    ok = result.get("ok") is True
+    changed_true = result.get("changed") is True
+    changed_false = result.get("changed") is False
 
     if code == "PAYMENT_TRANSACTION_FAILED":
-        if previous_status == "failed":
+        if ok and changed_true:
+            return f"✅ Payment {transaction_id} помечен failed."
+        if ok and changed_false:
             return f"ℹ️ Payment {transaction_id} уже помечен failed — изменений нет."
-        return f"✅ Payment {transaction_id} помечен failed."
+        return "❌ Не удалось обновить статус Payment."
 
     if code == "PAYMENT_TRANSACTION_NOT_FOUND":
         return f"❌ Payment {transaction_id} не найден."
 
     if code == "INVALID_PAYMENT_TRANSACTION_TRANSITION":
-        return f"❌ {result.get('error') or 'Переход в failed возможен только из статуса pending.'}"
+        return "❌ Переход в failed возможен только из статуса pending."
 
     if code == "PAYMENT_PERSISTENCE_FAILED":
         return "❌ Не удалось обновить статус Payment."
 
-    log.warning(f"_payment_transaction_failure_message: unmapped code={code!r} transaction_id={transaction_id}")
-    return f"❌ Ошибка ({code or 'unknown'}): {result.get('error') or 'см. логи'}"
+    log.warning("_payment_transaction_failure_message unmapped safe fallback")
+    return "❌ Не удалось обновить статус Payment."
 
 
 async def newpaymenttemplate_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -12395,8 +12439,10 @@ async def confirmpayment_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
         result = confirm_payment_transaction(transaction_id, confirmed_by)
         await _reply(update, _payment_transaction_confirmation_message(result, transaction_id), parse_mode=None)
-    except Exception as e:
-        log.error(f"confirmpayment_cmd error: {e}")
+    except Exception:
+        # Phase 17E-2A6-H1: fixed literal only — no exception
+        # interpolation, no transaction ID, no confirmed_by.
+        log.error("confirmpayment_cmd infrastructure failure")
         await _reply(update, "❌ Не удалось подтвердить Payment.", parse_mode=None)
 
 
@@ -12429,8 +12475,11 @@ async def reversepayment_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
         result = reverse_payment_transaction(transaction_id, reversal_reason, reversed_by)
         await _reply(update, _payment_transaction_reversal_message(result, transaction_id), parse_mode=None)
-    except Exception as e:
-        log.error(f"reversepayment_cmd error: {e}")
+    except Exception:
+        # Phase 17E-2A6-H1: fixed literal only — no exception
+        # interpolation, no transaction ID, no reversed_by, no
+        # reversal reason.
+        log.error("reversepayment_cmd infrastructure failure")
         await _reply(update, "❌ Не удалось реверснуть Payment.", parse_mode=None)
 
 
@@ -12458,8 +12507,10 @@ async def failpayment_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
         result = fail_payment_transaction(transaction_id)
         await _reply(update, _payment_transaction_failure_message(result, transaction_id), parse_mode=None)
-    except Exception as e:
-        log.error(f"failpayment_cmd error: {e}")
+    except Exception:
+        # Phase 17E-2A6-H1: fixed literal only — no exception
+        # interpolation, no transaction ID.
+        log.error("failpayment_cmd infrastructure failure")
         await _reply(update, "❌ Не удалось обновить статус Payment.", parse_mode=None)
 
 

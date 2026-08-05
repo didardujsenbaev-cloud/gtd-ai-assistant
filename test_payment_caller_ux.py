@@ -291,12 +291,12 @@ class TestPaymentTransactionCreationMessageMapping(unittest.TestCase):
 
 class TestPaymentTransactionConfirmationMessageMapping(unittest.TestCase):
     def test_confirmed_success(self):
-        result = {"ok": True, "code": "PAYMENT_TRANSACTION_CONFIRMED", "error": None, "paid_amount": "50000.00", "remaining_amount": "100000.00", "currency": "KZT"}
+        result = {"ok": True, "changed": True, "code": "PAYMENT_TRANSACTION_CONFIRMED", "error": None, "paid_amount": "50000.00", "remaining_amount": "100000.00", "currency": "KZT"}
         msg = th._payment_transaction_confirmation_message(result, "PTXN-001")
         self.assertIn("✅", msg)
 
     def test_no_op(self):
-        msg = th._payment_transaction_confirmation_message({"ok": True, "code": "PAYMENT_TRANSACTION_CONFIRMATION_UNCHANGED", "error": None}, "PTXN-001")
+        msg = th._payment_transaction_confirmation_message({"ok": True, "changed": False, "code": "PAYMENT_TRANSACTION_CONFIRMATION_UNCHANGED", "error": None}, "PTXN-001")
         self.assertIn("ℹ️", msg)
 
     def test_overpayment_block(self):
@@ -337,12 +337,12 @@ class TestPaymentTransactionConfirmationMessageMapping(unittest.TestCase):
 
 class TestPaymentTransactionReversalMessageMapping(unittest.TestCase):
     def test_reversed_success(self):
-        result = {"ok": True, "code": "PAYMENT_TRANSACTION_REVERSED", "error": None, "paid_amount": "0.00", "remaining_amount": "150000.00", "currency": "KZT"}
+        result = {"ok": True, "changed": True, "code": "PAYMENT_TRANSACTION_REVERSED", "error": None, "paid_amount": "0.00", "remaining_amount": "150000.00", "currency": "KZT"}
         msg = th._payment_transaction_reversal_message(result, "PTXN-001")
         self.assertIn("✅", msg)
 
     def test_no_op(self):
-        msg = th._payment_transaction_reversal_message({"ok": True, "code": "PAYMENT_TRANSACTION_REVERSAL_UNCHANGED", "error": None}, "PTXN-001")
+        msg = th._payment_transaction_reversal_message({"ok": True, "changed": False, "code": "PAYMENT_TRANSACTION_REVERSAL_UNCHANGED", "error": None}, "PTXN-001")
         self.assertIn("ℹ️", msg)
 
     def test_reason_required(self):
@@ -350,7 +350,7 @@ class TestPaymentTransactionReversalMessageMapping(unittest.TestCase):
         self.assertIn("❌", msg)
 
     def test_never_echoes_reversal_reason(self):
-        result = {"ok": True, "code": "PAYMENT_TRANSACTION_REVERSED", "error": None, "paid_amount": "0.00", "remaining_amount": "1.00", "currency": "KZT"}
+        result = {"ok": True, "changed": True, "code": "PAYMENT_TRANSACTION_REVERSED", "error": None, "paid_amount": "0.00", "remaining_amount": "1.00", "currency": "KZT"}
         msg = th._payment_transaction_reversal_message(result, "PTXN-001")
         self.assertNotIn("client requested a secret refund reason", msg)
 
@@ -361,16 +361,348 @@ class TestPaymentTransactionReversalMessageMapping(unittest.TestCase):
 
 class TestPaymentTransactionFailureMessageMapping(unittest.TestCase):
     def test_failed(self):
-        msg = th._payment_transaction_failure_message({"ok": True, "code": "PAYMENT_TRANSACTION_FAILED", "error": None, "previous_status": "pending"}, "PTXN-001")
+        msg = th._payment_transaction_failure_message({"ok": True, "changed": True, "code": "PAYMENT_TRANSACTION_FAILED", "error": None, "previous_status": "pending"}, "PTXN-001")
         self.assertIn("✅", msg)
 
     def test_no_op(self):
-        msg = th._payment_transaction_failure_message({"ok": True, "code": "PAYMENT_TRANSACTION_FAILED", "error": None, "previous_status": "failed"}, "PTXN-001")
+        msg = th._payment_transaction_failure_message({"ok": True, "changed": False, "code": "PAYMENT_TRANSACTION_FAILED", "error": None, "previous_status": "failed"}, "PTXN-001")
         self.assertIn("ℹ️", msg)
 
     def test_invalid_transition(self):
         msg = th._payment_transaction_failure_message({"ok": False, "code": "INVALID_PAYMENT_TRANSACTION_TRANSITION", "error": "x"}, "PTXN-001")
         self.assertIn("❌", msg)
+
+
+_H1_SECRET_MARKERS = ("LEDGER-SECRET", "TRANSACTION-SECRET", "OBLIGATION-SECRET", "BALANCE-SECRET", "API-PAYLOAD-SECRET", "REVERSAL-SECRET")
+
+
+class TestPaymentTransactionConfirmationMessageHardening(unittest.TestCase):
+    """Phase 17E-2A6-H1: comprehensive hardened-mapper battery,
+    mirroring the Document/Offer Notes mapper convention."""
+
+    def test_valid_success(self):
+        msg = th._payment_transaction_confirmation_message(
+            {"ok": True, "changed": True, "code": "PAYMENT_TRANSACTION_CONFIRMED", "error": None, "paid_amount": "1.00", "remaining_amount": "1.00", "currency": "KZT"}, "PTXN-001",
+        )
+        self.assertIn("✅", msg)
+
+    def test_valid_unchanged(self):
+        msg = th._payment_transaction_confirmation_message(
+            {"ok": True, "changed": False, "code": "PAYMENT_TRANSACTION_CONFIRMATION_UNCHANGED", "error": None}, "PTXN-001",
+        )
+        self.assertIn("ℹ️", msg)
+
+    def test_ok_false_with_success_code_never_success(self):
+        msg = th._payment_transaction_confirmation_message(
+            {"ok": False, "changed": False, "code": "PAYMENT_TRANSACTION_CONFIRMED", "error": "Infrastructure failure"}, "PTXN-001",
+        )
+        self.assertNotIn("✅", msg)
+        self.assertEqual(msg, "❌ Не удалось подтвердить Payment.")
+
+    def test_ok_false_with_unchanged_code_never_unchanged_ux(self):
+        msg = th._payment_transaction_confirmation_message(
+            {"ok": False, "changed": False, "code": "PAYMENT_TRANSACTION_CONFIRMATION_UNCHANGED", "error": "Infrastructure failure"}, "PTXN-001",
+        )
+        self.assertNotIn("ℹ️", msg)
+        self.assertEqual(msg, "❌ Не удалось подтвердить Payment.")
+
+    def test_missing_ok(self):
+        msg = th._payment_transaction_confirmation_message({"changed": True, "code": "PAYMENT_TRANSACTION_CONFIRMED"}, "PTXN-001")
+        self.assertEqual(msg, "❌ Не удалось подтвердить Payment.")
+
+    def test_missing_changed(self):
+        msg = th._payment_transaction_confirmation_message({"ok": True, "code": "PAYMENT_TRANSACTION_CONFIRMED"}, "PTXN-001")
+        self.assertEqual(msg, "❌ Не удалось подтвердить Payment.")
+
+    def test_blank_code(self):
+        msg = th._payment_transaction_confirmation_message({"ok": False, "code": "", "error": "Infrastructure failure"}, "PTXN-001")
+        self.assertEqual(msg, "❌ Не удалось подтвердить Payment.")
+
+    def test_unknown_code(self):
+        msg = th._payment_transaction_confirmation_message({"ok": False, "code": "SOME_FUTURE_CODE", "error": "raw domain error"}, "PTXN-001")
+        self.assertEqual(msg, "❌ Не удалось подтвердить Payment.")
+        self.assertNotIn("raw domain error", msg)
+        self.assertNotIn("SOME_FUTURE_CODE", msg)
+
+    def test_infrastructure_failure_never_rendered(self):
+        msg = th._payment_transaction_confirmation_message({"ok": False, "code": "", "error": "Infrastructure failure"}, "PTXN-001")
+        self.assertNotIn("Infrastructure failure", msg)
+
+    def test_arbitrary_secret_marker_error_never_rendered(self):
+        for marker in _H1_SECRET_MARKERS:
+            with self.subTest(marker=marker):
+                msg = th._payment_transaction_confirmation_message({"ok": False, "code": "", "error": f"boom {marker}"}, "PTXN-001")
+                self.assertNotIn(marker, msg)
+
+    def test_invalid_transition_error_never_rendered(self):
+        msg = th._payment_transaction_confirmation_message(
+            {"ok": False, "code": "INVALID_PAYMENT_TRANSACTION_TRANSITION", "error": "raw LEDGER-SECRET"}, "PTXN-001",
+        )
+        self.assertNotIn("LEDGER-SECRET", msg)
+        self.assertEqual(msg, "❌ Подтверждение возможно только из статуса pending.")
+
+    def test_empty_dict(self):
+        self.assertEqual(th._payment_transaction_confirmation_message({}, "PTXN-001"), "❌ Не удалось подтвердить Payment.")
+
+    def test_none_result_does_not_raise(self):
+        self.assertEqual(th._payment_transaction_confirmation_message(None, "PTXN-001"), "❌ Не удалось подтвердить Payment.")
+
+    def test_string_result_does_not_raise(self):
+        self.assertEqual(th._payment_transaction_confirmation_message("not a dict", "PTXN-001"), "❌ Не удалось подтвердить Payment.")
+
+    def test_list_result_does_not_raise(self):
+        self.assertEqual(th._payment_transaction_confirmation_message(["ok", True], "PTXN-001"), "❌ Не удалось подтвердить Payment.")
+
+    def test_integer_result_does_not_raise(self):
+        self.assertEqual(th._payment_transaction_confirmation_message(42, "PTXN-001"), "❌ Не удалось подтвердить Payment.")
+
+    def test_ok_truthy_string_not_treated_as_true(self):
+        msg = th._payment_transaction_confirmation_message(
+            {"ok": "true", "changed": True, "code": "PAYMENT_TRANSACTION_CONFIRMED", "error": None}, "PTXN-001",
+        )
+        self.assertEqual(msg, "❌ Не удалось подтвердить Payment.")
+
+    def test_ok_truthy_int_not_treated_as_true(self):
+        msg = th._payment_transaction_confirmation_message(
+            {"ok": 1, "changed": True, "code": "PAYMENT_TRANSACTION_CONFIRMED", "error": None}, "PTXN-001",
+        )
+        self.assertEqual(msg, "❌ Не удалось подтвердить Payment.")
+
+    def test_changed_falsy_string_not_treated_as_false(self):
+        msg = th._payment_transaction_confirmation_message(
+            {"ok": True, "changed": "false", "code": "PAYMENT_TRANSACTION_CONFIRMATION_UNCHANGED", "error": None}, "PTXN-001",
+        )
+        self.assertEqual(msg, "❌ Не удалось подтвердить Payment.")
+
+    def test_changed_truthy_int_not_treated_as_true(self):
+        msg = th._payment_transaction_confirmation_message(
+            {"ok": True, "changed": 1, "code": "PAYMENT_TRANSACTION_CONFIRMED", "error": None}, "PTXN-001",
+        )
+        self.assertEqual(msg, "❌ Не удалось подтвердить Payment.")
+
+    def test_fallback_log_is_fixed_literal(self):
+        with patch("business_core.telegram_handlers.log.warning") as mock_warn:
+            th._payment_transaction_confirmation_message({"ok": False, "code": "UNMAPPED_XYZ", "error": "leak-LEDGER-SECRET"}, "PTXN-001")
+        mock_warn.assert_called_once_with("_payment_transaction_confirmation_message unmapped safe fallback")
+        for call in mock_warn.call_args_list:
+            for arg in list(call.args) + list(call.kwargs.values()):
+                self.assertNotIn("LEDGER-SECRET", str(arg))
+                self.assertNotIn("UNMAPPED_XYZ", str(arg))
+
+    def test_known_branch_does_not_log(self):
+        with patch("business_core.telegram_handlers.log.warning") as mock_warn:
+            th._payment_transaction_confirmation_message({"ok": True, "changed": True, "code": "PAYMENT_TRANSACTION_CONFIRMED", "error": None}, "PTXN-001")
+        mock_warn.assert_not_called()
+
+
+class TestPaymentTransactionReversalMessageHardening(unittest.TestCase):
+    def test_valid_success(self):
+        msg = th._payment_transaction_reversal_message(
+            {"ok": True, "changed": True, "code": "PAYMENT_TRANSACTION_REVERSED", "error": None, "paid_amount": "1.00", "remaining_amount": "1.00", "currency": "KZT"}, "PTXN-001",
+        )
+        self.assertIn("✅", msg)
+
+    def test_valid_unchanged(self):
+        msg = th._payment_transaction_reversal_message(
+            {"ok": True, "changed": False, "code": "PAYMENT_TRANSACTION_REVERSAL_UNCHANGED", "error": None}, "PTXN-001",
+        )
+        self.assertIn("ℹ️", msg)
+
+    def test_ok_false_with_success_code_never_success(self):
+        msg = th._payment_transaction_reversal_message(
+            {"ok": False, "changed": False, "code": "PAYMENT_TRANSACTION_REVERSED", "error": "Infrastructure failure"}, "PTXN-001",
+        )
+        self.assertNotIn("✅", msg)
+        self.assertEqual(msg, "❌ Не удалось реверснуть Payment.")
+
+    def test_ok_false_with_unchanged_code_never_unchanged_ux(self):
+        msg = th._payment_transaction_reversal_message(
+            {"ok": False, "changed": False, "code": "PAYMENT_TRANSACTION_REVERSAL_UNCHANGED", "error": "Infrastructure failure"}, "PTXN-001",
+        )
+        self.assertNotIn("ℹ️", msg)
+        self.assertEqual(msg, "❌ Не удалось реверснуть Payment.")
+
+    def test_missing_ok(self):
+        msg = th._payment_transaction_reversal_message({"changed": True, "code": "PAYMENT_TRANSACTION_REVERSED"}, "PTXN-001")
+        self.assertEqual(msg, "❌ Не удалось реверснуть Payment.")
+
+    def test_missing_changed(self):
+        msg = th._payment_transaction_reversal_message({"ok": True, "code": "PAYMENT_TRANSACTION_REVERSED"}, "PTXN-001")
+        self.assertEqual(msg, "❌ Не удалось реверснуть Payment.")
+
+    def test_blank_code(self):
+        msg = th._payment_transaction_reversal_message({"ok": False, "code": "", "error": "Infrastructure failure"}, "PTXN-001")
+        self.assertEqual(msg, "❌ Не удалось реверснуть Payment.")
+
+    def test_unknown_code(self):
+        msg = th._payment_transaction_reversal_message({"ok": False, "code": "SOME_FUTURE_CODE", "error": "raw domain error"}, "PTXN-001")
+        self.assertEqual(msg, "❌ Не удалось реверснуть Payment.")
+        self.assertNotIn("raw domain error", msg)
+        self.assertNotIn("SOME_FUTURE_CODE", msg)
+
+    def test_infrastructure_failure_never_rendered(self):
+        msg = th._payment_transaction_reversal_message({"ok": False, "code": "", "error": "Infrastructure failure"}, "PTXN-001")
+        self.assertNotIn("Infrastructure failure", msg)
+
+    def test_arbitrary_secret_marker_error_never_rendered(self):
+        for marker in _H1_SECRET_MARKERS:
+            with self.subTest(marker=marker):
+                msg = th._payment_transaction_reversal_message({"ok": False, "code": "", "error": f"boom {marker}"}, "PTXN-001")
+                self.assertNotIn(marker, msg)
+
+    def test_invalid_transition_error_never_rendered(self):
+        msg = th._payment_transaction_reversal_message(
+            {"ok": False, "code": "INVALID_PAYMENT_TRANSACTION_TRANSITION", "error": "raw REVERSAL-SECRET"}, "PTXN-001",
+        )
+        self.assertNotIn("REVERSAL-SECRET", msg)
+        self.assertEqual(msg, "❌ Реверс возможен только из статуса confirmed.")
+
+    def test_empty_dict(self):
+        self.assertEqual(th._payment_transaction_reversal_message({}, "PTXN-001"), "❌ Не удалось реверснуть Payment.")
+
+    def test_none_result_does_not_raise(self):
+        self.assertEqual(th._payment_transaction_reversal_message(None, "PTXN-001"), "❌ Не удалось реверснуть Payment.")
+
+    def test_string_result_does_not_raise(self):
+        self.assertEqual(th._payment_transaction_reversal_message("not a dict", "PTXN-001"), "❌ Не удалось реверснуть Payment.")
+
+    def test_list_result_does_not_raise(self):
+        self.assertEqual(th._payment_transaction_reversal_message(["ok", True], "PTXN-001"), "❌ Не удалось реверснуть Payment.")
+
+    def test_integer_result_does_not_raise(self):
+        self.assertEqual(th._payment_transaction_reversal_message(42, "PTXN-001"), "❌ Не удалось реверснуть Payment.")
+
+    def test_ok_truthy_string_not_treated_as_true(self):
+        msg = th._payment_transaction_reversal_message(
+            {"ok": "true", "changed": True, "code": "PAYMENT_TRANSACTION_REVERSED", "error": None}, "PTXN-001",
+        )
+        self.assertEqual(msg, "❌ Не удалось реверснуть Payment.")
+
+    def test_ok_truthy_int_not_treated_as_true(self):
+        msg = th._payment_transaction_reversal_message(
+            {"ok": 1, "changed": True, "code": "PAYMENT_TRANSACTION_REVERSED", "error": None}, "PTXN-001",
+        )
+        self.assertEqual(msg, "❌ Не удалось реверснуть Payment.")
+
+    def test_changed_falsy_string_not_treated_as_false(self):
+        msg = th._payment_transaction_reversal_message(
+            {"ok": True, "changed": "false", "code": "PAYMENT_TRANSACTION_REVERSAL_UNCHANGED", "error": None}, "PTXN-001",
+        )
+        self.assertEqual(msg, "❌ Не удалось реверснуть Payment.")
+
+    def test_fallback_log_is_fixed_literal(self):
+        with patch("business_core.telegram_handlers.log.warning") as mock_warn:
+            th._payment_transaction_reversal_message({"ok": False, "code": "UNMAPPED_XYZ", "error": "leak-REVERSAL-SECRET"}, "PTXN-001")
+        mock_warn.assert_called_once_with("_payment_transaction_reversal_message unmapped safe fallback")
+        for call in mock_warn.call_args_list:
+            for arg in list(call.args) + list(call.kwargs.values()):
+                self.assertNotIn("REVERSAL-SECRET", str(arg))
+                self.assertNotIn("UNMAPPED_XYZ", str(arg))
+
+    def test_known_branch_does_not_log(self):
+        with patch("business_core.telegram_handlers.log.warning") as mock_warn:
+            th._payment_transaction_reversal_message({"ok": True, "changed": True, "code": "PAYMENT_TRANSACTION_REVERSED", "error": None}, "PTXN-001")
+        mock_warn.assert_not_called()
+
+
+class TestPaymentTransactionFailureMessageHardening(unittest.TestCase):
+    def test_valid_success(self):
+        msg = th._payment_transaction_failure_message(
+            {"ok": True, "changed": True, "code": "PAYMENT_TRANSACTION_FAILED", "error": None}, "PTXN-001",
+        )
+        self.assertIn("✅", msg)
+
+    def test_valid_unchanged(self):
+        msg = th._payment_transaction_failure_message(
+            {"ok": True, "changed": False, "code": "PAYMENT_TRANSACTION_FAILED", "error": None}, "PTXN-001",
+        )
+        self.assertIn("ℹ️", msg)
+
+    def test_ok_false_with_failed_code_never_success_or_unchanged(self):
+        msg = th._payment_transaction_failure_message(
+            {"ok": False, "changed": False, "code": "PAYMENT_TRANSACTION_FAILED", "error": "Infrastructure failure"}, "PTXN-001",
+        )
+        self.assertNotIn("✅", msg)
+        self.assertNotIn("ℹ️", msg)
+        self.assertEqual(msg, "❌ Не удалось обновить статус Payment.")
+
+    def test_ok_true_changed_missing_never_success(self):
+        msg = th._payment_transaction_failure_message({"ok": True, "code": "PAYMENT_TRANSACTION_FAILED"}, "PTXN-001")
+        self.assertEqual(msg, "❌ Не удалось обновить статус Payment.")
+
+    def test_blank_code(self):
+        msg = th._payment_transaction_failure_message({"ok": False, "code": "", "error": "Infrastructure failure"}, "PTXN-001")
+        self.assertEqual(msg, "❌ Не удалось обновить статус Payment.")
+
+    def test_unknown_code(self):
+        msg = th._payment_transaction_failure_message({"ok": False, "code": "SOME_FUTURE_CODE", "error": "raw domain error"}, "PTXN-001")
+        self.assertEqual(msg, "❌ Не удалось обновить статус Payment.")
+        self.assertNotIn("raw domain error", msg)
+        self.assertNotIn("SOME_FUTURE_CODE", msg)
+
+    def test_infrastructure_failure_never_rendered(self):
+        msg = th._payment_transaction_failure_message({"ok": False, "code": "", "error": "Infrastructure failure"}, "PTXN-001")
+        self.assertNotIn("Infrastructure failure", msg)
+
+    def test_arbitrary_secret_marker_error_never_rendered(self):
+        for marker in _H1_SECRET_MARKERS:
+            with self.subTest(marker=marker):
+                msg = th._payment_transaction_failure_message({"ok": False, "code": "", "error": f"boom {marker}"}, "PTXN-001")
+                self.assertNotIn(marker, msg)
+
+    def test_invalid_transition_error_never_rendered(self):
+        msg = th._payment_transaction_failure_message(
+            {"ok": False, "code": "INVALID_PAYMENT_TRANSACTION_TRANSITION", "error": "raw TRANSACTION-SECRET"}, "PTXN-001",
+        )
+        self.assertNotIn("TRANSACTION-SECRET", msg)
+        self.assertEqual(msg, "❌ Переход в failed возможен только из статуса pending.")
+
+    def test_empty_dict(self):
+        self.assertEqual(th._payment_transaction_failure_message({}, "PTXN-001"), "❌ Не удалось обновить статус Payment.")
+
+    def test_none_result_does_not_raise(self):
+        self.assertEqual(th._payment_transaction_failure_message(None, "PTXN-001"), "❌ Не удалось обновить статус Payment.")
+
+    def test_string_result_does_not_raise(self):
+        self.assertEqual(th._payment_transaction_failure_message("not a dict", "PTXN-001"), "❌ Не удалось обновить статус Payment.")
+
+    def test_list_result_does_not_raise(self):
+        self.assertEqual(th._payment_transaction_failure_message(["ok", True], "PTXN-001"), "❌ Не удалось обновить статус Payment.")
+
+    def test_integer_result_does_not_raise(self):
+        self.assertEqual(th._payment_transaction_failure_message(42, "PTXN-001"), "❌ Не удалось обновить статус Payment.")
+
+    def test_ok_truthy_string_not_treated_as_true(self):
+        msg = th._payment_transaction_failure_message(
+            {"ok": "true", "changed": True, "code": "PAYMENT_TRANSACTION_FAILED", "error": None}, "PTXN-001",
+        )
+        self.assertEqual(msg, "❌ Не удалось обновить статус Payment.")
+
+    def test_ok_truthy_int_not_treated_as_true(self):
+        msg = th._payment_transaction_failure_message(
+            {"ok": 1, "changed": True, "code": "PAYMENT_TRANSACTION_FAILED", "error": None}, "PTXN-001",
+        )
+        self.assertEqual(msg, "❌ Не удалось обновить статус Payment.")
+
+    def test_changed_falsy_string_not_treated_as_false(self):
+        msg = th._payment_transaction_failure_message(
+            {"ok": True, "changed": "false", "code": "PAYMENT_TRANSACTION_FAILED", "error": None}, "PTXN-001",
+        )
+        self.assertEqual(msg, "❌ Не удалось обновить статус Payment.")
+
+    def test_fallback_log_is_fixed_literal(self):
+        with patch("business_core.telegram_handlers.log.warning") as mock_warn:
+            th._payment_transaction_failure_message({"ok": False, "code": "UNMAPPED_XYZ", "error": "leak-BALANCE-SECRET"}, "PTXN-001")
+        mock_warn.assert_called_once_with("_payment_transaction_failure_message unmapped safe fallback")
+        for call in mock_warn.call_args_list:
+            for arg in list(call.args) + list(call.kwargs.values()):
+                self.assertNotIn("BALANCE-SECRET", str(arg))
+                self.assertNotIn("UNMAPPED_XYZ", str(arg))
+
+    def test_known_branch_does_not_log(self):
+        with patch("business_core.telegram_handlers.log.warning") as mock_warn:
+            th._payment_transaction_failure_message({"ok": True, "changed": True, "code": "PAYMENT_TRANSACTION_FAILED", "error": None}, "PTXN-001")
+        mock_warn.assert_not_called()
 
 
 # ────────────────────────────────────────────────────────────

@@ -910,5 +910,141 @@ class TestConfirmReversePartialState(unittest.TestCase):
         mock_obligation_write.assert_not_called()
 
 
+_MALFORMED_WRITE_RESULTS = (
+    {},
+    {"changed": True, "code": "", "error": None},  # missing ok
+    None,
+    "not a dict",
+    ["ok", True],
+    42,
+    {"ok": "true", "changed": True, "code": "", "error": None},
+    {"ok": 1, "changed": True, "code": "", "error": None},
+)
+
+
+class TestPaymentWrapperMalformedResultHardening(unittest.TestCase):
+    """Phase 17E-2A6-H1: proves confirm/reverse/fail never raise on a
+    malformed manager or synchronization result, never synthesize
+    false success from a non-True ok, and preserve the existing
+    lifecycle failure code (PAYMENT_PERSISTENCE_FAILED / the existing
+    partial-state code) rather than inventing a new one."""
+
+    def _txn(self, status="pending"):
+        return {
+            "Payment Transaction ID": "PTXN-001", "Business ID": "BIZ-001",
+            "Payment Obligation ID": "POB-001", "Amount": "50000.00", "Currency": "KZT", "Status": status,
+        }
+
+    def test_confirm_write_result_malformed_never_raises_never_false_success(self):
+        for bad in _MALFORMED_WRITE_RESULTS:
+            with self.subTest(bad=bad):
+                with patch("business_core.payment_manager.find_payment_transaction_by_id", return_value=self._txn("pending")), \
+                     patch("business_core.payment_manager.find_payment_obligation_by_id", return_value=_OBLIGATION_FOR_TXN), \
+                     patch("business_core.payment_manager.list_payment_transactions_strict", return_value=[]), \
+                     patch("business_core.payment_manager.update_payment_transaction_status", return_value=bad):
+                    r = bb.confirm_payment_transaction("PTXN-001", "dida")
+                self.assertFalse(r["ok"])
+                self.assertEqual(r["code"], "PAYMENT_PERSISTENCE_FAILED")
+
+    def test_confirm_write_result_missing_ok_preserves_persistence_failed(self):
+        with patch("business_core.payment_manager.find_payment_transaction_by_id", return_value=self._txn("pending")), \
+             patch("business_core.payment_manager.find_payment_obligation_by_id", return_value=_OBLIGATION_FOR_TXN), \
+             patch("business_core.payment_manager.list_payment_transactions_strict", return_value=[]), \
+             patch("business_core.payment_manager.update_payment_transaction_status", return_value={"changed": True, "code": "", "error": None}):
+            r = bb.confirm_payment_transaction("PTXN-001", "dida")
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["code"], "PAYMENT_PERSISTENCE_FAILED")
+
+    def test_reverse_write_result_malformed_never_raises_never_false_success(self):
+        for bad in _MALFORMED_WRITE_RESULTS:
+            with self.subTest(bad=bad):
+                with patch("business_core.payment_manager.find_payment_transaction_by_id", return_value=self._txn("confirmed")), \
+                     patch("business_core.payment_manager.update_payment_transaction_status", return_value=bad):
+                    r = bb.reverse_payment_transaction("PTXN-001", "reason", "dida")
+                self.assertFalse(r["ok"])
+                self.assertEqual(r["code"], "PAYMENT_PERSISTENCE_FAILED")
+
+    def test_fail_write_result_malformed_never_raises_never_false_success(self):
+        for bad in _MALFORMED_WRITE_RESULTS:
+            with self.subTest(bad=bad):
+                with patch("business_core.payment_manager.find_payment_transaction_by_id", return_value=self._txn("pending")), \
+                     patch("business_core.payment_manager.update_payment_transaction_status", return_value=bad):
+                    r = bb.fail_payment_transaction("PTXN-001")
+                self.assertFalse(r["ok"])
+                self.assertEqual(r["code"], "PAYMENT_PERSISTENCE_FAILED")
+
+    def test_fail_write_result_changed_string_false_not_treated_as_true(self):
+        with patch("business_core.payment_manager.find_payment_transaction_by_id", return_value=self._txn("pending")), \
+             patch("business_core.payment_manager.update_payment_transaction_status",
+                   return_value={"ok": True, "changed": "false", "code": "", "error": None}):
+            r = bb.fail_payment_transaction("PTXN-001")
+        self.assertTrue(r["ok"])
+        self.assertIs(r["changed"], False)
+
+    def test_confirm_sync_result_none_after_transaction_write_preserves_partial_state(self):
+        original = self._txn("pending")
+        confirmed_row = {**original, "Status": "confirmed"}
+        with patch("business_core.payment_manager.find_payment_transaction_by_id", side_effect=[original, confirmed_row]), \
+             patch("business_core.payment_manager.find_payment_obligation_by_id", return_value=_OBLIGATION_FOR_TXN), \
+             patch("business_core.payment_manager.list_payment_transactions_strict", return_value=[]), \
+             patch("business_core.payment_manager.update_payment_transaction_status",
+                   return_value={"ok": True, "changed": True, "code": "", "error": None}), \
+             patch.object(bb, "_synchronize_payment_obligation_after_transaction_change", return_value=None), \
+             patch("business_core.payment_manager.update_payment_obligation_balance") as mock_write:
+            r = bb.confirm_payment_transaction("PTXN-001", "dida")
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["code"], "PAYMENT_OBLIGATION_POST_WRITE_VERIFICATION_FAILED")
+        self.assertFalse(r["retry_safe"])
+        self.assertEqual(r["final_status"], "confirmed")
+        mock_write.assert_not_called()
+
+    def test_confirm_sync_result_empty_dict_after_transaction_write_preserves_partial_state(self):
+        original = self._txn("pending")
+        confirmed_row = {**original, "Status": "confirmed"}
+        with patch("business_core.payment_manager.find_payment_transaction_by_id", side_effect=[original, confirmed_row]), \
+             patch("business_core.payment_manager.find_payment_obligation_by_id", return_value=_OBLIGATION_FOR_TXN), \
+             patch("business_core.payment_manager.list_payment_transactions_strict", return_value=[]), \
+             patch("business_core.payment_manager.update_payment_transaction_status",
+                   return_value={"ok": True, "changed": True, "code": "", "error": None}), \
+             patch.object(bb, "_synchronize_payment_obligation_after_transaction_change", return_value={}), \
+             patch("business_core.payment_manager.update_payment_obligation_balance") as mock_write:
+            r = bb.confirm_payment_transaction("PTXN-001", "dida")
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["code"], "PAYMENT_OBLIGATION_POST_WRITE_VERIFICATION_FAILED")
+        mock_write.assert_not_called()
+
+    def test_confirm_sync_result_ok_truthy_string_not_treated_as_success(self):
+        original = self._txn("pending")
+        confirmed_row = {**original, "Status": "confirmed"}
+        with patch("business_core.payment_manager.find_payment_transaction_by_id", side_effect=[original, confirmed_row]), \
+             patch("business_core.payment_manager.find_payment_obligation_by_id", return_value=_OBLIGATION_FOR_TXN), \
+             patch("business_core.payment_manager.list_payment_transactions_strict", return_value=[]), \
+             patch("business_core.payment_manager.update_payment_transaction_status",
+                   return_value={"ok": True, "changed": True, "code": "", "error": None}), \
+             patch.object(bb, "_synchronize_payment_obligation_after_transaction_change",
+                          return_value={"ok": "true", "paid_amount": "1.00", "remaining_amount": "1.00", "status": "partially_paid"}), \
+             patch("business_core.payment_manager.update_payment_obligation_balance") as mock_write:
+            r = bb.confirm_payment_transaction("PTXN-001", "dida")
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["code"], "PAYMENT_OBLIGATION_POST_WRITE_VERIFICATION_FAILED")
+        mock_write.assert_not_called()
+
+    def test_reverse_sync_result_malformed_after_transaction_write_preserves_partial_state(self):
+        original = self._txn("confirmed")
+        original["Payment Date"] = "2026-01-01"
+        reversed_row = {**original, "Status": "reversed"}
+        with patch("business_core.payment_manager.find_payment_transaction_by_id", side_effect=[original, reversed_row]), \
+             patch("business_core.payment_manager.update_payment_transaction_status",
+                   return_value={"ok": True, "changed": True, "code": "", "error": None}), \
+             patch.object(bb, "_synchronize_payment_obligation_after_transaction_change", return_value=None), \
+             patch("business_core.payment_manager.update_payment_obligation_balance") as mock_write:
+            r = bb.reverse_payment_transaction("PTXN-001", "reason", "dida")
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["code"], "PAYMENT_OBLIGATION_POST_WRITE_VERIFICATION_FAILED")
+        self.assertFalse(r["retry_safe"])
+        self.assertEqual(r["final_status"], "reversed")
+        mock_write.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

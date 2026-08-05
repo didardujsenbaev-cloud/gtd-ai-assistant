@@ -4292,5 +4292,371 @@ class TestConfirmPaymentLedgerReadFailureRealChain(unittest.TestCase):
         self.assertIn("✅", text)
 
 
+# ═════════════════════════════════════════════════════════════
+# Phase 17E-2A6-H1: Payment lifecycle handler outer-exception
+# secrecy + real-chain regressions. Legacy /confirmpayment,
+# /reversepayment, /failpayment remain unauthorized (unchanged,
+# out of scope) — this proves the manager/wrapper/mapper/handler
+# secrecy chain established this phase prevents raw exception text,
+# manager error text, and secret markers from ever reaching
+# Telegram or logs, across every reachable infrastructure-failure
+# point, without claiming atomicity anywhere.
+# ═════════════════════════════════════════════════════════════
+
+_SECRET_REVERSAL_MARKER = "REVERSAL-SECRET"
+_ALL_H1_SECRET_MARKERS = _ALL_H0_SECRET_MARKERS + (_SECRET_BIZ_MARKER, _SECRET_REVERSAL_MARKER)
+
+
+def _h1_boom_with_secrets(*_a, **_k):
+    raise RuntimeError(
+        f"synthetic failure containing {_LEDGER_SECRET_MARKER} and {_TRANSACTION_SECRET_MARKER} "
+        f"and {_OBLIGATION_SECRET_MARKER} and {_BALANCE_SECRET_MARKER} and {_H0_API_PAYLOAD_MARKER} "
+        f"and {_SECRET_BIZ_MARKER} and {_SECRET_REVERSAL_MARKER}"
+    )
+
+
+class TestPaymentLifecycleHandlerOuterExceptionSecrecy(unittest.TestCase):
+    """Section 23: force an unexpected exception from the
+    business_builder wrapper itself (not a Sheets-layer failure) and
+    prove the handler's own outer except-boundary is safe."""
+
+    def test_confirmpayment_cmd_unexpected_wrapper_exception(self):
+        update = _make_update()
+        with patch("business_core.business_builder.confirm_payment_transaction", side_effect=_h1_boom_with_secrets), \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
+             patch("business_core.telegram_handlers.log.error") as mock_log_error:
+            _run(th.confirmpayment_cmd(update, _make_context(
+                ["payment_transaction_id=PTXN-001", "confirmed_by=owner"]
+            )))
+        call = update.message.reply_text.call_args
+        text = call.args[0] if call.args else call.kwargs.get("text", "")
+        self.assertEqual(text, "❌ Не удалось подтвердить Payment.")
+        mock_log_error.assert_called_once_with("confirmpayment_cmd infrastructure failure")
+        for marker in _ALL_H1_SECRET_MARKERS:
+            self.assertNotIn(marker, text)
+            for call_args in mock_log_error.call_args_list:
+                for arg in list(call_args.args) + list(call_args.kwargs.values()):
+                    self.assertNotIn(marker, str(arg))
+        self.assertNotIn("PTXN-001", text)
+        self.assertNotIn("owner", text)
+
+    def test_reversepayment_cmd_unexpected_wrapper_exception(self):
+        update = _make_update()
+        with patch("business_core.business_builder.reverse_payment_transaction", side_effect=_h1_boom_with_secrets), \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
+             patch("business_core.telegram_handlers.log.error") as mock_log_error:
+            _run(th.reversepayment_cmd(update, _make_context(
+                ["payment_transaction_id=PTXN-001", f"reversal_reason=secret {_SECRET_REVERSAL_MARKER}", "reversed_by=owner"]
+            )))
+        call = update.message.reply_text.call_args
+        text = call.args[0] if call.args else call.kwargs.get("text", "")
+        self.assertEqual(text, "❌ Не удалось реверснуть Payment.")
+        mock_log_error.assert_called_once_with("reversepayment_cmd infrastructure failure")
+        for marker in _ALL_H1_SECRET_MARKERS:
+            self.assertNotIn(marker, text)
+            for call_args in mock_log_error.call_args_list:
+                for arg in list(call_args.args) + list(call_args.kwargs.values()):
+                    self.assertNotIn(marker, str(arg))
+        self.assertNotIn("PTXN-001", text)
+        self.assertNotIn("owner", text)
+
+    def test_failpayment_cmd_unexpected_wrapper_exception(self):
+        update = _make_update()
+        with patch("business_core.business_builder.fail_payment_transaction", side_effect=_h1_boom_with_secrets), \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
+             patch("business_core.telegram_handlers.log.error") as mock_log_error:
+            _run(th.failpayment_cmd(update, _make_context(["payment_transaction_id=PTXN-001"])))
+        call = update.message.reply_text.call_args
+        text = call.args[0] if call.args else call.kwargs.get("text", "")
+        self.assertEqual(text, "❌ Не удалось обновить статус Payment.")
+        mock_log_error.assert_called_once_with("failpayment_cmd infrastructure failure")
+        for marker in _ALL_H1_SECRET_MARKERS:
+            self.assertNotIn(marker, text)
+        self.assertNotIn("PTXN-001", text)
+
+    def test_confirmpayment_cmd_normal_success_path_unaffected(self):
+        update = _make_update()
+        with patch("business_core.business_builder.confirm_payment_transaction",
+                   return_value={"ok": True, "changed": True, "code": "PAYMENT_TRANSACTION_CONFIRMED", "error": None, "paid_amount": "1.00", "remaining_amount": "1.00", "currency": "KZT"}), \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+            _run(th.confirmpayment_cmd(update, _make_context(
+                ["payment_transaction_id=PTXN-001", "confirmed_by=owner"]
+            )))
+        call = update.message.reply_text.call_args
+        text = call.args[0] if call.args else call.kwargs.get("text", "")
+        self.assertIn("✅", text)
+
+
+class TestPaymentLifecycleRealChainRegressions(unittest.TestCase):
+    """Section 24: synthetic real-chain regressions covering every
+    reachable infrastructure-failure and malformed-result point in
+    the confirm/reverse/fail chains, using synthetic rows only."""
+
+    def _txn_row(self, status="pending", amount="100.00"):
+        return {
+            "Payment Transaction ID": "PTXN-001", "Business ID": "BIZ-001", "Payment Obligation ID": "POB-001",
+            "Client ID": "PRS-001", "Amount": amount, "Currency": "KZT", "Payment Date": "2026-01-01",
+            "Payment Method": "", "External Transaction ID": "", "Caller Idempotency Key": "",
+            "Evidence Document ID": "", "Status": status, "Reversal Reason": "",
+            "Confirmed At": "", "Confirmed By": "", "Reversed At": "", "Reversed By": "",
+            "Created At": "", "Created By": "", "Updated At": "", "Notes": "",
+        }
+
+    def _obligation_row(self, status="issued", paid="0.00", remaining="1000.00"):
+        return {
+            "Payment Obligation ID": "POB-001", "Business ID": "BIZ-001", "Client ID": "PRS-001",
+            "Object ID": "", "Service ID": "", "Roadmap ID": "", "Stage ID": "",
+            "Commercial Milestone Template ID": "", "Caller Idempotency Key": "",
+            "Title Snapshot": "T", "Description Snapshot": "", "Obligation Amount": "1000.00", "Currency": "KZT",
+            "Due Date": "", "Status": status, "Paid Amount": paid, "Remaining Amount": remaining,
+            "Created At": "", "Created By": "", "Issued At": "", "Paid At": "", "Cancelled At": "",
+            "Updated At": "", "Notes": "",
+        }
+
+    def test_1_confirm_transaction_write_exception(self):
+        """Case 1: Transaction status write itself raises — must fail
+        closed before any Obligation write, with the fixed
+        PAYMENT_PERSISTENCE_FAILED message."""
+        update = _make_update()
+        txn_row = self._txn_row("pending")
+        obligation_row = self._obligation_row()
+
+        def find_row_side_effect(registry, record_id):
+            if registry == "payment_transactions":
+                return (2, dict(txn_row))
+            if registry == "payment_obligations":
+                return (3, dict(obligation_row))
+            return None
+
+        txn_sheet = MagicMock()
+        txn_sheet.row_values.return_value = list(txn_row.keys())
+        txn_sheet.update_cell.side_effect = _h1_boom_with_secrets
+
+        def get_business_sheet_side_effect(registry):
+            if registry == "payment_transactions":
+                return txn_sheet
+            raise AssertionError(f"unexpected sheet read for {registry}")
+
+        with patch("business_core.sheets.find_row_by_id", side_effect=find_row_side_effect), \
+             patch("business_core.sheets.get_business_sheet", side_effect=get_business_sheet_side_effect), \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
+             patch("business_core.payment_manager.update_payment_obligation_balance") as mock_obligation_write:
+            _run(th.confirmpayment_cmd(update, _make_context(
+                ["payment_transaction_id=PTXN-001", "confirmed_by=owner"]
+            )))
+
+        call = update.message.reply_text.call_args
+        text = call.args[0] if call.args else call.kwargs.get("text", "")
+        self.assertEqual(text, "❌ Не удалось подтвердить Payment.")
+        for marker in _ALL_H1_SECRET_MARKERS:
+            self.assertNotIn(marker, text)
+        self.assertNotIn("Infrastructure failure", text)
+        self.assertNotIn("✅", text)
+        mock_obligation_write.assert_not_called()
+
+    def test_2_confirm_obligation_balance_write_exception(self):
+        """Case 2: Transaction write succeeds, but the Obligation
+        balance write inside synchronization raises — must preserve
+        the manual-review partial-state warning, not a false success.
+        The obligation starts at Paid Amount 0.00 with a real ledger
+        entry that recomputes to a non-zero balance, so the write is
+        actually attempted (not skipped as a no-op)."""
+        update = _make_update()
+        txn_row = self._txn_row("pending")
+        obligation_row = self._obligation_row()
+        confirmed_ledger_entry = {**txn_row, "Status": "confirmed"}
+
+        find_calls = {"n": 0}
+
+        def find_row_side_effect(registry, record_id):
+            if registry == "payment_transactions":
+                find_calls["n"] += 1
+                row = dict(txn_row)
+                if find_calls["n"] > 1:
+                    row["Status"] = "confirmed"
+                return (2, row)
+            if registry == "payment_obligations":
+                return (3, dict(obligation_row))
+            return None
+
+        obligation_sheet = MagicMock()
+        obligation_sheet.row_values.return_value = list(obligation_row.keys())
+        obligation_sheet.update_cell.side_effect = _h1_boom_with_secrets
+
+        with patch("business_core.sheets.find_row_by_id", side_effect=find_row_side_effect), \
+             patch("business_core.sheets.get_business_sheet", return_value=obligation_sheet), \
+             patch("business_core.payment_manager.update_payment_transaction_status",
+                   return_value={"ok": True, "changed": True, "code": "", "error": None}), \
+             patch("business_core.payment_manager.list_payment_transactions_strict", return_value=[confirmed_ledger_entry]), \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+            _run(th.confirmpayment_cmd(update, _make_context(
+                ["payment_transaction_id=PTXN-001", "confirmed_by=owner"]
+            )))
+
+        call = update.message.reply_text.call_args
+        text = call.args[0] if call.args else call.kwargs.get("text", "")
+        self.assertEqual(text, "\n".join([
+            "⚠️ Payment подтверждён, но синхронизация баланса Obligation не удалась.",
+            "Требуется ручная проверка.",
+        ]))
+        for marker in _ALL_H1_SECRET_MARKERS:
+            self.assertNotIn(marker, text)
+        self.assertNotIn("Infrastructure failure", text)
+        self.assertNotIn("✅", text)
+
+    def test_3_reverse_transaction_write_exception(self):
+        update = _make_update()
+        txn_row = self._txn_row("confirmed")
+        txn_sheet = MagicMock()
+        txn_sheet.row_values.return_value = list(txn_row.keys())
+        txn_sheet.update_cell.side_effect = _h1_boom_with_secrets
+
+        with patch("business_core.sheets.find_row_by_id", return_value=(2, dict(txn_row))), \
+             patch("business_core.sheets.get_business_sheet", return_value=txn_sheet), \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
+             patch("business_core.payment_manager.update_payment_obligation_balance") as mock_obligation_write:
+            _run(th.reversepayment_cmd(update, _make_context(
+                ["payment_transaction_id=PTXN-001", f"reversal_reason=secret {_SECRET_REVERSAL_MARKER}", "reversed_by=owner"]
+            )))
+
+        call = update.message.reply_text.call_args
+        text = call.args[0] if call.args else call.kwargs.get("text", "")
+        self.assertEqual(text, "❌ Не удалось реверснуть Payment.")
+        for marker in _ALL_H1_SECRET_MARKERS:
+            self.assertNotIn(marker, text)
+        self.assertNotIn("✅", text)
+        mock_obligation_write.assert_not_called()
+
+    def test_4_reverse_obligation_balance_write_exception(self):
+        update = _make_update()
+        txn_row = self._txn_row("confirmed")
+        obligation_row = self._obligation_row(status="partially_paid", paid="100.00", remaining="900.00")
+
+        find_calls = {"n": 0}
+
+        def find_row_side_effect(registry, record_id):
+            if registry == "payment_transactions":
+                find_calls["n"] += 1
+                row = dict(txn_row)
+                if find_calls["n"] > 1:
+                    row["Status"] = "reversed"
+                return (2, row)
+            if registry == "payment_obligations":
+                return (3, dict(obligation_row))
+            return None
+
+        txn_sheet = MagicMock()
+        txn_sheet.row_values.return_value = list(txn_row.keys())
+        obligation_sheet = MagicMock()
+        obligation_sheet.row_values.return_value = list(obligation_row.keys())
+        obligation_sheet.update_cell.side_effect = _h1_boom_with_secrets
+
+        def get_business_sheet_side_effect(registry):
+            if registry == "payment_transactions":
+                return txn_sheet
+            if registry == "payment_obligations":
+                return obligation_sheet
+            raise AssertionError(f"unexpected sheet read for {registry}")
+
+        with patch("business_core.sheets.find_row_by_id", side_effect=find_row_side_effect), \
+             patch("business_core.sheets.get_business_sheet", side_effect=get_business_sheet_side_effect), \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+            _run(th.reversepayment_cmd(update, _make_context(
+                ["payment_transaction_id=PTXN-001", "reversal_reason=refund", "reversed_by=owner"]
+            )))
+
+        call = update.message.reply_text.call_args
+        text = call.args[0] if call.args else call.kwargs.get("text", "")
+        self.assertEqual(text, "\n".join([
+            "⚠️ Payment реверснут, но синхронизация баланса Obligation не удалась.",
+            "Требуется ручная проверка.",
+        ]))
+        for marker in _ALL_H1_SECRET_MARKERS:
+            self.assertNotIn(marker, text)
+        self.assertNotIn("✅", text)
+
+    def test_5_fail_transaction_write_exception(self):
+        update = _make_update()
+        txn_row = self._txn_row("pending")
+        txn_sheet = MagicMock()
+        txn_sheet.row_values.return_value = list(txn_row.keys())
+        txn_sheet.update_cell.side_effect = _h1_boom_with_secrets
+
+        with patch("business_core.sheets.find_row_by_id", return_value=(2, dict(txn_row))), \
+             patch("business_core.sheets.get_business_sheet", return_value=txn_sheet), \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+            _run(th.failpayment_cmd(update, _make_context(["payment_transaction_id=PTXN-001"])))
+
+        call = update.message.reply_text.call_args
+        text = call.args[0] if call.args else call.kwargs.get("text", "")
+        self.assertEqual(text, "❌ Не удалось обновить статус Payment.")
+        for marker in _ALL_H1_SECRET_MARKERS:
+            self.assertNotIn(marker, text)
+        self.assertNotIn("✅", text)
+
+    def test_6_transaction_finder_exception_reaching_handler_boundary(self):
+        """Case 6: the first finder itself raises (Sheets outage
+        before any row is even found) — the wrapper's own
+        find_payment_transaction_by_id has no try/except (matches the
+        established finder convention), so this exception propagates
+        all the way to the handler's own outer boundary."""
+        update = _make_update()
+        with patch("business_core.sheets.find_row_by_id", side_effect=_h1_boom_with_secrets), \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
+             patch("business_core.telegram_handlers.log.error") as mock_log_error:
+            _run(th.confirmpayment_cmd(update, _make_context(
+                ["payment_transaction_id=PTXN-001", "confirmed_by=owner"]
+            )))
+        call = update.message.reply_text.call_args
+        text = call.args[0] if call.args else call.kwargs.get("text", "")
+        self.assertEqual(text, "❌ Не удалось подтвердить Payment.")
+        mock_log_error.assert_called_once_with("confirmpayment_cmd infrastructure failure")
+        for marker in _ALL_H1_SECRET_MARKERS:
+            self.assertNotIn(marker, text)
+
+    def test_7_malformed_manager_result_through_real_chain(self):
+        """Case 7: update_payment_transaction_status returns a
+        malformed (non-dict) result — the wrapper must not crash and
+        must fall through to PAYMENT_PERSISTENCE_FAILED."""
+        update = _make_update()
+        with patch("business_core.payment_manager.find_payment_transaction_by_id", return_value=self._txn_row("pending")), \
+             patch("business_core.payment_manager.find_payment_obligation_by_id", return_value=self._obligation_row()), \
+             patch("business_core.payment_manager.list_payment_transactions_strict", return_value=[]), \
+             patch("business_core.payment_manager.update_payment_transaction_status", return_value=None), \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+            _run(th.confirmpayment_cmd(update, _make_context(
+                ["payment_transaction_id=PTXN-001", "confirmed_by=owner"]
+            )))
+        call = update.message.reply_text.call_args
+        text = call.args[0] if call.args else call.kwargs.get("text", "")
+        self.assertEqual(text, "❌ Не удалось подтвердить Payment.")
+
+    def test_8_malformed_synchronization_result_through_real_chain(self):
+        """Case 8: _synchronize_payment_obligation_after_transaction_change
+        returns a malformed (non-dict) result after the Transaction
+        write already succeeded — must preserve the manual-review
+        partial-state warning, never a false success."""
+        update = _make_update()
+        with patch("business_core.payment_manager.find_payment_transaction_by_id",
+                   side_effect=[self._txn_row("pending"), self._txn_row("confirmed")]), \
+             patch("business_core.payment_manager.find_payment_obligation_by_id", return_value=self._obligation_row()), \
+             patch("business_core.payment_manager.list_payment_transactions_strict", return_value=[]), \
+             patch("business_core.payment_manager.update_payment_transaction_status",
+                   return_value={"ok": True, "changed": True, "code": "", "error": None}), \
+             patch("business_core.business_builder._synchronize_payment_obligation_after_transaction_change", return_value="not a dict"), \
+             patch("business_core.payment_manager.update_payment_obligation_balance") as mock_obligation_write, \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+            _run(th.confirmpayment_cmd(update, _make_context(
+                ["payment_transaction_id=PTXN-001", "confirmed_by=owner"]
+            )))
+        call = update.message.reply_text.call_args
+        text = call.args[0] if call.args else call.kwargs.get("text", "")
+        self.assertEqual(text, "\n".join([
+            "⚠️ Payment подтверждён, но синхронизация баланса Obligation не удалась.",
+            "Требуется ручная проверка.",
+        ]))
+        mock_obligation_write.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

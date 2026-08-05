@@ -592,5 +592,193 @@ class TestStrictTransactionLedgerRead(unittest.TestCase):
         self.assertEqual(a, b)
 
 
+_SECRET_REVERSAL_MARKER = "REVERSAL-SECRET"
+_ALL_H1_SECRET_MARKERS = _ALL_LEDGER_SECRET_MARKERS + (_SECRET_REVERSAL_MARKER,)
+
+
+def _boom_with_h1_secrets(*_a, **_k):
+    raise RuntimeError(
+        f"synthetic failure containing {_SECRET_LEDGER_MARKER} and {_SECRET_TRANSACTION_MARKER} "
+        f"and {_SECRET_OBLIGATION_MARKER} and {_SECRET_BALANCE_MARKER} and {_SECRET_API_MARKER} "
+        f"and {_SECRET_REVERSAL_MARKER}"
+    )
+
+
+def _txn_row():
+    return dict(zip(TRANSACTION_HEADERS, TRANSACTION_ROW))
+
+
+class TestFindTransactionRowExceptionSecrecy(unittest.TestCase):
+    def test_no_secrets_in_log_call_args(self):
+        pm = _fresh_pm()
+        with patch("business_core.sheets.find_row_by_id", side_effect=_boom_with_h1_secrets), \
+             patch("business_core.payment_manager.log.warning") as mock_warn:
+            result = pm._find_transaction_row(f"PTXN-{_SECRET_TRANSACTION_MARKER}")
+        self.assertIsNone(result)
+        mock_warn.assert_called_once_with("_find_transaction_row infrastructure failure")
+        for call in mock_warn.call_args_list:
+            for arg in list(call.args) + list(call.kwargs.values()):
+                text = str(arg)
+                for marker in _ALL_H1_SECRET_MARKERS:
+                    self.assertNotIn(marker, text)
+
+
+class TestUpdatePaymentTransactionStatusExceptionSecrecy(unittest.TestCase):
+    def _sheet_raising_at(self, col_header):
+        row = _txn_row()
+        sheet = MagicMock()
+        sheet.row_values.return_value = TRANSACTION_HEADERS
+        target_col = TRANSACTION_HEADERS.index(col_header) + 1
+
+        def update_cell_side_effect(row_num, col, value):
+            if col == target_col:
+                _boom_with_h1_secrets()
+
+        sheet.update_cell.side_effect = update_cell_side_effect
+        return row, sheet
+
+    def _run_and_assert_sanitized(self, col_header, **kwargs):
+        pm = _fresh_pm()
+        row, sheet = self._sheet_raising_at(col_header)
+        with patch("business_core.sheets.find_row_by_id", return_value=(2, row)), \
+             patch("business_core.sheets.get_business_sheet", return_value=sheet), \
+             patch("business_core.payment_manager.log.error") as mock_error:
+            result = pm.update_payment_transaction_status("PTXN-001", "confirmed", **kwargs)
+        mock_error.assert_called_once_with("update_payment_transaction_status infrastructure failure")
+        for call in mock_error.call_args_list:
+            for arg in list(call.args) + list(call.kwargs.values()):
+                text = str(arg)
+                for marker in _ALL_H1_SECRET_MARKERS:
+                    self.assertNotIn(marker, text)
+        self.assertEqual(result, {"ok": False, "changed": False, "code": "", "error": "Infrastructure failure"})
+
+    def test_status_write_exception(self):
+        self._run_and_assert_sanitized("Status", confirmed_at="2026-01-01", confirmed_by="owner")
+
+    def test_confirmed_at_write_exception(self):
+        row = _txn_row()
+        row["Status"] = "pending"
+        pm = _fresh_pm()
+        _, sheet = self._sheet_raising_at("Confirmed At")
+        sheet.row_values.return_value = TRANSACTION_HEADERS
+        with patch("business_core.sheets.find_row_by_id", return_value=(2, row)), \
+             patch("business_core.sheets.get_business_sheet", return_value=sheet), \
+             patch("business_core.payment_manager.log.error") as mock_error:
+            result = pm.update_payment_transaction_status("PTXN-001", "confirmed", confirmed_at="2026-01-01", confirmed_by="owner")
+        mock_error.assert_called_once_with("update_payment_transaction_status infrastructure failure")
+        self.assertEqual(result["error"], "Infrastructure failure")
+
+    def test_confirmed_by_write_exception(self):
+        row = _txn_row()
+        row["Status"] = "confirmed"
+        pm = _fresh_pm()
+        _, sheet = self._sheet_raising_at("Confirmed By")
+        sheet.row_values.return_value = TRANSACTION_HEADERS
+        with patch("business_core.sheets.find_row_by_id", return_value=(2, row)), \
+             patch("business_core.sheets.get_business_sheet", return_value=sheet), \
+             patch("business_core.payment_manager.log.error") as mock_error:
+            result = pm.update_payment_transaction_status("PTXN-001", "confirmed", confirmed_at="2026-01-01", confirmed_by="owner")
+        mock_error.assert_called_once_with("update_payment_transaction_status infrastructure failure")
+        self.assertEqual(result["error"], "Infrastructure failure")
+
+    def test_reversed_at_write_exception(self):
+        row = _txn_row()
+        row["Status"] = "confirmed"
+        pm = _fresh_pm()
+        _, sheet = self._sheet_raising_at("Reversed At")
+        sheet.row_values.return_value = TRANSACTION_HEADERS
+        with patch("business_core.sheets.find_row_by_id", return_value=(2, row)), \
+             patch("business_core.sheets.get_business_sheet", return_value=sheet), \
+             patch("business_core.payment_manager.log.error") as mock_error:
+            result = pm.update_payment_transaction_status(
+                "PTXN-001", "reversed", reversed_at="2026-01-02", reversed_by="owner", reversal_reason="x",
+            )
+        mock_error.assert_called_once_with("update_payment_transaction_status infrastructure failure")
+        self.assertEqual(result["error"], "Infrastructure failure")
+
+    def test_reversed_by_write_exception(self):
+        row = _txn_row()
+        row["Status"] = "confirmed"
+        pm = _fresh_pm()
+        _, sheet = self._sheet_raising_at("Reversed By")
+        sheet.row_values.return_value = TRANSACTION_HEADERS
+        with patch("business_core.sheets.find_row_by_id", return_value=(2, row)), \
+             patch("business_core.sheets.get_business_sheet", return_value=sheet), \
+             patch("business_core.payment_manager.log.error") as mock_error:
+            result = pm.update_payment_transaction_status(
+                "PTXN-001", "reversed", reversed_at="2026-01-02", reversed_by="owner", reversal_reason="x",
+            )
+        mock_error.assert_called_once_with("update_payment_transaction_status infrastructure failure")
+        self.assertEqual(result["error"], "Infrastructure failure")
+
+    def test_reversal_reason_write_exception_no_reason_leaked(self):
+        row = _txn_row()
+        row["Status"] = "confirmed"
+        pm = _fresh_pm()
+        _, sheet = self._sheet_raising_at("Reversal Reason")
+        sheet.row_values.return_value = TRANSACTION_HEADERS
+        with patch("business_core.sheets.find_row_by_id", return_value=(2, row)), \
+             patch("business_core.sheets.get_business_sheet", return_value=sheet), \
+             patch("business_core.payment_manager.log.error") as mock_error:
+            result = pm.update_payment_transaction_status(
+                "PTXN-001", "reversed", reversed_at="2026-01-02", reversed_by="owner",
+                reversal_reason=f"secret reason {_SECRET_REVERSAL_MARKER}",
+            )
+        mock_error.assert_called_once_with("update_payment_transaction_status infrastructure failure")
+        self.assertEqual(result["error"], "Infrastructure failure")
+        for call in mock_error.call_args_list:
+            for arg in list(call.args) + list(call.kwargs.values()):
+                self.assertNotIn(_SECRET_REVERSAL_MARKER, str(arg))
+
+    def test_updated_at_write_exception(self):
+        self._run_and_assert_sanitized("Updated At", confirmed_at="2026-01-01", confirmed_by="owner")
+
+
+class TestUpdatePaymentObligationBalanceExceptionSecrecy(unittest.TestCase):
+    def _obligation_row(self):
+        return dict(zip(OBLIGATION_HEADERS, OBLIGATION_ROW))
+
+    def _run_at(self, col_header):
+        pm = _fresh_pm()
+        row = self._obligation_row()
+        sheet = MagicMock()
+        sheet.row_values.return_value = OBLIGATION_HEADERS
+        target_col = OBLIGATION_HEADERS.index(col_header) + 1
+
+        def update_cell_side_effect(row_num, col, value):
+            if col == target_col:
+                _boom_with_h1_secrets()
+
+        sheet.update_cell.side_effect = update_cell_side_effect
+        with patch("business_core.sheets.find_row_by_id", return_value=(2, row)), \
+             patch("business_core.sheets.get_business_sheet", return_value=sheet), \
+             patch("business_core.payment_manager.log.error") as mock_error:
+            result = pm.update_payment_obligation_balance(
+                "POB-001", status="partially_paid", paid_amount="1.00", remaining_amount="149999.00", paid_at="2026-01-01",
+            )
+        mock_error.assert_called_once_with("update_payment_obligation_balance infrastructure failure")
+        for call in mock_error.call_args_list:
+            for arg in list(call.args) + list(call.kwargs.values()):
+                text = str(arg)
+                for marker in _ALL_H1_SECRET_MARKERS:
+                    self.assertNotIn(marker, text)
+        self.assertEqual(result, {"ok": False, "changed": False, "code": "", "error": "Infrastructure failure"})
+
+    def test_status_write_exception(self):
+        self._run_at("Status")
+
+    def test_paid_amount_write_exception(self):
+        self._run_at("Paid Amount")
+
+    def test_remaining_amount_write_exception(self):
+        self._run_at("Remaining Amount")
+
+    def test_paid_at_write_exception(self):
+        self._run_at("Paid At")
+
+    def test_updated_at_write_exception(self):
+        self._run_at("Updated At")
+
+
 if __name__ == "__main__":
     unittest.main()
