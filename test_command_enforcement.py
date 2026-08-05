@@ -334,13 +334,7 @@ class TestNoCacheNoBypassNoUnrelatedFileChange(unittest.TestCase):
         )
         self.assertEqual(result.stdout.strip(), "")
 
-    def test_authorization_py_unchanged(self):
-        import subprocess
-        result = subprocess.run(
-            ["git", "diff", "--name-only", "HEAD", "--", "business_core/authorization.py"],
-            capture_output=True, text=True, cwd=".",
-        )
-        self.assertEqual(result.stdout.strip(), "")
+    # Authorization-domain source invariants are enforced in test_authorization_domain.py.
 
     def test_identity_manager_unchanged(self):
         import subprocess

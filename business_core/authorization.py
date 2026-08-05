@@ -45,6 +45,7 @@ AUTHZ_RESOURCES = (
     "OPERATIONAL",
     "FINANCE",
     "ACCESS_CONTROL",
+    "TASK",
 )
 
 AUTHZ_ACTIONS = (
@@ -107,11 +108,13 @@ _READ_ONLY = frozenset({"READ"})
 _DOCUMENT_SPECIALIST_DOC_ACTIONS = frozenset({"READ", "CREATE", "UPDATE", "ARCHIVE"})
 _NONE = frozenset()
 
+_COORDINATOR_TASK_ACTIONS = frozenset({"READ", "CREATE", "UPDATE", "ASSIGN"})
+
 ROLE_RESOURCE_ACTION_MATRIX = {
     "OWNER": {
         "BUSINESS": _ALL_ACTIONS, "CLIENT": _ALL_ACTIONS, "OBJECT": _ALL_ACTIONS,
         "DOCUMENT": _ALL_ACTIONS, "OPERATIONAL": _ALL_ACTIONS, "FINANCE": _ALL_ACTIONS,
-        "ACCESS_CONTROL": _ALL_ACTIONS,
+        "ACCESS_CONTROL": _ALL_ACTIONS, "TASK": _ALL_ACTIONS,
     },
     "ADMIN": {
         "BUSINESS": frozenset({"READ", "CREATE", "UPDATE", "ARCHIVE", "ASSIGN"}),
@@ -121,6 +124,7 @@ ROLE_RESOURCE_ACTION_MATRIX = {
         "OPERATIONAL": frozenset({"READ", "CREATE", "UPDATE", "ARCHIVE", "ASSIGN"}),
         "FINANCE": frozenset({"READ", "CREATE", "UPDATE", "ARCHIVE", "ASSIGN"}),
         "ACCESS_CONTROL": _NONE,
+        "TASK": frozenset({"READ", "CREATE", "UPDATE", "ARCHIVE", "ASSIGN"}),
     },
     "COORDINATOR": {
         "BUSINESS": _NONE, "CLIENT": _NONE,
@@ -128,6 +132,7 @@ ROLE_RESOURCE_ACTION_MATRIX = {
         "DOCUMENT": _WRITE_LIGHT,
         "OPERATIONAL": _WRITE_LIGHT,
         "FINANCE": _NONE, "ACCESS_CONTROL": _NONE,
+        "TASK": _COORDINATOR_TASK_ACTIONS,
     },
     "DOCUMENT_SPECIALIST": {
         "BUSINESS": _NONE,
@@ -136,11 +141,12 @@ ROLE_RESOURCE_ACTION_MATRIX = {
         "DOCUMENT": _DOCUMENT_SPECIALIST_DOC_ACTIONS,
         "OPERATIONAL": _READ_ONLY,
         "FINANCE": _NONE, "ACCESS_CONTROL": _NONE,
+        "TASK": _READ_ONLY,
     },
     "VIEWER": {
         "BUSINESS": _READ_ONLY, "CLIENT": _READ_ONLY, "OBJECT": _READ_ONLY,
         "DOCUMENT": _READ_ONLY, "OPERATIONAL": _READ_ONLY, "FINANCE": _READ_ONLY,
-        "ACCESS_CONTROL": _NONE,
+        "ACCESS_CONTROL": _NONE, "TASK": _READ_ONLY,
     },
 }
 
@@ -152,7 +158,7 @@ ROLE_RESOURCE_ACTION_MATRIX = {
 _SCOPE_RESOURCE_COMPATIBILITY = {
     "ALL_BUSINESSES": frozenset(AUTHZ_RESOURCES),
     "SELECTED_BUSINESSES": frozenset({
-        "BUSINESS", "CLIENT", "OBJECT", "DOCUMENT", "OPERATIONAL", "FINANCE",
+        "BUSINESS", "CLIENT", "OBJECT", "DOCUMENT", "OPERATIONAL", "FINANCE", "TASK",
     }),
     "ASSIGNED_OBJECTS_ONLY": frozenset({"OBJECT", "DOCUMENT", "OPERATIONAL"}),
 }
@@ -170,7 +176,7 @@ def _validate_structural_target(resource: str, action: str, business_id: str, ob
     if resource in ("OBJECT", "DOCUMENT", "OPERATIONAL"):
         if not business_id or not object_id:
             return "TARGET_REQUIRED"
-    elif resource in ("CLIENT", "FINANCE"):
+    elif resource in ("CLIENT", "FINANCE", "TASK"):
         if not business_id:
             return "TARGET_REQUIRED"
     elif resource == "ACCESS_CONTROL":

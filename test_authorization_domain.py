@@ -927,5 +927,621 @@ class TestArchitectureGuards(unittest.TestCase):
         self.assertNotIn("from business_core import authorization", content)
 
 
+# ─────────────────────────────────────────────────────────────
+# Phase 18A.3: TASK resource addition.
+#
+# Adds TASK as an isolated Authorization Domain resource only —
+# no Task command is authorized, no COMMAND_ENFORCEMENT_MAP entry
+# is added, no handler is touched. This section proves the new
+# resource behaves exactly as designed (business-only structural
+# shape, exact per-role grants, correct scope compatibility) and
+# that every pre-existing resource/role/scope behavior is
+# byte-identical to before this phase.
+# ─────────────────────────────────────────────────────────────
+
+_PRE_PHASE_RESOURCES = (
+    "BUSINESS", "CLIENT", "OBJECT", "DOCUMENT", "OPERATIONAL", "FINANCE", "ACCESS_CONTROL",
+)
+
+_PRE_PHASE_ACTIONS = ("READ", "CREATE", "UPDATE", "ARCHIVE", "ASSIGN", "MANAGE_ACCESS")
+
+_PRE_PHASE_MATRIX = {
+    "OWNER": {
+        "BUSINESS": frozenset(_PRE_PHASE_ACTIONS), "CLIENT": frozenset(_PRE_PHASE_ACTIONS),
+        "OBJECT": frozenset(_PRE_PHASE_ACTIONS), "DOCUMENT": frozenset(_PRE_PHASE_ACTIONS),
+        "OPERATIONAL": frozenset(_PRE_PHASE_ACTIONS), "FINANCE": frozenset(_PRE_PHASE_ACTIONS),
+        "ACCESS_CONTROL": frozenset(_PRE_PHASE_ACTIONS),
+    },
+    "ADMIN": {
+        "BUSINESS": frozenset({"READ", "CREATE", "UPDATE", "ARCHIVE", "ASSIGN"}),
+        "CLIENT": frozenset({"READ", "CREATE", "UPDATE", "ARCHIVE", "ASSIGN"}),
+        "OBJECT": frozenset({"READ", "CREATE", "UPDATE", "ARCHIVE", "ASSIGN"}),
+        "DOCUMENT": frozenset({"READ", "CREATE", "UPDATE", "ARCHIVE", "ASSIGN"}),
+        "OPERATIONAL": frozenset({"READ", "CREATE", "UPDATE", "ARCHIVE", "ASSIGN"}),
+        "FINANCE": frozenset({"READ", "CREATE", "UPDATE", "ARCHIVE", "ASSIGN"}),
+        "ACCESS_CONTROL": frozenset(),
+    },
+    "COORDINATOR": {
+        "BUSINESS": frozenset(), "CLIENT": frozenset(),
+        "OBJECT": frozenset({"READ", "UPDATE"}),
+        "DOCUMENT": frozenset({"READ", "CREATE", "UPDATE"}),
+        "OPERATIONAL": frozenset({"READ", "CREATE", "UPDATE"}),
+        "FINANCE": frozenset(), "ACCESS_CONTROL": frozenset(),
+    },
+    "DOCUMENT_SPECIALIST": {
+        "BUSINESS": frozenset(),
+        "CLIENT": frozenset({"READ"}),
+        "OBJECT": frozenset({"READ"}),
+        "DOCUMENT": frozenset({"READ", "CREATE", "UPDATE", "ARCHIVE"}),
+        "OPERATIONAL": frozenset({"READ"}),
+        "FINANCE": frozenset(), "ACCESS_CONTROL": frozenset(),
+    },
+    "VIEWER": {
+        "BUSINESS": frozenset({"READ"}), "CLIENT": frozenset({"READ"}), "OBJECT": frozenset({"READ"}),
+        "DOCUMENT": frozenset({"READ"}), "OPERATIONAL": frozenset({"READ"}), "FINANCE": frozenset({"READ"}),
+        "ACCESS_CONTROL": frozenset(),
+    },
+}
+
+_PRE_PHASE_SELECTED_BUSINESSES = frozenset({"BUSINESS", "CLIENT", "OBJECT", "DOCUMENT", "OPERATIONAL", "FINANCE"})
+_PRE_PHASE_ASSIGNED_OBJECTS_ONLY = frozenset({"OBJECT", "DOCUMENT", "OPERATIONAL"})
+_PRE_PHASE_OBJECT_ADDRESSABLE = frozenset({"OBJECT", "DOCUMENT", "OPERATIONAL"})
+
+
+class TestTaskResourceEnum(unittest.TestCase):
+    def test_previous_seven_resources_unchanged_and_in_order(self):
+        self.assertEqual(az.AUTHZ_RESOURCES[:7], _PRE_PHASE_RESOURCES)
+
+    def test_task_appended_exactly_once(self):
+        self.assertEqual(az.AUTHZ_RESOURCES.count("TASK"), 1)
+        self.assertEqual(az.AUTHZ_RESOURCES[-1], "TASK")
+
+    def test_final_resource_count_is_eight(self):
+        self.assertEqual(len(az.AUTHZ_RESOURCES), 8)
+
+    def test_actions_unchanged(self):
+        self.assertEqual(az.AUTHZ_ACTIONS, _PRE_PHASE_ACTIONS)
+
+    def test_final_action_count_is_six(self):
+        self.assertEqual(len(az.AUTHZ_ACTIONS), 6)
+
+
+class TestTaskMatrixExact(AuthorizationTestBase):
+    def test_owner_task_grant_matches_canonical_full_set(self):
+        self.assertEqual(az.ROLE_RESOURCE_ACTION_MATRIX["OWNER"]["TASK"], frozenset(az.AUTHZ_ACTIONS))
+
+    def test_admin_task_grant_exact(self):
+        self.assertEqual(
+            az.ROLE_RESOURCE_ACTION_MATRIX["ADMIN"]["TASK"],
+            frozenset({"READ", "CREATE", "UPDATE", "ARCHIVE", "ASSIGN"}),
+        )
+
+    def test_coordinator_task_grant_exact(self):
+        self.assertEqual(
+            az.ROLE_RESOURCE_ACTION_MATRIX["COORDINATOR"]["TASK"],
+            frozenset({"READ", "CREATE", "UPDATE", "ASSIGN"}),
+        )
+
+    def test_document_specialist_task_grant_exact(self):
+        self.assertEqual(az.ROLE_RESOURCE_ACTION_MATRIX["DOCUMENT_SPECIALIST"]["TASK"], frozenset({"READ"}))
+
+    def test_viewer_task_grant_exact(self):
+        self.assertEqual(az.ROLE_RESOURCE_ACTION_MATRIX["VIEWER"]["TASK"], frozenset({"READ"}))
+
+    def test_admin_task_denied_manage_access(self):
+        self._grant_and_check("ADMIN", "MANAGE_ACCESS", expected_allowed=False)
+
+    def test_coordinator_task_denied_archive(self):
+        self._grant_and_check("COORDINATOR", "ARCHIVE", expected_allowed=False)
+
+    def test_coordinator_task_denied_manage_access(self):
+        self._grant_and_check("COORDINATOR", "MANAGE_ACCESS", expected_allowed=False)
+
+    def test_document_specialist_task_denied_create(self):
+        self._grant_and_check("DOCUMENT_SPECIALIST", "CREATE", expected_allowed=False)
+
+    def test_document_specialist_task_denied_update(self):
+        self._grant_and_check("DOCUMENT_SPECIALIST", "UPDATE", expected_allowed=False)
+
+    def test_document_specialist_task_denied_archive(self):
+        self._grant_and_check("DOCUMENT_SPECIALIST", "ARCHIVE", expected_allowed=False)
+
+    def test_document_specialist_task_denied_assign(self):
+        self._grant_and_check("DOCUMENT_SPECIALIST", "ASSIGN", expected_allowed=False)
+
+    def test_viewer_task_denied_create(self):
+        self._grant_and_check("VIEWER", "CREATE", expected_allowed=False)
+
+    def test_viewer_task_denied_update(self):
+        self._grant_and_check("VIEWER", "UPDATE", expected_allowed=False)
+
+    def test_viewer_task_denied_assign(self):
+        self._grant_and_check("VIEWER", "ASSIGN", expected_allowed=False)
+
+    def test_coordinator_task_allowed_assign(self):
+        self._grant_and_check("COORDINATOR", "ASSIGN", expected_allowed=True)
+
+    def test_document_specialist_task_allowed_read(self):
+        self._grant_and_check("DOCUMENT_SPECIALIST", "READ", expected_allowed=True)
+
+    def _grant_and_check(self, role, action, expected_allowed):
+        self.identities = [_identity()]
+        self.employees = {"EMP-1": _employee()}
+        self.role_assignments = [_ara(role=role)]
+        self.scope_assignments = [_asa(scope_type="ALL_BUSINESSES")]
+        r = self._authorize(resource="TASK", action=action, business_id="B")
+        self.assertEqual(r["allowed"], expected_allowed)
+        if not expected_allowed:
+            self.assertEqual(r["code"], "ROLE_NOT_PERMITTED")
+
+
+class TestTaskStructuralTarget(AuthorizationTestBase):
+    def test_blank_business_id_denied(self):
+        self.identities = [_identity()]
+        self.employees = {"EMP-1": _employee()}
+        self.role_assignments = [_ara(role="OWNER")]
+        self.scope_assignments = [_asa(scope_type="ALL_BUSINESSES")]
+        r = self._authorize(resource="TASK", action="READ", business_id="")
+        self.assertFalse(r["allowed"])
+        self.assertEqual(r["code"], "TARGET_REQUIRED")
+
+    def test_valid_business_id_structurally_passes(self):
+        self.assertIsNone(az._validate_structural_target("TASK", "READ", "B", ""))
+
+    def test_object_id_not_required(self):
+        self.assertIsNone(az._validate_structural_target("TASK", "UPDATE", "B", ""))
+
+    def test_object_less_task_accepted_end_to_end(self):
+        self.identities = [_identity()]
+        self.employees = {"EMP-1": _employee()}
+        self.role_assignments = [_ara(role="OWNER")]
+        self.scope_assignments = [_asa(scope_type="ALL_BUSINESSES")]
+        r = self._authorize(resource="TASK", action="UPDATE", business_id="B", object_id="")
+        self.assertTrue(r["allowed"])
+
+    def test_optional_object_id_present_does_not_break_structural_pass(self):
+        self.assertIsNone(az._validate_structural_target("TASK", "UPDATE", "B", "O"))
+
+    def test_task_absent_from_object_addressable_resources(self):
+        self.assertNotIn("TASK", az._OBJECT_ADDRESSABLE_RESOURCES)
+
+    def test_operational_still_requires_object_id(self):
+        self.assertEqual(az._validate_structural_target("OPERATIONAL", "READ", "B", ""), "TARGET_REQUIRED")
+
+    def test_document_still_requires_object_id(self):
+        self.assertEqual(az._validate_structural_target("DOCUMENT", "READ", "B", ""), "TARGET_REQUIRED")
+
+    def test_object_still_requires_object_id(self):
+        self.assertEqual(az._validate_structural_target("OBJECT", "READ", "B", ""), "TARGET_REQUIRED")
+
+
+class TestTaskScopeCompatibility(AuthorizationTestBase):
+    def test_all_businesses_includes_task_automatically(self):
+        self.assertIn("TASK", az._SCOPE_RESOURCE_COMPATIBILITY["ALL_BUSINESSES"])
+
+    def test_all_businesses_task_end_to_end(self):
+        self.identities = [_identity()]
+        self.employees = {"EMP-1": _employee()}
+        self.role_assignments = [_ara(role="VIEWER")]
+        self.scope_assignments = [_asa(scope_type="ALL_BUSINESSES")]
+        r = self._authorize(resource="TASK", action="READ", business_id="ANY")
+        self.assertTrue(r["allowed"])
+
+    def test_selected_businesses_includes_task_explicitly(self):
+        self.assertIn("TASK", az._SCOPE_RESOURCE_COMPATIBILITY["SELECTED_BUSINESSES"])
+
+    def test_selected_businesses_task_matching(self):
+        self.identities = [_identity()]
+        self.employees = {"EMP-1": _employee()}
+        self.role_assignments = [_ara(role="VIEWER")]
+        self.scope_assignments = [_asa(scope_type="SELECTED_BUSINESSES", business_id="B1")]
+        r = self._authorize(resource="TASK", action="READ", business_id="B1")
+        self.assertTrue(r["allowed"])
+
+    def test_selected_businesses_task_non_matching(self):
+        self.identities = [_identity()]
+        self.employees = {"EMP-1": _employee()}
+        self.role_assignments = [_ara(role="VIEWER")]
+        self.scope_assignments = [_asa(scope_type="SELECTED_BUSINESSES", business_id="B1")]
+        r = self._authorize(resource="TASK", action="READ", business_id="B2")
+        self.assertFalse(r["allowed"])
+        self.assertEqual(r["code"], "SCOPE_NOT_MATCHED")
+
+    def test_assigned_objects_only_excludes_task(self):
+        self.assertNotIn("TASK", az._SCOPE_RESOURCE_COMPATIBILITY["ASSIGNED_OBJECTS_ONLY"])
+
+    def test_assigned_objects_only_denies_task_even_with_object_id_supplied(self):
+        self.identities = [_identity()]
+        self.employees = {"EMP-1": _employee()}
+        self.role_assignments = [_ara(role="OWNER")]
+        self.scope_assignments = [_asa(scope_type="ASSIGNED_OBJECTS_ONLY", object_id="OBJ-7")]
+        r = self._authorize(resource="TASK", action="READ", business_id="B")
+        self.assertFalse(r["allowed"])
+        self.assertEqual(r["code"], "SCOPE_NOT_MATCHED")
+
+    def test_assigned_objects_only_object_document_operational_unchanged(self):
+        for resource in ("OBJECT", "DOCUMENT", "OPERATIONAL"):
+            with self.subTest(resource=resource):
+                self.identities = [_identity()]
+                self.employees = {"EMP-1": _employee()}
+                self.role_assignments = [_ara(role="OWNER")]
+                self.scope_assignments = [_asa(scope_type="ASSIGNED_OBJECTS_ONLY", object_id="OBJ-7")]
+                r = self._authorize(resource=resource, action="READ", business_id="B", object_id="OBJ-7")
+                self.assertTrue(r["allowed"])
+
+
+class TestTaskExistingResourceInvariants(unittest.TestCase):
+    def test_every_existing_resource_role_grant_byte_equal_to_pre_phase(self):
+        for role, resource_map in _PRE_PHASE_MATRIX.items():
+            for resource, expected_actions in resource_map.items():
+                with self.subTest(role=role, resource=resource):
+                    self.assertEqual(az.ROLE_RESOURCE_ACTION_MATRIX[role][resource], expected_actions)
+
+    def test_only_task_is_new_across_all_five_roles(self):
+        for role in _PRE_PHASE_MATRIX:
+            with self.subTest(role=role):
+                new_keys = set(az.ROLE_RESOURCE_ACTION_MATRIX[role].keys()) - set(_PRE_PHASE_MATRIX[role].keys())
+                self.assertEqual(new_keys, {"TASK"})
+
+    def test_object_addressable_resources_unchanged(self):
+        self.assertEqual(az._OBJECT_ADDRESSABLE_RESOURCES, _PRE_PHASE_OBJECT_ADDRESSABLE)
+
+    def test_structural_target_existing_branches_unchanged(self):
+        # OBJECT/DOCUMENT/OPERATIONAL, CLIENT/FINANCE, ACCESS_CONTROL,
+        # BUSINESS all behave exactly as before — only TASK was added
+        # to the CLIENT/FINANCE-shaped branch.
+        self.assertEqual(az._validate_structural_target("OBJECT", "READ", "B", ""), "TARGET_REQUIRED")
+        self.assertIsNone(az._validate_structural_target("OBJECT", "READ", "B", "O"))
+        self.assertEqual(az._validate_structural_target("CLIENT", "READ", "", ""), "TARGET_REQUIRED")
+        self.assertIsNone(az._validate_structural_target("CLIENT", "READ", "B", ""))
+        self.assertEqual(az._validate_structural_target("FINANCE", "READ", "", ""), "TARGET_REQUIRED")
+        self.assertIsNone(az._validate_structural_target("FINANCE", "READ", "B", ""))
+        self.assertEqual(az._validate_structural_target("ACCESS_CONTROL", "READ", "B", ""), "TARGET_REQUIRED")
+        self.assertIsNone(az._validate_structural_target("ACCESS_CONTROL", "READ", "", ""))
+        self.assertEqual(az._validate_structural_target("BUSINESS", "UPDATE", "", ""), "TARGET_REQUIRED")
+        self.assertIsNone(az._validate_structural_target("BUSINESS", "READ", "", ""))
+
+    def test_selected_businesses_gained_only_task(self):
+        self.assertEqual(
+            az._SCOPE_RESOURCE_COMPATIBILITY["SELECTED_BUSINESSES"] - _PRE_PHASE_SELECTED_BUSINESSES,
+            {"TASK"},
+        )
+
+    def test_assigned_objects_only_gained_nothing(self):
+        self.assertEqual(az._SCOPE_RESOURCE_COMPATIBILITY["ASSIGNED_OBJECTS_ONLY"], _PRE_PHASE_ASSIGNED_OBJECTS_ONLY)
+
+    def test_no_existing_decision_code_changed(self):
+        # AUTHZ_DECISION_CODES itself is untouched by this phase.
+        self.assertEqual(len(az.AUTHZ_DECISION_CODES), 19)
+        self.assertIn("TARGET_REQUIRED", az.AUTHZ_DECISION_CODES)
+        self.assertIn("SCOPE_NOT_MATCHED", az.AUTHZ_DECISION_CODES)
+
+
+class TestTaskCrossLayerIsolation(unittest.TestCase):
+    def test_telegram_handlers_zero_diff(self):
+        import subprocess
+        result = subprocess.run(
+            ["git", "diff", "--name-only", "HEAD", "--", "business_core/telegram_handlers.py"],
+            capture_output=True, text=True, cwd=".",
+        )
+        self.assertEqual(result.stdout.strip(), "")
+
+    def test_no_resource_task_call_in_handlers_yet(self):
+        with open("business_core/telegram_handlers.py", encoding="utf-8") as f:
+            content = f.read()
+        self.assertNotIn('resource="TASK"', content)
+
+    def test_command_enforcement_map_still_size_fourteen(self):
+        from business_core import telegram_handlers as th
+        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 14)
+
+    def test_command_enforcement_map_no_task_keys(self):
+        from business_core import telegram_handlers as th
+        for key in th.COMMAND_ENFORCEMENT_MAP:
+            self.assertNotIn("task", key.lower())
+
+    def test_telegram_authorization_zero_diff(self):
+        import subprocess
+        result = subprocess.run(
+            ["git", "diff", "--name-only", "HEAD", "--", "business_core/telegram_authorization.py"],
+            capture_output=True, text=True, cwd=".",
+        )
+        self.assertEqual(result.stdout.strip(), "")
+
+    def test_identity_manager_zero_diff(self):
+        import subprocess
+        result = subprocess.run(
+            ["git", "diff", "--name-only", "HEAD", "--", "business_core/identity_manager.py"],
+            capture_output=True, text=True, cwd=".",
+        )
+        self.assertEqual(result.stdout.strip(), "")
+
+    def test_business_builder_zero_diff(self):
+        import subprocess
+        result = subprocess.run(
+            ["git", "diff", "--name-only", "HEAD", "--", "business_core/business_builder.py"],
+            capture_output=True, text=True, cwd=".",
+        )
+        self.assertEqual(result.stdout.strip(), "")
+
+    def test_task_manager_zero_diff(self):
+        import subprocess
+        result = subprocess.run(
+            ["git", "diff", "--name-only", "HEAD", "--", "business_core/task_manager.py"],
+            capture_output=True, text=True, cwd=".",
+        )
+        self.assertEqual(result.stdout.strip(), "")
+
+    def test_sheets_zero_diff(self):
+        import subprocess
+        result = subprocess.run(
+            ["git", "diff", "--name-only", "HEAD", "--", "business_core/sheets.py"],
+            capture_output=True, text=True, cwd=".",
+        )
+        self.assertEqual(result.stdout.strip(), "")
+
+
+# ─────────────────────────────────────────────────────────────
+# Phase 18A.3-G: dedicated Authorization Domain source-identity
+# guard, replacing the removed blanket
+# test_authorization_py_unchanged.
+#
+# Protection model (two complementary layers — neither replaces the
+# other):
+#
+#   PART A — exact-value/behavior tests (TestTaskResourceEnum,
+#   TestTaskMatrixExact, TestTaskStructuralTarget,
+#   TestTaskScopeCompatibility, TestMatrix.test_every_matrix_cell,
+#   TestScopeCompatibility) already freeze the exact, current,
+#   correct values of AUTHZ_RESOURCES, AUTHZ_ACTIONS,
+#   ROLE_RESOURCE_ACTION_MATRIX, _SCOPE_RESOURCE_COMPATIBILITY,
+#   _validate_structural_target, and _OBJECT_ADDRESSABLE_RESOURCES.
+#   These are permanent, commit-independent guards — they will
+#   fail the instant any of those values silently drifts from what
+#   this phase established as correct, in any future commit,
+#   forever. They do not depend on comparing against git HEAD.
+#
+#   PART B (below) — a source-identity guard comparing the current
+#   working tree against git HEAD, for every OTHER top-level
+#   construct in authorization.py. AUTHZ_RESOURCES,
+#   ROLE_RESOURCE_ACTION_MATRIX, _SCOPE_RESOURCE_COMPATIBILITY, and
+#   _validate_structural_target are excluded from this specific
+#   comparison — not because they are unprotected, but because Part
+#   A already protects their correct value directly and more
+#   precisely than a source-diff could (a source-diff only proves
+#   "nothing changed since the last commit"; an exact-value test
+#   proves "the value is exactly what it must be", which remains
+#   true across every future commit, not just the next one). Once
+#   this phase is committed, git HEAD itself will include these four
+#   constructs' new values, and this Part B comparison will then
+#   naturally protect them too, for every commit after that — the
+#   exclusion here is specific to this phase's own in-progress diff,
+#   not a permanent carve-out.
+#
+#   AUTHZ_ACTIONS and _OBJECT_ADDRESSABLE_RESOURCES are NOT excluded
+#   from Part B — they are not approved to differ in this phase, so
+#   they remain both exact-value-tested (Part A) and source-identity
+#   guarded (Part B) simultaneously, exactly like every other
+#   untouched construct.
+# ─────────────────────────────────────────────────────────────
+
+import ast as _ast
+
+
+def _authorization_construct_sources(src: str) -> dict:
+    """
+    Maps every top-level function/async-function/assignment/
+    annotated-assignment name in `src` to its exact source text,
+    sliced by each node's own lineno/end_lineno — the same
+    line-slicing technique already used by
+    test_command_enforcement.py's _top_level_function_sources,
+    extended here to also cover module-level constants (functions
+    alone are insufficient for authorization.py, whose
+    security-relevant surface is mostly data: the resource/action
+    enums and the role/resource/action matrix).
+    """
+    tree = _ast.parse(src)
+    lines = src.splitlines(keepends=True)
+    out = {}
+    for node in tree.body:
+        if isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
+            out[node.name] = "".join(lines[node.lineno - 1:node.end_lineno])
+        elif isinstance(node, _ast.Assign):
+            for target in node.targets:
+                if isinstance(target, _ast.Name):
+                    out[target.id] = "".join(lines[node.lineno - 1:node.end_lineno])
+        elif isinstance(node, _ast.AnnAssign):
+            if isinstance(node.target, _ast.Name):
+                out[node.target.id] = "".join(lines[node.lineno - 1:node.end_lineno])
+    return out
+
+
+# The exact four constructs Phase 18A.3 is approved to change —
+# permanently protected instead by the exact-value/behavior tests
+# named in the module docstring above (Part A), not by this
+# comparison.
+_TASK_PHASE_APPROVED_TO_DIFFER = frozenset({
+    "AUTHZ_RESOURCES", "ROLE_RESOURCE_ACTION_MATRIX",
+    "_SCOPE_RESOURCE_COMPATIBILITY", "_validate_structural_target",
+})
+
+# The one genuinely new private constant Phase 18A.3 introduces (a
+# helper solely for constructing ROLE_RESOURCE_ACTION_MATRIX's new
+# TASK/COORDINATOR grant) — the only name permitted to exist in the
+# current working tree with no counterpart in HEAD.
+_TASK_PHASE_NEWLY_ADDED_CONSTRUCTS = frozenset({"_COORDINATOR_TASK_ACTIONS"})
+
+
+def _git_show_head_authorization_py() -> str:
+    import subprocess
+    result = subprocess.run(
+        ["git", "show", "HEAD:business_core/authorization.py"],
+        capture_output=True, text=True, cwd=".",
+    )
+    if result.returncode != 0:
+        raise AssertionError(f"git show HEAD:business_core/authorization.py failed: {result.stderr}")
+    return result.stdout
+
+
+class TestAuthorizationSourceIdentityGuard(unittest.TestCase):
+    """Part B: proves every authorization.py construct outside the
+    four Phase-18A.3-approved names is byte-identical to HEAD, and
+    that no construct was silently removed, renamed, or joined by an
+    unapproved new addition."""
+
+    def test_no_construct_removed_or_unapproved_addition(self):
+        head_constructs = _authorization_construct_sources(_git_show_head_authorization_py())
+        with open("business_core/authorization.py", encoding="utf-8") as f:
+            current_constructs = _authorization_construct_sources(f.read())
+
+        removed = set(head_constructs) - set(current_constructs)
+        self.assertEqual(removed, set(), f"authorization.py: construct(s) removed or renamed: {sorted(removed)}")
+
+        added = set(current_constructs) - set(head_constructs)
+        unapproved_added = added - _TASK_PHASE_NEWLY_ADDED_CONSTRUCTS
+        self.assertEqual(
+            unapproved_added, set(),
+            f"authorization.py: unapproved new top-level construct(s): {sorted(unapproved_added)}",
+        )
+
+    def test_every_untouched_construct_source_identical_to_head(self):
+        head_constructs = _authorization_construct_sources(_git_show_head_authorization_py())
+        with open("business_core/authorization.py", encoding="utf-8") as f:
+            current_constructs = _authorization_construct_sources(f.read())
+
+        for name in head_constructs:
+            if name in _TASK_PHASE_APPROVED_TO_DIFFER:
+                continue
+            with self.subTest(construct=name):
+                self.assertEqual(
+                    head_constructs[name], current_constructs.get(name),
+                    f"authorization.py: unapproved construct '{name}' changed — only "
+                    f"{sorted(_TASK_PHASE_APPROVED_TO_DIFFER)} may differ this phase",
+                )
+
+    def test_specifically_protects_named_constants(self):
+        # Explicit, named coverage for the constants the phase brief
+        # called out by name — redundant with the exhaustive AST scan
+        # above, but makes the specific security-relevant names
+        # traceable in a test failure without reading the AST helper.
+        head_constructs = _authorization_construct_sources(_git_show_head_authorization_py())
+        with open("business_core/authorization.py", encoding="utf-8") as f:
+            current_constructs = _authorization_construct_sources(f.read())
+        for name in ("AUTHZ_ACTIONS", "AUTHZ_DECISION_CODES", "_DENIAL_PRECEDENCE", "_TARGETLESS_BUSINESS_READ_ROLES",
+                     "_OBJECT_ADDRESSABLE_RESOURCES"):
+            with self.subTest(construct=name):
+                self.assertIn(name, head_constructs)
+                self.assertEqual(head_constructs[name], current_constructs.get(name))
+
+    def test_specifically_protects_named_functions(self):
+        head_constructs = _authorization_construct_sources(_git_show_head_authorization_py())
+        with open("business_core/authorization.py", encoding="utf-8") as f:
+            current_constructs = _authorization_construct_sources(f.read())
+        for name in ("_scope_matches_target", "_targetless_business_read", "_in_force_status",
+                     "_parse_canonical_timestamp", "authorize_business_core_access",
+                     "get_business_core_access_summary", "_base_result", "_deny", "_read_failed",
+                     "_pick_precedence", "_now_utc", "_read_failed_summary"):
+            with self.subTest(construct=name):
+                self.assertIn(name, head_constructs)
+                self.assertEqual(head_constructs[name], current_constructs.get(name))
+
+    def test_ast_discovery_finds_all_baseline_constructs_named_above(self):
+        # Proves the two explicit "named" tests above are not a
+        # manually-incomplete subset — every top-level construct AST
+        # discovery finds in HEAD is either one of the four approved-
+        # to-differ names or is covered by one of the two explicit
+        # named-protection tests (or is itself one of the small
+        # internal helper constants used only to build the matrix,
+        # e.g. _ALL_ACTIONS/_WRITE_LIGHT/_READ_ONLY/_NONE/
+        # _DOCUMENT_SPECIALIST_DOC_ACTIONS/_TIMESTAMP_FORMAT, which
+        # the exhaustive source-identity test above still protects
+        # even though no single named test calls them out).
+        head_constructs = _authorization_construct_sources(_git_show_head_authorization_py())
+        explicitly_named = {
+            "AUTHZ_ACTIONS", "AUTHZ_DECISION_CODES", "_DENIAL_PRECEDENCE", "_TARGETLESS_BUSINESS_READ_ROLES",
+            "_OBJECT_ADDRESSABLE_RESOURCES",
+            "_scope_matches_target", "_targetless_business_read", "_in_force_status",
+            "_parse_canonical_timestamp", "authorize_business_core_access",
+            "get_business_core_access_summary", "_base_result", "_deny", "_read_failed",
+            "_pick_precedence", "_now_utc", "_read_failed_summary",
+        }
+        unnamed_but_still_source_guarded = set(head_constructs) - explicitly_named - _TASK_PHASE_APPROVED_TO_DIFFER
+        # These remain protected only by test_every_untouched_construct_source_identical_to_head,
+        # not by a dedicated named test — listed here so the coverage
+        # gap (if any new one appears) is visible in a diff.
+        self.assertEqual(
+            unnamed_but_still_source_guarded,
+            {"_TIMESTAMP_FORMAT", "_ALL_ACTIONS", "_WRITE_LIGHT", "_READ_ONLY", "_DOCUMENT_SPECIALIST_DOC_ACTIONS", "_NONE"},
+        )
+
+
+class TestAuthorizationSourceIdentityHelperUnit(unittest.TestCase):
+    """Negative verification (§5, Option A): unit-tests the AST
+    comparison helper directly against synthetic in-memory source
+    strings — proves the guard actually detects the failure modes it
+    claims to, without ever writing to authorization.py on disk."""
+
+    _BASELINE_SRC = (
+        "AUTHZ_RESOURCES = (\"BUSINESS\", \"TASK\")\n"
+        "AUTHZ_ACTIONS = (\"READ\", \"UPDATE\")\n"
+        "\n"
+        "def authorize_business_core_access(x):\n"
+        "    return x\n"
+        "\n"
+        "def _scope_matches_target(x):\n"
+        "    return x\n"
+    )
+
+    def test_change_to_protected_function_is_detected(self):
+        mutated = self._BASELINE_SRC.replace(
+            "def authorize_business_core_access(x):\n    return x\n",
+            "def authorize_business_core_access(x):\n    return x + 1\n",
+        )
+        baseline = _authorization_construct_sources(self._BASELINE_SRC)
+        current = _authorization_construct_sources(mutated)
+        self.assertNotEqual(baseline["authorize_business_core_access"], current["authorize_business_core_access"])
+
+    def test_removal_of_protected_function_is_detected(self):
+        mutated = self._BASELINE_SRC.replace("def _scope_matches_target(x):\n    return x\n", "")
+        baseline = _authorization_construct_sources(self._BASELINE_SRC)
+        current = _authorization_construct_sources(mutated)
+        removed = set(baseline) - set(current)
+        self.assertEqual(removed, {"_scope_matches_target"})
+
+    def test_unexpected_new_top_level_function_is_detected(self):
+        mutated = self._BASELINE_SRC + "\ndef _sneaky_new_function(x):\n    return x\n"
+        baseline = _authorization_construct_sources(self._BASELINE_SRC)
+        current = _authorization_construct_sources(mutated)
+        added = set(current) - set(baseline)
+        self.assertEqual(added, {"_sneaky_new_function"})
+        self.assertNotIn("_sneaky_new_function", _TASK_PHASE_NEWLY_ADDED_CONSTRUCTS)
+
+    def test_approved_construct_difference_is_ignored_by_source_identity_helper(self):
+        mutated = self._BASELINE_SRC.replace(
+            "AUTHZ_RESOURCES = (\"BUSINESS\", \"TASK\")\n",
+            "AUTHZ_RESOURCES = (\"BUSINESS\", \"TASK\", \"EXTRA\")\n",
+        )
+        baseline = _authorization_construct_sources(self._BASELINE_SRC)
+        current = _authorization_construct_sources(mutated)
+        # A source-identity comparison WOULD flag this difference —
+        # exactly why the real guard explicitly skips
+        # "AUTHZ_RESOURCES" via _TASK_PHASE_APPROVED_TO_DIFFER, and
+        # relies on TestTaskResourceEnum's exact-value test instead.
+        self.assertNotEqual(baseline["AUTHZ_RESOURCES"], current["AUTHZ_RESOURCES"])
+        self.assertIn("AUTHZ_RESOURCES", _TASK_PHASE_APPROVED_TO_DIFFER)
+
+    def test_exact_value_test_would_catch_invalid_task_grant(self):
+        # Synthetic proof that an exact-value assertion (the Part A
+        # mechanism that permanently protects the four approved
+        # constructs after this phase, per the module comment above)
+        # correctly distinguishes a valid grant from an invalid one —
+        # exercised here without touching the real matrix.
+        synthetic_matrix = {"COORDINATOR": {"TASK": frozenset({"READ", "CREATE", "UPDATE", "ASSIGN"})}}
+        expected = frozenset({"READ", "CREATE", "UPDATE", "ASSIGN"})
+        self.assertEqual(synthetic_matrix["COORDINATOR"]["TASK"], expected)
+        invalid_synthetic_matrix = {"COORDINATOR": {"TASK": frozenset({"READ", "CREATE", "UPDATE", "ARCHIVE"})}}
+        self.assertNotEqual(invalid_synthetic_matrix["COORDINATOR"]["TASK"], expected)
+
+
 if __name__ == "__main__":
     unittest.main()
