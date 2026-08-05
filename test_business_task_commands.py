@@ -15,6 +15,7 @@ import asyncio
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, AsyncMock, patch
 
 WORKSPACE = Path(__file__).parent
@@ -40,7 +41,8 @@ def _make_update(text: str, args_list: list[str]):
     update.message.text = text
     update.message.reply_text = AsyncMock()
     update.update_id = 12345
-    update.effective_user.id = 999
+    update.effective_user = SimpleNamespace(id=999)
+    update.effective_chat = SimpleNamespace(type="private")
     context = MagicMock()
     context.args = args_list
     return update, context
@@ -956,60 +958,420 @@ class TestReassignTaskCommand(unittest.TestCase):
         self.assertIn("⚠️", reply)
 
 
-class TestUnassignTaskCommand(unittest.TestCase):
+_UNASSIGNTASK_FINDER_PATH = "business_core.task_manager.find_task_by_id"
+_UNASSIGNTASK_MUTATOR_PATH = "business_core.business_builder.unassign_task"
+_UNASSIGNTASK_AUTHZ_PATH = "business_core.telegram_authorization.authorize_telegram_business_core_request"
+
+_UNASSIGNTASK_ROW = {
+    "task_id": "TSK-001", "business_id": "BIZ-001",
+    "responsible_role_id": "ROLE-001", "assignee_person_id": "PRS-001",
+    "status": "in_progress", "object_id": "OBJ-001",
+}
+
+
+def _unassigntask_allow_result():
+    return {"ok": True, "allowed": True, "code": "TELEGRAM_ACCESS_ALLOWED",
+            "authorization_result": {"ok": True, "allowed": True, "code": "ACCESS_ALLOWED"}}
+
+
+def _unassigntask_deny_result():
+    return {"ok": True, "allowed": False, "code": "AUTHORIZATION_DENIED",
+            "authorization_result": {"ok": True, "allowed": False, "code": "SCOPE_NOT_MATCHED"}}
+
+
+def _unassigntask_infra_failure_result():
+    return {"ok": False, "allowed": False, "code": "AUTHORIZATION_UNAVAILABLE",
+            "authorization_result": None}
+
+
+def _unassigntask_clean_success():
+    return {"ok": True, "code": "TASK_UNASSIGNED", "error": None,
+            "changed": True, "assignment_changed": True, "partial_state": False}
+
+
+def _unassigntask_noop():
+    return {"ok": True, "code": "TASK_UNASSIGNED", "error": None,
+            "changed": False, "assignment_changed": False, "partial_state": False}
+
+
+def _unassigntask_partial_failure():
+    return {"ok": False, "code": "TASK_UNASSIGNMENT_PARTIAL_FAILURE",
+            "error": "TASK_ASSIGNMENT_CACHE_CLEAR_FAILED",
+            "changed": True, "assignment_changed": True, "cache_changed": False,
+            "partial_state": True, "manual_review_required": True, "retry_safe": False}
+
+
+_UNSET = object()
+
+
+class UnassignTaskCommandTestBase(unittest.TestCase):
+    def _run_handler(self, update, args=None, *, finder_side_effect=None, finder_return=_UNASSIGNTASK_ROW,
+                      finder_second_return=_UNSET, authz_result=None, mutator_return=None, mutator_side_effect=None,
+                      task_id="TSK-001", th=None):
+        th = th or _fresh_th()
+        call_log = []
+
+        if finder_side_effect is not None:
+            def _finder(tid):
+                call_log.append(("finder", tid))
+                return finder_side_effect(tid) if callable(finder_side_effect) else (_ for _ in ()).throw(finder_side_effect)
+            mock_finder = MagicMock(side_effect=_finder)
+        else:
+            second = finder_return if finder_second_return is _UNSET else finder_second_return
+            returns = [finder_return, second]
+
+            def _finder(tid):
+                call_log.append(("finder", tid))
+                return returns.pop(0) if returns else second
+            mock_finder = MagicMock(side_effect=_finder)
+
+        async def _authz(update, **kwargs):
+            call_log.append(("authorize", kwargs.get("resource"), kwargs.get("action"), kwargs.get("business_id")))
+            return authz_result if authz_result is not None else _unassigntask_allow_result()
+        mock_authz = AsyncMock(side_effect=_authz)
+
+        if mutator_side_effect is not None:
+            def _mutator(tid):
+                call_log.append(("mutate", tid))
+                raise mutator_side_effect
+            mock_mutator = MagicMock(side_effect=_mutator)
+        else:
+            def _mutator(tid):
+                call_log.append(("mutate", tid))
+                return mutator_return if mutator_return is not None else _unassigntask_clean_success()
+            mock_mutator = MagicMock(side_effect=_mutator)
+
+        ctx_args = args if args is not None else [f"task_id={task_id}"]
+        ctx = MagicMock()
+        ctx.args = ctx_args
+
+        async def run():
+            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
+                 patch(_UNASSIGNTASK_FINDER_PATH, new=mock_finder), \
+                 patch(_UNASSIGNTASK_AUTHZ_PATH, new=mock_authz), \
+                 patch(_UNASSIGNTASK_MUTATOR_PATH, new=mock_mutator):
+                await th.unassigntask_cmd(update, ctx)
+
+        _run(run())
+        return mock_finder, mock_authz, mock_mutator, call_log
+
+    def _sent_text(self, update) -> str:
+        call = update.message.reply_text.call_args
+        return call.args[0] if call.args else call.kwargs.get("text", "")
+
+
+class TestUnassignTaskCommand(UnassignTaskCommandTestBase):
 
     def test_registered(self):
         th = _fresh_th()
         self.assertTrue(hasattr(th, "unassigntask_cmd"))
 
-    def test_unassigned(self):
+    # ── Section 17: argument/parser tests ──────────────────────
+
+    def test_named_task_id_accepted(self):
+        upd, _ = _make_update("/unassigntask task_id=TSK-001", ["task_id=TSK-001"])
+        finder, authz, mutator, _ = self._run_handler(upd)
+        mutator.assert_called_once_with("TSK-001")
+
+    def test_positional_task_id_accepted(self):
+        upd, _ = _make_update("/unassigntask TSK-001", ["TSK-001"])
+        finder, authz, mutator, _ = self._run_handler(upd, args=["TSK-001"])
+        mutator.assert_called_once_with("TSK-001")
+
+    def test_blank_task_id_rejected(self):
+        upd, _ = _make_update("/unassigntask", [])
+        finder, authz, mutator, _ = self._run_handler(upd, args=[])
+        finder.assert_not_called()
+        authz.assert_not_called()
+        mutator.assert_not_called()
+        self.assertIn("❌", self._sent_text(upd))
+
+    def test_unknown_named_key_rejected(self):
+        upd, _ = _make_update("/unassigntask task_id=TSK-001 foo=bar", ["task_id=TSK-001", "foo=bar"])
+        finder, authz, mutator, _ = self._run_handler(upd, args=["task_id=TSK-001", "foo=bar"])
+        finder.assert_not_called()
+        authz.assert_not_called()
+        mutator.assert_not_called()
+        self.assertIn("❌", self._sent_text(upd))
+
+    def test_caller_supplied_business_id_rejected(self):
+        upd, _ = _make_update("/unassigntask task_id=TSK-001 business_id=BIZ-999", ["task_id=TSK-001", "business_id=BIZ-999"])
+        finder, authz, mutator, _ = self._run_handler(upd, args=["task_id=TSK-001", "business_id=BIZ-999"])
+        finder.assert_not_called()
+        authz.assert_not_called()
+        mutator.assert_not_called()
+
+    def test_caller_supplied_object_id_rejected(self):
+        upd, _ = _make_update("/unassigntask task_id=TSK-001 object_id=OBJ-999", ["task_id=TSK-001", "object_id=OBJ-999"])
+        finder, authz, mutator, _ = self._run_handler(upd, args=["task_id=TSK-001", "object_id=OBJ-999"])
+        mutator.assert_not_called()
+
+    def test_caller_supplied_role_person_assignment_fields_rejected(self):
+        for extra in ("role_id=ROLE-999", "person_id=PRS-999", "assignment_id=TAS-999"):
+            with self.subTest(extra=extra):
+                upd, _ = _make_update(f"/unassigntask task_id=TSK-001 {extra}", ["task_id=TSK-001", extra])
+                finder, authz, mutator, _ = self._run_handler(upd, args=["task_id=TSK-001", extra])
+                mutator.assert_not_called()
+
+    def test_named_task_id_wins_over_positional(self):
+        upd, _ = _make_update("/unassigntask TSK-XXX task_id=TSK-001", ["TSK-XXX", "task_id=TSK-001"])
+        finder, authz, mutator, _ = self._run_handler(upd, args=["TSK-XXX", "task_id=TSK-001"])
+        # A bare positional token becomes _pos0 — itself an allowed
+        # key — so both task_id and _pos0 may be present together;
+        # named task_id wins per established `.get("task_id") or
+        # .get("_pos0", "")` parser convention, matching every other
+        # Task command's existing precedent.
+        for call in finder.call_args_list:
+            self.assertEqual(call.args, ("TSK-001",))
+        mutator.assert_called_once_with("TSK-001")
+
+    # ── Section 7-8: first lookup / authorization ──────────────
+
+    def test_task_not_found_no_authorization_no_mutation(self):
+        upd, _ = _make_update("/unassigntask task_id=TSK-999", ["task_id=TSK-999"])
+        finder, authz, mutator, _ = self._run_handler(upd, finder_return=None, task_id="TSK-999")
+        finder.assert_called_once_with("TSK-999")
+        authz.assert_not_called()
+        mutator.assert_not_called()
+
+    def test_first_lookup_exception_no_authorization_no_mutation(self):
+        upd, _ = _make_update("/unassigntask task_id=TSK-001", ["task_id=TSK-001"])
+        finder, authz, mutator, _ = self._run_handler(upd, finder_side_effect=RuntimeError("boom"))
+        authz.assert_not_called()
+        mutator.assert_not_called()
+
+    # ── Malformed first-lookup shape (fail-closed) ─────────────
+
+    class _PoisonedFirst:
+        def __str__(self):
+            return "STR-SECRET-MARKER"
+
+        def __repr__(self):
+            return "REPR-SECRET-MARKER"
+
+    class _PoisonedFirstGetRaises:
+        """Not a dict — has a .get() method that raises if ever
+        called. isinstance(x, dict) is False for this object, so the
+        handler must reject it before .get() is ever invoked."""
+        def get(self, *a, **kw):
+            raise RuntimeError("GET-RAISE-SECRET-MARKER")
+
+    def test_malformed_first_lookup_shapes_fail_closed(self):
+        markers = ("STR-SECRET-MARKER", "REPR-SECRET-MARKER")
+        malformed = [None, {}, [], "bad", object(), 0, 1, self._PoisonedFirst()]
+        for value in malformed:
+            with self.subTest(first=repr(value)):
+                upd, _ = _make_update("/unassigntask task_id=TSK-001", ["task_id=TSK-001"])
+                with patch("business_core.telegram_handlers.log") as mock_log:
+                    finder, authz, mutator, _ = self._run_handler(upd, finder_return=value)
+                authz.assert_not_called()
+                mutator.assert_not_called()
+                self.assertEqual(finder.call_count, 1)
+                self.assertEqual(upd.message.reply_text.call_count, 1)
+                reply = self._sent_text(upd)
+                self.assertEqual(reply, "Запись недоступна или не найдена.")
+                for marker in markers:
+                    self.assertNotIn(marker, reply)
+                for call in mock_log.mock_calls:
+                    call_text = str(call)
+                    for marker in markers:
+                        self.assertNotIn(marker, call_text)
+
+    def test_malformed_first_lookup_get_raises_is_never_called(self):
+        # A non-dict object whose .get() would raise if ever called —
+        # proves the isinstance(dict) guard rejects it before .get()
+        # is invoked at all, so the poisoned .get() never executes.
+        upd, _ = _make_update("/unassigntask task_id=TSK-001", ["task_id=TSK-001"])
+        poisoned = self._PoisonedFirstGetRaises()
+        finder, authz, mutator, _ = self._run_handler(upd, finder_return=poisoned)
+        authz.assert_not_called()
+        mutator.assert_not_called()
+        self.assertEqual(self._sent_text(upd), "Запись недоступна или не найдена.")
+
+    # ── Malformed second-lookup shape (fail-closed) ────────────
+
+    def test_malformed_second_lookup_shapes_fail_closed(self):
+        markers = ("STR-SECRET-MARKER", "REPR-SECRET-MARKER")
+        malformed = [None, {}, [], "bad", object(), 0, 1, self._PoisonedFirst()]
+        for value in malformed:
+            with self.subTest(second=repr(value)):
+                upd, _ = _make_update("/unassigntask task_id=TSK-001", ["task_id=TSK-001"])
+                with patch("business_core.telegram_handlers.log") as mock_log:
+                    finder, authz, mutator, _ = self._run_handler(upd, finder_second_return=value)
+                authz.assert_called_once()
+                self.assertEqual(finder.call_count, 2)
+                mutator.assert_not_called()
+                self.assertEqual(upd.message.reply_text.call_count, 1)
+                reply = self._sent_text(upd)
+                self.assertEqual(reply, "Запись изменилась. Повтори команду ещё раз.")
+                for marker in markers:
+                    self.assertNotIn(marker, reply)
+                for call in mock_log.mock_calls:
+                    call_text = str(call)
+                    for marker in markers:
+                        self.assertNotIn(marker, call_text)
+
+    def test_empty_dict_first_lookup_blocked_via_blank_business_id(self):
+        """Documents the exact source path: {} passes isinstance(dict)
+        but its Business ID normalizes to blank, so it is blocked by
+        the existing required-ownership check — not by falling
+        through to the (second-lookup-only) protected-field
+        comparison, which {} never reaches on the first lookup."""
+        upd, _ = _make_update("/unassigntask task_id=TSK-001", ["task_id=TSK-001"])
+        finder, authz, mutator, _ = self._run_handler(upd, finder_return={})
+        authz.assert_not_called()
+        mutator.assert_not_called()
+        self.assertEqual(self._sent_text(upd), "Запись недоступна или не найдена.")
+
+    def test_empty_dict_second_lookup_blocked_via_blank_business_id(self):
+        """Same explicit blank-Business-ID path on the second lookup —
+        {} normalizes to a blank Business ID and is blocked before the
+        3-field protected comparison ever executes."""
+        upd, _ = _make_update("/unassigntask task_id=TSK-001", ["task_id=TSK-001"])
+        finder, authz, mutator, _ = self._run_handler(upd, finder_second_return={})
+        authz.assert_called_once()
+        mutator.assert_not_called()
+        self.assertEqual(self._sent_text(upd), "Запись изменилась. Повтори команду ещё раз.")
+
+    def test_authorization_uses_resource_task_action_assign(self):
+        upd, _ = _make_update("/unassigntask task_id=TSK-001", ["task_id=TSK-001"])
+        finder, authz, mutator, call_log = self._run_handler(upd)
+        authz_call = [c for c in call_log if c[0] == "authorize"][0]
+        self.assertEqual(authz_call[1], "TASK")
+        self.assertEqual(authz_call[2], "ASSIGN")
+
+    def test_authorization_uses_stored_business_id_not_caller_supplied(self):
+        upd, _ = _make_update("/unassigntask task_id=TSK-001", ["task_id=TSK-001"])
+        finder, authz, mutator, call_log = self._run_handler(upd)
+        authz_call = [c for c in call_log if c[0] == "authorize"][0]
+        self.assertEqual(authz_call[3], "BIZ-001")
+
+    def test_authorization_called_exactly_once(self):
+        upd, _ = _make_update("/unassigntask task_id=TSK-001", ["task_id=TSK-001"])
+        finder, authz, mutator, _ = self._run_handler(upd)
+        authz.assert_called_once()
+
+    def test_authorization_denial_prevents_mutation(self):
+        upd, _ = _make_update("/unassigntask task_id=TSK-001", ["task_id=TSK-001"])
+        finder, authz, mutator, _ = self._run_handler(upd, authz_result=_unassigntask_deny_result())
+        mutator.assert_not_called()
+        self.assertEqual(finder.call_count, 1)
+
+    def test_authorization_infrastructure_failure_prevents_mutation(self):
+        upd, _ = _make_update("/unassigntask task_id=TSK-001", ["task_id=TSK-001"])
+        finder, authz, mutator, _ = self._run_handler(upd, authz_result=_unassigntask_infra_failure_result())
+        mutator.assert_not_called()
+
+    # ── Section 9: second lookup / protected-field comparison ──
+
+    def test_second_lookup_occurs_after_authorization(self):
+        upd, _ = _make_update("/unassigntask task_id=TSK-001", ["task_id=TSK-001"])
+        finder, authz, mutator, call_log = self._run_handler(upd)
+        order = [c[0] for c in call_log]
+        self.assertEqual(order, ["finder", "authorize", "finder", "mutate"])
+
+    def test_second_lookup_missing_blocks_mutation(self):
+        upd, _ = _make_update("/unassigntask task_id=TSK-001", ["task_id=TSK-001"])
+        finder, authz, mutator, _ = self._run_handler(upd, finder_second_return=None)
+        mutator.assert_not_called()
+
+    def test_business_id_change_blocks_mutation(self):
+        upd, _ = _make_update("/unassigntask task_id=TSK-001", ["task_id=TSK-001"])
+        changed_row = {**_UNASSIGNTASK_ROW, "business_id": "BIZ-002"}
+        finder, authz, mutator, _ = self._run_handler(upd, finder_second_return=changed_row)
+        mutator.assert_not_called()
+
+    def test_responsible_role_id_change_blocks_mutation(self):
+        upd, _ = _make_update("/unassigntask task_id=TSK-001", ["task_id=TSK-001"])
+        changed_row = {**_UNASSIGNTASK_ROW, "responsible_role_id": "ROLE-999"}
+        finder, authz, mutator, _ = self._run_handler(upd, finder_second_return=changed_row)
+        mutator.assert_not_called()
+
+    def test_assignee_person_id_change_blocks_mutation(self):
+        upd, _ = _make_update("/unassigntask task_id=TSK-001", ["task_id=TSK-001"])
+        changed_row = {**_UNASSIGNTASK_ROW, "assignee_person_id": "PRS-999"}
+        finder, authz, mutator, _ = self._run_handler(upd, finder_second_return=changed_row)
+        mutator.assert_not_called()
+
+    def test_status_only_change_does_not_block_mutation(self):
+        upd, _ = _make_update("/unassigntask task_id=TSK-001", ["task_id=TSK-001"])
+        changed_row = {**_UNASSIGNTASK_ROW, "status": "done"}
+        finder, authz, mutator, _ = self._run_handler(upd, finder_second_return=changed_row)
+        mutator.assert_called_once_with("TSK-001")
+
+    def test_object_id_only_change_does_not_block_mutation(self):
+        upd, _ = _make_update("/unassigntask task_id=TSK-001", ["task_id=TSK-001"])
+        changed_row = {**_UNASSIGNTASK_ROW, "object_id": "OBJ-999"}
+        finder, authz, mutator, _ = self._run_handler(upd, finder_second_return=changed_row)
+        mutator.assert_called_once_with("TSK-001")
+
+    def test_second_lookup_exception_blocks_mutation(self):
+        upd, _ = _make_update("/unassigntask task_id=TSK-001", ["task_id=TSK-001"])
+        calls = {"n": 0}
+
+        def _finder_side_effect(tid):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return _UNASSIGNTASK_ROW
+            raise RuntimeError("boom")
+        finder, authz, mutator, _ = self._run_handler(upd, finder_side_effect=_finder_side_effect)
+        mutator.assert_not_called()
+
+    def test_same_task_across_both_reads_mutation_allowed(self):
+        upd, _ = _make_update("/unassigntask task_id=TSK-001", ["task_id=TSK-001"])
+        finder, authz, mutator, _ = self._run_handler(upd)
+        mutator.assert_called_once_with("TSK-001")
+
+    # ── Section 10: mutation / mapper integration ──────────────
+
+    def test_mutation_called_exactly_once(self):
+        upd, _ = _make_update("/unassigntask task_id=TSK-001", ["task_id=TSK-001"])
+        finder, authz, mutator, _ = self._run_handler(upd)
+        mutator.assert_called_once()
+
+    def test_clean_success_reply(self):
+        upd, _ = _make_update("/unassigntask task_id=TSK-001", ["task_id=TSK-001"])
+        self._run_handler(upd, mutator_return=_unassigntask_clean_success())
+        self.assertIn("✅", self._sent_text(upd))
+
+    def test_already_unassigned_noop_reply(self):
+        upd, _ = _make_update("/unassigntask task_id=TSK-001", ["task_id=TSK-001"])
+        self._run_handler(upd, mutator_return=_unassigntask_noop())
+        self.assertIn("ℹ️", self._sent_text(upd))
+
+    def test_partial_state_failure_reply(self):
+        upd, _ = _make_update("/unassigntask task_id=TSK-001", ["task_id=TSK-001"])
+        self._run_handler(upd, mutator_return=_unassigntask_partial_failure())
+        self.assertIn("⚠️", self._sent_text(upd))
+
+    def test_multiple_active_conflict_reply(self):
+        upd, _ = _make_update("/unassigntask task_id=TSK-001", ["task_id=TSK-001"])
+        self._run_handler(upd, mutator_return={
+            "ok": False, "code": "MULTIPLE_ACTIVE_TASK_ASSIGNMENTS_INTEGRITY_ERROR",
+            "conflicting_assignment_ids": ("TAS-A", "TAS-B"), "error": "x",
+        })
+        self.assertIn("⚠️", self._sent_text(upd))
+
+    def test_reply_at_most_once(self):
+        upd, _ = _make_update("/unassigntask task_id=TSK-001", ["task_id=TSK-001"])
+        self._run_handler(upd)
+        self.assertEqual(upd.message.reply_text.call_count, 1)
+
+    def test_no_retry_on_mutation_exception(self):
+        upd, _ = _make_update("/unassigntask task_id=TSK-001", ["task_id=TSK-001"])
+        finder, authz, mutator, _ = self._run_handler(upd, mutator_side_effect=RuntimeError("boom internal detail"))
+        mutator.assert_called_once()
+        reply = self._sent_text(upd)
+        self.assertIn("❌", reply)
+        self.assertNotIn("boom internal detail", reply)
+        self.assertNotIn("Traceback", reply)
+
+    def test_mutation_exception_fixed_log_literal(self):
         th = _fresh_th()
-        upd, ctx = _make_update("/unassigntask task_id=TSK-001", ["task_id=TSK-001"])
-
-        async def run():
-            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
-                 patch("business_core.business_builder.unassign_task",
-                       return_value={
-                           "ok": True, "code": "TASK_UNASSIGNED", "error": None,
-                           "changed": True, "assignment_changed": True, "partial_state": False,
-                       }):
-                await th.unassigntask_cmd(upd, ctx)
-
-        _run(run())
-        reply = upd.message.reply_text.call_args[0][0]
-        self.assertIn("✅", reply)
-
-    def test_zero_active_no_op(self):
-        th = _fresh_th()
-        upd, ctx = _make_update("/unassigntask task_id=TSK-001", ["task_id=TSK-001"])
-
-        async def run():
-            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
-                 patch("business_core.business_builder.unassign_task",
-                       return_value={
-                           "ok": True, "code": "TASK_UNASSIGNED", "error": None,
-                           "changed": False, "assignment_changed": False, "partial_state": False,
-                       }):
-                await th.unassigntask_cmd(upd, ctx)
-
-        _run(run())
-        reply = upd.message.reply_text.call_args[0][0]
-        self.assertIn("ℹ️", reply)
-
-    def test_multiple_active_conflict(self):
-        th = _fresh_th()
-        upd, ctx = _make_update("/unassigntask task_id=TSK-001", ["task_id=TSK-001"])
-
-        async def run():
-            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
-                 patch("business_core.business_builder.unassign_task",
-                       return_value={"ok": False, "code": "MULTIPLE_ACTIVE_TASK_ASSIGNMENTS_INTEGRITY_ERROR",
-                                     "conflicting_assignment_ids": ("TAS-A", "TAS-B"), "error": "x"}):
-                await th.unassigntask_cmd(upd, ctx)
-
-        _run(run())
-        reply = upd.message.reply_text.call_args[0][0]
-        self.assertIn("⚠️", reply)
+        upd, _ = _make_update("/unassigntask task_id=TSK-001", ["task_id=TSK-001"])
+        with patch.object(th, "log") as mock_log:
+            self._run_handler(upd, mutator_side_effect=RuntimeError("boom internal detail"), th=th)
+            mock_log.error.assert_called_once_with("unassigntask_cmd mutation infrastructure failure")
 
     def test_missing_task_id_shows_usage(self):
         th = _fresh_th()
@@ -1037,7 +1399,11 @@ class TestNoRawExceptionExposure(unittest.TestCase):
             ("updatetask_cmd", ("transition_task_status",), "/updatetask task_id=TSK-001 status=ready", ["task_id=TSK-001", "status=ready"]),
             ("assigntask_cmd", ("assign_task",), "/assigntask task_id=TSK-001 role_id=ROLE-001", ["task_id=TSK-001", "role_id=ROLE-001"]),
             ("reassigntask_cmd", ("assign_task",), "/reassigntask task_id=TSK-001 role_id=ROLE-001", ["task_id=TSK-001", "role_id=ROLE-001"]),
-            ("unassigntask_cmd", ("unassign_task",), "/unassigntask task_id=TSK-001", ["task_id=TSK-001"]),
+            # unassigntask_cmd is now an authorized, secure-mutation-flow
+            # command (first lookup + authorization + reread all sit
+            # ahead of the mutation call) — its own raw-exception-secrecy
+            # coverage lives in TestUnassignTaskCommand.test_no_retry_on_mutation_exception
+            # instead, with the finder/authorization properly mocked.
         ]
         for cmd_name, targets, text, args_list in commands_and_patches:
             upd, ctx = _make_update(text, args_list)

@@ -1224,19 +1224,23 @@ class TestTaskCrossLayerIsolation(unittest.TestCase):
     # test_task_architecture_guards.py's dedicated top-level construct
     # guard instead.
 
-    def test_no_resource_task_call_in_handlers_yet(self):
+    def test_resource_task_call_confined_to_unassigntask_handler(self):
         with open("business_core/telegram_handlers.py", encoding="utf-8") as f:
             content = f.read()
-        self.assertNotIn('resource="TASK"', content)
+        self.assertEqual(content.count('resource="TASK"'), 1)
+        start = content.index('async def unassigntask_cmd(')
+        candidates = [i for i in (content.find("\nasync def ", start + 10), content.find("\ndef ", start + 10)) if i != -1]
+        end = min(candidates) if candidates else len(content)
+        self.assertIn('resource="TASK"', content[start:end])
 
-    def test_command_enforcement_map_still_size_fourteen(self):
+    def test_command_enforcement_map_size_fifteen(self):
         from business_core import telegram_handlers as th
-        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 14)
+        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 15)
 
-    def test_command_enforcement_map_no_task_keys(self):
+    def test_command_enforcement_map_only_unassigntask_is_task_key(self):
         from business_core import telegram_handlers as th
-        for key in th.COMMAND_ENFORCEMENT_MAP:
-            self.assertNotIn("task", key.lower())
+        task_keys = [key for key in th.COMMAND_ENFORCEMENT_MAP if "task" in key.lower()]
+        self.assertEqual(task_keys, ["unassigntask"])
 
     def test_telegram_authorization_zero_diff(self):
         import subprocess

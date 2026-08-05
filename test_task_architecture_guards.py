@@ -458,15 +458,11 @@ class TestUnassignTaskPartialStateHardening(unittest.TestCase):
         ).stdout
         self.assertEqual(diff.strip(), "")
 
-    def test_command_enforcement_map_still_size_14_and_no_task_entry(self):
-        import business_core.telegram_handlers as th
-        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 14)
-        for name, spec in th.COMMAND_ENFORCEMENT_MAP.items():
-            self.assertNotEqual(spec.get("resource"), "TASK", f"{name} must not be wired to resource=TASK")
-
-    def test_unassigntask_command_not_newly_authorized(self):
-        import business_core.telegram_handlers as th
-        self.assertNotIn("unassigntask", th.COMMAND_ENFORCEMENT_MAP)
+    # COMMAND_ENFORCEMENT_MAP's size and TASK-resource exclusion were
+    # true for the unassign_task business-layer hardening phase
+    # specifically, before /unassigntask itself was authorized; the
+    # current map contract is scoped by
+    # TestUnassigntaskHandlerAuthorization below instead.
 
     # The mapper's raw-error fallback wording asserted here was true
     # before the mapper itself was hardened; _task_assignment_message's
@@ -643,6 +639,67 @@ class TestTaskAssignmentMessageMapperHardening(unittest.TestCase):
         module_level_prefix = src[:start]
         self.assertNotIn("_TASK_ASSIGNMENT_GENERIC_FAILURE", module_level_prefix)
         self.assertNotIn("_TASK_ASSIGNMENT_GENERIC_FAILURE", src)
+
+
+# ─────────────────────────────────────────────────────────────
+# unassigntask_cmd malformed-lookup fail-closed guards.
+# ─────────────────────────────────────────────────────────────
+
+class TestUnassigntaskMalformedLookupFailClosed(unittest.TestCase):
+
+    def test_isinstance_dict_check_precedes_first_get(self):
+        body = _th_function_body("unassigntask_cmd")
+        isinstance_idx = body.index("isinstance(first_task, dict)")
+        first_get_idx = body.index('first_task.get(')
+        self.assertLess(isinstance_idx, first_get_idx)
+
+    def test_isinstance_dict_check_precedes_second_get(self):
+        body = _th_function_body("unassigntask_cmd")
+        isinstance_idx = body.index("isinstance(second_task, dict)")
+        second_get_idx = body.index('second_task.get(')
+        self.assertLess(isinstance_idx, second_get_idx)
+
+    def test_malformed_first_branch_returns_before_authorization(self):
+        body = _th_function_body("unassigntask_cmd")
+        malformed_idx = body.index("isinstance(first_task, dict)")
+        authorize_idx = body.index("_authorize_or_reply(")
+        self.assertLess(malformed_idx, authorize_idx)
+
+    def test_malformed_second_branch_returns_before_mutation(self):
+        body = _th_function_body("unassigntask_cmd")
+        malformed_idx = body.index("isinstance(second_task, dict)")
+        mutate_idx = body.index("_mutate_target_in_thread(")
+        self.assertLess(malformed_idx, mutate_idx)
+
+    def test_no_broad_dict_coercion(self):
+        body = _th_function_body("unassigntask_cmd")
+        self.assertNotIn("dict(first_task)", body)
+        self.assertNotIn("dict(second_task)", body)
+
+    def test_no_raw_lookup_value_rendering_or_logging(self):
+        body = _th_function_body("unassigntask_cmd")
+        for forbidden in (
+            "str(first_task)", "repr(first_task)", "str(second_task)", "repr(second_task)",
+            "type(first_task)", "type(second_task)",
+        ):
+            self.assertNotIn(forbidden, body)
+
+    def test_no_retry_construct(self):
+        body = _th_function_body("unassigntask_cmd")
+        for forbidden in ("while True", "for attempt", "range(3)", "retry_count"):
+            self.assertNotIn(forbidden, body)
+
+    def test_exactly_two_canonical_lookups_in_source(self):
+        body = _th_function_body("unassigntask_cmd")
+        self.assertEqual(body.count("_resolve_target_in_thread("), 2)
+
+    def test_no_or_empty_dict_fallback_remains_on_first_lookup(self):
+        # The narrow correction replaced (first_task or {}).get(...)
+        # with an explicit isinstance check — the old permissive
+        # fallback idiom must not reappear.
+        body = _th_function_body("unassigntask_cmd")
+        self.assertNotIn("(first_task or {})", body)
+        self.assertNotIn("(second_task or {})", body)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -893,12 +950,16 @@ class TestBusinessBuilderConstructGuardHelperUnit(unittest.TestCase):
 # (mirrors the business_builder.py guard above — see that section's
 # comment for the rationale). Proves that of every top-level Import/
 # ImportFrom/FunctionDef/AsyncFunctionDef/ClassDef/Assign/AnnAssign in
-# telegram_handlers.py, only _task_assignment_message may differ —
-# no handler command function, registration, or module-level constant
-# (including COMMAND_ENFORCEMENT_MAP) changes.
+# telegram_handlers.py, only unassigntask_cmd and COMMAND_ENFORCEMENT_MAP
+# may differ — no other handler command function, registration, or
+# module-level constant changes. _task_assignment_message (approved to
+# differ in the prior mapper-hardening phase) is now source-identical
+# again, protected the same as every other function.
 # ─────────────────────────────────────────────────────────────
 
-_TELEGRAM_HANDLERS_APPROVED_TO_DIFFER = frozenset({"function:_task_assignment_message"})
+_TELEGRAM_HANDLERS_APPROVED_TO_DIFFER = frozenset({
+    "async_function:unassigntask_cmd", "assignment:COMMAND_ENFORCEMENT_MAP",
+})
 
 _TELEGRAM_HANDLERS_KNOWN_BENIGN_TOP_LEVEL_NODE_TYPES = (ast.Expr, ast.Pass)
 
@@ -1009,23 +1070,42 @@ class TestTelegramHandlersTopLevelConstructGuard(unittest.TestCase):
         self.assertIn("function:_task_assignment_message", head)
         self.assertIn("function:_task_assignment_message", current)
 
-    def test_no_handler_command_function_changed(self):
+    def test_no_other_handler_command_function_changed(self):
         head_src = _git_show_head_telegram_handlers_py()
         current_src = (BUSINESS_CORE / "telegram_handlers.py").read_text(encoding="utf-8")
         head = _telegram_handlers_top_level_constructs(head_src)
         current = _telegram_handlers_top_level_constructs(current_src)
-        for name in ("assigntask_cmd", "reassigntask_cmd", "unassigntask_cmd", "bctasks_cmd", "bctask_cmd", "newbctask_cmd", "updatetask_cmd"):
+        for name in ("assigntask_cmd", "reassigntask_cmd", "bctasks_cmd", "bctask_cmd", "newbctask_cmd", "updatetask_cmd"):
             key = f"async_function:{name}"
             self.assertIn(key, head)
             self.assertEqual(head[key], current[key], f"{name} must not change this phase")
 
-    def test_command_enforcement_map_construct_unchanged(self):
+    def test_task_assignment_message_unchanged_this_phase(self):
+        head_src = _git_show_head_telegram_handlers_py()
+        current_src = (BUSINESS_CORE / "telegram_handlers.py").read_text(encoding="utf-8")
+        head = _telegram_handlers_top_level_constructs(head_src)
+        current = _telegram_handlers_top_level_constructs(current_src)
+        self.assertEqual(head["function:_task_assignment_message"], current["function:_task_assignment_message"])
+
+    def test_command_enforcement_map_gains_exactly_one_entry(self):
         head_src = _git_show_head_telegram_handlers_py()
         current_src = (BUSINESS_CORE / "telegram_handlers.py").read_text(encoding="utf-8")
         head = _telegram_handlers_top_level_constructs(head_src)
         current = _telegram_handlers_top_level_constructs(current_src)
         self.assertIn("assignment:COMMAND_ENFORCEMENT_MAP", head)
-        self.assertEqual(head["assignment:COMMAND_ENFORCEMENT_MAP"], current["assignment:COMMAND_ENFORCEMENT_MAP"])
+        self.assertNotEqual(head["assignment:COMMAND_ENFORCEMENT_MAP"], current["assignment:COMMAND_ENFORCEMENT_MAP"])
+
+        import business_core.telegram_handlers as th
+        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 15)
+        self.assertIn("unassigntask", th.COMMAND_ENFORCEMENT_MAP)
+        self.assertEqual(
+            th.COMMAND_ENFORCEMENT_MAP["unassigntask"],
+            {
+                "resource": "TASK", "action": "ASSIGN", "target_shape": "BUSINESS",
+                "operation_kind": "MUTATION", "requires_fresh_reread": True,
+                "mutation_side_effect_class": "MULTI_ROW_MUTATION", "idempotency_class": "IDEMPOTENT",
+            },
+        )
 
     def test_telegram_handlers_exhaustive_top_level_node_coverage(self):
         head_src = _git_show_head_telegram_handlers_py()
@@ -1069,11 +1149,11 @@ class TestTelegramHandlersConstructGuardHelperUnit(unittest.TestCase):
         "def _task_assignment_message(result, task_id):\n"
         "    return task_id\n"
         "\n"
-        "async def assigntask_cmd(update, context):\n"
+        "async def unassigntask_cmd(update, context):\n"
         "    return None\n"
     )
 
-    def _diff(self, modified_src: str, approved=frozenset({"function:_task_assignment_message"})):
+    def _diff(self, modified_src: str, approved=frozenset({"async_function:unassigntask_cmd", "assignment:COMMAND_ENFORCEMENT_MAP"})):
         head = _telegram_handlers_top_level_constructs(self._BASELINE)
         current = _telegram_handlers_top_level_constructs(modified_src)
         removed = set(head) - set(current)
@@ -1085,14 +1165,19 @@ class TestTelegramHandlersConstructGuardHelperUnit(unittest.TestCase):
         return removed, added, changed
 
     def test_unrelated_handler_change_detected(self):
-        modified = self._BASELINE.replace("return None", "return 1")
+        modified = self._BASELINE.replace(
+            "def _task_assignment_message(result, task_id):\n    return task_id",
+            "def _task_assignment_message(result, task_id):\n    return task_id + '!'",
+        )
         removed, added, changed = self._diff(modified)
-        self.assertIn("async_function:assigntask_cmd", changed)
+        self.assertIn("function:_task_assignment_message", changed)
 
-    def test_command_enforcement_map_change_detected(self):
+    def test_command_enforcement_map_change_permitted(self):
         modified = self._BASELINE.replace("COMMAND_ENFORCEMENT_MAP = {}", 'COMMAND_ENFORCEMENT_MAP = {"unassigntask": {}}')
         removed, added, changed = self._diff(modified)
-        self.assertIn("assignment:COMMAND_ENFORCEMENT_MAP", changed)
+        self.assertEqual(removed, set())
+        self.assertEqual(added, set())
+        self.assertNotIn("assignment:COMMAND_ENFORCEMENT_MAP", changed)
 
     def test_import_change_detected(self):
         modified = self._BASELINE.replace("import os", "import sys")
@@ -1106,9 +1191,11 @@ class TestTelegramHandlersConstructGuardHelperUnit(unittest.TestCase):
         self.assertIn("class:Foo", changed)
 
     def test_removal_detected(self):
-        modified = self._BASELINE.replace("\nasync def assigntask_cmd(update, context):\n    return None\n", "\n")
+        modified = self._BASELINE.replace(
+            "\ndef _task_assignment_message(result, task_id):\n    return task_id\n", "\n",
+        )
         removed, added, changed = self._diff(modified)
-        self.assertIn("async_function:assigntask_cmd", removed)
+        self.assertIn("function:_task_assignment_message", removed)
 
     def test_unexpected_new_function_detected(self):
         modified = self._BASELINE + "\nasync def sneaky_cmd(update, context):\n    return None\n"
@@ -1116,25 +1203,27 @@ class TestTelegramHandlersConstructGuardHelperUnit(unittest.TestCase):
         self.assertIn("async_function:sneaky_cmd", added)
 
     def test_rename_detected_as_removal_plus_addition(self):
-        modified = self._BASELINE.replace("async def assigntask_cmd(", "async def renamed_cmd(")
-        removed, added, changed = self._diff(modified)
-        self.assertIn("async_function:assigntask_cmd", removed)
-        self.assertIn("async_function:renamed_cmd", added)
-
-    def test_task_assignment_message_change_is_permitted(self):
         modified = self._BASELINE.replace(
-            "def _task_assignment_message(result, task_id):\n    return task_id",
-            "def _task_assignment_message(result, task_id):\n    return task_id + '!'",
+            "def _task_assignment_message(result, task_id):", "def _renamed_message(result, task_id):",
+        )
+        removed, added, changed = self._diff(modified)
+        self.assertIn("function:_task_assignment_message", removed)
+        self.assertIn("function:_renamed_message", added)
+
+    def test_unassigntask_cmd_change_is_permitted(self):
+        modified = self._BASELINE.replace(
+            "async def unassigntask_cmd(update, context):\n    return None",
+            "async def unassigntask_cmd(update, context):\n    return 1",
         )
         removed, added, changed = self._diff(modified)
         self.assertEqual(removed, set())
         self.assertEqual(added, set())
-        self.assertNotIn("function:_task_assignment_message", changed)
+        self.assertNotIn("async_function:unassigntask_cmd", changed)
 
     def test_second_new_handler_command_rejected(self):
-        modified = self._BASELINE + "\nasync def unassigntask_cmd(update, context):\n    return None\n"
+        modified = self._BASELINE + "\nasync def assigntask_cmd(update, context):\n    return None\n"
         removed, added, changed = self._diff(modified)
-        self.assertIn("async_function:unassigntask_cmd", added)
+        self.assertIn("async_function:assigntask_cmd", added)
 
     def test_duplicate_construct_identifier_fails_explicitly(self):
         duplicate_src = self._BASELINE + "\nCOMMAND_ENFORCEMENT_MAP = {}\n"

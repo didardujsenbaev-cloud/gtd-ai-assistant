@@ -118,6 +118,11 @@ COMMAND_ENFORCEMENT_MAP = {
         "operation_kind": "MUTATION", "requires_fresh_reread": True,
         "mutation_side_effect_class": "MULTI_ROW_MUTATION", "idempotency_class": "IDEMPOTENT",
     },
+    "unassigntask": {
+        "resource": "TASK", "action": "ASSIGN", "target_shape": "BUSINESS",
+        "operation_kind": "MUTATION", "requires_fresh_reread": True,
+        "mutation_side_effect_class": "MULTI_ROW_MUTATION", "idempotency_class": "IDEMPOTENT",
+    },
 }
 
 _BC_ENFORCEMENT_NOT_FOUND_OR_DENIED_MSG = "Запись недоступна или не найдена."
@@ -16422,27 +16427,103 @@ async def reassigntask_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 async def unassigntask_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     /unassigntask task_id=TSK-001
+
+    Phase 18A.5: TASK/ASSIGN, target_shape=BUSINESS, MUTATION,
+    requires_fresh_reread=True. Business ID plus the Task's own
+    Responsible Role ID / Assignee Person ID are resolved twice —
+    once before authorization, once immediately before mutation — and
+    the two reads must match exactly, or the write is refused (fail
+    closed). Status is deliberately not compared: unassign_task never
+    branches on Task status, so a concurrent status change alone must
+    not block this command. Exactly {"task_id", "_pos0"} is the only
+    permitted parsed key set — any other key is rejected before the
+    finder ever runs.
     """
     if not _is_bc_enabled():
-        await _reply(update, _bc_disabled_msg())
+        await _reply(update, _bc_disabled_msg(), parse_mode=None)
+        return
+
+    if not await _validate_bc_transport_or_reply(update):
         return
 
     raw = " ".join(context.args or [])
     args = _parse_kv_args(raw)
+
+    if not set(args.keys()) <= {"task_id", "_pos0"}:
+        await _reply(update, "❌ /unassigntask принимает только task_id.", parse_mode=None)
+        return
+
     task_id = args.get("task_id") or args.get("_pos0", "")
 
     if not task_id:
-        await _reply(update, "❌ Укажи task_id.\n\nПример: /unassigntask task_id=TSK-001")
+        await _reply(update, "❌ Укажи task_id.\n\nПример: /unassigntask task_id=TSK-001", parse_mode=None)
+        return
+
+    from business_core.task_manager import find_task_by_id
+    from business_core.business_builder import unassign_task
+
+    try:
+        first_task = await _resolve_target_in_thread(find_task_by_id, task_id)
+    except Exception:
+        await _reply(update, _BC_ENFORCEMENT_TEMPORARILY_UNAVAILABLE_MSG, parse_mode=None)
+        return
+
+    # A canonical finder is documented to return Optional[dict] — any
+    # other shape (a bare string, a list, a plain object, ...) is
+    # treated as unusable/malformed and fails closed here, before any
+    # attribute access, rather than risking an uncaught AttributeError
+    # past this handler's own boundaries.
+    if not isinstance(first_task, dict):
+        await _reply(update, _BC_ENFORCEMENT_NOT_FOUND_OR_DENIED_MSG, parse_mode=None)
+        return
+
+    first_business_id = str(first_task.get("business_id", "")).strip()
+    if not first_business_id:
+        await _reply(update, _BC_ENFORCEMENT_NOT_FOUND_OR_DENIED_MSG, parse_mode=None)
+        return
+    first_role_id = str(first_task.get("responsible_role_id", "")).strip()
+    first_person_id = str(first_task.get("assignee_person_id", "")).strip()
+
+    if not await _authorize_or_reply(
+        update, resource="TASK", action="ASSIGN", business_id=first_business_id,
+    ):
         return
 
     try:
-        from business_core.business_builder import unassign_task
+        second_task = await _resolve_target_in_thread(find_task_by_id, task_id)
+    except Exception:
+        await _reply(update, _BC_ENFORCEMENT_TEMPORARILY_UNAVAILABLE_MSG, parse_mode=None)
+        return
 
-        result = unassign_task(task_id)
-        await _reply(update, _task_assignment_message(result, task_id))
-    except Exception as e:
-        log.error(f"unassigntask_cmd error: {e}")
-        await _reply(update, "❌ Ошибка при снятии назначения Task.")
+    if not isinstance(second_task, dict):
+        await _reply(update, _BC_ENFORCEMENT_OWNERSHIP_CHANGED_MSG, parse_mode=None)
+        return
+
+    second_business_id = str(second_task.get("business_id", "")).strip()
+    if not second_business_id:
+        await _reply(update, _BC_ENFORCEMENT_OWNERSHIP_CHANGED_MSG, parse_mode=None)
+        return
+    second_role_id = str(second_task.get("responsible_role_id", "")).strip()
+    second_person_id = str(second_task.get("assignee_person_id", "")).strip()
+
+    if (
+        second_business_id != first_business_id
+        or second_role_id != first_role_id
+        or second_person_id != first_person_id
+    ):
+        await _reply(update, _BC_ENFORCEMENT_OWNERSHIP_CHANGED_MSG, parse_mode=None)
+        return
+
+    try:
+        result = await _mutate_target_in_thread(unassign_task, task_id)
+    except Exception:
+        # Fixed literal only — no exception interpolation, no task_id,
+        # no Business ID, no actor identity.
+        log.error("unassigntask_cmd mutation infrastructure failure")
+        await _reply(update, "❌ Не удалось снять назначение с Task.", parse_mode=None)
+        return
+
+    await _reply(update, _task_assignment_message(result, task_id), parse_mode=None)
 
 
 def register_business_handlers(app: Application) -> None:

@@ -176,6 +176,11 @@ _EXPECTED_MUTATION_ENTRY = {
         "operation_kind": "MUTATION", "requires_fresh_reread": True,
         "mutation_side_effect_class": "MULTI_ROW_MUTATION", "idempotency_class": "IDEMPOTENT",
     },
+    "unassigntask": {
+        "resource": "TASK", "action": "ASSIGN", "target_shape": "BUSINESS",
+        "operation_kind": "MUTATION", "requires_fresh_reread": True,
+        "mutation_side_effect_class": "MULTI_ROW_MUTATION", "idempotency_class": "IDEMPOTENT",
+    },
 }
 
 _NON_ENFORCED_SAMPLE_HANDLERS = [
@@ -209,8 +214,8 @@ class TestEnforcementMap(unittest.TestCase):
             with self.subTest(command=key):
                 self.assertEqual(th.COMMAND_ENFORCEMENT_MAP[key], val)
 
-    def test_no_fifteenth_command_in_map(self):
-        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 14)
+    def test_no_sixteenth_command_in_map(self):
+        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 15)
 
     def test_updatelead_not_in_map(self):
         self.assertNotIn("updatelead", th.COMMAND_ENFORCEMENT_MAP)
@@ -418,10 +423,12 @@ class TestPhase17E2A4H1OfferHardeningScope(unittest.TestCase):
         # _payment_transaction_failure_message (mapper secrecy
         # hardening), and confirmpayment_cmd/reversepayment_cmd/
         # failpayment_cmd (outer-exception logging secrecy only).
-        # _task_assignment_message is the only approved
+        # _task_assignment_message was the only approved
         # telegram_handlers.py function change for the Task assignment
-        # mapper hardening; every Task handler command function and
-        # COMMAND_ENFORCEMENT_MAP itself are protected separately by
+        # mapper hardening. unassigntask_cmd is now additionally
+        # approved for its own authorization wiring; every other Task
+        # handler command function and COMMAND_ENFORCEMENT_MAP's
+        # top-level construct identity are protected separately by
         # test_task_architecture_guards.py.
         _assert_only_functions_changed_or_added(
             self, "business_core/telegram_handlers.py",
@@ -430,7 +437,7 @@ class TestPhase17E2A4H1OfferHardeningScope(unittest.TestCase):
                 "_payment_transaction_confirmation_message",
                 "_payment_transaction_reversal_message", "_payment_transaction_failure_message",
                 "confirmpayment_cmd", "reversepayment_cmd", "failpayment_cmd", "updateinteractionnotes_cmd",
-                "_task_assignment_message",
+                "_task_assignment_message", "unassigntask_cmd",
             },
             allowed_added_function_names={
                 "_offer_notes_message", "updateoffernotes_cmd",
@@ -492,8 +499,10 @@ class TestPhase17E2A4H1OfferHardeningScope(unittest.TestCase):
     def test_payment_ledger_read_failed_code_added_no_extra_map_entry_beyond_failpayment(self):
         # Phase 17E-2A6-H1 itself added no map entry. Phase
         # 17E-2A6-AUTH-B1 added failpayment; Phase 17E-2A6-AUTH-B2
-        # added confirmpayment and reversepayment. No fifteenth entry.
-        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 14)
+        # added confirmpayment and reversepayment. unassigntask was
+        # added later, in the Task assignment mapper's own
+        # authorization phase — no other entry beyond these four.
+        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 15)
         self.assertIn("failpayment", th.COMMAND_ENFORCEMENT_MAP)
         self.assertIn("confirmpayment", th.COMMAND_ENFORCEMENT_MAP)
         self.assertIn("reversepayment", th.COMMAND_ENFORCEMENT_MAP)
@@ -558,10 +567,12 @@ class TestPhase17E2A4H1OfferHardeningScope(unittest.TestCase):
         # _payment_transaction_failure_message (mapper secrecy
         # hardening), and confirmpayment_cmd/reversepayment_cmd/
         # failpayment_cmd (outer-exception logging secrecy only).
-        # _task_assignment_message is the only approved
+        # _task_assignment_message was the only approved
         # telegram_handlers.py function change for the Task assignment
-        # mapper hardening; every Task handler command function and
-        # COMMAND_ENFORCEMENT_MAP itself are protected separately by
+        # mapper hardening. unassigntask_cmd is now additionally
+        # approved for its own authorization wiring; every other Task
+        # handler command function and COMMAND_ENFORCEMENT_MAP's
+        # top-level construct identity are protected separately by
         # test_task_architecture_guards.py.
         _assert_only_functions_changed_or_added(
             self, "business_core/telegram_handlers.py",
@@ -570,7 +581,7 @@ class TestPhase17E2A4H1OfferHardeningScope(unittest.TestCase):
                 "_payment_transaction_confirmation_message",
                 "_payment_transaction_reversal_message", "_payment_transaction_failure_message",
                 "confirmpayment_cmd", "reversepayment_cmd", "failpayment_cmd", "updateinteractionnotes_cmd",
-                "_task_assignment_message",
+                "_task_assignment_message", "unassigntask_cmd",
             },
             allowed_added_function_names={
                 "_offer_notes_message", "updateoffernotes_cmd",
@@ -599,14 +610,15 @@ class TestPhase17E2A4H1OfferHardeningScope(unittest.TestCase):
         self.assertTrue(hasattr(th, "updatedocnotes_cmd"))
         self.assertIn("updatedocnotes", th.COMMAND_ENFORCEMENT_MAP)
 
-    def test_enforcement_map_now_fourteen_entries(self):
-        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 14)
+    def test_enforcement_map_now_fifteen_entries(self):
+        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 15)
 
-    def test_exactly_eight_dedicated_mutation_handlers_use_mutate_helper(self):
+    def test_exactly_nine_dedicated_mutation_handlers_use_mutate_helper(self):
         dedicated = [
             "updateinteractionnotes_cmd", "updateleadnotes_cmd",
             "updateobligationnotes_cmd", "updateoffernotes_cmd", "updatedocnotes_cmd",
             "failpayment_cmd", "confirmpayment_cmd", "reversepayment_cmd",
+            "unassigntask_cmd",
         ]
         for name in dedicated:
             self.assertTrue(hasattr(th, name))
