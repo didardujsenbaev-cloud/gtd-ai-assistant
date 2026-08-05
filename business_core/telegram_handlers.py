@@ -103,6 +103,11 @@ COMMAND_ENFORCEMENT_MAP = {
         "operation_kind": "MUTATION", "allowed_modes": ("NOTES_ONLY",), "requires_fresh_reread": True,
         "mutation_side_effect_class": "SINGLE_ROW_MUTATION", "idempotency_class": "IDEMPOTENT",
     },
+    "failpayment": {
+        "resource": "FINANCE", "action": "UPDATE", "target_shape": "BUSINESS",
+        "operation_kind": "MUTATION", "requires_fresh_reread": True,
+        "mutation_side_effect_class": "SINGLE_ROW_MUTATION", "idempotency_class": "IDEMPOTENT",
+    },
 }
 
 _BC_ENFORCEMENT_NOT_FOUND_OR_DENIED_MSG = "Запись недоступна или не найдена."
@@ -12483,35 +12488,95 @@ async def reversepayment_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await _reply(update, "❌ Не удалось реверснуть Payment.", parse_mode=None)
 
 
+_FAILPAYMENT_ALLOWED_KEYS = frozenset({"payment_transaction_id", "_pos0"})
+
+
 async def failpayment_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     /failpayment payment_transaction_id=PTXN-001
+    /failpayment PTXN-001
 
-    Marks one pending Payment Transaction as failed — never affects
-    Obligation balance.
+    Phase 17E-2A6-AUTH-B1: dedicated, fully authorized single-row
+    mutation — FINANCE/UPDATE, target_shape=BUSINESS, MUTATION,
+    requires_fresh_reread=True. Reuses business_builder's
+    fail_payment_transaction wrapper only — never touches Obligation
+    balance/status. /confirmpayment and /reversepayment remain
+    unchanged and outside COMMAND_ENFORCEMENT_MAP. Exactly
+    {"payment_transaction_id", "_pos0"} is the only permitted parsed
+    key set — any other key is rejected before the finder ever runs.
     """
     if not _is_bc_enabled():
         await _reply(update, _bc_disabled_msg(), parse_mode=None)
         return
 
+    if not await _validate_bc_transport_or_reply(update):
+        return
+
     raw = " ".join(context.args or [])
     args = _parse_kv_args(raw)
+
+    if not set(args.keys()) <= _FAILPAYMENT_ALLOWED_KEYS:
+        await _reply(update, "❌ /failpayment принимает только payment_transaction_id.", parse_mode=None)
+        return
+
     transaction_id = args.get("payment_transaction_id") or args.get("_pos0", "")
 
     if not transaction_id:
         await _reply(update, "❌ Укажи payment_transaction_id.\n\nПример: /failpayment payment_transaction_id=PTXN-001", parse_mode=None)
         return
 
-    try:
-        from business_core.business_builder import fail_payment_transaction
+    from business_core.payment_manager import find_payment_transaction_by_id
+    from business_core.business_builder import fail_payment_transaction
 
-        result = fail_payment_transaction(transaction_id)
-        await _reply(update, _payment_transaction_failure_message(result, transaction_id), parse_mode=None)
+    try:
+        first_txn = await _resolve_target_in_thread(find_payment_transaction_by_id, transaction_id)
+    except Exception:
+        await _reply(update, _BC_ENFORCEMENT_TEMPORARILY_UNAVAILABLE_MSG, parse_mode=None)
+        return
+
+    first_business_id = str((first_txn or {}).get("Business ID", "")).strip()
+    if first_txn is None or not first_business_id:
+        await _reply(update, _BC_ENFORCEMENT_NOT_FOUND_OR_DENIED_MSG, parse_mode=None)
+        return
+    first_obligation_id = str(first_txn.get("Payment Obligation ID", "")).strip()
+    first_status = str(first_txn.get("Status", "")).strip()
+
+    if not await _authorize_or_reply(
+        update, resource="FINANCE", action="UPDATE", business_id=first_business_id,
+    ):
+        return
+
+    try:
+        second_txn = await _resolve_target_in_thread(find_payment_transaction_by_id, transaction_id)
+    except Exception:
+        await _reply(update, _BC_ENFORCEMENT_TEMPORARILY_UNAVAILABLE_MSG, parse_mode=None)
+        return
+
+    second_business_id = str((second_txn or {}).get("Business ID", "")).strip()
+    if second_txn is None or not second_business_id:
+        await _reply(update, _BC_ENFORCEMENT_OWNERSHIP_CHANGED_MSG, parse_mode=None)
+        return
+    second_obligation_id = str(second_txn.get("Payment Obligation ID", "")).strip()
+    second_status = str(second_txn.get("Status", "")).strip()
+
+    if (
+        second_business_id != first_business_id
+        or second_obligation_id != first_obligation_id
+        or second_status != first_status
+    ):
+        await _reply(update, _BC_ENFORCEMENT_OWNERSHIP_CHANGED_MSG, parse_mode=None)
+        return
+
+    try:
+        result = await _mutate_target_in_thread(fail_payment_transaction, transaction_id)
     except Exception:
         # Phase 17E-2A6-H1: fixed literal only — no exception
         # interpolation, no transaction ID.
         log.error("failpayment_cmd infrastructure failure")
         await _reply(update, "❌ Не удалось обновить статус Payment.", parse_mode=None)
+        return
+
+    await _reply(update, _payment_transaction_failure_message(result, transaction_id), parse_mode=None)
 
 
 # ─────────────────────────────────────────────────────────────

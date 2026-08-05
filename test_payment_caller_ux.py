@@ -924,8 +924,17 @@ class TestCanonicalBoundaries(unittest.TestCase):
         mock_reverse.assert_called_once()
 
     def test_failpayment_calls_business_builder_only(self):
+        # Phase 17E-2A6-AUTH-B1: /failpayment is now authorized —
+        # reaching the wrapper requires a mocked first/second lookup
+        # and a mocked allow decision, in addition to the wrapper
+        # mock itself.
         update, context = _cmd("/failpayment payment_transaction_id=PTXN-001")
-        with patch("business_core.business_builder.fail_payment_transaction",
+        txn_row = {"Business ID": "BIZ-001", "Payment Obligation ID": "POB-001", "Status": "pending"}
+        with patch("business_core.payment_manager.find_payment_transaction_by_id", return_value=txn_row), \
+             patch("business_core.telegram_authorization.authorize_telegram_business_core_request",
+                   new=AsyncMock(return_value={"ok": True, "allowed": True, "code": "TELEGRAM_ACCESS_ALLOWED", "retry_safe": True,
+                                                "authorization_result": {"ok": True, "allowed": True, "code": "ACCESS_ALLOWED"}})), \
+             patch("business_core.business_builder.fail_payment_transaction",
                    return_value={"ok": True, "code": "PAYMENT_TRANSACTION_FAILED", "error": None, "previous_status": "pending"}) as mock_fail:
             _run(th.failpayment_cmd(update, context))
         mock_fail.assert_called_once()
@@ -1080,8 +1089,16 @@ class TestNoRawExceptionOrDictExposure(unittest.TestCase):
             self.assertNotIn("Ошибка: {e}", body)
 
     def test_unhandled_exception_yields_safe_message(self):
+        # Phase 17E-2A6-AUTH-B1: /failpayment now requires a mocked
+        # first/second lookup and an allow decision to reach the
+        # mutation boundary this test targets.
         update, context = _cmd("/failpayment payment_transaction_id=PTXN-001")
-        with patch("business_core.business_builder.fail_payment_transaction", side_effect=RuntimeError("raw internal secret")):
+        txn_row = {"Business ID": "BIZ-001", "Payment Obligation ID": "POB-001", "Status": "pending"}
+        with patch("business_core.payment_manager.find_payment_transaction_by_id", return_value=txn_row), \
+             patch("business_core.telegram_authorization.authorize_telegram_business_core_request",
+                   new=AsyncMock(return_value={"ok": True, "allowed": True, "code": "TELEGRAM_ACCESS_ALLOWED", "retry_safe": True,
+                                                "authorization_result": {"ok": True, "allowed": True, "code": "ACCESS_ALLOWED"}})), \
+             patch("business_core.business_builder.fail_payment_transaction", side_effect=RuntimeError("raw internal secret")):
             _run(th.failpayment_cmd(update, context))
         text = _sent_text(update)
         self.assertNotIn("raw internal secret", text)

@@ -655,7 +655,7 @@ _OTHER_MUTATION_CANDIDATE_HANDLERS = [
 
 class TestArchitecture(unittest.TestCase):
     def test_enforcement_map_has_exactly_eleven_entries(self):
-        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 11)
+        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 12)
 
     def test_six_phase_17e1_entries_unchanged(self):
         expected_six = {
@@ -1458,7 +1458,7 @@ class TestLeadNotesIsolation(unittest.TestCase):
 
 class TestLeadNotesArchitecture(unittest.TestCase):
     def test_enforcement_map_has_exactly_eleven_entries(self):
-        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 11)
+        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 12)
 
     def test_updateleadnotes_metadata_exact(self):
         self.assertEqual(th.COMMAND_ENFORCEMENT_MAP["updateleadnotes"], {
@@ -2151,7 +2151,7 @@ class TestObligationNotesIsolation(unittest.TestCase):
 
 class TestObligationNotesArchitecture(unittest.TestCase):
     def test_enforcement_map_has_exactly_eleven_entries(self):
-        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 11)
+        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 12)
 
     def test_updateobligationnotes_metadata_exact(self):
         self.assertEqual(th.COMMAND_ENFORCEMENT_MAP["updateobligationnotes"], {
@@ -3129,7 +3129,7 @@ class TestOfferNotesIsolation(unittest.TestCase):
 
 class TestOfferNotesArchitecture(unittest.TestCase):
     def test_enforcement_map_has_exactly_eleven_entries(self):
-        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 11)
+        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 12)
 
     def test_updateoffernotes_metadata_exact(self):
         self.assertEqual(th.COMMAND_ENFORCEMENT_MAP["updateoffernotes"], {
@@ -4052,7 +4052,7 @@ class TestDocumentNotesIsolation(unittest.TestCase):
 
 class TestDocumentNotesArchitecture(unittest.TestCase):
     def test_enforcement_map_has_exactly_eleven_entries(self):
-        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 11)
+        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 12)
 
     def test_updatedocnotes_metadata_exact(self):
         self.assertEqual(th.COMMAND_ENFORCEMENT_MAP["updatedocnotes"], {
@@ -4294,13 +4294,21 @@ class TestConfirmPaymentLedgerReadFailureRealChain(unittest.TestCase):
 
 # ═════════════════════════════════════════════════════════════
 # Phase 17E-2A6-H1: Payment lifecycle handler outer-exception
-# secrecy + real-chain regressions. Legacy /confirmpayment,
-# /reversepayment, /failpayment remain unauthorized (unchanged,
-# out of scope) — this proves the manager/wrapper/mapper/handler
-# secrecy chain established this phase prevents raw exception text,
-# manager error text, and secret markers from ever reaching
-# Telegram or logs, across every reachable infrastructure-failure
-# point, without claiming atomicity anywhere.
+# secrecy + real-chain regressions. Legacy /confirmpayment and
+# /reversepayment remain unauthorized (unchanged, out of scope) —
+# this proves the manager/wrapper/mapper/handler secrecy chain
+# established this phase prevents raw exception text, manager error
+# text, and secret markers from ever reaching Telegram or logs,
+# across every reachable infrastructure-failure point, without
+# claiming atomicity anywhere.
+#
+# Phase 17E-2A6-AUTH-B1: /failpayment gained transport preflight,
+# authorization, and a mandatory second lookup — the two
+# failpayment-specific tests below now additionally mock the
+# authorization adapter to reach the mutation boundary they test.
+# Dedicated transport/argument/lookup/authorization test coverage
+# for the new failpayment authorization gate lives in the
+# TestFailPayment* classes further below.
 # ═════════════════════════════════════════════════════════════
 
 _SECRET_REVERSAL_MARKER = "REVERSAL-SECRET"
@@ -4362,7 +4370,10 @@ class TestPaymentLifecycleHandlerOuterExceptionSecrecy(unittest.TestCase):
 
     def test_failpayment_cmd_unexpected_wrapper_exception(self):
         update = _make_update()
-        with patch("business_core.business_builder.fail_payment_transaction", side_effect=_h1_boom_with_secrets), \
+        txn_row = {"Business ID": "BIZ-001", "Payment Obligation ID": "", "Status": "pending"}
+        with patch("business_core.payment_manager.find_payment_transaction_by_id", return_value=txn_row), \
+             patch(_AUTHZ_PATH, new=AsyncMock(return_value=_allow_result())), \
+             patch("business_core.business_builder.fail_payment_transaction", side_effect=_h1_boom_with_secrets), \
              patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
              patch("business_core.telegram_handlers.log.error") as mock_log_error:
             _run(th.failpayment_cmd(update, _make_context(["payment_transaction_id=PTXN-001"])))
@@ -4584,6 +4595,7 @@ class TestPaymentLifecycleRealChainRegressions(unittest.TestCase):
 
         with patch("business_core.sheets.find_row_by_id", return_value=(2, dict(txn_row))), \
              patch("business_core.sheets.get_business_sheet", return_value=txn_sheet), \
+             patch(_AUTHZ_PATH, new=AsyncMock(return_value=_allow_result())), \
              patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
             _run(th.failpayment_cmd(update, _make_context(["payment_transaction_id=PTXN-001"])))
 
@@ -4656,6 +4668,832 @@ class TestPaymentLifecycleRealChainRegressions(unittest.TestCase):
             "Требуется ручная проверка.",
         ]))
         mock_obligation_write.assert_not_called()
+
+
+# ═════════════════════════════════════════════════════════════
+# Phase 17E-2A6-AUTH-B1: /failpayment dedicated authorization gate.
+# Single-row foundation of the Payment lifecycle authorization
+# pattern — FINANCE/UPDATE, target_shape=BUSINESS, MUTATION,
+# requires_fresh_reread=True, SINGLE_ROW_MUTATION, IDEMPOTENT.
+# Mirrors the ObligationNotes* test structure above, adapted for:
+#   - the {"payment_transaction_id", "_pos0"} allowed-key set
+#     (named form and positional fallback, matching the pre-existing
+#     /failpayment and /payment argument convention);
+#   - a three-field stability comparison (Business ID, Payment
+#     Obligation ID, Status) instead of Business ID alone, since
+#     confirm/reverse write both fields and a concurrent status
+#     change must also be caught;
+#   - a single-argument mutator (fail_payment_transaction takes only
+#     payment_transaction_id — no second parameter to assert on).
+# /confirmpayment and /reversepayment are untouched by this phase —
+# their own H0/H1 real-chain regressions above are unaffected.
+# ═════════════════════════════════════════════════════════════
+
+_FP_ROW = {
+    "Payment Transaction ID": "PTXN-001", "Business ID": "BIZ-001", "Payment Obligation ID": "POB-001",
+    "Client ID": "PRS-001", "Amount": "100.00", "Currency": "KZT", "Payment Date": "2026-01-01",
+    "Payment Method": "", "External Transaction ID": "", "Caller Idempotency Key": "",
+    "Evidence Document ID": "", "Status": "pending", "Reversal Reason": "",
+    "Confirmed At": "", "Confirmed By": "", "Reversed At": "", "Reversed By": "",
+    "Created At": "", "Created By": "", "Updated At": "", "Notes": "",
+}
+_FP_ROW_BLANK_OBLIGATION = {**_FP_ROW, "Payment Obligation ID": ""}
+_FP_ROW_OTHER_BIZ = {**_FP_ROW, "Business ID": "BIZ-002"}
+_FP_ROW_OTHER_OBLIGATION = {**_FP_ROW, "Payment Obligation ID": "POB-002"}
+_FP_ROW_OTHER_STATUS = {**_FP_ROW, "Status": "failed"}
+_FP_ROW_MISSING_OWNERSHIP = {**_FP_ROW, "Business ID": ""}
+_FP_ROW_WHITESPACE_OWNERSHIP = {**_FP_ROW, "Business ID": "   "}
+
+_FP_FINDER_PATH = "business_core.payment_manager.find_payment_transaction_by_id"
+_FP_MUTATOR_PATH = "business_core.business_builder.fail_payment_transaction"
+
+_FP_ID_ARG = "payment_transaction_id=PTXN-001"
+_FP_ARGS = [_FP_ID_ARG]
+
+_FP_SECRET_ROW_MARKER = "TRANSACTION-SECRET"
+
+
+def _fp_boom_with_secrets(*_a, **_k):
+    raise RuntimeError(f"synthetic failure containing {_FP_SECRET_ROW_MARKER} and {_SECRET_BIZ_MARKER}")
+
+
+class FailPaymentMutationTestBase(unittest.TestCase):
+    def _run_handler(self, update, args=None, *, finder_side_effect=None, finder_return=None,
+                      authz_result=None, mutator_return=None, mutator_side_effect=None):
+        patches = []
+        if finder_side_effect is not None:
+            patches.append(patch(_FP_FINDER_PATH, side_effect=finder_side_effect))
+        else:
+            patches.append(patch(_FP_FINDER_PATH, return_value=finder_return))
+
+        mock_authz = AsyncMock(return_value=authz_result if authz_result is not None else _allow_result())
+        patches.append(patch(_AUTHZ_PATH, new=mock_authz))
+
+        if mutator_side_effect is not None:
+            mock_mutator = MagicMock(side_effect=mutator_side_effect)
+        else:
+            mock_mutator = MagicMock(return_value=mutator_return if mutator_return is not None else
+                                      {"ok": True, "changed": True, "code": "PAYMENT_TRANSACTION_FAILED", "error": None})
+        patches.append(patch(_FP_MUTATOR_PATH, new=mock_mutator))
+
+        ctx = _make_context(args if args is not None else _FP_ARGS)
+        with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+            for p in patches:
+                p.start()
+            try:
+                _run(th.failpayment_cmd(update, ctx))
+            finally:
+                for p in reversed(patches):
+                    p.stop()
+        return mock_authz, mock_mutator
+
+    def _sent_text(self, update) -> str:
+        call = update.message.reply_text.call_args
+        return call.args[0] if call.args else call.kwargs.get("text", "")
+
+
+class TestFailPaymentTransport(FailPaymentMutationTestBase):
+    def test_group_zero_finder_and_mutation(self):
+        update = _make_update(chat_type="group")
+        with patch(_FP_FINDER_PATH) as mock_finder, patch(_FP_MUTATOR_PATH) as mock_mutator, \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+            _run(th.failpayment_cmd(update, _make_context(_FP_ARGS)))
+        mock_finder.assert_not_called()
+        mock_mutator.assert_not_called()
+
+    def test_supergroup_zero_finder_and_mutation(self):
+        update = _make_update(chat_type="supergroup")
+        with patch(_FP_FINDER_PATH) as mock_finder, patch(_FP_MUTATOR_PATH) as mock_mutator, \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+            _run(th.failpayment_cmd(update, _make_context(_FP_ARGS)))
+        mock_finder.assert_not_called()
+        mock_mutator.assert_not_called()
+
+    def test_channel_zero_finder_and_mutation(self):
+        update = _make_update(chat_type="channel")
+        with patch(_FP_FINDER_PATH) as mock_finder, patch(_FP_MUTATOR_PATH) as mock_mutator, \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+            _run(th.failpayment_cmd(update, _make_context(_FP_ARGS)))
+        mock_finder.assert_not_called()
+        mock_mutator.assert_not_called()
+
+    def test_malformed_update_zero_finder_and_mutation(self):
+        update = SimpleNamespace()
+        with patch(_FP_FINDER_PATH) as mock_finder, patch(_FP_MUTATOR_PATH) as mock_mutator, \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+            _run(th.failpayment_cmd(update, _make_context(_FP_ARGS)))
+        mock_finder.assert_not_called()
+        mock_mutator.assert_not_called()
+
+    def test_missing_effective_user_zero_finder_and_mutation(self):
+        update = _make_update(user_id=None)
+        with patch(_FP_FINDER_PATH) as mock_finder, patch(_FP_MUTATOR_PATH) as mock_mutator, \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+            _run(th.failpayment_cmd(update, _make_context(_FP_ARGS)))
+        mock_finder.assert_not_called()
+        mock_mutator.assert_not_called()
+
+    def test_missing_user_id_zero_finder_and_mutation(self):
+        update = _make_update()
+        update.effective_user = SimpleNamespace(id=None)
+        with patch(_FP_FINDER_PATH) as mock_finder, patch(_FP_MUTATOR_PATH) as mock_mutator, \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+            _run(th.failpayment_cmd(update, _make_context(_FP_ARGS)))
+        mock_finder.assert_not_called()
+        mock_mutator.assert_not_called()
+
+    def test_private_allow_path_reaches_mutation(self):
+        update = _make_update()
+        _, mock_mutator = self._run_handler(update, finder_return=_FP_ROW)
+        mock_mutator.assert_called_once()
+
+
+class TestFailPaymentArguments(FailPaymentMutationTestBase):
+    def test_missing_id_zero_finder_and_mutation(self):
+        update = _make_update()
+        with patch(_FP_FINDER_PATH) as mock_finder, patch(_FP_MUTATOR_PATH) as mock_mutator, \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+            _run(th.failpayment_cmd(update, _make_context([])))
+        mock_finder.assert_not_called()
+        mock_mutator.assert_not_called()
+
+    def test_named_form_reaches_mutation(self):
+        update = _make_update()
+        _, mock_mutator = self._run_handler(update, args=["payment_transaction_id=PTXN-001"], finder_return=_FP_ROW)
+        mock_mutator.assert_called_once_with("PTXN-001")
+
+    def test_positional_form_reaches_mutation(self):
+        update = _make_update()
+        _, mock_mutator = self._run_handler(update, args=["PTXN-001"], finder_return=_FP_ROW)
+        mock_mutator.assert_called_once_with("PTXN-001")
+
+    def test_named_takes_precedence_over_positional(self):
+        update = _make_update()
+        with patch(_FP_FINDER_PATH, return_value=_FP_ROW) as mock_finder, \
+             patch(_AUTHZ_PATH, new=AsyncMock(return_value=_allow_result())), \
+             patch(_FP_MUTATOR_PATH, return_value={"ok": True, "changed": True, "code": "PAYMENT_TRANSACTION_FAILED", "error": None}) as mock_mutator, \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+            _run(th.failpayment_cmd(update, _make_context(["PTXN-999", "payment_transaction_id=PTXN-001"])))
+        mock_finder.assert_called_with("PTXN-001")
+        mock_mutator.assert_called_once_with("PTXN-001")
+
+    def test_unknown_key_rejected(self):
+        update = _make_update()
+        with patch(_FP_FINDER_PATH) as mock_finder, patch(_FP_MUTATOR_PATH) as mock_mutator, \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+            _run(th.failpayment_cmd(update, _make_context(_FP_ARGS + ["foo=bar"])))
+        mock_finder.assert_not_called()
+        mock_mutator.assert_not_called()
+
+    def test_unknown_key_usage_message(self):
+        update = _make_update()
+        with patch(_FP_FINDER_PATH), patch(_FP_MUTATOR_PATH), \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+            _run(th.failpayment_cmd(update, _make_context(_FP_ARGS + ["status=confirmed"])))
+        self.assertEqual(self._sent_text(update), "❌ /failpayment принимает только payment_transaction_id.")
+
+    def test_business_id_key_rejected(self):
+        update = _make_update()
+        with patch(_FP_FINDER_PATH) as mock_finder, patch(_FP_MUTATOR_PATH) as mock_mutator, \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+            _run(th.failpayment_cmd(update, _make_context(_FP_ARGS + ["business_id=BIZ-001"])))
+        mock_finder.assert_not_called()
+        mock_mutator.assert_not_called()
+
+    def test_object_id_key_rejected(self):
+        update = _make_update()
+        with patch(_FP_FINDER_PATH) as mock_finder, patch(_FP_MUTATOR_PATH) as mock_mutator, \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+            _run(th.failpayment_cmd(update, _make_context(_FP_ARGS + ["object_id=OBJ-001"])))
+        mock_finder.assert_not_called()
+        mock_mutator.assert_not_called()
+
+    def test_payment_obligation_id_key_rejected(self):
+        update = _make_update()
+        with patch(_FP_FINDER_PATH) as mock_finder, patch(_FP_MUTATOR_PATH) as mock_mutator, \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+            _run(th.failpayment_cmd(update, _make_context(_FP_ARGS + ["payment_obligation_id=POB-001"])))
+        mock_finder.assert_not_called()
+        mock_mutator.assert_not_called()
+
+    def test_status_key_rejected(self):
+        update = _make_update()
+        with patch(_FP_FINDER_PATH) as mock_finder, patch(_FP_MUTATOR_PATH) as mock_mutator, \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+            _run(th.failpayment_cmd(update, _make_context(_FP_ARGS + ["status=confirmed"])))
+        mock_finder.assert_not_called()
+        mock_mutator.assert_not_called()
+
+    def test_amount_key_rejected(self):
+        update = _make_update()
+        with patch(_FP_FINDER_PATH) as mock_finder, patch(_FP_MUTATOR_PATH) as mock_mutator, \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+            _run(th.failpayment_cmd(update, _make_context(_FP_ARGS + ["amount=50"])))
+        mock_finder.assert_not_called()
+        mock_mutator.assert_not_called()
+
+    def test_balance_key_rejected(self):
+        update = _make_update()
+        with patch(_FP_FINDER_PATH) as mock_finder, patch(_FP_MUTATOR_PATH) as mock_mutator, \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+            _run(th.failpayment_cmd(update, _make_context(_FP_ARGS + ["balance=50"])))
+        mock_finder.assert_not_called()
+        mock_mutator.assert_not_called()
+
+    def test_actor_key_rejected(self):
+        update = _make_update()
+        with patch(_FP_FINDER_PATH) as mock_finder, patch(_FP_MUTATOR_PATH) as mock_mutator, \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+            _run(th.failpayment_cmd(update, _make_context(_FP_ARGS + ["actor=owner"])))
+        mock_finder.assert_not_called()
+        mock_mutator.assert_not_called()
+
+    def test_confirmed_by_key_rejected(self):
+        update = _make_update()
+        with patch(_FP_FINDER_PATH) as mock_finder, patch(_FP_MUTATOR_PATH) as mock_mutator, \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+            _run(th.failpayment_cmd(update, _make_context(_FP_ARGS + ["confirmed_by=owner"])))
+        mock_finder.assert_not_called()
+        mock_mutator.assert_not_called()
+
+    def test_reversed_by_key_rejected(self):
+        update = _make_update()
+        with patch(_FP_FINDER_PATH) as mock_finder, patch(_FP_MUTATOR_PATH) as mock_mutator, \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+            _run(th.failpayment_cmd(update, _make_context(_FP_ARGS + ["reversed_by=owner"])))
+        mock_finder.assert_not_called()
+        mock_mutator.assert_not_called()
+
+    def test_reversal_reason_key_rejected(self):
+        update = _make_update()
+        with patch(_FP_FINDER_PATH) as mock_finder, patch(_FP_MUTATOR_PATH) as mock_mutator, \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+            _run(th.failpayment_cmd(update, _make_context(_FP_ARGS + ["reversal_reason=x"])))
+        mock_finder.assert_not_called()
+        mock_mutator.assert_not_called()
+
+    def test_valid_key_set_continues(self):
+        update = _make_update()
+        _, mock_mutator = self._run_handler(update, finder_return=_FP_ROW)
+        mock_mutator.assert_called_once()
+
+    def test_secret_values_never_echoed(self):
+        update = _make_update()
+        self._run_handler(
+            update, args=[f"payment_transaction_id={_FP_SECRET_ROW_MARKER}"],
+            finder_return=None,
+        )
+        self.assertNotIn(_FP_SECRET_ROW_MARKER, self._sent_text(update))
+
+
+class TestFailPaymentFirstLookup(FailPaymentMutationTestBase):
+    def test_finder_runs_via_asyncio_to_thread(self):
+        update = _make_update()
+        recorded = []
+
+        async def fake_to_thread(func, *args, **kwargs):
+            recorded.append((getattr(func, "__name__", None), args))
+            if len(recorded) <= 2:
+                return _FP_ROW
+            return {"ok": True, "changed": True, "code": "PAYMENT_TRANSACTION_FAILED", "error": None}
+
+        with patch("business_core.telegram_handlers.asyncio.to_thread", side_effect=fake_to_thread), \
+             patch(_AUTHZ_PATH, new=AsyncMock(return_value=_allow_result())), \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+            _run(th.failpayment_cmd(update, _make_context(_FP_ARGS)))
+        self.assertIn("PTXN-001", recorded[0][1])
+
+    def test_finder_called_before_authorization(self):
+        update = _make_update()
+        mock_authz, _ = self._run_handler(update, finder_return=_FP_ROW)
+        mock_authz.assert_called_once()
+
+    def test_finder_none_zero_authorization_and_mutation(self):
+        update = _make_update()
+        mock_authz, mock_mutator = self._run_handler(update, finder_return=None)
+        mock_authz.assert_not_called()
+        mock_mutator.assert_not_called()
+
+    def test_finder_none_generic_message(self):
+        update = _make_update()
+        self._run_handler(update, finder_return=None)
+        self.assertEqual(self._sent_text(update), "Запись недоступна или не найдена.")
+
+    def test_finder_exception_zero_authorization_and_mutation(self):
+        update = _make_update()
+
+        def boom(*_a, **_k):
+            raise RuntimeError("sheets down")
+
+        mock_authz, mock_mutator = self._run_handler(update, finder_side_effect=boom)
+        mock_authz.assert_not_called()
+        mock_mutator.assert_not_called()
+
+    def test_finder_exception_temporarily_unavailable_message(self):
+        update = _make_update()
+
+        def boom(*_a, **_k):
+            raise RuntimeError("sheets down")
+
+        self._run_handler(update, finder_side_effect=boom)
+        text = self._sent_text(update)
+        self.assertIn("Временная ошибка", text)
+        self.assertNotIn("RuntimeError", text)
+        self.assertNotIn("sheets down", text)
+
+    def test_missing_business_id_zero_authorization_and_mutation(self):
+        update = _make_update()
+        mock_authz, mock_mutator = self._run_handler(update, finder_return=_FP_ROW_MISSING_OWNERSHIP)
+        mock_authz.assert_not_called()
+        mock_mutator.assert_not_called()
+
+    def test_blank_business_id_zero_authorization_and_mutation(self):
+        update = _make_update()
+        mock_authz, mock_mutator = self._run_handler(update, finder_return=_FP_ROW_WHITESPACE_OWNERSHIP)
+        mock_authz.assert_not_called()
+        mock_mutator.assert_not_called()
+
+    def test_blank_obligation_id_allowed_reaches_authorization(self):
+        update = _make_update()
+        mock_authz, mock_mutator = self._run_handler(update, finder_return=_FP_ROW_BLANK_OBLIGATION)
+        mock_authz.assert_called_once()
+        mock_mutator.assert_called_once()
+
+
+class TestFailPaymentAuthorization(FailPaymentMutationTestBase):
+    def test_resource_finance_action_update(self):
+        update = _make_update()
+        mock_authz, _ = self._run_handler(update, finder_return=_FP_ROW)
+        _, kwargs = mock_authz.call_args
+        self.assertEqual(kwargs["resource"], "FINANCE")
+        self.assertEqual(kwargs["action"], "UPDATE")
+
+    def test_business_id_comes_only_from_stored_row(self):
+        update = _make_update()
+        mock_authz, _ = self._run_handler(update, finder_return=_FP_ROW)
+        _, kwargs = mock_authz.call_args
+        self.assertEqual(kwargs["business_id"], "BIZ-001")
+
+    def test_object_id_omitted(self):
+        update = _make_update()
+        mock_authz, _ = self._run_handler(update, finder_return=_FP_ROW)
+        _, kwargs = mock_authz.call_args
+        self.assertEqual(kwargs.get("object_id", ""), "")
+
+    def test_caller_cannot_spoof_business_id(self):
+        src = inspect.getsource(th.failpayment_cmd)
+        self.assertNotIn('args.get("business_id"', src)
+
+    def test_denial_zero_second_lookup_and_mutation(self):
+        update = _make_update()
+        calls = []
+
+        def finder(*a, **k):
+            calls.append(a)
+            return _FP_ROW
+
+        mock_authz, mock_mutator = self._run_handler(
+            update, finder_side_effect=finder, authz_result=_deny_result(),
+        )
+        self.assertEqual(len(calls), 1)
+        mock_mutator.assert_not_called()
+
+    def test_denial_generic_message(self):
+        update = _make_update()
+        self._run_handler(update, finder_return=_FP_ROW, authz_result=_deny_result())
+        self.assertEqual(self._sent_text(update), "Запись недоступна или не найдена.")
+
+    def test_infrastructure_failure_zero_mutation(self):
+        update = _make_update()
+        _, mock_mutator = self._run_handler(update, finder_return=_FP_ROW, authz_result=_infra_failure_result())
+        mock_mutator.assert_not_called()
+
+    def test_authorized_exactly_once(self):
+        update = _make_update()
+        mock_authz, _ = self._run_handler(update, finder_return=_FP_ROW)
+        self.assertEqual(mock_authz.call_count, 1)
+
+    def test_owner_allow_continues_to_mutation(self):
+        update = _make_update()
+        _, mock_mutator = self._run_handler(update, finder_return=_FP_ROW, authz_result=_allow_result())
+        mock_mutator.assert_called_once()
+
+
+class TestFailPaymentFreshReread(FailPaymentMutationTestBase):
+    def test_second_lookup_occurs_exactly_twice_total(self):
+        update = _make_update()
+        finder_calls = []
+
+        def finder(transaction_id):
+            finder_calls.append(transaction_id)
+            return _FP_ROW
+
+        self._run_handler(update, finder_side_effect=finder)
+        self.assertEqual(len(finder_calls), 2)
+        self.assertEqual(finder_calls, ["PTXN-001", "PTXN-001"])
+
+    def test_second_lookup_only_after_allow(self):
+        update = _make_update()
+        finder_calls = []
+
+        def finder(transaction_id):
+            finder_calls.append(transaction_id)
+            return _FP_ROW
+
+        self._run_handler(update, finder_side_effect=finder, authz_result=_deny_result())
+        self.assertEqual(len(finder_calls), 1)
+
+    def test_second_row_missing_zero_mutation(self):
+        update = _make_update()
+        calls = {"n": 0}
+
+        def finder(*_a, **_k):
+            calls["n"] += 1
+            return _FP_ROW if calls["n"] == 1 else None
+
+        _, mock_mutator = self._run_handler(update, finder_side_effect=finder)
+        mock_mutator.assert_not_called()
+
+    def test_second_row_missing_ownership_changed_message(self):
+        update = _make_update()
+        calls = {"n": 0}
+
+        def finder(*_a, **_k):
+            calls["n"] += 1
+            return _FP_ROW if calls["n"] == 1 else None
+
+        self._run_handler(update, finder_side_effect=finder)
+        self.assertEqual(self._sent_text(update), "Запись изменилась. Повтори команду ещё раз.")
+
+    def test_second_business_id_blank_zero_mutation(self):
+        update = _make_update()
+        calls = {"n": 0}
+
+        def finder(*_a, **_k):
+            calls["n"] += 1
+            return _FP_ROW if calls["n"] == 1 else _FP_ROW_MISSING_OWNERSHIP
+
+        _, mock_mutator = self._run_handler(update, finder_side_effect=finder)
+        mock_mutator.assert_not_called()
+
+    def test_business_id_changed_zero_mutation(self):
+        update = _make_update()
+        calls = {"n": 0}
+
+        def finder(*_a, **_k):
+            calls["n"] += 1
+            return _FP_ROW if calls["n"] == 1 else _FP_ROW_OTHER_BIZ
+
+        _, mock_mutator = self._run_handler(update, finder_side_effect=finder)
+        mock_mutator.assert_not_called()
+
+    def test_obligation_id_changed_zero_mutation(self):
+        update = _make_update()
+        calls = {"n": 0}
+
+        def finder(*_a, **_k):
+            calls["n"] += 1
+            return _FP_ROW if calls["n"] == 1 else _FP_ROW_OTHER_OBLIGATION
+
+        _, mock_mutator = self._run_handler(update, finder_side_effect=finder)
+        mock_mutator.assert_not_called()
+
+    def test_status_changed_zero_mutation(self):
+        update = _make_update()
+        calls = {"n": 0}
+
+        def finder(*_a, **_k):
+            calls["n"] += 1
+            return _FP_ROW if calls["n"] == 1 else _FP_ROW_OTHER_STATUS
+
+        _, mock_mutator = self._run_handler(update, finder_side_effect=finder)
+        mock_mutator.assert_not_called()
+
+    def test_mismatch_message_reveals_no_business_id(self):
+        update = _make_update()
+        calls = {"n": 0}
+
+        def finder(*_a, **_k):
+            calls["n"] += 1
+            return _FP_ROW if calls["n"] == 1 else _FP_ROW_OTHER_BIZ
+
+        self._run_handler(update, finder_side_effect=finder)
+        text = self._sent_text(update)
+        self.assertEqual(text, "Запись изменилась. Повтори команду ещё раз.")
+        self.assertNotIn("BIZ-001", text)
+        self.assertNotIn("BIZ-002", text)
+
+    def test_unchanged_stability_mutation_permitted(self):
+        update = _make_update()
+        _, mock_mutator = self._run_handler(update, finder_return=_FP_ROW)
+        mock_mutator.assert_called_once()
+
+    def test_no_automatic_reauthorization_on_mismatch(self):
+        update = _make_update()
+        calls = {"n": 0}
+
+        def finder(*_a, **_k):
+            calls["n"] += 1
+            return _FP_ROW if calls["n"] == 1 else _FP_ROW_OTHER_STATUS
+
+        mock_authz, _ = self._run_handler(update, finder_side_effect=finder)
+        mock_authz.assert_called_once()
+
+
+class TestFailPaymentMutation(FailPaymentMutationTestBase):
+    def test_mutation_runs_via_asyncio_to_thread(self):
+        update = _make_update()
+        seen_funcs = []
+
+        async def spy_to_thread(func, *args, **kwargs):
+            seen_funcs.append(getattr(func, "__name__", None))
+            if getattr(func, "__name__", None) == "find_payment_transaction_by_id":
+                return _FP_ROW
+            return {"ok": True, "changed": True, "code": "PAYMENT_TRANSACTION_FAILED", "error": None}
+
+        with patch("business_core.telegram_handlers.asyncio.to_thread", side_effect=spy_to_thread), \
+             patch(_AUTHZ_PATH, new=AsyncMock(return_value=_allow_result())), \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+            _run(th.failpayment_cmd(update, _make_context(_FP_ARGS)))
+        self.assertIn("fail_payment_transaction", seen_funcs)
+
+    def test_mutation_called_exactly_once(self):
+        update = _make_update()
+        _, mock_mutator = self._run_handler(update, finder_return=_FP_ROW)
+        mock_mutator.assert_called_once()
+
+    def test_mutation_called_with_exact_args(self):
+        update = _make_update()
+        _, mock_mutator = self._run_handler(update, finder_return=_FP_ROW)
+        mock_mutator.assert_called_once_with("PTXN-001")
+
+    def test_no_retry_on_mutation_exception(self):
+        update = _make_update()
+
+        def boom(*_a, **_k):
+            raise RuntimeError("write failed")
+
+        _, mock_mutator = self._run_handler(update, finder_return=_FP_ROW, mutator_side_effect=boom)
+        mock_mutator.assert_called_once()
+
+    def test_mutation_exception_no_raw_exception_in_reply(self):
+        update = _make_update()
+
+        def boom(*_a, **_k):
+            raise RuntimeError("write failed")
+
+        self._run_handler(update, finder_return=_FP_ROW, mutator_side_effect=boom)
+        text = self._sent_text(update)
+        self.assertNotIn("RuntimeError", text)
+        self.assertNotIn("write failed", text)
+
+    def test_mutation_exception_safe_generic_message(self):
+        update = _make_update()
+
+        def boom(*_a, **_k):
+            raise RuntimeError("write failed")
+
+        self._run_handler(update, finder_return=_FP_ROW, mutator_side_effect=boom)
+        self.assertEqual(self._sent_text(update), "❌ Не удалось обновить статус Payment.")
+
+    def test_mutation_exception_fixed_log_literal(self):
+        update = _make_update()
+
+        def boom(*_a, **_k):
+            raise RuntimeError("write failed")
+
+        with patch("business_core.telegram_handlers.log.error") as mock_log_error:
+            self._run_handler(update, finder_return=_FP_ROW, mutator_side_effect=boom)
+        mock_log_error.assert_called_once_with("failpayment_cmd infrastructure failure")
+
+    def test_mapper_reused_unchanged_on_success(self):
+        update = _make_update()
+        self._run_handler(update, finder_return=_FP_ROW, mutator_return={
+            "ok": True, "changed": True, "code": "PAYMENT_TRANSACTION_FAILED", "error": None,
+        })
+        self.assertEqual(self._sent_text(update), "✅ Payment PTXN-001 помечен failed.")
+
+    def test_mapper_reused_unchanged_on_unchanged(self):
+        update = _make_update()
+        self._run_handler(update, finder_return=_FP_ROW, mutator_return={
+            "ok": True, "changed": False, "code": "PAYMENT_TRANSACTION_FAILED", "error": None,
+        })
+        self.assertEqual(self._sent_text(update), "ℹ️ Payment PTXN-001 уже помечен failed — изменений нет.")
+
+    def test_residual_toctou_not_found_after_authorization(self):
+        # The handler's own second lookup already caught disappearance
+        # before ever calling the wrapper — this covers the residual
+        # case where business_builder itself reports not-found (e.g.
+        # a row deleted between the handler's second lookup and the
+        # wrapper's own internal read), routed through the unchanged,
+        # already-hardened mapper.
+        update = _make_update()
+        self._run_handler(update, finder_return=_FP_ROW, mutator_return={
+            "ok": False, "changed": False, "code": "PAYMENT_TRANSACTION_NOT_FOUND", "error": "not found",
+        })
+        self.assertEqual(self._sent_text(update), "❌ Payment PTXN-001 не найден.")
+
+    def test_invalid_transition_mapped(self):
+        update = _make_update()
+        self._run_handler(update, finder_return=_FP_ROW, mutator_return={
+            "ok": False, "changed": False, "code": "INVALID_PAYMENT_TRANSACTION_TRANSITION", "error": "x",
+        })
+        self.assertEqual(self._sent_text(update), "❌ Переход в failed возможен только из статуса pending.")
+
+    def test_persistence_failure_mapped(self):
+        update = _make_update()
+        self._run_handler(update, finder_return=_FP_ROW, mutator_return={
+            "ok": False, "changed": False, "code": "PAYMENT_PERSISTENCE_FAILED", "error": "x",
+        })
+        self.assertEqual(self._sent_text(update), "❌ Не удалось обновить статус Payment.")
+
+    def test_malformed_wrapper_result_does_not_raise(self):
+        update = _make_update()
+        self._run_handler(update, finder_return=_FP_ROW, mutator_return="not a dict")
+        self.assertEqual(self._sent_text(update), "❌ Не удалось обновить статус Payment.")
+
+
+class TestFailPaymentIdempotency(FailPaymentMutationTestBase):
+    def test_repeated_fail_produces_unchanged_message(self):
+        update = _make_update()
+        self._run_handler(update, finder_return=_FP_ROW, mutator_return={
+            "ok": True, "changed": False, "code": "PAYMENT_TRANSACTION_FAILED", "error": None,
+        })
+        self.assertIn("изменений нет", self._sent_text(update))
+
+    def test_no_automatic_retry_in_handler(self):
+        src = inspect.getsource(th.failpayment_cmd)
+        self.assertNotIn("for _ in range", src)
+        self.assertNotIn("while True", src)
+        self.assertNotIn("retry", src.lower())
+
+
+class TestFailPaymentIsolation(unittest.TestCase):
+    def test_confirmpayment_cmd_unchanged_source(self):
+        src = inspect.getsource(th.confirmpayment_cmd)
+        self.assertNotIn("_mutate_target_in_thread(", src)
+        self.assertNotIn("_authorize_or_reply(", src)
+        self.assertNotIn("_validate_bc_transport_or_reply(", src)
+
+    def test_reversepayment_cmd_unchanged_source(self):
+        src = inspect.getsource(th.reversepayment_cmd)
+        self.assertNotIn("_mutate_target_in_thread(", src)
+        self.assertNotIn("_authorize_or_reply(", src)
+        self.assertNotIn("_validate_bc_transport_or_reply(", src)
+
+    def test_confirmpayment_not_in_enforcement_map(self):
+        self.assertNotIn("confirmpayment", th.COMMAND_ENFORCEMENT_MAP)
+
+    def test_reversepayment_not_in_enforcement_map(self):
+        self.assertNotIn("reversepayment", th.COMMAND_ENFORCEMENT_MAP)
+
+    def test_failpayment_does_not_call_confirm_or_reverse(self):
+        tree = ast.parse(inspect.getsource(th.failpayment_cmd))
+        referenced_names = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
+        for forbidden in ("confirm_payment_transaction", "reverse_payment_transaction"):
+            self.assertNotIn(forbidden, referenced_names)
+
+    def test_failpayment_no_obligation_lookup_or_write(self):
+        src = inspect.getsource(th.failpayment_cmd)
+        for forbidden in ("find_payment_obligation_by_id", "update_payment_obligation_balance"):
+            self.assertNotIn(forbidden, src)
+
+    def test_failpayment_no_direct_sheets_write(self):
+        src = inspect.getsource(th.failpayment_cmd)
+        for forbidden in ("get_business_sheet(", "update_cell(", "find_row_by_id("):
+            self.assertNotIn(forbidden, src)
+
+    def test_failpayment_no_cache(self):
+        src = inspect.getsource(th.failpayment_cmd)
+        for forbidden in ("lru_cache", "cache_clear", "_CACHE", "TTLCache"):
+            self.assertNotIn(forbidden, src)
+
+
+class TestFailPaymentArchitecture(unittest.TestCase):
+    def test_enforcement_map_has_exactly_twelve_entries(self):
+        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 12)
+
+    def test_failpayment_metadata_exact(self):
+        self.assertEqual(th.COMMAND_ENFORCEMENT_MAP["failpayment"], {
+            "resource": "FINANCE", "action": "UPDATE", "target_shape": "BUSINESS",
+            "operation_kind": "MUTATION", "requires_fresh_reread": True,
+            "mutation_side_effect_class": "SINGLE_ROW_MUTATION", "idempotency_class": "IDEMPOTENT",
+        })
+
+    def test_registration_line_registered_once(self):
+        with open("business_core/telegram_handlers.py", encoding="utf-8") as f:
+            content = f.read()
+        self.assertEqual(content.count('CommandHandler("failpayment",'), 1)
+
+    def test_mutation_uses_helper_exactly_once_on_authorized_stable_path(self):
+        # Identity-based check on the asyncio.to_thread primitive
+        # itself (the same proven-stable pattern used by
+        # TestFailPaymentMutation.test_mutation_runs_via_asyncio_to_thread
+        # above) rather than patching the local _mutate_target_in_thread
+        # coroutine directly — patch()'s AsyncMock autodetection for a
+        # locally-defined async def proved order-dependent across the
+        # full suite in practice.
+        update = _make_update()
+        mock_mutator = MagicMock(return_value={"ok": True, "changed": True, "code": "PAYMENT_TRANSACTION_FAILED", "error": None})
+
+        async def spy_to_thread(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with patch(_FP_FINDER_PATH, return_value=_FP_ROW), \
+             patch(_AUTHZ_PATH, new=AsyncMock(return_value=_allow_result())), \
+             patch(_FP_MUTATOR_PATH, new=mock_mutator), \
+             patch("business_core.telegram_handlers.asyncio.to_thread", side_effect=spy_to_thread) as spy, \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+            _run(th.failpayment_cmd(update, _make_context(_FP_ARGS)))
+        mutator_calls = [c for c in spy.call_args_list if c.args and c.args[0] is mock_mutator]
+        self.assertEqual(len(mutator_calls), 1)
+
+    def test_unauthorized_path_zero_mutation(self):
+        update = _make_update()
+        with patch(_FP_FINDER_PATH, return_value=_FP_ROW), \
+             patch(_AUTHZ_PATH, new=AsyncMock(return_value=_deny_result())), \
+             patch(_FP_MUTATOR_PATH) as mock_mutator, \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+            _run(th.failpayment_cmd(update, _make_context(_FP_ARGS)))
+        mock_mutator.assert_not_called()
+
+    def test_unstable_path_zero_mutation(self):
+        update = _make_update()
+        calls = {"n": 0}
+
+        def finder(*_a, **_k):
+            calls["n"] += 1
+            return _FP_ROW if calls["n"] == 1 else _FP_ROW_OTHER_STATUS
+
+        with patch(_FP_FINDER_PATH, side_effect=finder), \
+             patch(_AUTHZ_PATH, new=AsyncMock(return_value=_allow_result())), \
+             patch(_FP_MUTATOR_PATH) as mock_mutator, \
+             patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+            _run(th.failpayment_cmd(update, _make_context(_FP_ARGS)))
+        mock_mutator.assert_not_called()
+
+
+class TestFailPaymentExceptionSecrecy(FailPaymentMutationTestBase):
+    def _assert_no_secrets_logged(self, mock_log_error):
+        for call in mock_log_error.call_args_list:
+            for arg in list(call.args) + list(call.kwargs.values()):
+                text = str(arg)
+                for marker in _ALL_SECRET_MARKERS:
+                    self.assertNotIn(marker, text)
+                self.assertNotIn(_FP_SECRET_ROW_MARKER, text)
+
+    def test_mutation_exception_no_secrets_in_log_call_args(self):
+        update = _make_update()
+        with patch("business_core.telegram_handlers.log.error") as mock_log_error:
+            self._run_handler(
+                update,
+                finder_return={**_FP_ROW, "Business ID": _SECRET_BIZ_MARKER},
+                mutator_side_effect=_fp_boom_with_secrets,
+            )
+        mock_log_error.assert_called_once()
+        self._assert_no_secrets_logged(mock_log_error)
+
+    def test_mutation_exception_no_secrets_in_reply(self):
+        update = _make_update()
+        self._run_handler(
+            update,
+            finder_return={**_FP_ROW, "Business ID": _SECRET_BIZ_MARKER},
+            mutator_side_effect=_fp_boom_with_secrets,
+        )
+        text = self._sent_text(update)
+        self.assertNotIn(_FP_SECRET_ROW_MARKER, text)
+        self.assertNotIn(_SECRET_BIZ_MARKER, text)
+        self.assertEqual(text, "❌ Не удалось обновить статус Payment.")
+
+    def test_first_lookup_exception_no_secrets_in_reply(self):
+        update = _make_update()
+        self._run_handler(update, finder_side_effect=_fp_boom_with_secrets)
+        text = self._sent_text(update)
+        self.assertNotIn(_FP_SECRET_ROW_MARKER, text)
+        self.assertEqual(text, "Временная ошибка проверки доступа. Попробуйте ещё раз позже.")
+
+    def test_second_lookup_exception_no_secrets_in_reply(self):
+        update = _make_update()
+        calls = {"n": 0}
+
+        def finder(*_a, **_k):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return _FP_ROW
+            raise RuntimeError(f"boom {_FP_SECRET_ROW_MARKER}")
+
+        self._run_handler(update, finder_side_effect=finder)
+        text = self._sent_text(update)
+        self.assertNotIn(_FP_SECRET_ROW_MARKER, text)
+        self.assertEqual(text, "Временная ошибка проверки доступа. Попробуйте ещё раз позже.")
+
+    def test_authorization_denial_no_secrets_in_reply(self):
+        update = _make_update()
+        self._run_handler(
+            update, finder_return={**_FP_ROW, "Business ID": _SECRET_BIZ_MARKER}, authz_result=_deny_result(),
+        )
+        text = self._sent_text(update)
+        self.assertNotIn(_SECRET_BIZ_MARKER, text)
 
 
 if __name__ == "__main__":
