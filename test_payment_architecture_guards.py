@@ -441,54 +441,69 @@ class TestPaymentCommandsCallOnlyCanonicalOrchestration(unittest.TestCase):
                 self.assertNotIn(call, body, f"{fn_name} must not call low-level {call.rstrip('(')} directly")
 
     def test_mutating_commands_call_business_builder_only(self):
-        # failpayment_cmd is intentionally excluded from this literal-
-        # call-substring check (Phase 17E-2A6-AUTH-B1): it now passes
-        # fail_payment_transaction BY REFERENCE into
-        # _mutate_target_in_thread(fail_payment_transaction, ...)
-        # rather than calling it directly — see the dedicated semantic
-        # test below (mirrors the Phase 17E-1 obligation_cmd/payment_cmd
+        # failpayment_cmd/confirmpayment_cmd/reversepayment_cmd are
+        # intentionally excluded from this literal-call-substring
+        # check (Phase 17E-2A6-AUTH-B1/B2): they now pass their
+        # wrapper functions BY REFERENCE into
+        # _mutate_target_in_thread(wrapper, ...) rather than calling
+        # them directly — see the dedicated semantic tests below
+        # (mirrors the Phase 17E-1 obligation_cmd/payment_cmd
         # precedent for _resolve_target_in_thread).
         expectations = {
             "newpaymenttemplate_cmd": "create_commercial_milestone_template(",
             "newobligation_cmd": "create_payment_obligation(",
             "recordpayment_cmd": "create_payment_transaction(",
-            "confirmpayment_cmd": "confirm_payment_transaction(",
-            "reversepayment_cmd": "reverse_payment_transaction(",
         }
         for fn_name, call in expectations.items():
             body = _th_function_body(fn_name)
             self.assertIn(call, body, f"{fn_name} must call business_builder.{call.rstrip('(')}")
 
-    def test_failpayment_resolves_mutator_through_thread_offload(self):
+    def _assert_resolves_mutator_through_thread_offload(self, fn_name, wrapper_name, expected_args):
         """
-        Phase 17E-2A6-AUTH-B1 semantic replacement for the literal
-        "fail_payment_transaction(" substring check, obsolete now that
-        failpayment_cmd routes its mutation through
-        _mutate_target_in_thread(fail_payment_transaction, transaction_id)
-        — mirrors test_obligation_and_payment_resolve_finder_through_
+        Phase 17E-2A6-AUTH-B1/B2 semantic replacement for the literal
+        "<wrapper>(" substring check, obsolete now that these handlers
+        route their mutation through
+        _mutate_target_in_thread(wrapper, ...) — mirrors
+        test_obligation_and_payment_resolve_finder_through_
         thread_offload's AST-based approach for the finder side.
         """
         src = (BUSINESS_CORE / "telegram_handlers.py").read_text(encoding="utf-8")
         tree = ast.parse(src)
-        node = next(n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == "failpayment_cmd")
+        node = next(n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == fn_name)
 
         offload_calls, direct_calls = [], []
         for n in ast.walk(node):
             if isinstance(n, ast.Call) and isinstance(n.func, ast.Name):
                 if n.func.id == "_mutate_target_in_thread":
                     offload_calls.append(n)
-                elif n.func.id == "fail_payment_transaction":
+                elif n.func.id == wrapper_name:
                     direct_calls.append(n)
 
         self.assertEqual(len(offload_calls), 1)
         call = offload_calls[0]
-        self.assertEqual(len(call.args), 2)
-        mutator_arg, id_arg = call.args
+        self.assertEqual(len(call.args), 1 + len(expected_args))
+        mutator_arg, *rest_args = call.args
         self.assertIsInstance(mutator_arg, ast.Name)
-        self.assertEqual(mutator_arg.id, "fail_payment_transaction")
-        self.assertIsInstance(id_arg, ast.Name)
-        self.assertEqual(id_arg.id, "transaction_id")
-        self.assertEqual(direct_calls, [], "fail_payment_transaction must never be called directly in failpayment_cmd")
+        self.assertEqual(mutator_arg.id, wrapper_name)
+        for arg_node, expected_name in zip(rest_args, expected_args):
+            self.assertIsInstance(arg_node, ast.Name)
+            self.assertEqual(arg_node.id, expected_name)
+        self.assertEqual(direct_calls, [], f"{wrapper_name} must never be called directly in {fn_name}")
+
+    def test_failpayment_resolves_mutator_through_thread_offload(self):
+        self._assert_resolves_mutator_through_thread_offload(
+            "failpayment_cmd", "fail_payment_transaction", ["transaction_id"],
+        )
+
+    def test_confirmpayment_resolves_mutator_through_thread_offload(self):
+        self._assert_resolves_mutator_through_thread_offload(
+            "confirmpayment_cmd", "confirm_payment_transaction", ["transaction_id", "confirmed_by"],
+        )
+
+    def test_reversepayment_resolves_mutator_through_thread_offload(self):
+        self._assert_resolves_mutator_through_thread_offload(
+            "reversepayment_cmd", "reverse_payment_transaction", ["transaction_id", "reversal_reason", "reversed_by"],
+        )
 
     def test_read_commands_call_exact_payment_manager_helpers_only(self):
         # obligation_cmd/payment_cmd are enforced (Phase 17E-1): their
@@ -721,15 +736,25 @@ class TestPaymentParserValidationOrdering(unittest.TestCase):
         self.assertLess(validation_idx, orchestration_idx)
 
     def test_confirmpayment_validates_before_orchestration(self):
+        # Phase 17E-2A6-AUTH-B2: confirmpayment_cmd's orchestration
+        # call is now the thread-offloaded mutation
+        # _mutate_target_in_thread(confirm_payment_transaction, ...) —
+        # "confirm_payment_transaction(" (a direct call) no longer
+        # appears anywhere in the body.
         body = _th_function_body("confirmpayment_cmd")
         validation_idx = body.index("if not transaction_id or not confirmed_by")
-        orchestration_idx = body.index("confirm_payment_transaction(")
+        orchestration_idx = body.index("_mutate_target_in_thread(")
         self.assertLess(validation_idx, orchestration_idx)
 
     def test_reversepayment_validates_before_orchestration(self):
+        # Phase 17E-2A6-AUTH-B2: reversepayment_cmd's orchestration
+        # call is now the thread-offloaded mutation
+        # _mutate_target_in_thread(reverse_payment_transaction, ...) —
+        # "reverse_payment_transaction(" (a direct call) no longer
+        # appears anywhere in the body.
         body = _th_function_body("reversepayment_cmd")
         validation_idx = body.index("if not transaction_id or not reversal_reason or not reversed_by")
-        orchestration_idx = body.index("reverse_payment_transaction(")
+        orchestration_idx = body.index("_mutate_target_in_thread(")
         self.assertLess(validation_idx, orchestration_idx)
 
     def test_failpayment_validates_before_orchestration(self):

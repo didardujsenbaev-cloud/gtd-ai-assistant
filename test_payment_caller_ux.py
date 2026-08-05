@@ -910,15 +910,31 @@ class TestCanonicalBoundaries(unittest.TestCase):
         mock_create.assert_called_once()
 
     def test_confirmpayment_calls_business_builder_only(self):
+        # Phase 17E-2A6-AUTH-B2: /confirmpayment is now authorized —
+        # reaching the wrapper requires a mocked first/second lookup
+        # and a mocked allow decision, in addition to the wrapper mock.
         update, context = _cmd("/confirmpayment payment_transaction_id=PTXN-001 confirmed_by=dida")
-        with patch("business_core.business_builder.confirm_payment_transaction",
+        txn_row = {"Business ID": "BIZ-001", "Payment Obligation ID": "POB-001", "Status": "pending"}
+        with patch("business_core.payment_manager.find_payment_transaction_by_id", return_value=txn_row), \
+             patch("business_core.telegram_authorization.authorize_telegram_business_core_request",
+                   new=AsyncMock(return_value={"ok": True, "allowed": True, "code": "TELEGRAM_ACCESS_ALLOWED", "retry_safe": True,
+                                                "authorization_result": {"ok": True, "allowed": True, "code": "ACCESS_ALLOWED"}})), \
+             patch("business_core.business_builder.confirm_payment_transaction",
                    return_value={"ok": True, "code": "PAYMENT_TRANSACTION_CONFIRMED", "error": None}) as mock_confirm:
             _run(th.confirmpayment_cmd(update, context))
         mock_confirm.assert_called_once()
 
     def test_reversepayment_calls_business_builder_only(self):
+        # Phase 17E-2A6-AUTH-B2: /reversepayment is now authorized —
+        # reaching the wrapper requires a mocked first/second lookup
+        # and a mocked allow decision, in addition to the wrapper mock.
         update, context = _cmd("/reversepayment payment_transaction_id=PTXN-001 reversal_reason=R reversed_by=dida")
-        with patch("business_core.business_builder.reverse_payment_transaction",
+        txn_row = {"Business ID": "BIZ-001", "Payment Obligation ID": "POB-001", "Status": "confirmed"}
+        with patch("business_core.payment_manager.find_payment_transaction_by_id", return_value=txn_row), \
+             patch("business_core.telegram_authorization.authorize_telegram_business_core_request",
+                   new=AsyncMock(return_value={"ok": True, "allowed": True, "code": "TELEGRAM_ACCESS_ALLOWED", "retry_safe": True,
+                                                "authorization_result": {"ok": True, "allowed": True, "code": "ACCESS_ALLOWED"}})), \
+             patch("business_core.business_builder.reverse_payment_transaction",
                    return_value={"ok": True, "code": "PAYMENT_TRANSACTION_REVERSED", "error": None}) as mock_reverse:
             _run(th.reversepayment_cmd(update, context))
         mock_reverse.assert_called_once()

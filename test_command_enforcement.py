@@ -166,6 +166,16 @@ _EXPECTED_MUTATION_ENTRY = {
         "operation_kind": "MUTATION", "requires_fresh_reread": True,
         "mutation_side_effect_class": "SINGLE_ROW_MUTATION", "idempotency_class": "IDEMPOTENT",
     },
+    "confirmpayment": {
+        "resource": "FINANCE", "action": "UPDATE", "target_shape": "BUSINESS",
+        "operation_kind": "MUTATION", "requires_fresh_reread": True,
+        "mutation_side_effect_class": "MULTI_ROW_MUTATION", "idempotency_class": "IDEMPOTENT",
+    },
+    "reversepayment": {
+        "resource": "FINANCE", "action": "UPDATE", "target_shape": "BUSINESS",
+        "operation_kind": "MUTATION", "requires_fresh_reread": True,
+        "mutation_side_effect_class": "MULTI_ROW_MUTATION", "idempotency_class": "IDEMPOTENT",
+    },
 }
 
 _NON_ENFORCED_SAMPLE_HANDLERS = [
@@ -177,13 +187,15 @@ _NON_ENFORCED_SAMPLE_HANDLERS = [
     "assignrole_cmd",
     # Phase 17E-2 candidate mutation commands explicitly deferred —
     # must NOT have gained transport/authorization in this phase.
+    # confirmpayment_cmd/reversepayment_cmd were authorized in Phase
+    # 17E-2A6-AUTH-B2 and are intentionally excluded from this list.
     "updatedoc_cmd", "updateobligation_cmd", "updateoffer_cmd", "updatelead_cmd",
-    "confirmpayment_cmd", "reversepayment_cmd", "sendoffer_cmd", "acceptoffer_cmd", "convertlead_cmd",
+    "sendoffer_cmd", "acceptoffer_cmd", "convertlead_cmd",
 ]
 
 
 class TestEnforcementMap(unittest.TestCase):
-    def test_map_keys_exactly_twelve_commands(self):
+    def test_map_keys_exactly_fourteen_commands(self):
         expected_keys = set(_EXPECTED_MAP.keys()) | set(_EXPECTED_MUTATION_ENTRY.keys())
         self.assertEqual(set(th.COMMAND_ENFORCEMENT_MAP.keys()), expected_keys)
 
@@ -197,12 +209,8 @@ class TestEnforcementMap(unittest.TestCase):
             with self.subTest(command=key):
                 self.assertEqual(th.COMMAND_ENFORCEMENT_MAP[key], val)
 
-    def test_no_thirteenth_command_in_map(self):
-        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 12)
-
-    def test_confirmpayment_reversepayment_not_in_map(self):
-        self.assertNotIn("confirmpayment", th.COMMAND_ENFORCEMENT_MAP)
-        self.assertNotIn("reversepayment", th.COMMAND_ENFORCEMENT_MAP)
+    def test_no_fifteenth_command_in_map(self):
+        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 14)
 
     def test_updatelead_not_in_map(self):
         self.assertNotIn("updatelead", th.COMMAND_ENFORCEMENT_MAP)
@@ -479,23 +487,23 @@ class TestPhase17E2A4H1OfferHardeningScope(unittest.TestCase):
 
     def test_payment_ledger_read_failed_code_added_no_extra_map_entry_beyond_failpayment(self):
         # Phase 17E-2A6-H1 itself added no map entry. Phase
-        # 17E-2A6-AUTH-B1 later added exactly one: failpayment.
-        # confirmpayment/reversepayment remain explicitly out of scope.
-        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 12)
-        self.assertNotIn("confirmpayment", th.COMMAND_ENFORCEMENT_MAP)
-        self.assertNotIn("reversepayment", th.COMMAND_ENFORCEMENT_MAP)
+        # 17E-2A6-AUTH-B1 added failpayment; Phase 17E-2A6-AUTH-B2
+        # added confirmpayment and reversepayment. No fifteenth entry.
+        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 14)
         self.assertIn("failpayment", th.COMMAND_ENFORCEMENT_MAP)
+        self.assertIn("confirmpayment", th.COMMAND_ENFORCEMENT_MAP)
+        self.assertIn("reversepayment", th.COMMAND_ENFORCEMENT_MAP)
 
-    def test_confirmpayment_reversepayment_remain_unauthorized(self):
-        # Phase 17E-2A6-H1 only hardened the exception branch of these
-        # two handlers — they must not have gained authorization or
-        # transport preflight (that remains explicitly out of scope).
-        # failpayment_cmd is intentionally excluded from this loop —
-        # Phase 17E-2A6-AUTH-B1 authorized it.
+    def test_confirmpayment_reversepayment_now_authorized(self):
+        # Phase 17E-2A6-AUTH-B2: confirmpayment_cmd/reversepayment_cmd
+        # gain transport preflight and authorization, matching the
+        # failpayment_cmd pattern established in Phase 17E-2A6-AUTH-B1.
         for name in ("confirmpayment_cmd", "reversepayment_cmd"):
             src = inspect.getsource(getattr(th, name))
-            self.assertNotIn("_authorize_or_reply(", src)
-            self.assertNotIn("_validate_bc_transport_or_reply(", src)
+            self.assertIn("_authorize_or_reply(", src)
+            self.assertIn("_validate_bc_transport_or_reply(", src)
+            self.assertIn('resource="FINANCE"', src)
+            self.assertIn('action="UPDATE"', src)
 
     def test_failpayment_cmd_now_authorized(self):
         # Phase 17E-2A6-AUTH-B1: failpayment_cmd gains transport
@@ -581,14 +589,14 @@ class TestPhase17E2A4H1OfferHardeningScope(unittest.TestCase):
         self.assertTrue(hasattr(th, "updatedocnotes_cmd"))
         self.assertIn("updatedocnotes", th.COMMAND_ENFORCEMENT_MAP)
 
-    def test_enforcement_map_now_twelve_entries(self):
-        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 12)
+    def test_enforcement_map_now_fourteen_entries(self):
+        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 14)
 
-    def test_exactly_six_dedicated_mutation_handlers_use_mutate_helper(self):
+    def test_exactly_eight_dedicated_mutation_handlers_use_mutate_helper(self):
         dedicated = [
             "updateinteractionnotes_cmd", "updateleadnotes_cmd",
             "updateobligationnotes_cmd", "updateoffernotes_cmd", "updatedocnotes_cmd",
-            "failpayment_cmd",
+            "failpayment_cmd", "confirmpayment_cmd", "reversepayment_cmd",
         ]
         for name in dedicated:
             self.assertTrue(hasattr(th, name))
