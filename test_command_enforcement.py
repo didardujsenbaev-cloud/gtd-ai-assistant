@@ -418,6 +418,11 @@ class TestPhase17E2A4H1OfferHardeningScope(unittest.TestCase):
         # _payment_transaction_failure_message (mapper secrecy
         # hardening), and confirmpayment_cmd/reversepayment_cmd/
         # failpayment_cmd (outer-exception logging secrecy only).
+        # _task_assignment_message is the only approved
+        # telegram_handlers.py function change for the Task assignment
+        # mapper hardening; every Task handler command function and
+        # COMMAND_ENFORCEMENT_MAP itself are protected separately by
+        # test_task_architecture_guards.py.
         _assert_only_functions_changed_or_added(
             self, "business_core/telegram_handlers.py",
             allowed_changed_function_names={
@@ -425,6 +430,7 @@ class TestPhase17E2A4H1OfferHardeningScope(unittest.TestCase):
                 "_payment_transaction_confirmation_message",
                 "_payment_transaction_reversal_message", "_payment_transaction_failure_message",
                 "confirmpayment_cmd", "reversepayment_cmd", "failpayment_cmd", "updateinteractionnotes_cmd",
+                "_task_assignment_message",
             },
             allowed_added_function_names={
                 "_offer_notes_message", "updateoffernotes_cmd",
@@ -552,6 +558,11 @@ class TestPhase17E2A4H1OfferHardeningScope(unittest.TestCase):
         # _payment_transaction_failure_message (mapper secrecy
         # hardening), and confirmpayment_cmd/reversepayment_cmd/
         # failpayment_cmd (outer-exception logging secrecy only).
+        # _task_assignment_message is the only approved
+        # telegram_handlers.py function change for the Task assignment
+        # mapper hardening; every Task handler command function and
+        # COMMAND_ENFORCEMENT_MAP itself are protected separately by
+        # test_task_architecture_guards.py.
         _assert_only_functions_changed_or_added(
             self, "business_core/telegram_handlers.py",
             allowed_changed_function_names={
@@ -559,6 +570,7 @@ class TestPhase17E2A4H1OfferHardeningScope(unittest.TestCase):
                 "_payment_transaction_confirmation_message",
                 "_payment_transaction_reversal_message", "_payment_transaction_failure_message",
                 "confirmpayment_cmd", "reversepayment_cmd", "failpayment_cmd", "updateinteractionnotes_cmd",
+                "_task_assignment_message",
             },
             allowed_added_function_names={
                 "_offer_notes_message", "updateoffernotes_cmd",

@@ -1218,13 +1218,11 @@ class TestTaskExistingResourceInvariants(unittest.TestCase):
 
 
 class TestTaskCrossLayerIsolation(unittest.TestCase):
-    def test_telegram_handlers_zero_diff(self):
-        import subprocess
-        result = subprocess.run(
-            ["git", "diff", "--name-only", "HEAD", "--", "business_core/telegram_handlers.py"],
-            capture_output=True, text=True, cwd=".",
-        )
-        self.assertEqual(result.stdout.strip(), "")
+    # telegram_handlers.py zero-diff was true for the TASK
+    # authorization resource commit itself; ongoing telegram_handlers.py
+    # changes (e.g. the Task assignment mapper hardening) are scoped by
+    # test_task_architecture_guards.py's dedicated top-level construct
+    # guard instead.
 
     def test_no_resource_task_call_in_handlers_yet(self):
         with open("business_core/telegram_handlers.py", encoding="utf-8") as f:

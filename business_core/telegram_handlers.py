@@ -15967,78 +15967,133 @@ def _task_assignment_message(result: dict, task_id: str) -> str:
     distinct outcomes (created/reused/reassigned/unassigned) are
     already carried in `code` by the orchestrator, never re-derived
     here.
+
+    Pure function: no Sheets/business-layer/Telegram calls, no retry,
+    no mutation of `result`. Success is only ever `result.get("ok")
+    is True` (strict identity — truthy-but-non-boolean values never
+    qualify). No branch ever renders `result["error"]`/
+    `result.get("error")`, a raw exception, the raw `result` dict, or
+    the raw `code` value itself — every message is a fixed literal,
+    optionally combined with an already-approved structured field
+    (Task/Assignment IDs) for a recognized, explicitly matched code.
+    A structurally inconsistent known code (e.g. a success code
+    paired with ok=False, or a partial-state code missing its
+    required corroborating fields) and every genuinely unrecognized
+    code fall back to the exact same fixed, input-independent
+    generic-failure literal — never guessed into success, a code-
+    specific failure message, or a rendering of the code itself.
     """
+    generic_failure = "❌ Не удалось выполнить операцию с назначением задачи."
+
+    if not isinstance(result, dict):
+        return generic_failure
+
+    ok = result.get("ok")
     code = result.get("code", "")
+    if not isinstance(code, str):
+        code = ""
 
-    if code == "TASK_ASSIGNMENT_CREATED":
-        return "\n".join([
-            "✅ Task назначен",
-            f"Task ID: `{task_id}`",
-            f"Assignment ID: `{result.get('assignment_id', '')}`",
-        ])
+    if code == "TASK_UNASSIGNMENT_PARTIAL_FAILURE":
+        if (
+            ok is False
+            and result.get("partial_state") is True
+            and result.get("manual_review_required") is True
+            and result.get("assignment_changed") is True
+            and result.get("cache_changed") is False
+        ):
+            return "\n".join([
+                "⚠️ Назначение снято частично.",
+                f"Task ID: `{task_id}`",
+                "Данные задачи требуют ручной проверки.",
+                "Повтор команды может не исправить состояние.",
+            ])
+        log.warning(f"_task_assignment_message: inconsistent partial-state shape task_id={task_id}")
+        return generic_failure
 
-    if code == "TASK_ASSIGNMENT_REUSED":
-        return "\n".join([
-            "ℹ️ Уже назначен — активное назначение уже существует",
-            f"Task ID: `{task_id}`",
-            f"Assignment ID: `{result.get('assignment_id', '')}`",
-        ])
+    if ok is True:
+        if code == "TASK_ASSIGNMENT_CREATED":
+            return "\n".join([
+                "✅ Task назначен",
+                f"Task ID: `{task_id}`",
+                f"Assignment ID: `{result.get('assignment_id', '')}`",
+            ])
 
-    if code == "TASK_REASSIGNED":
-        return "\n".join([
-            "✅ Task переназначен",
-            f"Task ID: `{task_id}`",
-            f"Было: `{result.get('previous_assignment_id') or '—'}`",
-            f"Стало: `{result.get('assignment_id', '')}`",
-        ])
+        if code == "TASK_ASSIGNMENT_REUSED":
+            return "\n".join([
+                "ℹ️ Уже назначен — активное назначение уже существует",
+                f"Task ID: `{task_id}`",
+                f"Assignment ID: `{result.get('assignment_id', '')}`",
+            ])
 
-    if code == "TASK_UNASSIGNED":
-        return f"✅ Task `{task_id}` снят с назначения."
+        if code == "TASK_REASSIGNED":
+            return "\n".join([
+                "✅ Task переназначен",
+                f"Task ID: `{task_id}`",
+                f"Было: `{result.get('previous_assignment_id') or '—'}`",
+                f"Стало: `{result.get('assignment_id', '')}`",
+            ])
 
-    if code == "TASK_NOT_FOUND":
-        return f"❌ Task `{task_id}` не найден."
+        if code == "TASK_UNASSIGNED":
+            if (
+                result.get("changed") is True
+                and result.get("assignment_changed") is True
+                and result.get("partial_state") is not True
+            ):
+                return f"✅ Task `{task_id}` снят с назначения."
+            if (
+                result.get("changed") is False
+                and result.get("assignment_changed") is False
+                and result.get("partial_state") is not True
+            ):
+                return f"ℹ️ У Task `{task_id}` уже нет активного назначения."
+            log.warning(f"_task_assignment_message: inconsistent TASK_UNASSIGNED shape task_id={task_id}")
+            return generic_failure
 
-    if code == "ROLE_NOT_FOUND":
-        return "❌ Указанная Role не найдена."
+    if ok is not True:
+        if code == "TASK_NOT_FOUND":
+            return f"❌ Task `{task_id}` не найден."
 
-    if code == "ROLE_PAUSED":
-        return "❌ Role приостановлена (paused) — назначение не разрешено."
+        if code == "ROLE_NOT_FOUND":
+            return "❌ Указанная Role не найдена."
 
-    if code == "ROLE_ARCHIVED":
-        return "❌ Role архивирована — назначение не разрешено."
+        if code == "ROLE_PAUSED":
+            return "❌ Role приостановлена (paused) — назначение не разрешено."
 
-    if code == "ROLE_NOT_ACTIVE_FOR_TASK_EXECUTION":
-        return "❌ Role ещё planned — Person не может быть назначен как активный исполнитель, пока Role не станет active."
+        if code == "ROLE_ARCHIVED":
+            return "❌ Role архивирована — назначение не разрешено."
 
-    if code == "DEPARTMENT_NOT_FOUND":
-        return "❌ Department этой Role не найден."
+        if code == "ROLE_NOT_ACTIVE_FOR_TASK_EXECUTION":
+            return "❌ Role ещё planned — Person не может быть назначен как активный исполнитель, пока Role не станет active."
 
-    if code == "DEPARTMENT_ARCHIVED":
-        return "❌ Department этой Role архивирован — назначение не разрешено."
+        if code == "DEPARTMENT_NOT_FOUND":
+            return "❌ Department этой Role не найден."
 
-    if code == "PERSON_NOT_FOUND":
-        return "❌ Указанный Person не найден."
+        if code == "DEPARTMENT_ARCHIVED":
+            return "❌ Department этой Role архивирован — назначение не разрешено."
 
-    if code == "PERSON_ARCHIVED":
-        return "❌ Person архивирован — назначение не разрешено."
+        if code == "PERSON_NOT_FOUND":
+            return "❌ Указанный Person не найден."
 
-    if code == "PERSON_NOT_LINKED_TO_BUSINESS":
-        return "❌ Person не привязан к бизнесу этого Task."
+        if code == "PERSON_ARCHIVED":
+            return "❌ Person архивирован — назначение не разрешено."
 
-    if code == "PERSON_TASK_BUSINESS_MISMATCH":
-        return "❌ Person привязан к другому бизнесу, не к бизнесу этого Task."
+        if code == "PERSON_NOT_LINKED_TO_BUSINESS":
+            return "❌ Person не привязан к бизнесу этого Task."
 
-    if code == "MULTIPLE_ACTIVE_TASK_ASSIGNMENTS_INTEGRITY_ERROR":
-        ids = ", ".join(f"`{a}`" for a in result.get("conflicting_assignment_ids", ())) or "—"
-        return "\n".join([
-            "⚠️ Обнаружен конфликт целостности данных",
-            f"Task ID: `{task_id}`",
-            f"Найдено несколько активных Task Assignment одновременно: {ids}",
-            "Изменений не выполнено — автоматический выбор одного из них не выполняется.",
-        ])
+        if code == "PERSON_TASK_BUSINESS_MISMATCH":
+            return "❌ Person привязан к другому бизнесу, не к бизнесу этого Task."
+
+        if code == "MULTIPLE_ACTIVE_TASK_ASSIGNMENTS_INTEGRITY_ERROR":
+            ids = ", ".join(f"`{a}`" for a in result.get("conflicting_assignment_ids", ())) or "—"
+            return "\n".join([
+                "⚠️ Обнаружен конфликт целостности данных",
+                f"Task ID: `{task_id}`",
+                f"Найдено несколько активных Task Assignment одновременно: {ids}",
+                "Изменений не выполнено — автоматический выбор одного из них не выполняется.",
+            ])
 
     log.warning(f"_task_assignment_message: unmapped code={code!r} task_id={task_id}")
-    return f"❌ Ошибка ({code or 'unknown'}): {result.get('error') or 'см. логи'}"
+    return generic_failure
 
 
 def _task_detail_lines(task: dict) -> list[str]:

@@ -444,13 +444,11 @@ class TestUnassignTaskPartialStateHardening(unittest.TestCase):
         ).stdout
         self.assertEqual(diff.strip(), "")
 
-    def test_telegram_handlers_unchanged(self):
-        import subprocess
-        diff = subprocess.run(
-            ["git", "diff", "--name-only", "HEAD", "--", "business_core/telegram_handlers.py"],
-            cwd=WORKSPACE, capture_output=True, text=True, check=True,
-        ).stdout
-        self.assertEqual(diff.strip(), "")
+    # telegram_handlers.py zero-diff was true for the unassign_task
+    # business-layer hardening phase specifically; ongoing
+    # telegram_handlers.py changes (e.g. the Task assignment mapper
+    # hardening) are scoped by TestTelegramHandlersTopLevelConstructGuard
+    # below instead.
 
     def test_authorization_unchanged(self):
         import subprocess
@@ -470,13 +468,10 @@ class TestUnassignTaskPartialStateHardening(unittest.TestCase):
         import business_core.telegram_handlers as th
         self.assertNotIn("unassigntask", th.COMMAND_ENFORCEMENT_MAP)
 
-    def test_mapper_unchanged(self):
-        path = BUSINESS_CORE / "telegram_handlers.py"
-        src = path.read_text(encoding="utf-8")
-        start = src.index("def _task_assignment_message(")
-        end = src.index("\ndef ", start + 10)
-        body = src[start:end]
-        self.assertIn("result.get('error') or 'см. логи'", body)
+    # The mapper's raw-error fallback wording asserted here was true
+    # before the mapper itself was hardened; _task_assignment_message's
+    # new safe-fallback contract is covered by
+    # TestTaskAssignmentMessageMapperHardening below instead.
 
     def test_write_order_assignment_end_then_cache_clear(self):
         body = _bb_function_body("unassign_task")
@@ -518,6 +513,136 @@ class TestUnassignTaskPartialStateHardening(unittest.TestCase):
         body = _bb_function_body("unassign_task")
         for forbidden in ("update_cell(", "append_business_row(", "batch_append_business_rows("):
             self.assertNotIn(forbidden, body)
+
+
+# ─────────────────────────────────────────────────────────────
+# _task_assignment_message mapper hardening guards.
+# ─────────────────────────────────────────────────────────────
+
+def _th_bare_function_source(fn_name: str) -> str:
+    path = BUSINESS_CORE / "telegram_handlers.py"
+    src = path.read_text(encoding="utf-8")
+    start = src.index(f"def {fn_name}(")
+    end = src.index("\ndef ", start + 10)
+    return src[start:end]
+
+
+def _th_function_code_only(fn_name: str) -> str:
+    """Same as _th_bare_function_source() but with the leading
+    docstring stripped, so guard assertions inspect only executable
+    code — the docstring itself intentionally names the exact
+    forbidden patterns (result["error"], business_builder.assign_task,
+    etc.) as prose explaining what the function avoids doing."""
+    full = _th_bare_function_source(fn_name)
+    first = full.find('"""')
+    if first == -1:
+        return full
+    second = full.find('"""', first + 3)
+    if second == -1:
+        return full
+    return full[:first] + full[second + 3:]
+
+
+class TestTaskAssignmentMessageMapperHardening(unittest.TestCase):
+
+    def test_no_result_get_error_rendering(self):
+        body = _th_function_code_only("_task_assignment_message")
+        self.assertNotIn('result.get("error")', body)
+        self.assertNotIn("result.get('error')", body)
+
+    def test_no_direct_result_error_subscript_rendering(self):
+        body = _th_function_code_only("_task_assignment_message")
+        self.assertNotIn('result["error"]', body)
+        self.assertNotIn("result['error']", body)
+
+    def test_no_str_or_repr_of_result(self):
+        body = _th_function_code_only("_task_assignment_message")
+        self.assertNotIn("str(result)", body)
+        self.assertNotIn("repr(result)", body)
+
+    def test_no_telegram_send_or_reply_call(self):
+        body = _th_function_code_only("_task_assignment_message")
+        for forbidden in ("_reply(", "await ", "send_message(", "bot.send"):
+            self.assertNotIn(forbidden, body)
+
+    def test_no_sheets_or_business_layer_call(self):
+        body = _th_function_code_only("_task_assignment_message")
+        for forbidden in ("get_business_sheet(", "read_business_sheet(", "business_builder.", "task_manager.", "update_cell(", "append_business_row("):
+            self.assertNotIn(forbidden, body)
+
+    def test_has_explicit_partial_state_branch(self):
+        body = _th_function_code_only("_task_assignment_message")
+        self.assertIn('code == "TASK_UNASSIGNMENT_PARTIAL_FAILURE"', body)
+
+    def test_has_distinct_noop_and_changed_success_handling(self):
+        body = _th_function_code_only("_task_assignment_message")
+        self.assertIn('result.get("changed") is True', body)
+        self.assertIn('result.get("changed") is False', body)
+
+    def test_strict_ok_is_true_identity_check_exists(self):
+        body = _th_function_code_only("_task_assignment_message")
+        self.assertIn("ok is True", body)
+        self.assertIn("ok is not True", body)
+
+    def test_no_retry_loop(self):
+        body = _th_function_code_only("_task_assignment_message")
+        for forbidden in ("while True", "for attempt", "range(3)", "retry_count"):
+            self.assertNotIn(forbidden, body)
+
+    def test_no_raw_exception_logging(self):
+        body = _th_function_code_only("_task_assignment_message")
+        log_lines = [line for line in body.splitlines() if "log.warning(" in line or "log.error(" in line]
+        for line in log_lines:
+            self.assertNotIn("error", line.split("f\"")[-1] if 'f"' in line else line)
+            self.assertNotIn("exc", line)
+
+    def test_no_result_dict_mutation_construct(self):
+        body = _th_function_code_only("_task_assignment_message")
+        for forbidden in ("result[", "result.update(", "result.pop(", "result.setdefault(", "del result"):
+            # result["error"]/result['error'] already covered above as a
+            # read; the only bracket-subscript writes would look like
+            # result["x"] = ... — none exist, since result is never
+            # assigned into.
+            if forbidden == "result[":
+                self.assertNotIn("result[", body.replace('result.get("', '').replace("result.get('", ''))
+            else:
+                self.assertNotIn(forbidden, body)
+
+    def test_generic_fallback_does_not_interpolate_code(self):
+        body = _th_function_code_only("_task_assignment_message")
+        non_log_lines = "\n".join(
+            line for line in body.splitlines()
+            if "log.warning(" not in line and "log.error(" not in line
+        )
+        for forbidden in ("{code", "(code ", "(code)", "code!r", "code or "):
+            self.assertNotIn(forbidden, non_log_lines)
+
+    def test_no_input_derived_token_interpolation_outside_known_branches(self):
+        """The only f-string interpolations anywhere in the function
+        must reference task_id or an already-approved structured field
+        (assignment_id/previous_assignment_id/conflicting_assignment_ids)
+        inside one of the explicit known-code branches — never code,
+        error, or any other raw result field, and never inside the
+        generic-fallback return itself."""
+        body = _th_function_code_only("_task_assignment_message")
+        generic_line = 'return generic_failure'
+        self.assertIn(generic_line, body)
+        # Every occurrence of the fixed return must be a bare return of
+        # the local variable, never an f-string built from result data.
+        for line in body.splitlines():
+            if "generic_failure" in line and "return" in line:
+                self.assertNotIn("f\"", line)
+                self.assertNotIn("f'", line)
+
+    def test_generic_failure_literal_is_function_local_not_module_level(self):
+        full_src = _th_bare_function_source("_task_assignment_message")
+        self.assertIn('generic_failure = "', full_src)
+        path = BUSINESS_CORE / "telegram_handlers.py"
+        src = path.read_text(encoding="utf-8")
+        start = src.index("def _task_assignment_message(")
+        module_level_prefix = src[:start]
+        self.assertNotIn("_TASK_ASSIGNMENT_GENERIC_FAILURE", module_level_prefix)
+        self.assertNotIn("_TASK_ASSIGNMENT_GENERIC_FAILURE", src)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -761,6 +886,260 @@ class TestBusinessBuilderConstructGuardHelperUnit(unittest.TestCase):
         duplicate_src = self._BASELINE + "\nCONST_A = 3\n"
         with self.assertRaises(ValueError):
             _business_builder_top_level_constructs(duplicate_src)
+
+
+# ─────────────────────────────────────────────────────────────
+# telegram_handlers.py comprehensive top-level construct guard
+# (mirrors the business_builder.py guard above — see that section's
+# comment for the rationale). Proves that of every top-level Import/
+# ImportFrom/FunctionDef/AsyncFunctionDef/ClassDef/Assign/AnnAssign in
+# telegram_handlers.py, only _task_assignment_message may differ —
+# no handler command function, registration, or module-level constant
+# (including COMMAND_ENFORCEMENT_MAP) changes.
+# ─────────────────────────────────────────────────────────────
+
+_TELEGRAM_HANDLERS_APPROVED_TO_DIFFER = frozenset({"function:_task_assignment_message"})
+
+_TELEGRAM_HANDLERS_KNOWN_BENIGN_TOP_LEVEL_NODE_TYPES = (ast.Expr, ast.Pass)
+
+
+def _telegram_handlers_target_names(target) -> list[str]:
+    if isinstance(target, ast.Name):
+        return [target.id]
+    if isinstance(target, (ast.Tuple, ast.List)):
+        names: list[str] = []
+        for elt in target.elts:
+            names.extend(_telegram_handlers_target_names(elt))
+        return names
+    if isinstance(target, ast.Starred):
+        return _telegram_handlers_target_names(target.value)
+    return [f"<non_name_target:{ast.dump(target)}>"]
+
+
+def _telegram_handlers_top_level_constructs(src: str) -> dict:
+    """Same construct-identity scheme as
+    _business_builder_top_level_constructs(), applied to
+    telegram_handlers.py — kept as a separate function (rather than a
+    shared generic helper) so each guard's already-approved,
+    previously-committed sibling implementation stays untouched."""
+    tree = ast.parse(src)
+    lines = src.splitlines(keepends=True)
+    out: dict[str, str] = {}
+
+    def _add(key: str, node) -> None:
+        if key in out:
+            raise ValueError(f"duplicate top-level construct identifier: {key!r} (line {node.lineno})")
+        out[key] = "".join(lines[node.lineno - 1:node.end_lineno])
+
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef):
+            _add(f"function:{node.name}", node)
+        elif isinstance(node, ast.AsyncFunctionDef):
+            _add(f"async_function:{node.name}", node)
+        elif isinstance(node, ast.ClassDef):
+            _add(f"class:{node.name}", node)
+        elif isinstance(node, ast.Assign):
+            names = []
+            for t in node.targets:
+                names.extend(_telegram_handlers_target_names(t))
+            _add("assignment:" + ",".join(sorted(names)), node)
+        elif isinstance(node, ast.AnnAssign):
+            names = _telegram_handlers_target_names(node.target)
+            _add("annassign:" + ",".join(sorted(names)), node)
+        elif isinstance(node, ast.Import):
+            parts = sorted(a.name + (f" as {a.asname}" if a.asname else "") for a in node.names)
+            _add("import:" + ",".join(parts), node)
+        elif isinstance(node, ast.ImportFrom):
+            parts = sorted(a.name + (f" as {a.asname}" if a.asname else "") for a in node.names)
+            module = ("." * (node.level or 0)) + (node.module or "")
+            _add(f"import_from:{module}:" + ",".join(parts), node)
+        # Everything else is proven accounted-for by
+        # test_telegram_handlers_exhaustive_top_level_node_coverage
+        # below, exactly as for business_builder.py's guard.
+    return out
+
+
+def _git_show_head_telegram_handlers_py() -> str:
+    import subprocess
+    result = subprocess.run(
+        ["git", "show", "HEAD:business_core/telegram_handlers.py"],
+        cwd=WORKSPACE, capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        raise AssertionError(f"git show HEAD:business_core/telegram_handlers.py failed: {result.stderr}")
+    return result.stdout
+
+
+class TestTelegramHandlersTopLevelConstructGuard(unittest.TestCase):
+
+    def test_only_approved_construct_differs(self):
+        head_src = _git_show_head_telegram_handlers_py()
+        current_src = (BUSINESS_CORE / "telegram_handlers.py").read_text(encoding="utf-8")
+
+        head = _telegram_handlers_top_level_constructs(head_src)
+        current = _telegram_handlers_top_level_constructs(current_src)
+
+        removed = set(head) - set(current)
+        added = set(current) - set(head)
+        self.assertEqual(removed, set(), f"telegram_handlers.py: construct(s) removed: {sorted(removed)}")
+        self.assertEqual(added, set(), f"telegram_handlers.py: unexpected new construct(s): {sorted(added)}")
+
+        for key in head:
+            if key in _TELEGRAM_HANDLERS_APPROVED_TO_DIFFER:
+                continue
+            self.assertEqual(
+                head[key], current[key],
+                f"telegram_handlers.py: unapproved construct changed: {key!r} — only "
+                f"{sorted(_TELEGRAM_HANDLERS_APPROVED_TO_DIFFER)} may differ this phase",
+            )
+
+    def test_no_new_top_level_construct_added(self):
+        head_src = _git_show_head_telegram_handlers_py()
+        current_src = (BUSINESS_CORE / "telegram_handlers.py").read_text(encoding="utf-8")
+        head = _telegram_handlers_top_level_constructs(head_src)
+        current = _telegram_handlers_top_level_constructs(current_src)
+        added = set(current) - set(head)
+        self.assertEqual(added, set())
+
+    def test_task_assignment_message_construct_present_in_both_versions(self):
+        head_src = _git_show_head_telegram_handlers_py()
+        current_src = (BUSINESS_CORE / "telegram_handlers.py").read_text(encoding="utf-8")
+        head = _telegram_handlers_top_level_constructs(head_src)
+        current = _telegram_handlers_top_level_constructs(current_src)
+        self.assertIn("function:_task_assignment_message", head)
+        self.assertIn("function:_task_assignment_message", current)
+
+    def test_no_handler_command_function_changed(self):
+        head_src = _git_show_head_telegram_handlers_py()
+        current_src = (BUSINESS_CORE / "telegram_handlers.py").read_text(encoding="utf-8")
+        head = _telegram_handlers_top_level_constructs(head_src)
+        current = _telegram_handlers_top_level_constructs(current_src)
+        for name in ("assigntask_cmd", "reassigntask_cmd", "unassigntask_cmd", "bctasks_cmd", "bctask_cmd", "newbctask_cmd", "updatetask_cmd"):
+            key = f"async_function:{name}"
+            self.assertIn(key, head)
+            self.assertEqual(head[key], current[key], f"{name} must not change this phase")
+
+    def test_command_enforcement_map_construct_unchanged(self):
+        head_src = _git_show_head_telegram_handlers_py()
+        current_src = (BUSINESS_CORE / "telegram_handlers.py").read_text(encoding="utf-8")
+        head = _telegram_handlers_top_level_constructs(head_src)
+        current = _telegram_handlers_top_level_constructs(current_src)
+        self.assertIn("assignment:COMMAND_ENFORCEMENT_MAP", head)
+        self.assertEqual(head["assignment:COMMAND_ENFORCEMENT_MAP"], current["assignment:COMMAND_ENFORCEMENT_MAP"])
+
+    def test_telegram_handlers_exhaustive_top_level_node_coverage(self):
+        head_src = _git_show_head_telegram_handlers_py()
+        tree = ast.parse(head_src)
+        constructs = _telegram_handlers_top_level_constructs(head_src)
+        accounted_count = 0
+        unaccounted_types = []
+        for node in tree.body:
+            if isinstance(node, (
+                ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef,
+                ast.Assign, ast.AnnAssign, ast.Import, ast.ImportFrom,
+            )):
+                accounted_count += 1
+            elif isinstance(node, _TELEGRAM_HANDLERS_KNOWN_BENIGN_TOP_LEVEL_NODE_TYPES):
+                continue
+            else:
+                unaccounted_types.append(type(node).__name__)
+        self.assertEqual(unaccounted_types, [], f"telegram_handlers.py has unprotected top-level node type(s): {unaccounted_types}")
+        self.assertEqual(accounted_count, len(constructs))
+
+    def test_no_duplicate_construct_identifiers_in_real_source(self):
+        head_src = _git_show_head_telegram_handlers_py()
+        _telegram_handlers_top_level_constructs(head_src)
+
+
+class TestTelegramHandlersConstructGuardHelperUnit(unittest.TestCase):
+    """Synthetic negative tests for
+    _telegram_handlers_top_level_constructs() — same coverage as the
+    business_builder.py helper unit tests, using only in-memory source
+    strings. Never reads or writes telegram_handlers.py on disk."""
+
+    _BASELINE = (
+        "import os\n"
+        "from collections import OrderedDict\n"
+        "\n"
+        "COMMAND_ENFORCEMENT_MAP = {}\n"
+        "\n"
+        "class Foo:\n"
+        "    pass\n"
+        "\n"
+        "def _task_assignment_message(result, task_id):\n"
+        "    return task_id\n"
+        "\n"
+        "async def assigntask_cmd(update, context):\n"
+        "    return None\n"
+    )
+
+    def _diff(self, modified_src: str, approved=frozenset({"function:_task_assignment_message"})):
+        head = _telegram_handlers_top_level_constructs(self._BASELINE)
+        current = _telegram_handlers_top_level_constructs(modified_src)
+        removed = set(head) - set(current)
+        added = set(current) - set(head)
+        changed = {
+            key for key in head
+            if key in current and key not in approved and head[key] != current[key]
+        }
+        return removed, added, changed
+
+    def test_unrelated_handler_change_detected(self):
+        modified = self._BASELINE.replace("return None", "return 1")
+        removed, added, changed = self._diff(modified)
+        self.assertIn("async_function:assigntask_cmd", changed)
+
+    def test_command_enforcement_map_change_detected(self):
+        modified = self._BASELINE.replace("COMMAND_ENFORCEMENT_MAP = {}", 'COMMAND_ENFORCEMENT_MAP = {"unassigntask": {}}')
+        removed, added, changed = self._diff(modified)
+        self.assertIn("assignment:COMMAND_ENFORCEMENT_MAP", changed)
+
+    def test_import_change_detected(self):
+        modified = self._BASELINE.replace("import os", "import sys")
+        removed, added, changed = self._diff(modified)
+        self.assertIn("import:os", removed)
+        self.assertIn("import:sys", added)
+
+    def test_class_change_detected(self):
+        modified = self._BASELINE.replace("class Foo:\n    pass", "class Foo:\n    x = 1")
+        removed, added, changed = self._diff(modified)
+        self.assertIn("class:Foo", changed)
+
+    def test_removal_detected(self):
+        modified = self._BASELINE.replace("\nasync def assigntask_cmd(update, context):\n    return None\n", "\n")
+        removed, added, changed = self._diff(modified)
+        self.assertIn("async_function:assigntask_cmd", removed)
+
+    def test_unexpected_new_function_detected(self):
+        modified = self._BASELINE + "\nasync def sneaky_cmd(update, context):\n    return None\n"
+        removed, added, changed = self._diff(modified)
+        self.assertIn("async_function:sneaky_cmd", added)
+
+    def test_rename_detected_as_removal_plus_addition(self):
+        modified = self._BASELINE.replace("async def assigntask_cmd(", "async def renamed_cmd(")
+        removed, added, changed = self._diff(modified)
+        self.assertIn("async_function:assigntask_cmd", removed)
+        self.assertIn("async_function:renamed_cmd", added)
+
+    def test_task_assignment_message_change_is_permitted(self):
+        modified = self._BASELINE.replace(
+            "def _task_assignment_message(result, task_id):\n    return task_id",
+            "def _task_assignment_message(result, task_id):\n    return task_id + '!'",
+        )
+        removed, added, changed = self._diff(modified)
+        self.assertEqual(removed, set())
+        self.assertEqual(added, set())
+        self.assertNotIn("function:_task_assignment_message", changed)
+
+    def test_second_new_handler_command_rejected(self):
+        modified = self._BASELINE + "\nasync def unassigntask_cmd(update, context):\n    return None\n"
+        removed, added, changed = self._diff(modified)
+        self.assertIn("async_function:unassigntask_cmd", added)
+
+    def test_duplicate_construct_identifier_fails_explicitly(self):
+        duplicate_src = self._BASELINE + "\nCOMMAND_ENFORCEMENT_MAP = {}\n"
+        with self.assertRaises(ValueError):
+            _telegram_handlers_top_level_constructs(duplicate_src)
 
 
 if __name__ == "__main__":

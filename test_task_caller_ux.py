@@ -22,6 +22,11 @@ sys.path.insert(0, str(WORKSPACE))
 
 import business_core.telegram_handlers as th
 
+# Test-side only — the mapper's generic-failure literal is intentionally
+# function-local in production (no module-level constant), so tests
+# compare against their own copy of the exact same fixed string.
+_TASK_ASSIGNMENT_GENERIC_FAILURE = "❌ Не удалось выполнить операцию с назначением задачи."
+
 
 class TestStatusTranslation(unittest.TestCase):
 
@@ -209,14 +214,257 @@ class TestTaskAssignmentMessageMapping(unittest.TestCase):
         self.assertIn("TAS-020", reassigned)
 
     def test_unassigned(self):
-        msg = th._task_assignment_message({"ok": True, "code": "TASK_UNASSIGNED"}, "TSK-001")
+        msg = th._task_assignment_message(
+            {"ok": True, "code": "TASK_UNASSIGNED", "changed": True, "assignment_changed": True, "partial_state": False},
+            "TSK-001",
+        )
         self.assertIn("✅", msg)
         self.assertIn("TSK-001", msg)
 
     def test_unassign_preserves_history_message_does_not_claim_deletion(self):
-        msg = th._task_assignment_message({"ok": True, "code": "TASK_UNASSIGNED"}, "TSK-001")
+        msg = th._task_assignment_message(
+            {"ok": True, "code": "TASK_UNASSIGNED", "changed": True, "assignment_changed": True, "partial_state": False},
+            "TSK-001",
+        )
         for forbidden in ("удал", "стёр", "delete"):
             self.assertNotIn(forbidden, msg.lower())
+
+    def test_unassigned_already_unassigned_noop_is_distinct(self):
+        clean = th._task_assignment_message(
+            {"ok": True, "code": "TASK_UNASSIGNED", "changed": True, "assignment_changed": True, "partial_state": False},
+            "TSK-001",
+        )
+        noop = th._task_assignment_message(
+            {"ok": True, "code": "TASK_UNASSIGNED", "changed": False, "assignment_changed": False, "partial_state": False},
+            "TSK-001",
+        )
+        self.assertNotEqual(clean, noop)
+        self.assertIn("✅", clean)
+        self.assertNotIn("✅", noop)
+        self.assertIn("ℹ️", noop)
+
+    def test_unassigned_contradictory_shape_is_safe_fallback(self):
+        for bad in (
+            {"ok": True, "code": "TASK_UNASSIGNED", "changed": True, "assignment_changed": False, "partial_state": False},
+            {"ok": True, "code": "TASK_UNASSIGNED", "changed": False, "assignment_changed": True, "partial_state": False},
+            {"ok": True, "code": "TASK_UNASSIGNED", "changed": True, "assignment_changed": True, "partial_state": True},
+            {"ok": True, "code": "TASK_UNASSIGNED"},
+        ):
+            msg = th._task_assignment_message(bad, "TSK-001")
+            self.assertEqual(msg, _TASK_ASSIGNMENT_GENERIC_FAILURE)
+
+    def test_valid_partial_state_warning(self):
+        msg = th._task_assignment_message({
+            "ok": False, "code": "TASK_UNASSIGNMENT_PARTIAL_FAILURE",
+            "error": "TASK_ASSIGNMENT_CACHE_CLEAR_FAILED",
+            "changed": True, "assignment_changed": True, "cache_changed": False,
+            "partial_state": True, "manual_review_required": True, "retry_safe": False,
+        }, "TSK-001")
+        self.assertIn("⚠️", msg)
+        self.assertIn("TSK-001", msg)
+
+    def test_partial_state_warning_contains_manual_review_meaning(self):
+        msg = th._task_assignment_message({
+            "ok": False, "code": "TASK_UNASSIGNMENT_PARTIAL_FAILURE",
+            "error": "TASK_ASSIGNMENT_CACHE_CLEAR_FAILED",
+            "changed": True, "assignment_changed": True, "cache_changed": False,
+            "partial_state": True, "manual_review_required": True, "retry_safe": False,
+        }, "TSK-001")
+        self.assertIn("ручной проверки", msg)
+
+    def test_partial_state_warning_contains_retry_limitation(self):
+        msg = th._task_assignment_message({
+            "ok": False, "code": "TASK_UNASSIGNMENT_PARTIAL_FAILURE",
+            "error": "TASK_ASSIGNMENT_CACHE_CLEAR_FAILED",
+            "changed": True, "assignment_changed": True, "cache_changed": False,
+            "partial_state": True, "manual_review_required": True, "retry_safe": False,
+        }, "TSK-001")
+        self.assertIn("Повтор", msg)
+
+    def test_partial_state_warning_does_not_expose_fixed_internal_error_code(self):
+        msg = th._task_assignment_message({
+            "ok": False, "code": "TASK_UNASSIGNMENT_PARTIAL_FAILURE",
+            "error": "TASK_ASSIGNMENT_CACHE_CLEAR_FAILED",
+            "changed": True, "assignment_changed": True, "cache_changed": False,
+            "partial_state": True, "manual_review_required": True, "retry_safe": False,
+        }, "TSK-001")
+        self.assertNotIn("TASK_ASSIGNMENT_CACHE_CLEAR_FAILED", msg)
+        self.assertNotIn("cache_result", msg)
+        self.assertNotIn("Sheets", msg)
+
+    def test_partial_state_inconsistent_fields_rejected(self):
+        base = {
+            "ok": False, "code": "TASK_UNASSIGNMENT_PARTIAL_FAILURE",
+            "changed": True, "assignment_changed": True, "cache_changed": False,
+            "partial_state": True, "manual_review_required": True,
+        }
+        for field, value in (
+            ("partial_state", False),
+            ("manual_review_required", False),
+            ("assignment_changed", False),
+            ("cache_changed", True),
+            ("ok", True),
+        ):
+            bad = dict(base, **{field: value})
+            msg = th._task_assignment_message(bad, "TSK-001")
+            self.assertEqual(msg, _TASK_ASSIGNMENT_GENERIC_FAILURE, f"field={field!r} value={value!r}")
+
+    def test_assignment_end_raw_error_not_rendered(self):
+        msg = th._task_assignment_message(
+            {"ok": False, "code": "", "error": "ASSIGNMENT-END-SECRET low-level failure"}, "TSK-001",
+        )
+        self.assertNotIn("ASSIGNMENT-END-SECRET", msg)
+
+    def test_unknown_raw_error_not_rendered(self):
+        msg = th._task_assignment_message(
+            {"ok": False, "code": "SOME_UNKNOWN_CODE", "error": "unexpected raw payload SECRET-XYZ"}, "TSK-001",
+        )
+        self.assertNotIn("SECRET-XYZ", msg)
+        self.assertNotIn("unexpected raw payload", msg)
+
+    def test_non_dict_safe_fallback(self):
+        for bad in (None, "a string", 123, ["a", "list"], object()):
+            msg = th._task_assignment_message(bad, "TSK-001")
+            self.assertEqual(msg, _TASK_ASSIGNMENT_GENERIC_FAILURE)
+
+    def test_truthy_non_boolean_ok_rejected(self):
+        for ok_value in (1, "true", [1], {"x": 1}, "True"):
+            msg = th._task_assignment_message({"ok": ok_value, "code": "TASK_ASSIGNMENT_CREATED", "assignment_id": "TAS-1"}, "TSK-001")
+            self.assertNotIn("✅", msg)
+            self.assertIn("❌", msg)
+            self.assertNotIn("TAS-1", msg)
+
+    def test_known_failure_code_with_ok_true_rejected(self):
+        msg = th._task_assignment_message({"ok": True, "code": "ROLE_PAUSED"}, "TSK-001")
+        self.assertNotIn("приостановлена", msg)
+        self.assertIn("❌", msg)
+
+    def test_known_success_code_with_ok_false_rejected(self):
+        msg = th._task_assignment_message({"ok": False, "code": "TASK_ASSIGNMENT_CREATED", "assignment_id": "TAS-1"}, "TSK-001")
+        self.assertNotIn("✅", msg)
+        self.assertNotIn("TAS-1", msg)
+
+    def test_unknown_code_with_ok_true_rejected(self):
+        msg = th._task_assignment_message({"ok": True, "code": "TOTALLY_MADE_UP_CODE"}, "TSK-001")
+        self.assertNotIn("✅", msg)
+
+    def test_empty_code_safe_fallback(self):
+        msg = th._task_assignment_message({"ok": False, "code": "", "error": "RAW-ERROR-MARKER"}, "TSK-001")
+        self.assertIn("❌", msg)
+        self.assertNotIn("RAW-ERROR-MARKER", msg)
+
+    def test_mapper_does_not_mutate_input(self):
+        import copy
+        result = {
+            "ok": False, "code": "TASK_UNASSIGNMENT_PARTIAL_FAILURE",
+            "error": "TASK_ASSIGNMENT_CACHE_CLEAR_FAILED",
+            "changed": True, "assignment_changed": True, "cache_changed": False,
+            "partial_state": True, "manual_review_required": True, "retry_safe": False,
+        }
+        before = copy.deepcopy(result)
+        th._task_assignment_message(result, "TSK-001")
+        self.assertEqual(result, before)
+
+    def test_nested_secret_fields_not_rendered(self):
+        markers = ("TASK-MAPPER-SECRET", "SHEETS-SECRET", "API-PAYLOAD-SECRET", "STACKTRACE-SECRET", "ASSIGNMENT-END-SECRET", "CACHE-CLEAR-SECRET")
+        poisoned_results = [
+            {"ok": False, "code": "TASK_UNASSIGNMENT_PARTIAL_FAILURE", "error": "CACHE-CLEAR-SECRET",
+             "changed": True, "assignment_changed": True, "cache_changed": False,
+             "partial_state": True, "manual_review_required": True,
+             "message": "TASK-MAPPER-SECRET", "details": "SHEETS-SECRET",
+             "payload": {"nested": "API-PAYLOAD-SECRET"}, "exception": "STACKTRACE-SECRET"},
+            {"ok": False, "code": "", "error": "ASSIGNMENT-END-SECRET",
+             "message": "TASK-MAPPER-SECRET", "payload": {"a": {"b": "SHEETS-SECRET"}}},
+            {"ok": False, "code": "UNKNOWN_XYZ", "error": "API-PAYLOAD-SECRET",
+             "exception": ValueError("STACKTRACE-SECRET")},
+        ]
+        for result in poisoned_results:
+            msg = th._task_assignment_message(result, "TSK-001")
+            for marker in markers:
+                self.assertNotIn(marker, msg)
+            for forbidden in ("Traceback", "ValueError", "KeyError", "HTTP", "JSON", "worksheet", "spreadsheet", "row_number"):
+                self.assertNotIn(forbidden, msg)
+
+    def test_secret_marker_directly_in_code_field_not_rendered(self):
+        markers = ("TASK-MAPPER-SECRET", "STACKTRACE-SECRET", "API-PAYLOAD-SECRET", "SHEETS-SECRET")
+
+        class _PoisonedRepr:
+            def __str__(self):
+                return "TASK-MAPPER-SECRET via __str__"
+
+            def __repr__(self):
+                return "STACKTRACE-SECRET via __repr__"
+
+        results = [
+            {"ok": False, "code": "TASK-MAPPER-SECRET"},
+            {"ok": True, "code": "STACKTRACE-SECRET"},
+            {"code": "API-PAYLOAD-SECRET"},
+            {"ok": False, "code": {"nested": "SHEETS-SECRET"}},
+            {"ok": False, "code": ["SHEETS-SECRET"]},
+            {"ok": False, "code": _PoisonedRepr()},
+        ]
+        for result in results:
+            msg = th._task_assignment_message(result, "TSK-001")
+            self.assertEqual(msg, _TASK_ASSIGNMENT_GENERIC_FAILURE)
+            for marker in markers:
+                self.assertNotIn(marker, msg)
+
+    def test_known_success_code_with_ok_false_exact_generic_output(self):
+        for code, extra in (
+            ("TASK_ASSIGNMENT_CREATED", {"assignment_id": "TAS-1"}),
+            ("TASK_REASSIGNED", {"assignment_id": "TAS-2", "previous_assignment_id": "TAS-1"}),
+            ("TASK_UNASSIGNED", {"changed": True, "assignment_changed": True, "partial_state": False}),
+        ):
+            result = {"ok": False, "code": code, **extra}
+            msg = th._task_assignment_message(result, "TSK-001")
+            self.assertEqual(msg, _TASK_ASSIGNMENT_GENERIC_FAILURE, f"code={code!r}")
+
+    def test_known_failure_code_with_ok_true_exact_generic_output(self):
+        for code, extra in (
+            ("TASK_NOT_FOUND", {}),
+            ("ROLE_PAUSED", {}),
+            ("MULTIPLE_ACTIVE_TASK_ASSIGNMENTS_INTEGRITY_ERROR", {"conflicting_assignment_ids": ("TAS-A", "TAS-B")}),
+        ):
+            result = {"ok": True, "code": code, **extra}
+            msg = th._task_assignment_message(result, "TSK-001")
+            self.assertEqual(msg, _TASK_ASSIGNMENT_GENERIC_FAILURE, f"code={code!r}")
+
+    def test_all_generic_cases_return_identical_fixed_literal(self):
+        class _Opaque:
+            def __str__(self):
+                return "OPAQUE-STR-SECRET"
+
+            def __repr__(self):
+                return "OPAQUE-REPR-SECRET"
+
+        cases = [
+            "not-a-dict",
+            {},
+            {"code": "UNKNOWN_XYZ"},
+            {"ok": None, "code": "UNKNOWN_XYZ"},
+            {"ok": 1, "code": "TASK_ASSIGNMENT_CREATED", "assignment_id": "TAS-1"},
+            {"ok": "true", "code": "TASK_ASSIGNMENT_CREATED", "assignment_id": "TAS-1"},
+            {"ok": True, "code": "UNKNOWN_XYZ"},
+            {"ok": False, "code": "UNKNOWN_XYZ"},
+            {"ok": False, "code": ""},
+            {"ok": False, "code": None},
+            {"ok": False, "code": {"nested": "x"}},
+            {"ok": False, "code": ["x"]},
+            {"ok": False, "code": _Opaque()},
+            {"ok": False, "code": "TASK_ASSIGNMENT_CREATED", "assignment_id": "TAS-1"},
+            {"ok": True, "code": "ROLE_PAUSED"},
+            {"ok": True, "code": "TASK_UNASSIGNED", "changed": True, "assignment_changed": False, "partial_state": False},
+            {"ok": False, "code": "TASK_UNASSIGNMENT_PARTIAL_FAILURE", "partial_state": False,
+             "manual_review_required": True, "assignment_changed": True, "cache_changed": False},
+            {"ok": False, "code": "UNKNOWN_XYZ", "error": "raw stuff", "message": "raw stuff 2"},
+        ]
+        for result in cases:
+            msg = th._task_assignment_message(result, "TSK-001")
+            self.assertEqual(msg, _TASK_ASSIGNMENT_GENERIC_FAILURE, f"result={result!r}")
+        self.assertEqual(
+            len({th._task_assignment_message(c, "TSK-001") for c in cases}), 1,
+            "every generic case must produce the exact same string",
+        )
 
     def test_task_not_found(self):
         msg = th._task_assignment_message({"ok": False, "code": "TASK_NOT_FOUND"}, "TSK-999")
@@ -281,8 +529,8 @@ class TestTaskAssignmentMessageMapping(unittest.TestCase):
 
     def test_unknown_code_safe_fallback(self):
         msg = th._task_assignment_message({"ok": False, "code": "NEW_CODE", "error": "x"}, "TSK-001")
-        self.assertIn("❌", msg)
-        self.assertIn("NEW_CODE", msg)
+        self.assertEqual(msg, _TASK_ASSIGNMENT_GENERIC_FAILURE)
+        self.assertNotIn("NEW_CODE", msg)
 
     def test_no_raw_dict_ever_rendered(self):
         for code in (

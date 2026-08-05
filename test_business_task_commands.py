@@ -969,7 +969,10 @@ class TestUnassignTaskCommand(unittest.TestCase):
         async def run():
             with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
                  patch("business_core.business_builder.unassign_task",
-                       return_value={"ok": True, "code": "TASK_UNASSIGNED", "error": None}):
+                       return_value={
+                           "ok": True, "code": "TASK_UNASSIGNED", "error": None,
+                           "changed": True, "assignment_changed": True, "partial_state": False,
+                       }):
                 await th.unassigntask_cmd(upd, ctx)
 
         _run(run())
@@ -983,12 +986,15 @@ class TestUnassignTaskCommand(unittest.TestCase):
         async def run():
             with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
                  patch("business_core.business_builder.unassign_task",
-                       return_value={"ok": True, "code": "TASK_UNASSIGNED", "error": None}):
+                       return_value={
+                           "ok": True, "code": "TASK_UNASSIGNED", "error": None,
+                           "changed": False, "assignment_changed": False, "partial_state": False,
+                       }):
                 await th.unassigntask_cmd(upd, ctx)
 
         _run(run())
         reply = upd.message.reply_text.call_args[0][0]
-        self.assertIn("✅", reply)
+        self.assertIn("ℹ️", reply)
 
     def test_multiple_active_conflict(self):
         th = _fresh_th()
