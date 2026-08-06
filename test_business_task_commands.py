@@ -53,36 +53,28 @@ def _make_update(text: str, args_list: list[str]):
 # ─────────────────────────────────────────────────────────────
 
 class TestNewBcTaskCommand(unittest.TestCase):
+    """Phase 18A.8-B0: /newbctask is temporarily fail-closed — no
+    parsing, no storage read/write, no authorization call, exactly one
+    fixed reply. Result-code-mapping behavior (formerly exercised by
+    invoking the handler with a mocked create_business_task) is now
+    tested directly against _task_creation_message in
+    TestTaskCreationMessageMapping below, since the handler no longer
+    calls create_business_task on this path."""
 
     def test_registered(self):
         th = _fresh_th()
         self.assertTrue(hasattr(th, "newbctask_cmd"))
 
-    def test_missing_business_id_shows_usage(self):
+    def test_map_does_not_contain_newbctask(self):
         th = _fresh_th()
-        upd, ctx = _make_update('/newbctask title="X"', ['title="X"'])
+        self.assertNotIn("newbctask", th.COMMAND_ENFORCEMENT_MAP)
 
-        async def run():
-            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
-                await th.newbctask_cmd(upd, ctx)
-
-        _run(run())
-        reply = upd.message.reply_text.call_args[0][0]
-        self.assertIn("❌", reply)
-
-    def test_missing_title_shows_usage(self):
+    def test_task_map_keys_unchanged(self):
         th = _fresh_th()
-        upd, ctx = _make_update("/newbctask business_id=BIZ-001", ["business_id=BIZ-001"])
+        task_keys = {k for k in th.COMMAND_ENFORCEMENT_MAP if "task" in k}
+        self.assertEqual(task_keys, {"unassigntask", "bctask", "bctasks"})
 
-        async def run():
-            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
-                await th.newbctask_cmd(upd, ctx)
-
-        _run(run())
-        reply = upd.message.reply_text.call_args[0][0]
-        self.assertIn("❌", reply)
-
-    def test_created(self):
+    def test_fail_closed_fixed_message_any_args(self):
         th = _fresh_th()
         upd, ctx = _make_update(
             '/newbctask business_id=BIZ-001 title="Prepare docs"',
@@ -90,179 +82,147 @@ class TestNewBcTaskCommand(unittest.TestCase):
         )
 
         async def run():
+            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+                await th.newbctask_cmd(upd, ctx)
+
+        _run(run())
+        upd.message.reply_text.assert_awaited_once_with(
+            "❌ Создание Business Task временно недоступно.", parse_mode=None,
+        )
+
+    def test_fail_closed_no_args(self):
+        th = _fresh_th()
+        upd, ctx = _make_update("/newbctask", [])
+
+        async def run():
+            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+                await th.newbctask_cmd(upd, ctx)
+
+        _run(run())
+        upd.message.reply_text.assert_awaited_once_with(
+            "❌ Создание Business Task временно недоступно.", parse_mode=None,
+        )
+
+    def test_create_business_task_never_called(self):
+        th = _fresh_th()
+        upd, ctx = _make_update(
+            '/newbctask business_id=BIZ-001 title="X"',
+            ["business_id=BIZ-001", 'title="X"'],
+        )
+
+        async def run():
             with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
-                 patch("business_core.business_builder.create_business_task",
-                       return_value={"ok": True, "code": "TASK_CREATED", "task_id": "TSK-001",
-                                     "business_id": "BIZ-001", "final_status": "new", "error": None}):
+                 patch("business_core.business_builder.create_business_task") as mock_create:
+                await th.newbctask_cmd(upd, ctx)
+                mock_create.assert_not_called()
+
+        _run(run())
+
+    def test_disabled_short_circuits_before_transport_check(self):
+        th = _fresh_th()
+        upd, ctx = _make_update('/newbctask business_id=BIZ-001 title="X"', ["business_id=BIZ-001", 'title="X"'])
+
+        async def run():
+            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=False):
                 await th.newbctask_cmd(upd, ctx)
 
         _run(run())
         reply = upd.message.reply_text.call_args[0][0]
-        self.assertIn("✅", reply)
-        self.assertIn("TSK-001", reply)
+        self.assertNotEqual(reply, "❌ Создание Business Task временно недоступно.")
+
+    def test_group_chat_rejected_by_transport_before_fixed_message(self):
+        th = _fresh_th()
+        upd, ctx = _make_update('/newbctask business_id=BIZ-001 title="X"', ["business_id=BIZ-001", 'title="X"'])
+        upd.effective_chat = SimpleNamespace(type="group")
+
+        async def run():
+            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
+                await th.newbctask_cmd(upd, ctx)
+
+        _run(run())
+        reply = upd.message.reply_text.call_args[0][0]
+        self.assertNotEqual(reply, "❌ Создание Business Task временно недоступно.")
+
+
+class TestTaskCreationMessageMapping(unittest.TestCase):
+    """Result-code-mapping tests for _task_creation_message, moved out
+    of TestNewBcTaskCommand — this layer is now the correct place to
+    verify create_business_task result rendering, since newbctask_cmd
+    itself no longer calls create_business_task."""
+
+    def test_created(self):
+        th = _fresh_th()
+        msg = th._task_creation_message({
+            "ok": True, "code": "TASK_CREATED", "task_id": "TSK-001",
+            "business_id": "BIZ-001", "final_status": "new", "error": None,
+        })
+        self.assertIn("✅", msg)
+        self.assertIn("TSK-001", msg)
 
     def test_reused(self):
         th = _fresh_th()
-        upd, ctx = _make_update(
-            '/newbctask business_id=BIZ-001 title="X" idempotency_key=K1',
-            ["business_id=BIZ-001", 'title="X"', "idempotency_key=K1"],
-        )
-
-        async def run():
-            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
-                 patch("business_core.business_builder.create_business_task",
-                       return_value={"ok": True, "code": "TASK_REUSED", "task_id": "TSK-050",
-                                     "business_id": "BIZ-001", "final_status": "ready", "error": None}):
-                await th.newbctask_cmd(upd, ctx)
-
-        _run(run())
-        reply = upd.message.reply_text.call_args[0][0]
-        self.assertNotIn("✅", reply)
-        self.assertIn("ℹ️", reply)
-        self.assertIn("TSK-050", reply)
+        msg = th._task_creation_message({
+            "ok": True, "code": "TASK_REUSED", "task_id": "TSK-050",
+            "business_id": "BIZ-001", "final_status": "ready", "error": None,
+        })
+        self.assertNotIn("✅", msg)
+        self.assertIn("ℹ️", msg)
+        self.assertIn("TSK-050", msg)
 
     def test_business_not_found(self):
         th = _fresh_th()
-        upd, ctx = _make_update(
-            '/newbctask business_id=BIZ-999 title="X"',
-            ["business_id=BIZ-999", 'title="X"'],
-        )
-
-        async def run():
-            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
-                 patch("business_core.business_builder.create_business_task",
-                       return_value={"ok": False, "code": "BUSINESS_NOT_FOUND", "business_id": "BIZ-999", "error": "not found"}):
-                await th.newbctask_cmd(upd, ctx)
-
-        _run(run())
-        reply = upd.message.reply_text.call_args[0][0]
-        self.assertIn("❌", reply)
-        self.assertIn("BIZ-999", reply)
+        msg = th._task_creation_message({
+            "ok": False, "code": "BUSINESS_NOT_FOUND", "business_id": "BIZ-999", "error": "not found",
+        })
+        self.assertIn("❌", msg)
+        self.assertIn("BIZ-999", msg)
 
     def test_roadmap_completed(self):
         th = _fresh_th()
-        upd, ctx = _make_update(
-            '/newbctask business_id=BIZ-001 title="X" roadmap_id=RM-001',
-            ["business_id=BIZ-001", 'title="X"', "roadmap_id=RM-001"],
-        )
-
-        async def run():
-            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
-                 patch("business_core.business_builder.create_business_task",
-                       return_value={"ok": False, "code": "ROADMAP_COMPLETED", "error": "done"}):
-                await th.newbctask_cmd(upd, ctx)
-
-        _run(run())
-        reply = upd.message.reply_text.call_args[0][0]
-        self.assertIn("❌", reply)
-        self.assertIn("завершён", reply.lower())
+        msg = th._task_creation_message({"ok": False, "code": "ROADMAP_COMPLETED", "error": "done"})
+        self.assertIn("❌", msg)
+        self.assertIn("завершён", msg.lower())
 
     def test_roadmap_cancelled(self):
         th = _fresh_th()
-        upd, ctx = _make_update('/newbctask business_id=BIZ-001 title="X"', ["business_id=BIZ-001", 'title="X"'])
-
-        async def run():
-            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
-                 patch("business_core.business_builder.create_business_task",
-                       return_value={"ok": False, "code": "ROADMAP_CANCELLED", "error": "x"}):
-                await th.newbctask_cmd(upd, ctx)
-
-        _run(run())
-        reply = upd.message.reply_text.call_args[0][0]
-        self.assertIn("❌", reply)
-        self.assertIn("отменён", reply.lower())
+        msg = th._task_creation_message({"ok": False, "code": "ROADMAP_CANCELLED", "error": "x"})
+        self.assertIn("❌", msg)
+        self.assertIn("отменён", msg.lower())
 
     def test_stage_terminal(self):
         th = _fresh_th()
-        upd, ctx = _make_update('/newbctask business_id=BIZ-001 title="X"', ["business_id=BIZ-001", 'title="X"'])
-
-        async def run():
-            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
-                 patch("business_core.business_builder.create_business_task",
-                       return_value={"ok": False, "code": "STAGE_TERMINAL", "error": "x"}):
-                await th.newbctask_cmd(upd, ctx)
-
-        _run(run())
-        reply = upd.message.reply_text.call_args[0][0]
-        self.assertIn("❌", reply)
+        msg = th._task_creation_message({"ok": False, "code": "STAGE_TERMINAL", "error": "x"})
+        self.assertIn("❌", msg)
 
     def test_relation_mismatch(self):
         th = _fresh_th()
-        upd, ctx = _make_update('/newbctask business_id=BIZ-001 title="X"', ["business_id=BIZ-001", 'title="X"'])
-
-        async def run():
-            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
-                 patch("business_core.business_builder.create_business_task",
-                       return_value={"ok": False, "code": "TASK_ENTITY_RELATION_MISMATCH", "error": "mismatch detail"}):
-                await th.newbctask_cmd(upd, ctx)
-
-        _run(run())
-        reply = upd.message.reply_text.call_args[0][0]
-        self.assertIn("❌", reply)
+        msg = th._task_creation_message({
+            "ok": False, "code": "TASK_ENTITY_RELATION_MISMATCH", "error": "mismatch detail",
+        })
+        self.assertIn("❌", msg)
 
     def test_multiple_idempotency_conflict(self):
         th = _fresh_th()
-        upd, ctx = _make_update('/newbctask business_id=BIZ-001 title="X"', ["business_id=BIZ-001", 'title="X"'])
+        msg = th._task_creation_message({
+            "ok": False, "code": "MULTIPLE_TASK_IDEMPOTENCY_MATCHES",
+            "conflicting_task_ids": ("TSK-A", "TSK-B"), "error": "x",
+        })
+        self.assertIn("⚠️", msg)
+        self.assertIn("TSK-A", msg)
+        self.assertIn("TSK-B", msg)
 
-        async def run():
-            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
-                 patch("business_core.business_builder.create_business_task",
-                       return_value={"ok": False, "code": "MULTIPLE_TASK_IDEMPOTENCY_MATCHES",
-                                     "conflicting_task_ids": ("TSK-A", "TSK-B"), "error": "x"}):
-                await th.newbctask_cmd(upd, ctx)
-
-        _run(run())
-        reply = upd.message.reply_text.call_args[0][0]
-        self.assertIn("⚠️", reply)
-        self.assertIn("TSK-A", reply)
-        self.assertIn("TSK-B", reply)
-
-    def test_unknown_code_fallback(self):
+    def test_storage_error(self):
         th = _fresh_th()
-        upd, ctx = _make_update('/newbctask business_id=BIZ-001 title="X"', ["business_id=BIZ-001", 'title="X"'])
+        msg = th._task_creation_message({"ok": False, "code": "TASK_STORAGE_ERROR", "error": None})
+        self.assertIn("❌", msg)
+        self.assertNotIn("None", msg)
 
-        async def run():
-            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
-                 patch("business_core.business_builder.create_business_task",
-                       return_value={"ok": False, "code": "SOMETHING_NEW", "error": "detail"}):
-                await th.newbctask_cmd(upd, ctx)
-
-        _run(run())
-        reply = upd.message.reply_text.call_args[0][0]
-        self.assertIn("❌", reply)
-        self.assertIn("SOMETHING_NEW", reply)
-
-    def test_idempotency_key_defaults_deterministically(self):
+    def test_unknown_code_fallback_does_not_leak_code_or_error(self):
         th = _fresh_th()
-        upd, ctx = _make_update('/newbctask business_id=BIZ-001 title="X"', ["business_id=BIZ-001", 'title="X"'])
-        captured = {}
-
-        def fake_create(business_id, title, **kwargs):
-            captured["idempotency_key"] = kwargs.get("idempotency_key")
-            return {"ok": True, "code": "TASK_CREATED", "task_id": "TSK-001", "business_id": business_id, "final_status": "new", "error": None}
-
-        async def run():
-            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
-                 patch("business_core.business_builder.create_business_task", side_effect=fake_create):
-                await th.newbctask_cmd(upd, ctx)
-
-        _run(run())
-        self.assertTrue(captured["idempotency_key"])
-
-    def test_manager_exception_does_not_leak_traceback(self):
-        th = _fresh_th()
-        upd, ctx = _make_update('/newbctask business_id=BIZ-001 title="X"', ["business_id=BIZ-001", 'title="X"'])
-
-        async def run():
-            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
-                 patch("business_core.business_builder.create_business_task", side_effect=RuntimeError("boom")):
-                await th.newbctask_cmd(upd, ctx)
-
-        _run(run())
-        reply = upd.message.reply_text.call_args[0][0]
-        self.assertIn("❌", reply)
-        self.assertNotIn("boom", reply)
-        self.assertNotIn("Traceback", reply)
+        msg = th._task_creation_message({"ok": False, "code": "SOMETHING_NEW", "error": "detail"})
+        self.assertIn("❌", msg)
+        self.assertNotIn("SOMETHING_NEW", msg)
+        self.assertNotIn("detail", msg)
 
 
 # ─────────────────────────────────────────────────────────────

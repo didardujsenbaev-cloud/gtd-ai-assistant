@@ -110,11 +110,69 @@ class TestCreateBusinessTaskRelationValidation(unittest.TestCase):
         ]
 
     def test_invalid_client_rejected(self):
+        # Phase 18A.8-B0: anti-enumeration — a missing/malformed/
+        # foreign-Business Client all collapse to the same fixed
+        # TASK_ENTITY_RELATION_MISMATCH code, never PERSON_NOT_FOUND.
         with patch("business_core.sheets.find_row_by_id", return_value=(2, {"ID": "BIZ-001"})), \
              patch("business_core.person_manager.find_person_by_id", return_value=None):
             result = create_business_task("BIZ-001", "Title", client_id="PRS-999")
         self.assertFalse(result["ok"])
-        self.assertEqual(result["code"], "PERSON_NOT_FOUND")
+        self.assertEqual(result["code"], "TASK_ENTITY_RELATION_MISMATCH")
+
+    def test_client_foreign_business_rejected(self):
+        with patch("business_core.sheets.find_row_by_id", return_value=(2, {"ID": "BIZ-001"})), \
+             patch("business_core.person_manager.find_person_by_id",
+                   return_value={"person_id": "PRS-001", "biz_ids": ["BIZ-999"]}):
+            result = create_business_task("BIZ-001", "Title", client_id="PRS-001")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "TASK_ENTITY_RELATION_MISMATCH")
+
+    def test_client_malformed_biz_ids_rejected(self):
+        with patch("business_core.sheets.find_row_by_id", return_value=(2, {"ID": "BIZ-001"})), \
+             patch("business_core.person_manager.find_person_by_id",
+                   return_value={"person_id": "PRS-001", "biz_ids": "BIZ-001"}):
+            result = create_business_task("BIZ-001", "Title", client_id="PRS-001")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "TASK_ENTITY_RELATION_MISMATCH")
+
+    def test_client_matching_business_accepted(self):
+        with patch("business_core.sheets.find_row_by_id", return_value=(2, {"ID": "BIZ-001"})), \
+             patch("business_core.person_manager.find_person_by_id",
+                   return_value={"person_id": "PRS-001", "biz_ids": ["BIZ-001"]}), \
+             patch("business_core.task_manager.find_tasks_by_idempotency_key", return_value=[]), \
+             patch("business_core.task_manager.create_task",
+                   return_value={"ok": True, "task_id": "TSK-001", "code": "TASK_CREATED", "error": None}):
+            result = create_business_task("BIZ-001", "Title", client_id="PRS-001")
+        self.assertTrue(result["ok"])
+
+    def test_roadmap_foreign_business_rejected(self):
+        roadmap = {"roadmap_id": "RM-001", "status": "active", "object_id": "", "service_id": "", "business_id": "BIZ-999"}
+        with patch("business_core.sheets.find_row_by_id", return_value=(2, {"ID": "BIZ-001"})), \
+             patch("business_core.roadmap_manager.find_roadmap_by_id", return_value=roadmap), \
+             patch("business_core.roadmap_manager.normalize_roadmap_status", side_effect=lambda s: s):
+            result = create_business_task("BIZ-001", "Title", roadmap_id="RM-001")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "TASK_ENTITY_RELATION_MISMATCH")
+
+    def test_roadmap_blank_business_id_rejected(self):
+        roadmap = {"roadmap_id": "RM-001", "status": "active", "object_id": "", "service_id": "", "business_id": ""}
+        with patch("business_core.sheets.find_row_by_id", return_value=(2, {"ID": "BIZ-001"})), \
+             patch("business_core.roadmap_manager.find_roadmap_by_id", return_value=roadmap), \
+             patch("business_core.roadmap_manager.normalize_roadmap_status", side_effect=lambda s: s):
+            result = create_business_task("BIZ-001", "Title", roadmap_id="RM-001")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "TASK_ENTITY_RELATION_MISMATCH")
+
+    def test_stage_derived_roadmap_foreign_business_rejected(self):
+        stage = {"stage_id": "STAGE-001", "roadmap_id": "RM-001", "status": "pending"}
+        roadmap = {"roadmap_id": "RM-001", "status": "active", "object_id": "", "service_id": "", "business_id": "BIZ-999"}
+        with patch("business_core.sheets.find_row_by_id", return_value=(2, {"ID": "BIZ-001"})), \
+             patch("business_core.roadmap_manager.find_stage_by_id", return_value=stage), \
+             patch("business_core.roadmap_manager.find_roadmap_by_id", return_value=roadmap), \
+             patch("business_core.roadmap_manager.normalize_roadmap_status", side_effect=lambda s: s):
+            result = create_business_task("BIZ-001", "Title", stage_id="STAGE-001")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "TASK_ENTITY_RELATION_MISMATCH")
 
     def test_invalid_object_rejected(self):
         with patch("business_core.sheets.find_row_by_id", return_value=(2, {"ID": "BIZ-001"})), \
@@ -126,6 +184,27 @@ class TestCreateBusinessTaskRelationValidation(unittest.TestCase):
     def test_object_business_mismatch_rejected(self):
         with patch("business_core.sheets.find_row_by_id", return_value=(2, {"ID": "BIZ-001"})), \
              patch("business_core.object_manager.find_object_by_id", return_value={"object_id": "OBJ-001", "biz_id": "BIZ-999"}):
+            result = create_business_task("BIZ-001", "Title", object_id="OBJ-001")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "TASK_ENTITY_RELATION_MISMATCH")
+
+    def test_object_blank_biz_id_rejected(self):
+        with patch("business_core.sheets.find_row_by_id", return_value=(2, {"ID": "BIZ-001"})), \
+             patch("business_core.object_manager.find_object_by_id", return_value={"object_id": "OBJ-001", "biz_id": ""}):
+            result = create_business_task("BIZ-001", "Title", object_id="OBJ-001")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "TASK_ENTITY_RELATION_MISMATCH")
+
+    def test_object_malformed_biz_id_type_rejected(self):
+        with patch("business_core.sheets.find_row_by_id", return_value=(2, {"ID": "BIZ-001"})), \
+             patch("business_core.object_manager.find_object_by_id", return_value={"object_id": "OBJ-001", "biz_id": ["BIZ-001"]}):
+            result = create_business_task("BIZ-001", "Title", object_id="OBJ-001")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "TASK_ENTITY_RELATION_MISMATCH")
+
+    def test_object_malformed_canonical_result_rejected(self):
+        with patch("business_core.sheets.find_row_by_id", return_value=(2, {"ID": "BIZ-001"})), \
+             patch("business_core.object_manager.find_object_by_id", return_value="not-a-dict"):
             result = create_business_task("BIZ-001", "Title", object_id="OBJ-001")
         self.assertFalse(result["ok"])
         self.assertEqual(result["code"], "TASK_ENTITY_RELATION_MISMATCH")
@@ -144,6 +223,39 @@ class TestCreateBusinessTaskRelationValidation(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertEqual(result["code"], "TASK_ENTITY_RELATION_MISMATCH")
 
+    def test_service_blank_biz_id_rejected(self):
+        with patch("business_core.sheets.find_row_by_id", return_value=(2, {"ID": "BIZ-001"})), \
+             patch("business_core.service_manager.find_service_by_id", return_value={"service_id": "SVC-001", "biz_id": ""}):
+            result = create_business_task("BIZ-001", "Title", service_id="SVC-001")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "TASK_ENTITY_RELATION_MISMATCH")
+
+    def test_service_malformed_biz_id_type_rejected(self):
+        with patch("business_core.sheets.find_row_by_id", return_value=(2, {"ID": "BIZ-001"})), \
+             patch("business_core.service_manager.find_service_by_id", return_value={"service_id": "SVC-001", "biz_id": 12345}):
+            result = create_business_task("BIZ-001", "Title", service_id="SVC-001")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "TASK_ENTITY_RELATION_MISMATCH")
+
+    def test_service_malformed_canonical_result_rejected(self):
+        with patch("business_core.sheets.find_row_by_id", return_value=(2, {"ID": "BIZ-001"})), \
+             patch("business_core.service_manager.find_service_by_id", return_value=["not", "a", "dict"]):
+            result = create_business_task("BIZ-001", "Title", service_id="SVC-001")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "TASK_ENTITY_RELATION_MISMATCH")
+
+    # NOTE: a "malformed canonical Roadmap result" case (find_roadmap_by_id
+    # returning a non-dict, non-None value) is deliberately not tested
+    # here — the roadmap_id path routes through
+    # _task_roadmap_stage_eligibility_for_creation() first (an
+    # existing helper outside this phase's approved-to-change scope),
+    # which calls roadmap.get(...) without an isinstance(dict) guard
+    # and would raise AttributeError instead of failing closed. This
+    # is a pre-existing gap in that helper, not introduced by this
+    # phase's new ownership check (K), and out of scope to fix here
+    # per the phase's construct allowlist — recorded as a residual
+    # risk for a future phase.
+
     def test_invalid_roadmap_rejected(self):
         with patch("business_core.sheets.find_row_by_id", return_value=(2, {"ID": "BIZ-001"})), \
              patch("business_core.roadmap_manager.find_roadmap_by_id", return_value=None):
@@ -160,7 +272,7 @@ class TestCreateBusinessTaskRelationValidation(unittest.TestCase):
 
     def test_stage_derives_roadmap_when_roadmap_omitted(self):
         stage = {"stage_id": "STAGE-001", "roadmap_id": "RM-001", "status": "pending"}
-        roadmap = {"roadmap_id": "RM-001", "status": "active", "object_id": "", "service_id": ""}
+        roadmap = {"roadmap_id": "RM-001", "status": "active", "object_id": "", "service_id": "", "business_id": "BIZ-001"}
         with patch("business_core.sheets.find_row_by_id", return_value=(2, {"ID": "BIZ-001"})), \
              patch("business_core.roadmap_manager.find_stage_by_id", return_value=stage), \
              patch("business_core.roadmap_manager.find_roadmap_by_id", return_value=roadmap), \
@@ -215,7 +327,7 @@ class TestCreateBusinessTaskRelationValidation(unittest.TestCase):
         self.assertEqual(result["code"], "ROADMAP_CANCELLED")
 
     def test_on_hold_roadmap_creation_allowed(self):
-        roadmap = {"roadmap_id": "RM-001", "status": "on_hold", "object_id": "", "service_id": ""}
+        roadmap = {"roadmap_id": "RM-001", "status": "on_hold", "object_id": "", "service_id": "", "business_id": "BIZ-001"}
         with patch("business_core.sheets.find_row_by_id", return_value=(2, {"ID": "BIZ-001"})), \
              patch("business_core.roadmap_manager.find_roadmap_by_id", return_value=roadmap), \
              patch("business_core.roadmap_manager.normalize_roadmap_status", side_effect=lambda s: s), \
@@ -226,7 +338,7 @@ class TestCreateBusinessTaskRelationValidation(unittest.TestCase):
         self.assertTrue(result["ok"])
 
     def test_roadmap_object_mismatch_rejected(self):
-        roadmap = {"roadmap_id": "RM-001", "status": "active", "object_id": "OBJ-999", "service_id": ""}
+        roadmap = {"roadmap_id": "RM-001", "status": "active", "object_id": "OBJ-999", "service_id": "", "business_id": "BIZ-001"}
         obj = {"object_id": "OBJ-001", "biz_id": "BIZ-001"}
         with patch("business_core.sheets.find_row_by_id", return_value=(2, {"ID": "BIZ-001"})), \
              patch("business_core.object_manager.find_object_by_id", return_value=obj), \
@@ -235,6 +347,340 @@ class TestCreateBusinessTaskRelationValidation(unittest.TestCase):
             result = create_business_task("BIZ-001", "Title", roadmap_id="RM-001", object_id="OBJ-001")
         self.assertFalse(result["ok"])
         self.assertEqual(result["code"], "TASK_ENTITY_RELATION_MISMATCH")
+
+
+class TestRoadmapStageEligibilityHardening(unittest.TestCase):
+    """Phase 18A.8-B0-F1: _task_roadmap_stage_eligibility_for_creation
+    must fail closed on every malformed/non-dict canonical Stage or
+    Roadmap result, on all three routes (roadmap_id-only, stage_id-
+    only, both), and must never let a supplied stage_id silently
+    resolve to a blank roadmap_id on a success path."""
+
+    def _run(self, **kwargs):
+        with patch("business_core.sheets.find_row_by_id", return_value=(2, {"ID": "BIZ-001"})), \
+             patch("business_core.task_manager.find_tasks_by_idempotency_key", return_value=[]), \
+             patch("business_core.task_manager.create_task") as mock_create:
+            mock_create.return_value = {"ok": True, "task_id": "TSK-001", "code": "TASK_CREATED", "error": None}
+            result = create_business_task("BIZ-001", "Title", **kwargs)
+            return result, mock_create
+
+    # ── Route A: roadmap_id only, malformed Roadmap ──
+
+    def test_roadmap_none_rejected(self):
+        with patch("business_core.roadmap_manager.find_roadmap_by_id", return_value=None):
+            result, mc = self._run(roadmap_id="RM-1")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "ROADMAP_NOT_FOUND")
+        mc.assert_not_called()
+
+    def test_roadmap_empty_dict_rejected(self):
+        with patch("business_core.roadmap_manager.find_roadmap_by_id", return_value={}):
+            result, mc = self._run(roadmap_id="RM-1")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "TASK_ENTITY_RELATION_MISMATCH")
+        mc.assert_not_called()
+
+    def test_roadmap_list_rejected_no_raise(self):
+        with patch("business_core.roadmap_manager.find_roadmap_by_id", return_value=[]):
+            result, mc = self._run(roadmap_id="RM-1")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "ROADMAP_NOT_FOUND")
+        mc.assert_not_called()
+
+    def test_roadmap_string_rejected_no_raise(self):
+        with patch("business_core.roadmap_manager.find_roadmap_by_id", return_value="bad"):
+            result, mc = self._run(roadmap_id="RM-1")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "ROADMAP_NOT_FOUND")
+        mc.assert_not_called()
+
+    def test_roadmap_plain_object_rejected_no_raise(self):
+        with patch("business_core.roadmap_manager.find_roadmap_by_id", return_value=object()):
+            result, mc = self._run(roadmap_id="RM-1")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "ROADMAP_NOT_FOUND")
+        mc.assert_not_called()
+
+    def test_roadmap_matching_business_proceeds(self):
+        roadmap = {"roadmap_id": "RM-1", "status": "active", "object_id": "", "service_id": "", "business_id": "BIZ-001"}
+        with patch("business_core.roadmap_manager.find_roadmap_by_id", return_value=roadmap), \
+             patch("business_core.roadmap_manager.normalize_roadmap_status", side_effect=lambda s: s):
+            result, mc = self._run(roadmap_id="RM-1")
+        self.assertTrue(result["ok"])
+        self.assertEqual(mc.call_count, 1)
+
+    # ── Route B: stage_id only, malformed Stage ──
+
+    def test_stage_none_rejected(self):
+        with patch("business_core.roadmap_manager.find_stage_by_id", return_value=None):
+            result, mc = self._run(stage_id="ST-1")
+        self.assertEqual(result["code"], "STAGE_NOT_FOUND")
+        mc.assert_not_called()
+
+    def test_stage_list_rejected_no_raise(self):
+        with patch("business_core.roadmap_manager.find_stage_by_id", return_value=[]):
+            result, mc = self._run(stage_id="ST-1")
+        self.assertEqual(result["code"], "STAGE_NOT_FOUND")
+        mc.assert_not_called()
+
+    def test_stage_string_rejected_no_raise(self):
+        with patch("business_core.roadmap_manager.find_stage_by_id", return_value="bad"):
+            result, mc = self._run(stage_id="ST-1")
+        self.assertEqual(result["code"], "STAGE_NOT_FOUND")
+        mc.assert_not_called()
+
+    def test_stage_plain_object_rejected_no_raise(self):
+        with patch("business_core.roadmap_manager.find_stage_by_id", return_value=object()):
+            result, mc = self._run(stage_id="ST-1")
+        self.assertEqual(result["code"], "STAGE_NOT_FOUND")
+        mc.assert_not_called()
+
+    def test_stage_empty_dict_rejected(self):
+        # A dict-but-empty Stage has no roadmap_id — must fail closed,
+        # never silently proceed with a blank resolved roadmap_id.
+        with patch("business_core.roadmap_manager.find_stage_by_id", return_value={}):
+            result, mc = self._run(stage_id="ST-1")
+        self.assertEqual(result["code"], "TASK_ENTITY_RELATION_MISMATCH")
+        mc.assert_not_called()
+
+    def test_stage_missing_roadmap_id_key_rejected(self):
+        with patch("business_core.roadmap_manager.find_stage_by_id", return_value={"stage_id": "ST-1", "status": "pending"}):
+            result, mc = self._run(stage_id="ST-1")
+        self.assertEqual(result["code"], "TASK_ENTITY_RELATION_MISMATCH")
+        mc.assert_not_called()
+
+    def test_stage_roadmap_id_none_rejected(self):
+        with patch("business_core.roadmap_manager.find_stage_by_id", return_value={"stage_id": "ST-1", "roadmap_id": None, "status": "pending"}):
+            result, mc = self._run(stage_id="ST-1")
+        self.assertEqual(result["code"], "TASK_ENTITY_RELATION_MISMATCH")
+        mc.assert_not_called()
+
+    def test_stage_roadmap_id_list_rejected(self):
+        with patch("business_core.roadmap_manager.find_stage_by_id", return_value={"stage_id": "ST-1", "roadmap_id": [], "status": "pending"}):
+            result, mc = self._run(stage_id="ST-1")
+        self.assertEqual(result["code"], "TASK_ENTITY_RELATION_MISMATCH")
+        mc.assert_not_called()
+
+    def test_stage_roadmap_id_dict_rejected(self):
+        with patch("business_core.roadmap_manager.find_stage_by_id", return_value={"stage_id": "ST-1", "roadmap_id": {}, "status": "pending"}):
+            result, mc = self._run(stage_id="ST-1")
+        self.assertEqual(result["code"], "TASK_ENTITY_RELATION_MISMATCH")
+        mc.assert_not_called()
+
+    def test_stage_roadmap_id_blank_rejected(self):
+        with patch("business_core.roadmap_manager.find_stage_by_id", return_value={"stage_id": "ST-1", "roadmap_id": "", "status": "pending"}):
+            result, mc = self._run(stage_id="ST-1")
+        self.assertEqual(result["code"], "TASK_ENTITY_RELATION_MISMATCH")
+        mc.assert_not_called()
+
+    def test_stage_roadmap_id_whitespace_only_rejected(self):
+        with patch("business_core.roadmap_manager.find_stage_by_id", return_value={"stage_id": "ST-1", "roadmap_id": "   ", "status": "pending"}):
+            result, mc = self._run(stage_id="ST-1")
+        self.assertEqual(result["code"], "TASK_ENTITY_RELATION_MISMATCH")
+        mc.assert_not_called()
+
+    def test_stage_valid_roadmap_id_then_malformed_roadmap_rejected(self):
+        stage = {"stage_id": "ST-1", "roadmap_id": "RM-1", "status": "pending"}
+        for malformed in (None, [], "bad", object()):
+            with patch("business_core.roadmap_manager.find_stage_by_id", return_value=stage), \
+                 patch("business_core.roadmap_manager.find_roadmap_by_id", return_value=malformed):
+                result, mc = self._run(stage_id="ST-1")
+            self.assertEqual(result["code"], "ROADMAP_NOT_FOUND", f"malformed={malformed!r}")
+            mc.assert_not_called()
+
+    def test_stage_only_success_never_yields_blank_roadmap_id(self):
+        # Durable invariant (18A.8-B0-F1 §9): whenever a stage_id is
+        # supplied and the eligibility check succeeds, create_task
+        # must have been called with a non-blank roadmap_id — proving
+        # create_business_task's Roadmap ownership block (K) was
+        # actually exercised, not silently skipped.
+        stage = {"stage_id": "ST-1", "roadmap_id": "RM-1", "status": "pending"}
+        roadmap = {"roadmap_id": "RM-1", "status": "active", "object_id": "", "service_id": "", "business_id": "BIZ-001"}
+        with patch("business_core.roadmap_manager.find_stage_by_id", return_value=stage), \
+             patch("business_core.roadmap_manager.find_roadmap_by_id", return_value=roadmap), \
+             patch("business_core.roadmap_manager.normalize_roadmap_status", side_effect=lambda s: s):
+            result, mc = self._run(stage_id="ST-1")
+        self.assertTrue(result["ok"])
+        self.assertEqual(mc.call_count, 1)
+        passed_roadmap_id = mc.call_args[1]["roadmap_id"]
+        self.assertIsInstance(passed_roadmap_id, str)
+        self.assertTrue(passed_roadmap_id.strip())
+        self.assertEqual(passed_roadmap_id, "RM-1")
+
+    # ── Route C: both roadmap_id and stage_id ──
+
+    def test_combined_supplied_roadmap_none_rejected(self):
+        stage = {"stage_id": "ST-1", "roadmap_id": "RM-1", "status": "pending"}
+        with patch("business_core.roadmap_manager.find_stage_by_id", return_value=stage), \
+             patch("business_core.roadmap_manager.find_roadmap_by_id", return_value=None):
+            result, mc = self._run(roadmap_id="RM-1", stage_id="ST-1")
+        self.assertEqual(result["code"], "ROADMAP_NOT_FOUND")
+        mc.assert_not_called()
+
+    def test_combined_supplied_roadmap_non_dict_rejected(self):
+        stage = {"stage_id": "ST-1", "roadmap_id": "RM-1", "status": "pending"}
+        for malformed in ([], "bad"):
+            with patch("business_core.roadmap_manager.find_stage_by_id", return_value=stage), \
+                 patch("business_core.roadmap_manager.find_roadmap_by_id", return_value=malformed):
+                result, mc = self._run(roadmap_id="RM-1", stage_id="ST-1")
+            self.assertEqual(result["code"], "ROADMAP_NOT_FOUND", f"malformed={malformed!r}")
+            mc.assert_not_called()
+
+    def test_combined_stage_roadmap_id_missing_rejected(self):
+        stage = {"stage_id": "ST-1", "status": "pending"}
+        with patch("business_core.roadmap_manager.find_stage_by_id", return_value=stage):
+            result, mc = self._run(roadmap_id="RM-1", stage_id="ST-1")
+        self.assertEqual(result["code"], "TASK_ENTITY_RELATION_MISMATCH")
+        mc.assert_not_called()
+
+    def test_combined_stage_roadmap_id_blank_rejected(self):
+        stage = {"stage_id": "ST-1", "roadmap_id": "", "status": "pending"}
+        with patch("business_core.roadmap_manager.find_stage_by_id", return_value=stage):
+            result, mc = self._run(roadmap_id="RM-1", stage_id="ST-1")
+        self.assertEqual(result["code"], "TASK_ENTITY_RELATION_MISMATCH")
+        mc.assert_not_called()
+
+    def test_combined_stage_points_elsewhere_rejected(self):
+        stage = {"stage_id": "ST-1", "roadmap_id": "RM-2", "status": "pending"}
+        with patch("business_core.roadmap_manager.find_stage_by_id", return_value=stage):
+            result, mc = self._run(roadmap_id="RM-1", stage_id="ST-1")
+        self.assertEqual(result["code"], "TASK_ENTITY_RELATION_MISMATCH")
+        mc.assert_not_called()
+
+    def test_combined_matching_business_proceeds(self):
+        stage = {"stage_id": "ST-1", "roadmap_id": "RM-1", "status": "pending"}
+        roadmap = {"roadmap_id": "RM-1", "status": "active", "object_id": "", "service_id": "", "business_id": "BIZ-001"}
+        with patch("business_core.roadmap_manager.find_stage_by_id", return_value=stage), \
+             patch("business_core.roadmap_manager.find_roadmap_by_id", return_value=roadmap), \
+             patch("business_core.roadmap_manager.normalize_roadmap_status", side_effect=lambda s: s):
+            result, mc = self._run(roadmap_id="RM-1", stage_id="ST-1")
+        self.assertTrue(result["ok"])
+        self.assertEqual(mc.call_count, 1)
+
+    # ── Terminal Stage / completed / cancelled Roadmap preserved ──
+
+    def test_terminal_stage_still_rejected_after_hardening(self):
+        stage = {"stage_id": "ST-1", "roadmap_id": "RM-1", "status": "done"}
+        with patch("business_core.roadmap_manager.find_stage_by_id", return_value=stage):
+            result, mc = self._run(stage_id="ST-1")
+        self.assertEqual(result["code"], "STAGE_TERMINAL")
+        mc.assert_not_called()
+
+    def test_stage_status_non_string_does_not_raise(self):
+        # A malformed (non-string) status must not crash the terminal
+        # check nor be stringified/reprd — it simply doesn't match the
+        # terminal set, so eligibility continues to the Roadmap step.
+        stage = {"stage_id": "ST-1", "roadmap_id": "RM-1", "status": 12345}
+        roadmap = {"roadmap_id": "RM-1", "status": "active", "object_id": "", "service_id": "", "business_id": "BIZ-001"}
+        with patch("business_core.roadmap_manager.find_stage_by_id", return_value=stage), \
+             patch("business_core.roadmap_manager.find_roadmap_by_id", return_value=roadmap), \
+             patch("business_core.roadmap_manager.normalize_roadmap_status", side_effect=lambda s: s):
+            result, mc = self._run(stage_id="ST-1")
+        self.assertTrue(result["ok"])
+
+    def test_completed_roadmap_still_rejected_after_hardening(self):
+        roadmap = {"roadmap_id": "RM-1", "status": "completed", "object_id": "", "service_id": "", "business_id": "BIZ-001"}
+        with patch("business_core.roadmap_manager.find_roadmap_by_id", return_value=roadmap), \
+             patch("business_core.roadmap_manager.normalize_roadmap_status", side_effect=lambda s: s):
+            result, mc = self._run(roadmap_id="RM-1")
+        self.assertEqual(result["code"], "ROADMAP_COMPLETED")
+        mc.assert_not_called()
+
+    def test_cancelled_roadmap_still_rejected_after_hardening(self):
+        roadmap = {"roadmap_id": "RM-1", "status": "cancelled", "object_id": "", "service_id": "", "business_id": "BIZ-001"}
+        with patch("business_core.roadmap_manager.find_roadmap_by_id", return_value=roadmap), \
+             patch("business_core.roadmap_manager.normalize_roadmap_status", side_effect=lambda s: s):
+            result, mc = self._run(roadmap_id="RM-1")
+        self.assertEqual(result["code"], "ROADMAP_CANCELLED")
+        mc.assert_not_called()
+
+    def test_roadmap_status_non_string_does_not_raise(self):
+        roadmap = {"roadmap_id": "RM-1", "status": object(), "object_id": "", "service_id": "", "business_id": "BIZ-001"}
+        with patch("business_core.roadmap_manager.find_roadmap_by_id", return_value=roadmap):
+            result, mc = self._run(roadmap_id="RM-1")
+        # normalize_roadmap_status is never handed the non-string value.
+        self.assertTrue(result["ok"])
+
+    # ── No roadmap_id and no stage_id: unaffected ──
+
+    def test_neither_supplied_unaffected(self):
+        result, mc = self._run()
+        self.assertTrue(result["ok"])
+        self.assertEqual(mc.call_count, 1)
+        self.assertEqual(mc.call_args[1]["roadmap_id"], "")
+
+
+class _PoisonedStrRepr:
+    """A canonical-lookup stand-in whose data-attribute access is
+    normal but whose __str__/__repr__ raise — proves the eligibility
+    helper never stringifies a malformed Stage/Roadmap value to build
+    an error message (it only ever returns a fixed literal)."""
+    def __str__(self):
+        raise RuntimeError("STR-SENTINEL-MARKER")
+
+    def __repr__(self):
+        raise RuntimeError("REPR-SENTINEL-MARKER")
+
+
+class TestRoadmapStageEligibilityPoisonObjects(unittest.TestCase):
+    """Poison-object safety for _task_roadmap_stage_eligibility_for_creation.
+
+    _PoisonedStrRepr (poisoned __str__/__repr__ only) is the realistic
+    adversarial case: isinstance(x, dict) never touches __str__ or
+    __repr__, so the isinstance gate rejects it cleanly and no
+    sentinel can leak into an error message, since every returned
+    error string is a fixed literal (never str(value) or repr(value))
+    — confirmed directly below.
+
+    A second, more extreme case — an object whose __getattribute__
+    itself unconditionally raises — is NOT included here as a passing
+    test. It is a documented, out-of-scope Python-level limitation,
+    not a gap in this helper: CPython's isinstance() can itself invoke
+    __getattribute__ (via the __class__ fallback used to support
+    proxy/duck-typed objects), so no amount of "isinstance-before-
+    .get()" hardening can fully neutralize an object that raises on
+    every single attribute access, including the ones isinstance()
+    itself may need. This is confirmed unreachable in practice: the
+    real find_stage_by_id()/find_roadmap_by_id() (business_core/
+    roadmap_manager.py) only ever return a plain dict or None per
+    their own documented contracts — never an arbitrary object."""
+
+    SENTINEL_STR = "STR-SENTINEL-MARKER"
+    SENTINEL_REPR = "REPR-SENTINEL-MARKER"
+
+    def _run(self, **kwargs):
+        with patch("business_core.sheets.find_row_by_id", return_value=(2, {"ID": "BIZ-001"})), \
+             patch("business_core.task_manager.find_tasks_by_idempotency_key", return_value=[]), \
+             patch("business_core.task_manager.create_task") as mock_create:
+            mock_create.return_value = {"ok": True, "task_id": "TSK-001", "code": "TASK_CREATED", "error": None}
+            result = create_business_task("BIZ-001", "Title", **kwargs)
+            return result, mock_create
+
+    def test_poisoned_str_repr_roadmap_rejected_no_sentinel(self):
+        with patch("business_core.roadmap_manager.find_roadmap_by_id", return_value=_PoisonedStrRepr()):
+            result, mc = self._run(roadmap_id="RM-1")
+        self.assertEqual(result["code"], "ROADMAP_NOT_FOUND")
+        mc.assert_not_called()
+        self.assertNotIn(self.SENTINEL_STR, str(result))
+        self.assertNotIn(self.SENTINEL_REPR, str(result))
+
+    def test_poisoned_str_repr_stage_rejected_no_sentinel(self):
+        with patch("business_core.roadmap_manager.find_stage_by_id", return_value=_PoisonedStrRepr()):
+            result, mc = self._run(stage_id="ST-1")
+        self.assertEqual(result["code"], "STAGE_NOT_FOUND")
+        mc.assert_not_called()
+        self.assertNotIn(self.SENTINEL_STR, str(result))
+        self.assertNotIn(self.SENTINEL_REPR, str(result))
+
+    def test_poisoned_str_repr_no_exception_escapes(self):
+        # The poisoned dunder methods are never invoked at all — proven
+        # by the calls above completing without raising STR/REPR-SENTINEL.
+        with patch("business_core.roadmap_manager.find_roadmap_by_id", return_value=_PoisonedStrRepr()):
+            try:
+                result, mc = self._run(roadmap_id="RM-1")
+            except Exception as e:
+                self.fail(f"unexpected exception: {type(e).__name__}: {e}")
+        self.assertFalse(result["ok"])
 
 
 class TestCreateBusinessTaskIdempotency(unittest.TestCase):
@@ -1024,6 +1470,77 @@ class TestListTasksStrictErrorMode(unittest.TestCase):
         src = inspect.getsource(th.bctasks_cmd)
         self.assertIn("raise_on_error=True", src)
         self.assertNotIn("raise_on_error=False", src)
+
+
+# ─────────────────────────────────────────────────────────────
+# create_task / create_business_task exception-leak contract
+# (Phase 18A.8-B0 §10, §11, §19)
+# ─────────────────────────────────────────────────────────────
+
+class TestCreateTaskStorageErrorContract(unittest.TestCase):
+
+    def test_storage_exception_yields_fixed_code_no_raw_error(self):
+        from business_core.task_manager import create_task
+        with patch("business_core.sheets.generate_next_id", side_effect=RuntimeError("SHEETS-SECRET-DETAIL")):
+            result = create_task("BIZ-001", "Title")
+        self.assertEqual(result, {"ok": False, "task_id": "", "code": "TASK_STORAGE_ERROR", "error": None})
+
+    def test_storage_exception_logs_fixed_literal_only(self):
+        from business_core.task_manager import create_task
+        with patch("business_core.sheets.generate_next_id", side_effect=RuntimeError("SHEETS-SECRET-DETAIL")), \
+             self.assertLogs("business_core.task_manager", level="ERROR") as cm:
+            create_task("BIZ-001", "Title")
+        self.assertEqual(len(cm.output), 1)
+        self.assertIn("create_task storage write failure", cm.output[0])
+        self.assertNotIn("SHEETS-SECRET-DETAIL", cm.output[0])
+
+    def test_storage_exception_no_retry_no_second_append(self):
+        from business_core.task_manager import create_task
+        with patch("business_core.sheets.generate_next_id", side_effect=RuntimeError("boom")) as mock_gen, \
+             patch("business_core.sheets.append_business_row") as mock_append:
+            create_task("BIZ-001", "Title")
+        self.assertEqual(mock_gen.call_count, 1)
+        mock_append.assert_not_called()
+
+
+class TestCreateBusinessTaskStorageErrorPropagation(unittest.TestCase):
+
+    def test_propagates_fixed_code_no_raw_error(self):
+        with patch("business_core.sheets.find_row_by_id", return_value=(2, {"ID": "BIZ-001"})), \
+             patch("business_core.task_manager.find_tasks_by_idempotency_key", return_value=[]), \
+             patch("business_core.task_manager.create_task",
+                   return_value={"ok": False, "task_id": "", "code": "TASK_STORAGE_ERROR", "error": None}):
+            result = create_business_task("BIZ-001", "Title")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "TASK_STORAGE_ERROR")
+        self.assertIsNone(result["error"])
+
+    def test_does_not_synthesize_error_text(self):
+        with patch("business_core.sheets.find_row_by_id", return_value=(2, {"ID": "BIZ-001"})), \
+             patch("business_core.task_manager.find_tasks_by_idempotency_key", return_value=[]), \
+             patch("business_core.task_manager.create_task",
+                   return_value={"ok": False, "task_id": "", "code": "TASK_STORAGE_ERROR", "error": None}):
+            result = create_business_task("BIZ-001", "Title")
+        self.assertNotIn("SHEETS-SECRET-DETAIL", str(result))
+
+    def test_does_not_retry_or_re_lookup_idempotency(self):
+        with patch("business_core.sheets.find_row_by_id", return_value=(2, {"ID": "BIZ-001"})), \
+             patch("business_core.task_manager.find_tasks_by_idempotency_key", return_value=[]) as mock_lookup, \
+             patch("business_core.task_manager.create_task",
+                   return_value={"ok": False, "task_id": "", "code": "TASK_STORAGE_ERROR", "error": None}) as mock_create:
+            create_business_task("BIZ-001", "Title", idempotency_key="KEY-1")
+        self.assertEqual(mock_lookup.call_count, 1)
+        self.assertEqual(mock_create.call_count, 1)
+
+
+class TestTaskCreationMessageStorageErrorRendering(unittest.TestCase):
+
+    def test_storage_error_maps_to_fixed_generic_message_no_secret(self):
+        from business_core.telegram_handlers import _task_creation_message
+        msg = _task_creation_message({"ok": False, "code": "TASK_STORAGE_ERROR", "error": None})
+        self.assertIn("❌", msg)
+        self.assertNotIn("SHEETS-SECRET-DETAIL", msg)
+        self.assertNotIn("None", msg)
 
 
 if __name__ == "__main__":

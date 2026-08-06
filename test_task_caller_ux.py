@@ -92,9 +92,13 @@ class TestTaskCreationMessageMapping(unittest.TestCase):
         self.assertIn("TSK-C", msg)
 
     def test_unknown_code_safe_fallback(self):
+        # Phase 18A.8-B0: an unmapped code degrades to the fixed
+        # generic message — it must never render the raw code or
+        # error text (anti-enumeration / no internal-detail leakage).
         msg = th._task_creation_message({"ok": False, "code": "TOTALLY_NEW", "error": "detail"})
         self.assertIn("❌", msg)
-        self.assertIn("TOTALLY_NEW", msg)
+        self.assertNotIn("TOTALLY_NEW", msg)
+        self.assertNotIn("detail", msg)
 
 
 class TestTaskAdminMessageMapping(unittest.TestCase):

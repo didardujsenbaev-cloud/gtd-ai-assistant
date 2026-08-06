@@ -409,12 +409,19 @@ class TestPhase17E2A4H1OfferHardeningScope(unittest.TestCase):
         # unassign_task is the only approved business_builder function
         # change; all other module constructs are protected by dedicated
         # architecture guards.
+        # Phase 18A.8-B0 additionally approves create_business_task
+        # (Client/Object/Service/Roadmap ownership fail-closed
+        # hardening, safe TASK_STORAGE_ERROR propagation).
+        # Phase 18A.8-B0-F1 additionally approves
+        # _task_roadmap_stage_eligibility_for_creation (non-dict
+        # Stage/Roadmap fail-closed hardening).
         _assert_only_functions_changed(
             self, "business_core/business_builder.py",
             {
                 "update_commercial_offer_admin_fields", "update_document_admin_fields",
                 "confirm_payment_transaction", "reverse_payment_transaction", "fail_payment_transaction",
-                "unassign_task",
+                "unassign_task", "create_business_task",
+                "_task_roadmap_stage_eligibility_for_creation",
             },
         )
 
@@ -447,6 +454,9 @@ class TestPhase17E2A4H1OfferHardeningScope(unittest.TestCase):
         # command function and COMMAND_ENFORCEMENT_MAP's top-level
         # construct identity are protected separately by
         # test_task_architecture_guards.py.
+        # Phase 18A.8-B0 additionally approves newbctask_cmd
+        # (temporary fail-closed rewrite) and _task_creation_message
+        # (result-shape hardening + TASK_STORAGE_ERROR mapping).
         _assert_only_functions_changed_or_added(
             self, "business_core/telegram_handlers.py",
             allowed_changed_function_names={
@@ -456,6 +466,7 @@ class TestPhase17E2A4H1OfferHardeningScope(unittest.TestCase):
                 "confirmpayment_cmd", "reversepayment_cmd", "failpayment_cmd", "updateinteractionnotes_cmd",
                 "_task_assignment_message", "unassigntask_cmd",
                 "_task_detail_lines", "bctask_cmd", "bctasks_cmd",
+                "newbctask_cmd", "_task_creation_message",
             },
             allowed_added_function_names={
                 "_offer_notes_message", "updateoffernotes_cmd",
@@ -597,6 +608,9 @@ class TestPhase17E2A4H1OfferHardeningScope(unittest.TestCase):
         # command function and COMMAND_ENFORCEMENT_MAP's top-level
         # construct identity are protected separately by
         # test_task_architecture_guards.py.
+        # Phase 18A.8-B0 additionally approves newbctask_cmd
+        # (temporary fail-closed rewrite) and _task_creation_message
+        # (result-shape hardening + TASK_STORAGE_ERROR mapping).
         _assert_only_functions_changed_or_added(
             self, "business_core/telegram_handlers.py",
             allowed_changed_function_names={
@@ -606,6 +620,7 @@ class TestPhase17E2A4H1OfferHardeningScope(unittest.TestCase):
                 "confirmpayment_cmd", "reversepayment_cmd", "failpayment_cmd", "updateinteractionnotes_cmd",
                 "_task_assignment_message", "unassigntask_cmd",
                 "_task_detail_lines", "bctask_cmd", "bctasks_cmd",
+                "newbctask_cmd", "_task_creation_message",
             },
             allowed_added_function_names={
                 "_offer_notes_message", "updateoffernotes_cmd",

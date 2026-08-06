@@ -306,9 +306,12 @@ def create_task(
         append_business_row("task_registry", row)
         log.info(f"create_task: {task_id} / {title}")
         return {"ok": True, "task_id": task_id, "code": "TASK_CREATED", "error": None}
-    except Exception as exc:
-        log.error(f"create_task error: {exc}")
-        return {"ok": False, "task_id": "", "code": "", "error": str(exc)}
+    except Exception:
+        # Fixed literal only — no exception interpolation, no Task
+        # row, no Business ID. The caller (create_business_task) must
+        # never receive raw exception text through this contract.
+        log.error("create_task storage write failure")
+        return {"ok": False, "task_id": "", "code": "TASK_STORAGE_ERROR", "error": None}
 
 
 _TASK_ADMIN_EDITABLE_FIELDS = (

@@ -3825,6 +3825,20 @@ def _task_roadmap_stage_eligibility_for_creation(roadmap_id: str, stage_id: str)
     (code, error, resolved_roadmap_id) — code is "" when eligible.
     Resolves Stage->Roadmap when only stage_id is supplied (Stage
     canonically derives Roadmap ID, per ADR-019 §7).
+
+    Every canonical lookup result (Stage, Roadmap) is type-checked
+    before any attribute is read from it — a malformed, non-dict
+    result (None, [], "bad", a poisoned object, etc.) from
+    find_stage_by_id()/find_roadmap_by_id() fails closed on a fixed
+    code instead of raising AttributeError or invoking str/repr on
+    the raw value. A Stage's own `roadmap_id` field is likewise
+    required to be a non-blank string before it is trusted — this is
+    the critical invariant callers rely on: whenever this function
+    returns success (code == "") for a call where roadmap_id or
+    stage_id was supplied, resolved_roadmap_id is guaranteed to be a
+    non-blank string, so create_business_task's Roadmap Business
+    ownership check (K) can never be silently skipped because a
+    malformed Stage caused resolved_roadmap_id to end up blank.
     """
     from business_core.roadmap_manager import find_stage_by_id, find_roadmap_by_id, normalize_roadmap_status
 
@@ -3832,10 +3846,18 @@ def _task_roadmap_stage_eligibility_for_creation(roadmap_id: str, stage_id: str)
 
     if stage_id:
         stage = find_stage_by_id(stage_id)
-        if stage is None:
+        if not isinstance(stage, dict):
             return "STAGE_NOT_FOUND", f"Stage {stage_id} не найден", resolved_roadmap_id
 
         stage_roadmap_id = stage.get("roadmap_id", "")
+        if not isinstance(stage_roadmap_id, str) or not stage_roadmap_id.strip():
+            return (
+                "TASK_ENTITY_RELATION_MISMATCH",
+                f"Stage {stage_id} не привязан к корректному Roadmap",
+                resolved_roadmap_id,
+            )
+        stage_roadmap_id = stage_roadmap_id.strip()
+
         if roadmap_id and stage_roadmap_id != roadmap_id:
             return (
                 "TASK_ENTITY_RELATION_MISMATCH",
@@ -3844,17 +3866,19 @@ def _task_roadmap_stage_eligibility_for_creation(roadmap_id: str, stage_id: str)
             )
         resolved_roadmap_id = stage_roadmap_id
 
-        if stage.get("status", "") in ("done", "skipped"):
-            return "STAGE_TERMINAL", f"Stage {stage_id} имеет терминальный статус '{stage.get('status', '')}'", resolved_roadmap_id
+        stage_status = stage.get("status", "")
+        if isinstance(stage_status, str) and stage_status in ("done", "skipped"):
+            return "STAGE_TERMINAL", f"Stage {stage_id} имеет терминальный статус '{stage_status}'", resolved_roadmap_id
 
     if not resolved_roadmap_id:
         return "", None, resolved_roadmap_id
 
     roadmap = find_roadmap_by_id(resolved_roadmap_id)
-    if roadmap is None:
+    if not isinstance(roadmap, dict):
         return "ROADMAP_NOT_FOUND", f"Roadmap {resolved_roadmap_id} не найден", resolved_roadmap_id
 
-    roadmap_status = normalize_roadmap_status(roadmap.get("status", ""))
+    raw_status = roadmap.get("status", "")
+    roadmap_status = normalize_roadmap_status(raw_status if isinstance(raw_status, str) else "")
     if roadmap_status == "completed":
         return "ROADMAP_COMPLETED", f"Roadmap {resolved_roadmap_id} завершён — новый связанный Task не может быть создан", resolved_roadmap_id
     if roadmap_status == "cancelled":
@@ -3893,16 +3917,20 @@ def create_business_task(
       B. Business exists (BUSINESS_NOT_FOUND)
       C. required title
       D. normalize optional inputs (blank strings, not None)
-      E. validate Client reference (PERSON_NOT_FOUND if supplied and missing)
-      F. validate Object reference (TASK_NOT_FOUND-style existence via
-         object_manager; TASK_ENTITY_RELATION_MISMATCH on Business mismatch)
+      E. validate Client reference — existence AND Business membership
+         (canonical biz_ids list) required (TASK_ENTITY_RELATION_MISMATCH)
+      F. validate Object reference — existence AND Business ownership
+         required; blank/malformed/foreign stored biz_id all fail
+         closed (TASK_ENTITY_RELATION_MISMATCH)
       G. validate Service reference (same shape as Object)
       H. validate Roadmap reference (ROADMAP_NOT_FOUND)
       I. validate Stage reference (STAGE_NOT_FOUND), derive Roadmap ID
          from Stage when Roadmap ID is omitted
       J. cross-validate Stage<->Roadmap (TASK_ENTITY_RELATION_MISMATCH)
-      K. cross-validate Roadmap<->Object/Service where supplied
-         (TASK_ENTITY_RELATION_MISMATCH)
+      K. Roadmap Business ownership — required unconditionally whenever
+         a Roadmap is in play, whether directly supplied or derived
+         from Stage — plus cross-validate Roadmap<->Object/Service
+         where supplied (TASK_ENTITY_RELATION_MISMATCH)
       L. lifecycle eligibility (ROADMAP_COMPLETED/ROADMAP_CANCELLED/
          STAGE_TERMINAL)
       M. idempotency lookup (Business ID + Idempotency Key)
@@ -3913,10 +3941,19 @@ def create_business_task(
       P. low-level persistence call
       Q. structured result (ADR-019 §25)
 
+    Every relation-ownership failure above (E/F/G/K) returns the same
+    fixed, non-enumerating code and message regardless of whether the
+    relation was not found, had blank/malformed ownership data, or
+    belonged to a different Business — the caller-visible outcome must
+    never distinguish these cases, and no actual foreign Business ID,
+    raw relation row, or raw membership list is ever returned or logged.
+
     No write before all validation passes.
     """
     from business_core.task_manager import create_task, find_tasks_by_idempotency_key
     from business_core.sheets import find_row_by_id
+
+    relation_unavailable_msg = "Указанная связь недоступна для этого Business."
 
     # A. Required business_id.
     if not business_id:
@@ -3937,59 +3974,72 @@ def create_business_task(
     roadmap_id = roadmap_id or ""
     stage_id = stage_id or ""
 
-    # E. Client reference.
+    # E. Client reference — existence-only is not sufficient; the
+    # Person must be a member of the requested Business via the
+    # canonical biz_ids list. Malformed/missing biz_ids fails closed.
     if client_id:
         from business_core.person_manager import find_person_by_id
         person = find_person_by_id(client_id)
-        if person is None:
-            return _task_result(ok=False, code="PERSON_NOT_FOUND", error=f"Client {client_id} не найден", business_id=business_id)
+        if not isinstance(person, dict):
+            return _task_result(ok=False, code="TASK_ENTITY_RELATION_MISMATCH", error=relation_unavailable_msg, business_id=business_id)
+        biz_ids = person.get("biz_ids")
+        if not isinstance(biz_ids, list):
+            return _task_result(ok=False, code="TASK_ENTITY_RELATION_MISMATCH", error=relation_unavailable_msg, business_id=business_id)
+        member_biz_ids = [b for b in biz_ids if isinstance(b, str)]
+        if business_id not in member_biz_ids:
+            return _task_result(ok=False, code="TASK_ENTITY_RELATION_MISMATCH", error=relation_unavailable_msg, business_id=business_id)
 
-    # F. Object reference.
+    # F. Object reference — existence AND Business ownership required.
+    # Blank/malformed stored biz_id now fails closed (no more silent
+    # skip when the ownership field itself is blank).
     if object_id:
         from business_core.object_manager import find_object_by_id
         obj = find_object_by_id(object_id)
-        if obj is None:
-            return _task_result(ok=False, code="TASK_ENTITY_RELATION_MISMATCH", error=f"Object {object_id} не найден", business_id=business_id)
-        if obj.get("biz_id", "") and obj.get("biz_id", "") != business_id:
-            return _task_result(
-                ok=False, code="TASK_ENTITY_RELATION_MISMATCH",
-                error=f"Object {object_id} принадлежит другому Business", business_id=business_id,
-            )
+        if not isinstance(obj, dict):
+            return _task_result(ok=False, code="TASK_ENTITY_RELATION_MISMATCH", error=relation_unavailable_msg, business_id=business_id)
+        obj_biz_id = obj.get("biz_id")
+        if not isinstance(obj_biz_id, str) or not obj_biz_id.strip() or obj_biz_id.strip() != business_id:
+            return _task_result(ok=False, code="TASK_ENTITY_RELATION_MISMATCH", error=relation_unavailable_msg, business_id=business_id)
 
-    # G. Service reference.
+    # G. Service reference — same fail-closed shape as Object.
     if service_id:
         from business_core.service_manager import find_service_by_id
         service = find_service_by_id(service_id)
-        if service is None:
-            return _task_result(ok=False, code="TASK_ENTITY_RELATION_MISMATCH", error=f"Service {service_id} не найден", business_id=business_id)
-        if service.get("biz_id", "") and service.get("biz_id", "") != business_id:
-            return _task_result(
-                ok=False, code="TASK_ENTITY_RELATION_MISMATCH",
-                error=f"Service {service_id} принадлежит другому Business", business_id=business_id,
-            )
+        if not isinstance(service, dict):
+            return _task_result(ok=False, code="TASK_ENTITY_RELATION_MISMATCH", error=relation_unavailable_msg, business_id=business_id)
+        service_biz_id = service.get("biz_id")
+        if not isinstance(service_biz_id, str) or not service_biz_id.strip() or service_biz_id.strip() != business_id:
+            return _task_result(ok=False, code="TASK_ENTITY_RELATION_MISMATCH", error=relation_unavailable_msg, business_id=business_id)
 
-    # H/I/J. Roadmap/Stage existence + cross-validation + lifecycle
-    # eligibility (L), all in one pass via the shared helper.
+    # H/I/J. Roadmap/Stage existence + Stage<->Roadmap cross-validation
+    # + lifecycle eligibility (L), all in one pass via the shared
+    # helper. This helper does not itself check Roadmap<->Business
+    # ownership — that is enforced unconditionally below (K), so a
+    # Stage's ownership is covered transitively through its resolved
+    # Roadmap without needing a Stage-specific Business field (Stage
+    # has none).
     eligibility_code, eligibility_error, resolved_roadmap_id = _task_roadmap_stage_eligibility_for_creation(roadmap_id, stage_id)
     if eligibility_code:
         return _task_result(ok=False, code=eligibility_code, error=eligibility_error, business_id=business_id)
     roadmap_id = resolved_roadmap_id
 
-    # K. Roadmap<->Object/Service consistency where supplied.
-    if roadmap_id and (object_id or service_id):
+    # K. Roadmap Business ownership — required unconditionally whenever
+    # a Roadmap is in play (directly supplied or derived from Stage),
+    # never merely inferred from a Roadmap<->Object/Service match.
+    # Shares the one Roadmap lookup with the existing Roadmap<->Object/
+    # Service consistency check below.
+    if roadmap_id:
         from business_core.roadmap_manager import find_roadmap_by_id
         roadmap = find_roadmap_by_id(roadmap_id)
-        if roadmap is not None:
-            if object_id and roadmap.get("object_id", "") and roadmap.get("object_id", "") != object_id:
-                return _task_result(
-                    ok=False, code="TASK_ENTITY_RELATION_MISMATCH",
-                    error=f"Roadmap {roadmap_id} принадлежит другому Object, не {object_id}", business_id=business_id,
-                )
-            if service_id and roadmap.get("service_id", "") and roadmap.get("service_id", "") != service_id:
-                return _task_result(
-                    ok=False, code="TASK_ENTITY_RELATION_MISMATCH",
-                    error=f"Roadmap {roadmap_id} принадлежит другому Service, не {service_id}", business_id=business_id,
-                )
+        if not isinstance(roadmap, dict):
+            return _task_result(ok=False, code="TASK_ENTITY_RELATION_MISMATCH", error=relation_unavailable_msg, business_id=business_id)
+        roadmap_business_id = roadmap.get("business_id")
+        if not isinstance(roadmap_business_id, str) or not roadmap_business_id.strip() or roadmap_business_id.strip() != business_id:
+            return _task_result(ok=False, code="TASK_ENTITY_RELATION_MISMATCH", error=relation_unavailable_msg, business_id=business_id)
+        if object_id and roadmap.get("object_id", "") and roadmap.get("object_id", "") != object_id:
+            return _task_result(ok=False, code="TASK_ENTITY_RELATION_MISMATCH", error=relation_unavailable_msg, business_id=business_id)
+        if service_id and roadmap.get("service_id", "") and roadmap.get("service_id", "") != service_id:
+            return _task_result(ok=False, code="TASK_ENTITY_RELATION_MISMATCH", error=relation_unavailable_msg, business_id=business_id)
 
     # M/N. Idempotency lookup.
     if idempotency_key:
@@ -4022,8 +4072,14 @@ def create_business_task(
         created_by=created_by, gtd_action_id=gtd_action_id,
     )
     if not write_result["ok"]:
+        write_code = write_result.get("code") or ""
+        if write_code == "TASK_STORAGE_ERROR":
+            # Fixed, stable propagation — never synthesize error text
+            # from the storage layer's own (already-safe) result, and
+            # never retry or re-run the idempotency lookup.
+            return _task_result(ok=False, code="TASK_STORAGE_ERROR", error=None, business_id=business_id, retry_safe=True)
         return _task_result(
-            ok=False, code=write_result.get("code") or "", error=write_result.get("error"),
+            ok=False, code=write_code, error=write_result.get("error"),
             business_id=business_id, retry_safe=bool(idempotency_key),
         )
 

@@ -15843,31 +15843,42 @@ def _task_status_ru(status: str) -> str:
 def _task_creation_message(result: dict) -> str:
     """
     Render any business_builder.create_business_task() result into a
-    single Russian Telegram message. Never exposes the raw result dict
-    or a traceback.
+    single Russian Telegram message. Never exposes the raw result
+    dict, a traceback, or an unchecked internal error string — every
+    field is read through a type-safe accessor before use, and a
+    malformed `result` (wrong type, missing keys, poisoned values)
+    degrades to a fixed safe message instead of raising or rendering
+    the raw input.
     """
-    code = result.get("code", "")
+    if not isinstance(result, dict):
+        return "❌ Ошибка при создании Task."
+
+    def _g(key: str, default: str = "") -> str:
+        value = result.get(key, default)
+        return value if isinstance(value, str) else default
+
+    code = _g("code")
 
     if code == "TASK_CREATED":
         return "\n".join([
             "✅ Task создан",
-            f"Task ID: `{result.get('task_id', '')}`",
-            f"Business ID: `{result.get('business_id', '')}`",
-            f"Статус: {_task_status_ru(result.get('final_status', 'new'))}",
+            f"Task ID: `{_g('task_id')}`",
+            f"Business ID: `{_g('business_id')}`",
+            f"Статус: {_task_status_ru(_g('final_status', 'new'))}",
         ])
 
     if code == "TASK_REUSED":
         return "\n".join([
             "ℹ️ Task уже существует — переиспользован по Idempotency Key",
-            f"Task ID: `{result.get('task_id', '')}`",
-            f"Статус: {_task_status_ru(result.get('final_status', ''))}",
+            f"Task ID: `{_g('task_id')}`",
+            f"Статус: {_task_status_ru(_g('final_status'))}",
         ])
 
     if code == "BUSINESS_NOT_FOUND":
-        return f"❌ Business `{result.get('business_id', '')}` не найден."
+        return f"❌ Business `{_g('business_id')}` не найден."
 
     if code == "TASK_ENTITY_RELATION_MISMATCH":
-        return f"❌ Несогласованные ссылки на сущности: {result.get('error') or 'см. логи'}"
+        return f"❌ Несогласованные ссылки на сущности: {_g('error') or 'см. логи'}"
 
     if code == "ROADMAP_NOT_FOUND":
         return "❌ Указанный Roadmap не найден."
@@ -15885,15 +15896,24 @@ def _task_creation_message(result: dict) -> str:
         return "❌ Stage имеет терминальный статус (done/skipped) — новый связанный Task не может быть создан."
 
     if code == "MULTIPLE_TASK_IDEMPOTENCY_MATCHES":
-        ids = ", ".join(f"`{t}`" for t in result.get("conflicting_task_ids", ())) or "—"
+        raw_ids = result.get("conflicting_task_ids", ())
+        id_list = raw_ids if isinstance(raw_ids, (tuple, list)) else ()
+        safe_ids = [t for t in id_list if isinstance(t, str)]
+        ids = ", ".join(f"`{t}`" for t in safe_ids) or "—"
         return "\n".join([
             "⚠️ Обнаружен конфликт целостности данных",
             f"Найдено несколько Task с одним Idempotency Key: {ids}",
             "Новый Task не создан — автоматический выбор одного из них не выполняется.",
         ])
 
-    log.warning(f"_task_creation_message: unmapped code={code!r} business_id={result.get('business_id', '')}")
-    return f"❌ Ошибка ({code or 'unknown'}): {result.get('error') or 'см. логи'}"
+    if code == "TASK_STORAGE_ERROR":
+        return "❌ Временная ошибка при создании Task. Попробуйте ещё раз позже."
+
+    # Fixed literal only — no code interpolation, no business_id, no
+    # error text. An unmapped code degrades to the same generic
+    # message every other unsafe path uses.
+    log.warning("_task_creation_message: unmapped code")
+    return "❌ Ошибка при создании Task."
 
 
 def _task_admin_message(result: dict, task_id: str) -> str:
@@ -16170,53 +16190,25 @@ def _task_detail_lines(task) -> list[str]:
 
 async def newbctask_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    /newbctask business_id=BIZ-001 title="..." [status=new]
-               [source=telegram] [idempotency_key=...]
-               [client_id=...] [object_id=...] [service_id=...]
-               [roadmap_id=...] [stage_id=...] [priority=...] [due_date=...]
+    /newbctask — temporarily disabled, fails closed before any parsing
+    or storage access.
 
-    Idempotency Key defaults to a deterministic, request-scoped value
-    derived from the Telegram update ID when omitted — never a blank
-    key on this path (ADR-019 §10/§23).
+    TASK/CREATE authorization does not exist yet for this command, and
+    the underlying create_business_task()/create_task() ownership and
+    error contracts were only just hardened — this command remains
+    fail-closed until a dedicated authorization phase adds the
+    TASK/CREATE gate and re-enables it. No argument is parsed, no
+    storage helper is imported or called, and no Task is written on
+    this path.
     """
     if not _is_bc_enabled():
-        await _reply(update, _bc_disabled_msg())
+        await _reply(update, _bc_disabled_msg(), parse_mode=None)
         return
 
-    raw = " ".join(context.args or [])
-    args = _parse_kv_args(raw)
-    business_id = args.get("business_id", "")
-    title = args.get("title", "")
-
-    if not business_id or not title:
-        await _reply(update,
-            "❌ Укажи business_id и title.\n\nПример:\n"
-            '`/newbctask business_id=BIZ-001 title="Подготовить документы"`'
-        )
+    if not await _validate_bc_transport_or_reply(update):
         return
 
-    try:
-        from business_core.business_builder import create_business_task
-
-        idempotency_key = args.get("idempotency_key", "") or f"tg-{update.update_id}"
-        result = create_business_task(
-            business_id, title,
-            description=args.get("description", ""),
-            priority=args.get("priority", ""),
-            due_date=args.get("due_date", ""),
-            source=args.get("source", "telegram"),
-            idempotency_key=idempotency_key,
-            client_id=args.get("client_id", ""),
-            object_id=args.get("object_id", ""),
-            service_id=args.get("service_id", ""),
-            roadmap_id=args.get("roadmap_id", ""),
-            stage_id=args.get("stage_id", ""),
-            created_by=str(update.effective_user.id) if update.effective_user else "",
-        )
-        await _reply(update, _task_creation_message(result))
-    except Exception as e:
-        log.error(f"newbctask_cmd error: {e}")
-        await _reply(update, "❌ Ошибка при создании Task.")
+    await _reply(update, "❌ Создание Business Task временно недоступно.", parse_mode=None)
 
 
 def _task_list_lines(tasks, business_id) -> list[str]:

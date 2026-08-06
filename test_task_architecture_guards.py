@@ -454,29 +454,15 @@ def _task_manager_top_level_constructs(src: str) -> dict:
 class TestUnassignTaskPartialStateHardening(unittest.TestCase):
 
     def test_only_unassign_task_changed_in_business_builder(self):
-        """Confined-diff guard: every business_builder.py line the
-        working tree adds relative to HEAD must fall strictly inside
-        unassign_task's own body — no other Task (or non-Task) function
-        in this file may differ."""
-        import subprocess
-        diff = subprocess.run(
-            ["git", "diff", "--unified=0", "HEAD", "--", "business_core/business_builder.py"],
-            cwd=WORKSPACE, capture_output=True, text=True, check=True,
-        ).stdout
-        if not diff:
-            self.skipTest("no working-tree diff against HEAD for business_builder.py")
-        body = _bb_function_body("unassign_task")
-        body_lines = {line for line in body.splitlines() if line.strip()}
-        for line in diff.splitlines():
-            if not line.startswith("+") or line.startswith("+++"):
-                continue
-            content = line[1:]
-            if not content.strip():
-                continue
-            self.assertIn(
-                content, body_lines,
-                f"business_builder.py added line falls outside unassign_task: {content!r}",
-            )
+        """Confined-diff guard: superseded as a whole-file line-diff
+        check by Phase 18A.8-B0, which legitimately adds a second
+        approved construct (create_business_task) to
+        business_builder.py. Scope protection for this file is now
+        carried entirely by TestBusinessBuilderTopLevelConstructGuard
+        above (_BUSINESS_BUILDER_APPROVED_TO_DIFFER), which is
+        construct-identity based rather than line-diff based and
+        already names both unassign_task and create_business_task."""
+        self.skipTest("superseded by TestBusinessBuilderTopLevelConstructGuard._BUSINESS_BUILDER_APPROVED_TO_DIFFER")
 
     def test_task_manager_unchanged(self):
         # list_tasks's raise_on_error strict-mode contract is now part
@@ -486,6 +472,10 @@ class TestUnassignTaskPartialStateHardening(unittest.TestCase):
         # a phase that legitimately changes a task_manager.py
         # construct must update the expected `changed` set here to
         # name exactly that construct.
+        #
+        # Phase 18A.8-B0 legitimately hardens create_task's exception
+        # contract (TASK_STORAGE_ERROR, no raw exception text) — the
+        # only approved changed construct this phase.
         import subprocess
 
         head_src = subprocess.run(
@@ -499,7 +489,7 @@ class TestUnassignTaskPartialStateHardening(unittest.TestCase):
         self.assertEqual(set(current) - set(head), set(), "task_manager.py: unapproved new top-level construct")
         self.assertEqual(set(head) - set(current), set(), "task_manager.py: a top-level construct was removed")
         changed = {k for k in head if head[k] != current[k]}
-        self.assertEqual(changed, set(), "task_manager.py: no construct may change this phase")
+        self.assertEqual(changed, {"function:create_task"}, "task_manager.py: only create_task may change this phase")
 
     _TASK_MANAGER_DUPLICATE_CASES = (
         (
@@ -1405,7 +1395,10 @@ class TestTaskListLinesFormatterSafety(unittest.TestCase):
 # function.
 # ─────────────────────────────────────────────────────────────
 
-_BUSINESS_BUILDER_APPROVED_TO_DIFFER = frozenset({"function:unassign_task"})
+_BUSINESS_BUILDER_APPROVED_TO_DIFFER = frozenset({
+    "function:unassign_task", "function:create_business_task",
+    "function:_task_roadmap_stage_eligibility_for_creation",
+})
 
 _BUSINESS_BUILDER_KNOWN_BENIGN_TOP_LEVEL_NODE_TYPES = (ast.Expr, ast.Pass)
 
@@ -1540,6 +1533,111 @@ class TestBusinessBuilderTopLevelConstructGuard(unittest.TestCase):
         _business_builder_top_level_constructs(head_src)
 
 
+class TestRoadmapStageEligibilityHelperArchitectureGuards(unittest.TestCase):
+    """Phase 18A.8-B0-F1: durable, git-history-independent behavioral
+    invariants for _task_roadmap_stage_eligibility_for_creation's
+    current working-tree source — proves the hardening shape itself,
+    not just that *something* changed relative to HEAD."""
+
+    def _source(self) -> str:
+        import inspect
+        from business_core import business_builder as bb
+        return inspect.getsource(bb._task_roadmap_stage_eligibility_for_creation)
+
+    def test_stage_dict_check_precedes_any_get_call(self):
+        src = self._source()
+        self.assertIn("isinstance(stage, dict)", src)
+        idx_check = src.index("isinstance(stage, dict)")
+        idx_first_get = src.index("stage.get(")
+        self.assertLess(idx_check, idx_first_get, "stage.get() must not appear before the isinstance(dict) gate")
+
+    def test_roadmap_dict_check_precedes_any_get_call(self):
+        src = self._source()
+        self.assertIn("isinstance(roadmap, dict)", src)
+        idx_check = src.index("isinstance(roadmap, dict)")
+        idx_first_get = src.index("roadmap.get(")
+        self.assertLess(idx_check, idx_first_get, "roadmap.get() must not appear before the isinstance(dict) gate")
+
+    def test_stage_roadmap_id_requires_non_blank_string(self):
+        src = self._source()
+        self.assertIn("isinstance(stage_roadmap_id, str)", src)
+        self.assertIn("stage_roadmap_id.strip()", src)
+
+    def test_no_create_task_call_inside_helper(self):
+        src = self._source()
+        self.assertNotIn("create_task(", src)
+
+    def test_no_append_or_write_call_inside_helper(self):
+        src = self._source()
+        for forbidden in ("append_business_row", "write_row", "update_row", ".write(", "generate_next_id"):
+            self.assertNotIn(forbidden, src, f"unexpected mutation-adjacent call: {forbidden!r}")
+
+    def test_no_logging_inside_helper(self):
+        src = self._source()
+        self.assertNotIn("log.", src)
+
+    def test_no_arbitrary_str_or_repr_of_lookup_results(self):
+        src = self._source()
+        self.assertNotIn("str(stage)", src)
+        self.assertNotIn("repr(stage)", src)
+        self.assertNotIn("str(roadmap)", src)
+        self.assertNotIn("repr(roadmap)", src)
+        self.assertNotIn("f\"{stage}", src)
+        self.assertNotIn("f\"{roadmap}", src)
+
+    def test_no_retry_or_loop_construct_inside_helper(self):
+        import ast
+        src = self._source()
+        tree = ast.parse(src)
+        loop_nodes = [n for n in ast.walk(tree) if isinstance(n, (ast.For, ast.AsyncFor, ast.While))]
+        self.assertEqual(loop_nodes, [], "no loop/retry construct expected inside this helper")
+
+    def test_stage_only_success_never_returns_blank_resolved_roadmap_id(self):
+        # Durable behavioral invariant, exercised directly against the
+        # helper (not through create_business_task) with every
+        # malformed Stage shape — every one either fails closed
+        # (non-empty code) or, if code == "" (eligible), resolved_
+        # roadmap_id must be a non-blank string.
+        from business_core import business_builder as bb
+        from unittest.mock import patch
+
+        malformed_stage_roadmap_ids = (None, [], {}, "", "   ")
+        for bad in malformed_stage_roadmap_ids:
+            stage = {"stage_id": "ST-1", "roadmap_id": bad, "status": "pending"}
+            with patch("business_core.roadmap_manager.find_stage_by_id", return_value=stage):
+                code, error, resolved = bb._task_roadmap_stage_eligibility_for_creation("", "ST-1")
+            self.assertNotEqual(code, "", f"stage roadmap_id={bad!r} must fail closed, not resolve to eligible")
+
+        valid_stage = {"stage_id": "ST-1", "roadmap_id": "RM-1", "status": "pending"}
+        valid_roadmap = {"roadmap_id": "RM-1", "status": "active", "business_id": "BIZ-001"}
+        with patch("business_core.roadmap_manager.find_stage_by_id", return_value=valid_stage), \
+             patch("business_core.roadmap_manager.find_roadmap_by_id", return_value=valid_roadmap), \
+             patch("business_core.roadmap_manager.normalize_roadmap_status", side_effect=lambda s: s):
+            code, error, resolved = bb._task_roadmap_stage_eligibility_for_creation("", "ST-1")
+        self.assertEqual(code, "")
+        self.assertIsInstance(resolved, str)
+        self.assertTrue(resolved.strip())
+
+    def test_non_dict_stage_and_roadmap_never_raise(self):
+        from business_core import business_builder as bb
+        from unittest.mock import patch
+
+        for malformed in (None, [], "bad", object()):
+            with patch("business_core.roadmap_manager.find_stage_by_id", return_value=malformed):
+                try:
+                    code, error, resolved = bb._task_roadmap_stage_eligibility_for_creation("", "ST-1")
+                except Exception as e:
+                    self.fail(f"stage={malformed!r} raised {type(e).__name__}: {e}")
+                self.assertNotEqual(code, "")
+
+            with patch("business_core.roadmap_manager.find_roadmap_by_id", return_value=malformed):
+                try:
+                    code, error, resolved = bb._task_roadmap_stage_eligibility_for_creation("RM-1", "")
+                except Exception as e:
+                    self.fail(f"roadmap={malformed!r} raised {type(e).__name__}: {e}")
+                self.assertNotEqual(code, "")
+
+
 class TestBusinessBuilderConstructGuardHelperUnit(unittest.TestCase):
     """Synthetic negative tests for
     _business_builder_top_level_constructs() and its identity-
@@ -1650,10 +1748,37 @@ class TestBusinessBuilderConstructGuardHelperUnit(unittest.TestCase):
 
 _TELEGRAM_HANDLERS_APPROVED_TO_DIFFER = frozenset({
     "async_function:bctasks_cmd", "assignment:COMMAND_ENFORCEMENT_MAP",
+    "async_function:newbctask_cmd", "function:_task_creation_message",
 })
 
-_TELEGRAM_HANDLERS_APPROVED_TO_ADD = frozenset({
-    "function:_task_list_lines",
+# NOTE: there is deliberately no "_TELEGRAM_HANDLERS_APPROVED_TO_ADD"
+# constant. That concept named a specific already-committed function
+# (_task_list_lines) as a "pending addition relative to HEAD" — but
+# once a commit lands, the working tree *is* HEAD for that construct,
+# so "added relative to HEAD" is permanently empty and the assertion
+# becomes unsatisfiable forever after the commit that introduced it.
+# The durable replacement is two independent things: (1) "this phase
+# adds nothing new" is asserted directly as `added == set()` in
+# test_no_unapproved_construct_added below — HEAD-relative, but never
+# names an already-merged construct, so it stays true until a future
+# phase genuinely adds something (at which point that phase updates
+# the assertion, same as any other stale-allowlist maintenance); and
+# (2) _task_list_lines' existence and shape are protected unconditionally,
+# independent of git history at all, by
+# TestTaskListLinesConstructInvariants below.
+
+# Fixed, git-history-independent inventory of every top-level function
+# in telegram_handlers.py that renders a Task result dict into a
+# Russian Telegram message. Used to catch an unexpected new formatter
+# function without relying on a broad name-pattern allowlist or a
+# git-HEAD comparison — this set is asserted against current working-
+# tree source directly, so it must be updated whenever a legitimate
+# new Task formatter is added (normal, expected maintenance, not a
+# "permanently stale" construct — unlike _TELEGRAM_HANDLERS_APPROVED_TO_ADD,
+# it is not tied to any particular commit).
+_TELEGRAM_HANDLERS_KNOWN_TASK_FORMATTERS = frozenset({
+    "_task_detail_lines", "_task_list_lines", "_task_assignment_message",
+    "_task_creation_message", "_task_admin_message", "_task_transition_message",
 })
 
 _TELEGRAM_HANDLERS_KNOWN_BENIGN_TOP_LEVEL_NODE_TYPES = (ast.Expr, ast.Pass)
@@ -1728,7 +1853,7 @@ def _git_show_head_telegram_handlers_py() -> str:
 
 class TestTelegramHandlersTopLevelConstructGuard(unittest.TestCase):
 
-    def test_only_approved_construct_differs(self):
+    def test_no_construct_removed(self):
         head_src = _git_show_head_telegram_handlers_py()
         current_src = (BUSINESS_CORE / "telegram_handlers.py").read_text(encoding="utf-8")
 
@@ -1736,14 +1861,35 @@ class TestTelegramHandlersTopLevelConstructGuard(unittest.TestCase):
         current = _telegram_handlers_top_level_constructs(current_src)
 
         removed = set(head) - set(current)
-        added = set(current) - set(head)
         self.assertEqual(removed, set(), f"telegram_handlers.py: construct(s) removed: {sorted(removed)}")
-        self.assertEqual(
-            added, _TELEGRAM_HANDLERS_APPROVED_TO_ADD,
-            f"telegram_handlers.py: unexpected new construct(s): {sorted(added - _TELEGRAM_HANDLERS_APPROVED_TO_ADD)}",
-        )
+
+    def test_no_unapproved_construct_added(self):
+        # Durable version of the old "added must equal
+        # _TELEGRAM_HANDLERS_APPROVED_TO_ADD" check. This phase
+        # (18A.8-B0) adds zero new top-level constructs to
+        # telegram_handlers.py — newbctask_cmd and _task_creation_message
+        # both already existed at HEAD and are only changed, not added.
+        # Unlike the retired constant, this assertion never names an
+        # already-merged construct, so it stays satisfiable on any
+        # clean checkout — it only needs updating when a future phase
+        # genuinely introduces a brand-new top-level construct here.
+        head_src = _git_show_head_telegram_handlers_py()
+        current_src = (BUSINESS_CORE / "telegram_handlers.py").read_text(encoding="utf-8")
+        head = _telegram_handlers_top_level_constructs(head_src)
+        current = _telegram_handlers_top_level_constructs(current_src)
+        added = set(current) - set(head)
+        self.assertEqual(added, set(), f"telegram_handlers.py: unexpected new construct(s): {sorted(added)}")
+
+    def test_only_approved_construct_changed(self):
+        head_src = _git_show_head_telegram_handlers_py()
+        current_src = (BUSINESS_CORE / "telegram_handlers.py").read_text(encoding="utf-8")
+
+        head = _telegram_handlers_top_level_constructs(head_src)
+        current = _telegram_handlers_top_level_constructs(current_src)
 
         for key in head:
+            if key not in current:
+                continue  # removal is covered by test_no_construct_removed
             if key in _TELEGRAM_HANDLERS_APPROVED_TO_DIFFER:
                 continue
             self.assertEqual(
@@ -1751,14 +1897,6 @@ class TestTelegramHandlersTopLevelConstructGuard(unittest.TestCase):
                 f"telegram_handlers.py: unapproved construct changed: {key!r} — only "
                 f"{sorted(_TELEGRAM_HANDLERS_APPROVED_TO_DIFFER)} may differ this phase",
             )
-
-    def test_no_new_top_level_construct_added(self):
-        head_src = _git_show_head_telegram_handlers_py()
-        current_src = (BUSINESS_CORE / "telegram_handlers.py").read_text(encoding="utf-8")
-        head = _telegram_handlers_top_level_constructs(head_src)
-        current = _telegram_handlers_top_level_constructs(current_src)
-        added = set(current) - set(head)
-        self.assertEqual(added, _TELEGRAM_HANDLERS_APPROVED_TO_ADD)
 
     def test_task_assignment_message_construct_present_in_both_versions(self):
         head_src = _git_show_head_telegram_handlers_py()
@@ -1773,7 +1911,11 @@ class TestTelegramHandlersTopLevelConstructGuard(unittest.TestCase):
         current_src = (BUSINESS_CORE / "telegram_handlers.py").read_text(encoding="utf-8")
         head = _telegram_handlers_top_level_constructs(head_src)
         current = _telegram_handlers_top_level_constructs(current_src)
-        for name in ("assigntask_cmd", "reassigntask_cmd", "bctask_cmd", "unassigntask_cmd", "newbctask_cmd", "updatetask_cmd"):
+        # newbctask_cmd is approved to change this phase (Phase
+        # 18A.8-B0 — fail-closed rewrite); protected instead by
+        # test_only_approved_construct_differs above via
+        # _TELEGRAM_HANDLERS_APPROVED_TO_DIFFER.
+        for name in ("assigntask_cmd", "reassigntask_cmd", "bctask_cmd", "unassigntask_cmd", "updatetask_cmd"):
             key = f"async_function:{name}"
             self.assertIn(key, head)
             self.assertEqual(head[key], current[key], f"{name} must not change this phase")
@@ -1848,6 +1990,50 @@ class TestTelegramHandlersTopLevelConstructGuard(unittest.TestCase):
         _telegram_handlers_top_level_constructs(head_src)
 
 
+class TestTaskListLinesConstructInvariants(unittest.TestCase):
+    """Durable, git-history-independent protection for _task_list_lines
+    and the Task-formatter surface — replaces the retired
+    "_task_list_lines is newly added relative to HEAD" assertion
+    (unsatisfiable forever once that commit landed). These checks run
+    against the current working-tree source only; they hold on a
+    clean checkout of any commit that includes _task_list_lines, on
+    the current Task-creation-hardening tree, and on any future
+    unrelated commit that doesn't touch this construct."""
+
+    def _current_constructs(self):
+        current_src = (BUSINESS_CORE / "telegram_handlers.py").read_text(encoding="utf-8")
+        return _telegram_handlers_top_level_constructs(current_src)
+
+    def test_task_list_lines_exists_exactly_once_as_sync_function(self):
+        current = self._current_constructs()
+        self.assertIn("function:_task_list_lines", current)
+        self.assertNotIn(
+            "async_function:_task_list_lines", current,
+            "_task_list_lines must remain a synchronous function",
+        )
+
+    def test_no_duplicate_construct_identifiers_in_current_source(self):
+        # The collector itself raises ValueError on any duplicate
+        # top-level identifier (function, class, assignment, import) —
+        # this proves the *current* working-tree source (not just
+        # HEAD) has none, unconditionally, independent of git state.
+        self._current_constructs()
+
+    def test_known_task_formatter_set_is_exact(self):
+        # Catches an unexpected new Task-result-to-message formatter
+        # function without a name-pattern allowlist: the set of
+        # top-level functions matching the known formatter names is
+        # exactly the fixed, named inventory — no more, no fewer.
+        current = self._current_constructs()
+        present = {
+            name for key in current
+            if key.startswith("function:")
+            for name in [key.split(":", 1)[1]]
+            if name in _TELEGRAM_HANDLERS_KNOWN_TASK_FORMATTERS
+        }
+        self.assertEqual(present, _TELEGRAM_HANDLERS_KNOWN_TASK_FORMATTERS)
+
+
 class TestTelegramHandlersConstructGuardHelperUnit(unittest.TestCase):
     """Synthetic negative tests for
     _telegram_handlers_top_level_constructs() — same coverage as the
@@ -1866,8 +2052,14 @@ class TestTelegramHandlersConstructGuardHelperUnit(unittest.TestCase):
         "def _task_assignment_message(result, task_id):\n"
         "    return task_id\n"
         "\n"
+        "def _task_list_lines(tasks, business_id):\n"
+        "    return []\n"
+        "\n"
         "async def unassigntask_cmd(update, context):\n"
         "    return None\n"
+        "\n"
+        "def register_business_handlers(app):\n"
+        "    app.add_handler('unassigntask', unassigntask_cmd)\n"
     )
 
     def _diff(self, modified_src: str, approved=frozenset({"async_function:unassigntask_cmd", "assignment:COMMAND_ENFORCEMENT_MAP"})):
@@ -1944,6 +2136,109 @@ class TestTelegramHandlersConstructGuardHelperUnit(unittest.TestCase):
 
     def test_duplicate_construct_identifier_fails_explicitly(self):
         duplicate_src = self._BASELINE + "\nCOMMAND_ENFORCEMENT_MAP = {}\n"
+        with self.assertRaises(ValueError):
+            _telegram_handlers_top_level_constructs(duplicate_src)
+
+    # ─────────────────────────────────────────────────────────────
+    # Phase 18A.8-B0-P0 §7: guard mutation tests, all using the same
+    # production collector (_telegram_handlers_top_level_constructs)
+    # as the real architecture guards above.
+    # ─────────────────────────────────────────────────────────────
+
+    def test_missing_task_list_lines_detected(self):
+        # 1. missing _task_list_lines
+        modified = self._BASELINE.replace(
+            "def _task_list_lines(tasks, business_id):\n    return []\n\n", "",
+        )
+        current = _telegram_handlers_top_level_constructs(modified)
+        self.assertNotIn("function:_task_list_lines", current)
+
+    def test_duplicate_task_list_lines_rejected(self):
+        # 2. duplicate _task_list_lines
+        duplicate_src = self._BASELINE + "\ndef _task_list_lines(tasks, business_id):\n    return ['dup']\n"
+        with self.assertRaises(ValueError):
+            _telegram_handlers_top_level_constructs(duplicate_src)
+
+    def test_async_task_list_lines_replacing_sync_detected(self):
+        # 3. async _task_list_lines replacing sync
+        modified = self._BASELINE.replace(
+            "def _task_list_lines(tasks, business_id):\n    return []",
+            "async def _task_list_lines(tasks, business_id):\n    return []",
+        )
+        current = _telegram_handlers_top_level_constructs(modified)
+        self.assertNotIn("function:_task_list_lines", current)
+        self.assertIn("async_function:_task_list_lines", current)
+
+    def test_second_same_name_function_rejected(self):
+        # 4. second same-name function (any function, not just the
+        # Task-list formatter)
+        duplicate_src = self._BASELINE + "\nasync def unassigntask_cmd(update, context):\n    return 1\n"
+        with self.assertRaises(ValueError):
+            _telegram_handlers_top_level_constructs(duplicate_src)
+
+    def test_unexpected_task_formatter_function_detected(self):
+        # 5. unexpected Task formatter function — an alternate-named
+        # formatter is an "added" construct just like any other new
+        # function; caught by the same added-set check the real guard
+        # uses (test_no_unapproved_construct_added), and separately by
+        # _TELEGRAM_HANDLERS_KNOWN_TASK_FORMATTERS on the real file.
+        modified = self._BASELINE + "\ndef _task_summary_lines(tasks, business_id):\n    return []\n"
+        removed, added, changed = self._diff(modified)
+        self.assertIn("function:_task_summary_lines", added)
+
+    def test_removed_protected_task_handler_detected(self):
+        # 6. removed protected Task handler
+        modified = self._BASELINE.replace(
+            "\nasync def unassigntask_cmd(update, context):\n    return None\n", "\n",
+        )
+        removed, added, changed = self._diff(modified, approved=frozenset({"assignment:COMMAND_ENFORCEMENT_MAP"}))
+        self.assertIn("async_function:unassigntask_cmd", removed)
+
+    def test_renamed_protected_task_handler_detected(self):
+        # 7. renamed protected Task handler
+        modified = self._BASELINE.replace(
+            "async def unassigntask_cmd(update, context):", "async def unassignedtask_cmd(update, context):",
+        )
+        removed, added, changed = self._diff(modified, approved=frozenset({"assignment:COMMAND_ENFORCEMENT_MAP"}))
+        self.assertIn("async_function:unassigntask_cmd", removed)
+        self.assertIn("async_function:unassignedtask_cmd", added)
+
+    def test_changed_registration_invariant_detected(self):
+        # 8. changed registration invariant — a mutation inside
+        # register_business_handlers's own body (e.g. a different
+        # command string) is caught as a changed construct exactly
+        # like any other function body edit.
+        modified = self._BASELINE.replace(
+            "app.add_handler('unassigntask', unassigntask_cmd)",
+            "app.add_handler('unassigntask', some_other_cmd)",
+        )
+        removed, added, changed = self._diff(modified)
+        self.assertIn("function:register_business_handlers", changed)
+
+    def test_unexpected_task_map_key_not_ast_visible_by_design(self):
+        # 9. unexpected Task map key — COMMAND_ENFORCEMENT_MAP's own
+        # assignment node is deliberately in the approved-to-differ
+        # set (its *value* legitimately changes across phases), so an
+        # unexpected new map key is NOT detectable by this AST-diff
+        # guard alone. That is intentional and by design: the actual
+        # map *contents* (including any new/removed key) are protected
+        # by dedicated exact-value runtime assertions instead — see
+        # test_command_enforcement_map_gains_exactly_one_entry above
+        # and test_mutation_entries_exact in test_command_enforcement.py.
+        modified = self._BASELINE.replace(
+            "COMMAND_ENFORCEMENT_MAP = {}", 'COMMAND_ENFORCEMENT_MAP = {"sneaky_new_key": {}}',
+        )
+        removed, added, changed = self._diff(modified)
+        self.assertEqual(removed, set())
+        self.assertEqual(added, set())
+        self.assertNotIn("assignment:COMMAND_ENFORCEMENT_MAP", changed)
+
+    def test_duplicate_top_level_construct_identifier_rejected(self):
+        # 10. duplicate top-level construct identifier (generic, any
+        # construct kind — already exercised for COMMAND_ENFORCEMENT_MAP
+        # above; repeated here for a different construct kind (class)
+        # to confirm the protection is not name- or kind-specific).
+        duplicate_src = self._BASELINE + "\nclass Foo:\n    x = 1\n"
         with self.assertRaises(ValueError):
             _telegram_handlers_top_level_constructs(duplicate_src)
 
