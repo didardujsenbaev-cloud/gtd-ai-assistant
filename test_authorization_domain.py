@@ -1224,23 +1224,30 @@ class TestTaskCrossLayerIsolation(unittest.TestCase):
     # test_task_architecture_guards.py's dedicated top-level construct
     # guard instead.
 
-    def test_resource_task_call_confined_to_unassigntask_handler(self):
+    def test_resource_task_call_confined_to_unassigntask_and_bctask_handlers(self):
+        # Phase 18A.6-B: bctask_cmd is now a second, independent
+        # resource="TASK" authorization call site (TASK/READ), alongside
+        # unassigntask_cmd's existing TASK/ASSIGN call. No other function
+        # may reference resource="TASK".
         with open("business_core/telegram_handlers.py", encoding="utf-8") as f:
             content = f.read()
-        self.assertEqual(content.count('resource="TASK"'), 1)
-        start = content.index('async def unassigntask_cmd(')
-        candidates = [i for i in (content.find("\nasync def ", start + 10), content.find("\ndef ", start + 10)) if i != -1]
-        end = min(candidates) if candidates else len(content)
-        self.assertIn('resource="TASK"', content[start:end])
+        self.assertEqual(content.count('resource="TASK"'), 2)
+        for fn_name in ("unassigntask_cmd", "bctask_cmd"):
+            start = content.index(f"async def {fn_name}(")
+            candidates = [i for i in (content.find("\nasync def ", start + 10), content.find("\ndef ", start + 10)) if i != -1]
+            end = min(candidates) if candidates else len(content)
+            self.assertIn('resource="TASK"', content[start:end])
 
-    def test_command_enforcement_map_size_fifteen(self):
+    def test_command_enforcement_map_size_sixteen(self):
         from business_core import telegram_handlers as th
-        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 15)
+        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 16)
 
-    def test_command_enforcement_map_only_unassigntask_is_task_key(self):
+    def test_command_enforcement_map_task_keys_unassigntask_and_bctask(self):
+        # Phase 18A.6-B added bctask (TASK/READ) alongside the existing
+        # unassigntask (TASK/ASSIGN) key.
         from business_core import telegram_handlers as th
-        task_keys = [key for key in th.COMMAND_ENFORCEMENT_MAP if "task" in key.lower()]
-        self.assertEqual(task_keys, ["unassigntask"])
+        task_keys = {key for key in th.COMMAND_ENFORCEMENT_MAP if "task" in key.lower()}
+        self.assertEqual(task_keys, {"unassigntask", "bctask"})
 
     def test_telegram_authorization_zero_diff(self):
         import subprocess

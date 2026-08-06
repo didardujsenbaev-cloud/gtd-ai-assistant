@@ -799,7 +799,7 @@ _OTHER_MUTATION_CANDIDATE_HANDLERS = [
 
 class TestArchitecture(unittest.TestCase):
     def test_enforcement_map_has_exactly_eleven_entries(self):
-        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 15)
+        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 16)
 
     def test_six_phase_17e1_entries_unchanged(self):
         expected_six = {
@@ -1602,7 +1602,7 @@ class TestLeadNotesIsolation(unittest.TestCase):
 
 class TestLeadNotesArchitecture(unittest.TestCase):
     def test_enforcement_map_has_exactly_eleven_entries(self):
-        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 15)
+        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 16)
 
     def test_updateleadnotes_metadata_exact(self):
         self.assertEqual(th.COMMAND_ENFORCEMENT_MAP["updateleadnotes"], {
@@ -2295,7 +2295,7 @@ class TestObligationNotesIsolation(unittest.TestCase):
 
 class TestObligationNotesArchitecture(unittest.TestCase):
     def test_enforcement_map_has_exactly_eleven_entries(self):
-        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 15)
+        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 16)
 
     def test_updateobligationnotes_metadata_exact(self):
         self.assertEqual(th.COMMAND_ENFORCEMENT_MAP["updateobligationnotes"], {
@@ -3273,7 +3273,7 @@ class TestOfferNotesIsolation(unittest.TestCase):
 
 class TestOfferNotesArchitecture(unittest.TestCase):
     def test_enforcement_map_has_exactly_eleven_entries(self):
-        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 15)
+        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 16)
 
     def test_updateoffernotes_metadata_exact(self):
         self.assertEqual(th.COMMAND_ENFORCEMENT_MAP["updateoffernotes"], {
@@ -4196,7 +4196,7 @@ class TestDocumentNotesIsolation(unittest.TestCase):
 
 class TestDocumentNotesArchitecture(unittest.TestCase):
     def test_enforcement_map_has_exactly_eleven_entries(self):
-        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 15)
+        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 16)
 
     def test_updatedocnotes_metadata_exact(self):
         self.assertEqual(th.COMMAND_ENFORCEMENT_MAP["updatedocnotes"], {
@@ -5540,7 +5540,7 @@ class TestFailPaymentIsolation(unittest.TestCase):
 
 class TestFailPaymentArchitecture(unittest.TestCase):
     def test_enforcement_map_has_exactly_twelve_entries(self):
-        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 15)
+        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 16)
 
     def test_failpayment_metadata_exact(self):
         self.assertEqual(th.COMMAND_ENFORCEMENT_MAP["failpayment"], {
@@ -6671,7 +6671,7 @@ class TestConfirmReversePaymentIsolation(unittest.TestCase):
 
 class TestConfirmReversePaymentArchitecture(unittest.TestCase):
     def test_enforcement_map_has_exactly_fourteen_entries(self):
-        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 15)
+        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 16)
 
     def test_confirmpayment_metadata_exact(self):
         self.assertEqual(th.COMMAND_ENFORCEMENT_MAP["confirmpayment"], {

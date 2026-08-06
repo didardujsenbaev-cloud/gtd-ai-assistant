@@ -123,6 +123,10 @@ COMMAND_ENFORCEMENT_MAP = {
         "operation_kind": "MUTATION", "requires_fresh_reread": True,
         "mutation_side_effect_class": "MULTI_ROW_MUTATION", "idempotency_class": "IDEMPOTENT",
     },
+    "bctask": {
+        "resource": "TASK", "action": "READ", "target_shape": "BUSINESS",
+        "operation_kind": "READ", "requires_fresh_reread": False,
+    },
 }
 
 _BC_ENFORCEMENT_NOT_FOUND_OR_DENIED_MSG = "Запись недоступна или не найдена."
@@ -16101,63 +16105,61 @@ def _task_assignment_message(result: dict, task_id: str) -> str:
     return generic_failure
 
 
-def _task_detail_lines(task: dict) -> list[str]:
+def _task_detail_lines(task) -> list[str]:
     """
-    Read-only rendering of one Task's full detail for /bctask,
-    including the assignment-cache consistency state. Never repairs an
-    inconsistency, never silently picks among multiple active
-    Assignments — only displays what the read-only helpers report.
-    """
-    from business_core.task_manager import get_current_task_assignment
-    from business_core import business_builder as bb
+    Pure, deterministic rendering of one already-authorized Task
+    snapshot for /bctask. Takes no argument beyond the Task dict
+    itself — every rendered field comes from that single snapshot,
+    the same one the caller's authorization decision was made
+    against, so there is nothing here that could describe a different
+    Business than the one just authorized.
 
-    consistency = bb.task_assignment_cache_is_consistent(task["task_id"])
+    No I/O of any kind (no Sheets/Telegram/authorization/business-
+    layer calls), no mutation of `task`. Malformed input (a non-dict
+    `task`, or any missing/non-string field) degrades to a safe
+    placeholder — it never raises and never renders a raw dictionary.
+    """
+    if not isinstance(task, dict):
+        return ["❌ Не удалось получить карточку Task."]
+
+    def _g(key: str) -> str:
+        value = task.get(key, "")
+        return value if isinstance(value, str) else ""
 
     lines = [
-        f"📌 Task {task['task_id']}",
+        f"📌 Task {_g('task_id') or '—'}",
         "",
-        f"Business ID: `{task['business_id']}`",
-        f"Title: {task['title']}",
-        f"Статус: {_task_status_ru(task['status'])}",
+        f"Business ID: `{_g('business_id') or '—'}`",
+        f"Title: {_g('title') or '—'}",
+        f"Статус: {_task_status_ru(_g('status'))}",
     ]
-    if task.get("priority"):
-        lines.append(f"Priority: {task['priority']}")
-    if task.get("due_date"):
-        lines.append(f"Due Date: {task['due_date']}")
+    if _g("priority"):
+        lines.append(f"Priority: {_g('priority')}")
+    if _g("due_date"):
+        lines.append(f"Due Date: {_g('due_date')}")
     for label, key in (
         ("Client ID", "client_id"), ("Object ID", "object_id"), ("Service ID", "service_id"),
         ("Roadmap ID", "roadmap_id"), ("Stage ID", "stage_id"),
     ):
-        if task.get(key):
-            lines.append(f"{label}: `{task[key]}`")
+        if _g(key):
+            lines.append(f"{label}: `{_g(key)}`")
 
-    lines.append(f"Responsible Role ID: `{task.get('responsible_role_id') or '—'}`")
-    lines.append(f"Assignee Person ID: `{task.get('assignee_person_id') or '—'}`")
-
-    current = get_current_task_assignment(task["task_id"])
-    if current:
-        lines.append(f"Active Assignment ID: `{current['task_assignment_id']}`")
-
-    if not consistency.get("ok"):
-        lines.append("⚠️ Не удалось проверить согласованность назначения.")
-    elif consistency.get("consistent"):
-        lines.append("✅ Assignment cache согласован")
-    else:
-        lines.append("⚠️ Assignment cache РАССОГЛАСОВАН с историей — требуется проверка (не исправляется автоматически)")
+    lines.append(f"Responsible Role ID: `{_g('responsible_role_id') or '—'}`")
+    lines.append(f"Assignee Person ID: `{_g('assignee_person_id') or '—'}`")
 
     for label, key in (
         ("Created At", "created_at"), ("Updated At", "updated_at"),
         ("Started At", "started_at"), ("Completed At", "completed_at"), ("Cancelled At", "cancelled_at"),
     ):
-        if task.get(key):
-            lines.append(f"{label}: {task[key]}")
+        if _g(key):
+            lines.append(f"{label}: {_g(key)}")
 
-    if task.get("source"):
-        lines.append(f"Source: {task['source']}")
-    if task.get("created_by"):
-        lines.append(f"Created By: {task['created_by']}")
-    if task.get("gtd_action_id"):
-        lines.append(f"GTD Action ID: `{task['gtd_action_id']}`")
+    if _g("source"):
+        lines.append(f"Source: {_g('source')}")
+    if _g("created_by"):
+        lines.append(f"Created By: {_g('created_by')}")
+    if _g("gtd_action_id"):
+        lines.append(f"GTD Action ID: `{_g('gtd_action_id')}`")
 
     return lines
 
@@ -16257,33 +16259,66 @@ async def bctask_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     """
     /bctask task_id=TSK-001
 
-    Read-only exact-ID Task detail, including assignment-cache
-    consistency state.
+    Read-only exact-ID Task detail: one canonical Task lookup,
+    authorized once against that Task's own stored Business ID, then
+    formatted from that same snapshot and nothing else. No storage
+    read of any kind happens after authorization succeeds — there is
+    no later write whose target could go stale, and no second read
+    whose result could describe a different Business than the one
+    just authorized. Exactly {"task_id", "_pos0"} is the only
+    permitted parsed key set — any other key is rejected before the
+    finder ever runs.
     """
     if not _is_bc_enabled():
-        await _reply(update, _bc_disabled_msg())
+        await _reply(update, _bc_disabled_msg(), parse_mode=None)
+        return
+
+    if not await _validate_bc_transport_or_reply(update):
         return
 
     raw = " ".join(context.args or [])
     args = _parse_kv_args(raw)
+
+    if not set(args.keys()) <= {"task_id", "_pos0"}:
+        await _reply(update, "❌ /bctask принимает только task_id.", parse_mode=None)
+        return
+
     task_id = args.get("task_id") or args.get("_pos0", "")
 
     if not task_id:
-        await _reply(update, "❌ Укажи task_id.\n\nПример: /bctask task_id=TSK-001")
+        await _reply(update, "❌ Укажи task_id.\n\nПример: /bctask task_id=TSK-001", parse_mode=None)
+        return
+
+    from business_core.task_manager import find_task_by_id
+
+    try:
+        task = await _resolve_target_in_thread(find_task_by_id, task_id)
+    except Exception:
+        await _reply(update, _BC_ENFORCEMENT_TEMPORARILY_UNAVAILABLE_MSG, parse_mode=None)
+        return
+
+    if not isinstance(task, dict):
+        await _reply(update, _BC_ENFORCEMENT_NOT_FOUND_OR_DENIED_MSG, parse_mode=None)
+        return
+
+    business_id_value = task.get("business_id", "")
+    business_id = business_id_value.strip() if isinstance(business_id_value, str) else ""
+    if not business_id:
+        await _reply(update, _BC_ENFORCEMENT_NOT_FOUND_OR_DENIED_MSG, parse_mode=None)
+        return
+
+    if not await _authorize_or_reply(
+        update, resource="TASK", action="READ", business_id=business_id,
+    ):
         return
 
     try:
-        from business_core.task_manager import find_task_by_id
-
-        task = find_task_by_id(task_id)
-        if not task:
-            await _reply(update, f"❌ Task {task_id} не найден.")
-            return
-
-        await _reply(update, "\n".join(_task_detail_lines(task)))
-    except Exception as e:
-        log.error(f"bctask_cmd error: {e}")
-        await _reply(update, "❌ Ошибка при получении карточки Task.")
+        await _reply(update, "\n".join(_task_detail_lines(task)), parse_mode=None)
+    except Exception:
+        # Fixed literal only — no exception interpolation, no task_id,
+        # no Business ID, no Task row.
+        log.error("bctask_cmd formatting/reply failure")
+        await _reply(update, "❌ Ошибка при получении карточки Task.", parse_mode=None)
 
 
 async def updatetask_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

@@ -181,6 +181,13 @@ _EXPECTED_MUTATION_ENTRY = {
         "operation_kind": "MUTATION", "requires_fresh_reread": True,
         "mutation_side_effect_class": "MULTI_ROW_MUTATION", "idempotency_class": "IDEMPOTENT",
     },
+    # Phase 18A.6-B: not a mutation (operation_kind=READ, no mutation_side_effect_class/
+    # idempotency_class keys) — lives in this dict because, like unassigntask, its map
+    # entry doesn't fit the plain 3-key _EXPECTED_MAP shape used by the six simple reads.
+    "bctask": {
+        "resource": "TASK", "action": "READ", "target_shape": "BUSINESS",
+        "operation_kind": "READ", "requires_fresh_reread": False,
+    },
 }
 
 _NON_ENFORCED_SAMPLE_HANDLERS = [
@@ -214,8 +221,9 @@ class TestEnforcementMap(unittest.TestCase):
             with self.subTest(command=key):
                 self.assertEqual(th.COMMAND_ENFORCEMENT_MAP[key], val)
 
-    def test_no_sixteenth_command_in_map(self):
-        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 15)
+    def test_no_seventeenth_command_in_map(self):
+        # Phase 18A.6-B added the 16th entry (bctask); no 17th exists.
+        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 16)
 
     def test_updatelead_not_in_map(self):
         self.assertNotIn("updatelead", th.COMMAND_ENFORCEMENT_MAP)
@@ -425,10 +433,13 @@ class TestPhase17E2A4H1OfferHardeningScope(unittest.TestCase):
         # failpayment_cmd (outer-exception logging secrecy only).
         # _task_assignment_message was the only approved
         # telegram_handlers.py function change for the Task assignment
-        # mapper hardening. unassigntask_cmd is now additionally
-        # approved for its own authorization wiring; every other Task
-        # handler command function and COMMAND_ENFORCEMENT_MAP's
-        # top-level construct identity are protected separately by
+        # mapper hardening. unassigntask_cmd was additionally
+        # approved for its own authorization wiring in that phase, but
+        # is now source-identical to HEAD again. Phase 18A.6-B
+        # additionally approves _task_detail_lines and bctask_cmd for
+        # the /bctask TASK/READ hardening; every other Task handler
+        # command function and COMMAND_ENFORCEMENT_MAP's top-level
+        # construct identity are protected separately by
         # test_task_architecture_guards.py.
         _assert_only_functions_changed_or_added(
             self, "business_core/telegram_handlers.py",
@@ -438,6 +449,7 @@ class TestPhase17E2A4H1OfferHardeningScope(unittest.TestCase):
                 "_payment_transaction_reversal_message", "_payment_transaction_failure_message",
                 "confirmpayment_cmd", "reversepayment_cmd", "failpayment_cmd", "updateinteractionnotes_cmd",
                 "_task_assignment_message", "unassigntask_cmd",
+                "_task_detail_lines", "bctask_cmd",
             },
             allowed_added_function_names={
                 "_offer_notes_message", "updateoffernotes_cmd",
@@ -501,8 +513,9 @@ class TestPhase17E2A4H1OfferHardeningScope(unittest.TestCase):
         # 17E-2A6-AUTH-B1 added failpayment; Phase 17E-2A6-AUTH-B2
         # added confirmpayment and reversepayment. unassigntask was
         # added later, in the Task assignment mapper's own
-        # authorization phase — no other entry beyond these four.
-        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 15)
+        # authorization phase, and bctask in Phase 18A.6-B's Task
+        # read-authorization hardening — no other entry beyond these five.
+        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 16)
         self.assertIn("failpayment", th.COMMAND_ENFORCEMENT_MAP)
         self.assertIn("confirmpayment", th.COMMAND_ENFORCEMENT_MAP)
         self.assertIn("reversepayment", th.COMMAND_ENFORCEMENT_MAP)
@@ -569,10 +582,13 @@ class TestPhase17E2A4H1OfferHardeningScope(unittest.TestCase):
         # failpayment_cmd (outer-exception logging secrecy only).
         # _task_assignment_message was the only approved
         # telegram_handlers.py function change for the Task assignment
-        # mapper hardening. unassigntask_cmd is now additionally
-        # approved for its own authorization wiring; every other Task
-        # handler command function and COMMAND_ENFORCEMENT_MAP's
-        # top-level construct identity are protected separately by
+        # mapper hardening. unassigntask_cmd was additionally
+        # approved for its own authorization wiring in that phase, but
+        # is now source-identical to HEAD again. Phase 18A.6-B
+        # additionally approves _task_detail_lines and bctask_cmd for
+        # the /bctask TASK/READ hardening; every other Task handler
+        # command function and COMMAND_ENFORCEMENT_MAP's top-level
+        # construct identity are protected separately by
         # test_task_architecture_guards.py.
         _assert_only_functions_changed_or_added(
             self, "business_core/telegram_handlers.py",
@@ -582,6 +598,7 @@ class TestPhase17E2A4H1OfferHardeningScope(unittest.TestCase):
                 "_payment_transaction_reversal_message", "_payment_transaction_failure_message",
                 "confirmpayment_cmd", "reversepayment_cmd", "failpayment_cmd", "updateinteractionnotes_cmd",
                 "_task_assignment_message", "unassigntask_cmd",
+                "_task_detail_lines", "bctask_cmd",
             },
             allowed_added_function_names={
                 "_offer_notes_message", "updateoffernotes_cmd",
@@ -610,8 +627,8 @@ class TestPhase17E2A4H1OfferHardeningScope(unittest.TestCase):
         self.assertTrue(hasattr(th, "updatedocnotes_cmd"))
         self.assertIn("updatedocnotes", th.COMMAND_ENFORCEMENT_MAP)
 
-    def test_enforcement_map_now_fifteen_entries(self):
-        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 15)
+    def test_enforcement_map_now_sixteen_entries(self):
+        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 16)
 
     def test_exactly_nine_dedicated_mutation_handlers_use_mutate_helper(self):
         dedicated = [

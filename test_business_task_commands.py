@@ -350,126 +350,323 @@ TASK_DICT = {
 }
 
 
-class TestBcTaskCommand(unittest.TestCase):
+def _bctask_allow_result():
+    return {"ok": True, "allowed": True, "code": "TELEGRAM_ACCESS_ALLOWED",
+            "authorization_result": {"ok": True, "allowed": True, "code": "ACCESS_ALLOWED"}}
+
+
+def _bctask_deny_result():
+    return {"ok": True, "allowed": False, "code": "AUTHORIZATION_DENIED",
+            "authorization_result": {"ok": True, "allowed": False, "code": "SCOPE_NOT_MATCHED"}}
+
+
+def _bctask_infra_failure_result():
+    return {"ok": False, "allowed": False, "code": "AUTHORIZATION_UNAVAILABLE",
+            "authorization_result": None}
+
+
+class BcTaskCommandTestBase(unittest.TestCase):
+    def _run_handler(self, update, args=None, *, finder_side_effect=None, finder_return=None,
+                      authz_result=None, task_id="TSK-001", th=None):
+        th = th or _fresh_th()
+        call_log = []
+
+        if finder_side_effect is not None:
+            def _finder(tid):
+                call_log.append(("finder", tid))
+                if callable(finder_side_effect):
+                    return finder_side_effect(tid)
+                raise finder_side_effect
+            mock_finder = MagicMock(side_effect=_finder)
+        else:
+            def _finder(tid):
+                call_log.append(("finder", tid))
+                return finder_return
+            mock_finder = MagicMock(side_effect=_finder)
+
+        async def _authz(update, **kwargs):
+            call_log.append(("authorize", kwargs.get("resource"), kwargs.get("action"), kwargs.get("business_id")))
+            return authz_result if authz_result is not None else _bctask_allow_result()
+        mock_authz = AsyncMock(side_effect=_authz)
+
+        ctx_args = args if args is not None else [f"task_id={task_id}"]
+        ctx = MagicMock()
+        ctx.args = ctx_args
+
+        async def run():
+            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
+                 patch("business_core.task_manager.find_task_by_id", new=mock_finder), \
+                 patch("business_core.telegram_authorization.authorize_telegram_business_core_request", new=mock_authz), \
+                 patch("business_core.task_manager.get_current_task_assignment") as mock_current_assignment, \
+                 patch("business_core.business_builder.task_assignment_cache_is_consistent") as mock_consistency:
+                await th.bctask_cmd(update, ctx)
+                call_log.append(("_no_assignment_helper_called", mock_current_assignment.called))
+                call_log.append(("_no_consistency_helper_called", mock_consistency.called))
+
+        _run(run())
+        return mock_finder, mock_authz, call_log
+
+    def _sent_text(self, update) -> str:
+        call = update.message.reply_text.call_args
+        return call.args[0] if call.args else call.kwargs.get("text", "")
+
+
+class TestBcTaskCommand(BcTaskCommandTestBase):
 
     def test_registered(self):
         th = _fresh_th()
         self.assertTrue(hasattr(th, "bctask_cmd"))
 
     def test_missing_task_id_shows_usage(self):
-        th = _fresh_th()
-        upd, ctx = _make_update("/bctask", [])
-
-        async def run():
-            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
-                await th.bctask_cmd(upd, ctx)
-
-        _run(run())
-        reply = upd.message.reply_text.call_args[0][0]
-        self.assertIn("❌", reply)
+        upd, _ = _make_update("/bctask", [])
+        finder, authz, _ = self._run_handler(upd, args=[])
+        finder.assert_not_called()
+        authz.assert_not_called()
+        self.assertIn("❌", self._sent_text(upd))
 
     def test_not_found(self):
-        th = _fresh_th()
-        upd, ctx = _make_update("/bctask task_id=TSK-999", ["task_id=TSK-999"])
-
-        async def run():
-            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
-                 patch("business_core.task_manager.find_task_by_id", return_value=None):
-                await th.bctask_cmd(upd, ctx)
-
-        _run(run())
-        reply = upd.message.reply_text.call_args[0][0]
-        self.assertIn("❌", reply)
-        self.assertIn("TSK-999", reply)
+        upd, _ = _make_update("/bctask task_id=TSK-999", ["task_id=TSK-999"])
+        finder, authz, _ = self._run_handler(upd, finder_return=None, task_id="TSK-999")
+        finder.assert_called_once_with("TSK-999")
+        authz.assert_not_called()
+        self.assertIn("недоступна", self._sent_text(upd).lower())
 
     def test_found_unassigned(self):
-        th = _fresh_th()
-        upd, ctx = _make_update("/bctask task_id=TSK-001", ["task_id=TSK-001"])
+        upd, _ = _make_update("/bctask task_id=TSK-001", ["task_id=TSK-001"])
         task = dict(TASK_DICT, responsible_role_id="", assignee_person_id="")
-
-        async def run():
-            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
-                 patch("business_core.task_manager.find_task_by_id", return_value=task), \
-                 patch("business_core.business_builder.task_assignment_cache_is_consistent",
-                       return_value={"ok": True, "consistent": True, "error": None}), \
-                 patch("business_core.task_manager.get_current_task_assignment", return_value=None):
-                await th.bctask_cmd(upd, ctx)
-
-        _run(run())
-        reply = upd.message.reply_text.call_args[0][0]
+        self._run_handler(upd, finder_return=task)
+        reply = self._sent_text(upd)
         self.assertIn("TSK-001", reply)
         self.assertIn("—", reply)  # unassigned placeholder somewhere
 
-    def test_found_with_consistent_assignment(self):
-        th = _fresh_th()
-        upd, ctx = _make_update("/bctask task_id=TSK-001", ["task_id=TSK-001"])
-        current = {"task_assignment_id": "TAS-050", "responsible_role_id": "ROLE-001", "assignee_person_id": "", "status": "active"}
+    def test_reply_contains_no_assignment_or_cache_output(self):
+        # Active Assignment ID and cache-consistency state were removed
+        # from /bctask output entirely — they were sourced from reads
+        # that are not scoped to the authorized Business ID.
+        upd, _ = _make_update("/bctask task_id=TSK-001", ["task_id=TSK-001"])
+        self._run_handler(upd, finder_return=dict(TASK_DICT))
+        reply = self._sent_text(upd)
+        for marker in ("Active Assignment ID", "Assignment cache", "РАССОГЛАСОВАН", "согласованность назначения"):
+            self.assertNotIn(marker, reply)
 
-        async def run():
-            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
-                 patch("business_core.task_manager.find_task_by_id", return_value=dict(TASK_DICT)), \
-                 patch("business_core.business_builder.task_assignment_cache_is_consistent",
-                       return_value={"ok": True, "consistent": True, "error": None}), \
-                 patch("business_core.task_manager.get_current_task_assignment", return_value=current):
-                await th.bctask_cmd(upd, ctx)
-
-        _run(run())
-        reply = upd.message.reply_text.call_args[0][0]
-        self.assertIn("TAS-050", reply)
-        self.assertIn("согласован", reply.lower())
-
-    def test_cache_mismatch_displayed(self):
-        th = _fresh_th()
-        upd, ctx = _make_update("/bctask task_id=TSK-001", ["task_id=TSK-001"])
-
-        async def run():
-            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
-                 patch("business_core.task_manager.find_task_by_id", return_value=dict(TASK_DICT)), \
-                 patch("business_core.business_builder.task_assignment_cache_is_consistent",
-                       return_value={"ok": True, "consistent": False, "error": None}), \
-                 patch("business_core.task_manager.get_current_task_assignment", return_value=None):
-                await th.bctask_cmd(upd, ctx)
-
-        _run(run())
-        reply = upd.message.reply_text.call_args[0][0]
-        self.assertIn("РАССОГЛАСОВАН", reply)
-
-    def test_multiple_active_conflict_no_current_shown(self):
-        th = _fresh_th()
-        upd, ctx = _make_update("/bctask task_id=TSK-001", ["task_id=TSK-001"])
-
-        async def run():
-            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
-                 patch("business_core.task_manager.find_task_by_id", return_value=dict(TASK_DICT)), \
-                 patch("business_core.business_builder.task_assignment_cache_is_consistent",
-                       return_value={"ok": True, "consistent": False, "error": "multiple active Task Assignments"}), \
-                 patch("business_core.task_manager.get_current_task_assignment", return_value=None):
-                await th.bctask_cmd(upd, ctx)
-
-        _run(run())
-        reply = upd.message.reply_text.call_args[0][0]
-        self.assertIn("РАССОГЛАСОВАН", reply)
-        self.assertNotIn("Active Assignment ID", reply)
+    def test_no_assignment_or_cache_helper_invoked(self):
+        upd, _ = _make_update("/bctask task_id=TSK-001", ["task_id=TSK-001"])
+        _, _, call_log = self._run_handler(upd, finder_return=dict(TASK_DICT))
+        self.assertIn(("_no_assignment_helper_called", False), call_log)
+        self.assertIn(("_no_consistency_helper_called", False), call_log)
 
     def test_description_not_logged(self):
+        upd, _ = _make_update("/bctask task_id=TSK-001", ["task_id=TSK-001"])
+        with patch("business_core.telegram_handlers.log") as mock_log:
+            self._run_handler(upd, finder_return=dict(TASK_DICT))
+            for call in mock_log.method_calls:
+                for arg in call.args:
+                    self.assertNotIn("secret notes", str(arg))
+
+    # ── Section 15 required tests ──────────────────────────────
+
+    def test_named_task_id_accepted(self):
+        upd, _ = _make_update("/bctask task_id=TSK-001", ["task_id=TSK-001"])
+        finder, authz, _ = self._run_handler(upd, finder_return=dict(TASK_DICT))
+        finder.assert_called_once_with("TSK-001")
+
+    def test_positional_task_id_accepted(self):
+        upd, _ = _make_update("/bctask TSK-001", ["TSK-001"])
+        finder, authz, _ = self._run_handler(upd, args=["TSK-001"], finder_return=dict(TASK_DICT))
+        finder.assert_called_once_with("TSK-001")
+
+    def test_named_task_id_precedence(self):
+        upd, _ = _make_update("/bctask TSK-XXX task_id=TSK-001", ["TSK-XXX", "task_id=TSK-001"])
+        finder, authz, _ = self._run_handler(upd, args=["TSK-XXX", "task_id=TSK-001"], finder_return=dict(TASK_DICT))
+        finder.assert_called_once_with("TSK-001")
+
+    def test_blank_task_id_rejected(self):
+        upd, _ = _make_update("/bctask", [])
+        finder, authz, _ = self._run_handler(upd, args=[])
+        finder.assert_not_called()
+        authz.assert_not_called()
+
+    def test_unknown_key_rejected(self):
+        upd, _ = _make_update("/bctask task_id=TSK-001 foo=bar", ["task_id=TSK-001", "foo=bar"])
+        finder, authz, _ = self._run_handler(upd, args=["task_id=TSK-001", "foo=bar"])
+        finder.assert_not_called()
+        authz.assert_not_called()
+
+    def test_caller_business_id_rejected(self):
+        upd, _ = _make_update("/bctask task_id=TSK-001 business_id=BIZ-999", ["task_id=TSK-001", "business_id=BIZ-999"])
+        finder, authz, _ = self._run_handler(upd, args=["task_id=TSK-001", "business_id=BIZ-999"])
+        finder.assert_not_called()
+
+    def test_caller_object_role_person_fields_rejected(self):
+        for extra in ("object_id=OBJ-999", "role_id=ROLE-999", "responsible_role_id=ROLE-999",
+                      "person_id=PRS-999", "assignee_person_id=PRS-999", "assignment_id=TAS-999"):
+            with self.subTest(extra=extra):
+                upd, _ = _make_update(f"/bctask task_id=TSK-001 {extra}", ["task_id=TSK-001", extra])
+                finder, authz, _ = self._run_handler(upd, args=["task_id=TSK-001", extra])
+                finder.assert_not_called()
+
+    def test_transport_failure_blocks_lookup(self):
+        upd, _ = _make_update("/bctask task_id=TSK-001", ["task_id=TSK-001"])
+        upd.effective_chat = None
         th = _fresh_th()
-        upd, ctx = _make_update("/bctask task_id=TSK-001", ["task_id=TSK-001"])
-        captured_calls = []
+        finder, authz, _ = self._run_handler(upd, finder_return=dict(TASK_DICT), th=th)
+        finder.assert_not_called()
+        authz.assert_not_called()
 
-        async def run():
-            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
-                 patch("business_core.task_manager.find_task_by_id", return_value=dict(TASK_DICT)), \
-                 patch("business_core.business_builder.task_assignment_cache_is_consistent",
-                       return_value={"ok": True, "consistent": True, "error": None}), \
-                 patch("business_core.task_manager.get_current_task_assignment", return_value=None), \
-                 patch("business_core.telegram_handlers.log") as mock_log:
-                await th.bctask_cmd(upd, ctx)
-                captured_calls.extend(mock_log.method_calls)
+    _MALFORMED_FIRST_SHAPES = [None, {}, [], "bad", object(), 0, 1]
 
-        _run(run())
-        for call in captured_calls:
-            for arg in call.args:
-                self.assertNotIn("secret notes", str(arg))
+    class _Poisoned:
+        def __str__(self):
+            return "STR-SECRET-MARKER"
+
+        def __repr__(self):
+            return "REPR-SECRET-MARKER"
+
+    def test_malformed_lookup_shapes_fail_closed(self):
+        markers = ("STR-SECRET-MARKER", "REPR-SECRET-MARKER")
+        for value in self._MALFORMED_FIRST_SHAPES + [self._Poisoned()]:
+            with self.subTest(first=repr(value)):
+                upd, _ = _make_update("/bctask task_id=TSK-001", ["task_id=TSK-001"])
+                with patch("business_core.telegram_handlers.log") as mock_log:
+                    finder, authz, _ = self._run_handler(upd, finder_return=value)
+                authz.assert_not_called()
+                self.assertEqual(finder.call_count, 1)
+                self.assertEqual(upd.message.reply_text.call_count, 1)
+                reply = self._sent_text(upd)
+                for marker in markers:
+                    self.assertNotIn(marker, reply)
+                for call in mock_log.mock_calls:
+                    call_text = str(call)
+                    for marker in markers:
+                        self.assertNotIn(marker, call_text)
+
+    def test_empty_dict_lookup_blocked_via_blank_business_id(self):
+        upd, _ = _make_update("/bctask task_id=TSK-001", ["task_id=TSK-001"])
+        finder, authz, _ = self._run_handler(upd, finder_return={})
+        authz.assert_not_called()
+        self.assertEqual(self._sent_text(upd), "Запись недоступна или не найдена.")
+
+    def test_blank_stored_business_id_blocked(self):
+        upd, _ = _make_update("/bctask task_id=TSK-001", ["task_id=TSK-001"])
+        task = dict(TASK_DICT, business_id="")
+        finder, authz, _ = self._run_handler(upd, finder_return=task)
+        authz.assert_not_called()
+        self.assertEqual(self._sent_text(upd), "Запись недоступна или не найдена.")
+
+    class _PoisonedBusinessId:
+        def __str__(self):
+            return "STR-SECRET-MARKER"
+
+        def __repr__(self):
+            return "REPR-SECRET-MARKER"
+
+    class _RaisingBusinessId:
+        def __str__(self):
+            raise RuntimeError("RAISE-SECRET-MARKER")
+
+        def __repr__(self):
+            raise RuntimeError("RAISE-SECRET-MARKER")
+
+    _MALFORMED_BUSINESS_ID_SHAPES = [None, [], {}, object(), 0, 1]
+
+    def test_malformed_business_id_shapes_fail_closed(self):
+        markers = ("STR-SECRET-MARKER", "REPR-SECRET-MARKER", "RAISE-SECRET-MARKER")
+        shapes = self._MALFORMED_BUSINESS_ID_SHAPES + [self._PoisonedBusinessId(), self._RaisingBusinessId()]
+        for value in shapes:
+            with self.subTest(business_id=repr(type(value))):
+                upd, _ = _make_update("/bctask task_id=TSK-001", ["task_id=TSK-001"])
+                task = dict(TASK_DICT, business_id=value)
+                with patch("business_core.telegram_handlers.log") as mock_log:
+                    finder, authz, _ = self._run_handler(upd, finder_return=task)
+                authz.assert_not_called()
+                self.assertEqual(upd.message.reply_text.call_count, 1)
+                reply = self._sent_text(upd)
+                self.assertEqual(reply, "Запись недоступна или не найдена.")
+                for marker in markers:
+                    self.assertNotIn(marker, reply)
+                for call in mock_log.mock_calls:
+                    call_text = str(call)
+                    for marker in markers:
+                        self.assertNotIn(marker, call_text)
+
+    def test_authorization_uses_resource_task_action_read(self):
+        upd, _ = _make_update("/bctask task_id=TSK-001", ["task_id=TSK-001"])
+        finder, authz, call_log = self._run_handler(upd, finder_return=dict(TASK_DICT))
+        authz_call = [c for c in call_log if c[0] == "authorize"][0]
+        self.assertEqual(authz_call[1], "TASK")
+        self.assertEqual(authz_call[2], "READ")
+
+    def test_authorization_uses_stored_business_id(self):
+        upd, _ = _make_update("/bctask task_id=TSK-001", ["task_id=TSK-001"])
+        finder, authz, call_log = self._run_handler(upd, finder_return=dict(TASK_DICT))
+        authz_call = [c for c in call_log if c[0] == "authorize"][0]
+        self.assertEqual(authz_call[3], "BIZ-001")
+
+    def test_authorization_called_exactly_once(self):
+        upd, _ = _make_update("/bctask task_id=TSK-001", ["task_id=TSK-001"])
+        finder, authz, _ = self._run_handler(upd, finder_return=dict(TASK_DICT))
+        authz.assert_called_once()
+
+    def test_authorization_deny_blocks_formatter(self):
+        upd, _ = _make_update("/bctask task_id=TSK-001", ["task_id=TSK-001"])
+        self._run_handler(upd, finder_return=dict(TASK_DICT), authz_result=_bctask_deny_result())
+        reply = self._sent_text(upd)
+        self.assertNotIn("Prepare docs", reply)
+        self.assertEqual(reply, "Запись недоступна или не найдена.")
+
+    def test_authorization_read_failure_blocks_formatter(self):
+        upd, _ = _make_update("/bctask task_id=TSK-001", ["task_id=TSK-001"])
+        self._run_handler(upd, finder_return=dict(TASK_DICT), authz_result=_bctask_infra_failure_result())
+        reply = self._sent_text(upd)
+        self.assertNotIn("Prepare docs", reply)
+        self.assertEqual(reply, "Временная ошибка проверки доступа. Попробуйте ещё раз позже.")
+
+    def test_allowed_flow_reply_contains_formatted_detail_once(self):
+        upd, _ = _make_update("/bctask task_id=TSK-001", ["task_id=TSK-001"])
+        self._run_handler(upd, finder_return=dict(TASK_DICT))
+        self.assertEqual(upd.message.reply_text.call_count, 1)
+        self.assertIn("Prepare docs", self._sent_text(upd))
+
+    def test_formatter_called_exactly_once_with_the_first_task_object(self):
+        upd, _ = _make_update("/bctask task_id=TSK-001", ["task_id=TSK-001"])
+        task = dict(TASK_DICT)
+        th = _fresh_th()
+        with patch("business_core.telegram_handlers._task_detail_lines", wraps=th._task_detail_lines) as mock_formatter:
+            self._run_handler(upd, finder_return=task, th=th)
+        mock_formatter.assert_called_once()
+        self.assertIs(mock_formatter.call_args.args[0], task)
+
+    def test_lookup_occurs_through_finder_exactly_once(self):
+        upd, _ = _make_update("/bctask task_id=TSK-001", ["task_id=TSK-001"])
+        finder, authz, _ = self._run_handler(upd, finder_return=dict(TASK_DICT))
+        self.assertEqual(finder.call_count, 1)
+
+    def test_no_reread_no_second_finder_call(self):
+        upd, _ = _make_update("/bctask task_id=TSK-001", ["task_id=TSK-001"])
+        finder, authz, call_log = self._run_handler(upd, finder_return=dict(TASK_DICT))
+        finder_calls = [c for c in call_log if c[0] == "finder"]
+        self.assertEqual(len(finder_calls), 1)
+
+    def test_no_mutation_helper_called(self):
+        upd, _ = _make_update("/bctask task_id=TSK-001", ["task_id=TSK-001"])
+        with patch("business_core.business_builder.unassign_task") as mock_unassign, \
+             patch("business_core.task_manager.end_task_assignment") as mock_end, \
+             patch("business_core.task_manager.update_task_assignment_cache") as mock_cache:
+            self._run_handler(upd, finder_return=dict(TASK_DICT))
+            mock_unassign.assert_not_called()
+            mock_end.assert_not_called()
+            mock_cache.assert_not_called()
+
+    def test_exception_during_formatting_uses_fixed_literal_log(self):
+        upd, _ = _make_update("/bctask task_id=TSK-001", ["task_id=TSK-001"])
+        th = _fresh_th()
+        with patch.object(th, "log") as mock_log, \
+             patch("business_core.telegram_handlers._task_detail_lines", side_effect=RuntimeError("boom internal detail")):
+            self._run_handler(upd, finder_return=dict(TASK_DICT), th=th)
+            mock_log.error.assert_called_once_with("bctask_cmd formatting/reply failure")
+        reply = self._sent_text(upd)
+        self.assertNotIn("boom internal detail", reply)
+        self.assertIn("❌", reply)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -1395,15 +1592,15 @@ class TestNoRawExceptionExposure(unittest.TestCase):
         commands_and_patches = [
             ("newbctask_cmd", ("create_business_task",), '/newbctask business_id=BIZ-001 title="X"', ["business_id=BIZ-001", 'title="X"']),
             ("bctasks_cmd", ("task_manager.list_tasks",), "/bctasks", []),
-            ("bctask_cmd", ("task_manager.find_task_by_id",), "/bctask task_id=TSK-001", ["task_id=TSK-001"]),
             ("updatetask_cmd", ("transition_task_status",), "/updatetask task_id=TSK-001 status=ready", ["task_id=TSK-001", "status=ready"]),
             ("assigntask_cmd", ("assign_task",), "/assigntask task_id=TSK-001 role_id=ROLE-001", ["task_id=TSK-001", "role_id=ROLE-001"]),
             ("reassigntask_cmd", ("assign_task",), "/reassigntask task_id=TSK-001 role_id=ROLE-001", ["task_id=TSK-001", "role_id=ROLE-001"]),
-            # unassigntask_cmd is now an authorized, secure-mutation-flow
-            # command (first lookup + authorization + reread all sit
-            # ahead of the mutation call) — its own raw-exception-secrecy
-            # coverage lives in TestUnassignTaskCommand.test_no_retry_on_mutation_exception
-            # instead, with the finder/authorization properly mocked.
+            # unassigntask_cmd and bctask_cmd are now authorized,
+            # secure-flow commands (canonical lookup + authorization sit
+            # ahead of any mutation/formatting) — their own raw-exception-
+            # secrecy coverage lives in TestUnassignTaskCommand and
+            # TestBcTaskCommand instead, with the finder/authorization
+            # properly mocked.
         ]
         for cmd_name, targets, text, args_list in commands_and_patches:
             upd, ctx = _make_update(text, args_list)

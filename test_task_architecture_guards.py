@@ -519,7 +519,8 @@ def _th_bare_function_source(fn_name: str) -> str:
     path = BUSINESS_CORE / "telegram_handlers.py"
     src = path.read_text(encoding="utf-8")
     start = src.index(f"def {fn_name}(")
-    end = src.index("\ndef ", start + 10)
+    candidates = [i for i in (src.find("\ndef ", start + 10), src.find("\nasync def ", start + 10)) if i != -1]
+    end = min(candidates) if candidates else len(src)
     return src[start:end]
 
 
@@ -700,6 +701,189 @@ class TestUnassigntaskMalformedLookupFailClosed(unittest.TestCase):
         body = _th_function_body("unassigntask_cmd")
         self.assertNotIn("(first_task or {})", body)
         self.assertNotIn("(second_task or {})", body)
+
+
+# ─────────────────────────────────────────────────────────────
+# bctask_cmd secure-read-flow guards.
+# ─────────────────────────────────────────────────────────────
+
+class TestBctaskSecureReadFlow(unittest.TestCase):
+
+    def test_transport_validation_exists(self):
+        body = _th_function_body("bctask_cmd")
+        self.assertIn("_validate_bc_transport_or_reply(update)", body)
+
+    def test_allowed_keys_enforced(self):
+        body = _th_function_body("bctask_cmd")
+        self.assertIn('set(args.keys()) <= {"task_id", "_pos0"}', body)
+
+    def test_lookup_uses_thread_helper(self):
+        body = _th_function_body("bctask_cmd")
+        self.assertIn("_resolve_target_in_thread(find_task_by_id, task_id)", body)
+
+    def test_exactly_one_canonical_lookup_of_task(self):
+        body = _th_function_body("bctask_cmd")
+        self.assertEqual(body.count("_resolve_target_in_thread(find_task_by_id"), 1)
+
+    def test_isinstance_dict_check_precedes_get(self):
+        body = _th_function_body("bctask_cmd")
+        isinstance_idx = body.index("isinstance(task, dict)")
+        get_idx = body.index("task.get(")
+        self.assertLess(isinstance_idx, get_idx)
+
+    def test_malformed_branch_returns_before_authorization(self):
+        body = _th_function_body("bctask_cmd")
+        malformed_idx = body.index("isinstance(task, dict)")
+        authorize_idx = body.index("_authorize_or_reply(")
+        self.assertLess(malformed_idx, authorize_idx)
+
+    def test_authorization_precedes_formatter_call(self):
+        body = _th_function_body("bctask_cmd")
+        authorize_idx = body.index("_authorize_or_reply(")
+        formatter_idx = body.index("_task_detail_lines(")
+        self.assertLess(authorize_idx, formatter_idx)
+
+    def test_authorization_uses_task_read(self):
+        body = _th_function_body("bctask_cmd")
+        self.assertIn('resource="TASK"', body)
+        self.assertIn('action="READ"', body)
+
+    def test_no_or_empty_dict_fallback(self):
+        body = _th_function_body("bctask_cmd")
+        self.assertNotIn("(task or {})", body)
+
+    def test_no_broad_dict_coercion(self):
+        body = _th_function_body("bctask_cmd")
+        self.assertNotIn("dict(task)", body)
+
+    def test_no_raw_lookup_value_rendering_or_logging(self):
+        body = _th_function_body("bctask_cmd")
+        for forbidden in ("str(task)", "repr(task)", "type(task)"):
+            self.assertNotIn(forbidden, body)
+
+    def test_no_retry_construct(self):
+        body = _th_function_body("bctask_cmd")
+        for forbidden in ("while True", "for attempt", "range(3)", "retry_count"):
+            self.assertNotIn(forbidden, body)
+
+    def test_no_mutation_call(self):
+        body = _th_function_body("bctask_cmd")
+        for forbidden in ("unassign_task(", "assign_task(", "transition_task_status(", "_mutate_target_in_thread("):
+            self.assertNotIn(forbidden, body)
+
+    def test_fixed_literal_exception_logging(self):
+        body = _th_function_body("bctask_cmd")
+        self.assertIn('log.error("bctask_cmd formatting/reply failure")', body)
+        for forbidden in ("str(exc)", "repr(exc)", "f\"bctask_cmd error: {e}\"", "exc_info=True"):
+            self.assertNotIn(forbidden, body)
+
+    def test_no_assignment_helper_reference(self):
+        body = _th_function_body("bctask_cmd")
+        self.assertNotIn("get_current_task_assignment", body)
+
+    def test_no_cache_consistency_helper_reference(self):
+        body = _th_function_body("bctask_cmd")
+        self.assertNotIn("task_assignment_cache_is_consistent", body)
+
+    def test_no_business_builder_import(self):
+        body = _th_function_body("bctask_cmd")
+        self.assertNotIn("business_builder", body)
+
+    def test_no_post_authorization_storage_helper_call(self):
+        # After authorization succeeds, nothing between that call and
+        # the formatter/reply may read storage — the only remaining
+        # calls in that span are the formatter and the reply itself.
+        body = _th_function_body("bctask_cmd")
+        authorize_idx = body.index("_authorize_or_reply(")
+        after_authorize_call_end = body.index(":\n        return\n", authorize_idx) + len(":\n        return\n")
+        tail = body[after_authorize_call_end:]
+        for forbidden in ("_resolve_target_in_thread(", "_mutate_target_in_thread(", "find_task_by_id("):
+            self.assertNotIn(forbidden, tail)
+
+    def test_strict_business_id_type_check_precedes_authorization(self):
+        body = _th_function_body("bctask_cmd")
+        check_idx = body.index("isinstance(business_id_value, str)")
+        authorize_idx = body.index("_authorize_or_reply(")
+        self.assertLess(check_idx, authorize_idx)
+
+    def test_no_arbitrary_str_conversion_of_business_id(self):
+        body = _th_function_body("bctask_cmd")
+        self.assertNotIn("str(task.get(\"business_id\"", body)
+        self.assertNotIn("str(business_id_value)", body)
+
+
+# ─────────────────────────────────────────────────────────────
+# _task_detail_lines formatter fail-closed guards.
+# ─────────────────────────────────────────────────────────────
+
+class TestTaskDetailLinesFormatterSafety(unittest.TestCase):
+
+    def test_isinstance_dict_check_first(self):
+        body = _th_bare_function_source("_task_detail_lines")
+        self.assertIn("isinstance(task, dict)", body)
+        isinstance_idx = body.index("isinstance(task, dict)")
+        first_subscript_idx = body.find("task[")
+        if first_subscript_idx != -1:
+            self.assertLess(isinstance_idx, first_subscript_idx)
+
+    def test_no_direct_subscript_access(self):
+        body = _th_bare_function_source("_task_detail_lines")
+        self.assertNotIn("task['", body)
+        self.assertNotIn('task["', body)
+
+    def test_no_raw_error_rendering(self):
+        body = _th_bare_function_source("_task_detail_lines")
+        self.assertNotIn('result["error"]', body)
+        self.assertNotIn('result.get("error")', body)
+
+    def test_no_str_or_repr_of_arbitrary_input(self):
+        body = _th_bare_function_source("_task_detail_lines")
+        for forbidden in ("str(task)", "repr(task)"):
+            self.assertNotIn(forbidden, body)
+
+    def test_no_assignment_or_cache_output(self):
+        body = _th_bare_function_source("_task_detail_lines")
+        for forbidden in ("current_assignment", "consistency", "Active Assignment ID", "Assignment cache", "РАССОГЛАСОВАН"):
+            self.assertNotIn(forbidden, body)
+
+    def test_no_sheets_telegram_authorization_business_layer_calls(self):
+        body = _th_bare_function_source("_task_detail_lines")
+        for forbidden in (
+            "get_business_sheet(", "read_business_sheet(", "_reply(", "await ",
+            "authorize_business_core_access(", "business_builder.", "task_manager.",
+        ):
+            self.assertNotIn(forbidden, body)
+
+    def test_no_logging_of_task_row(self):
+        body = _th_bare_function_source("_task_detail_lines")
+        self.assertNotIn("log.", body)
+
+    def test_formatter_does_not_mutate_input(self):
+        import copy
+        from business_core.telegram_handlers import _task_detail_lines
+        task = {"task_id": "TSK-1", "business_id": "BIZ-1", "title": "X", "status": "ready"}
+        before = copy.deepcopy(task)
+        _task_detail_lines(task)
+        self.assertEqual(task, before)
+
+    def test_formatter_never_raises_for_malformed_input(self):
+        from business_core.telegram_handlers import _task_detail_lines
+
+        class Poisoned:
+            def __str__(self):
+                return "STR-SECRET-MARKER"
+
+            def __repr__(self):
+                return "REPR-SECRET-MARKER"
+
+        cases = [None, {}, [], "bad", object(), 0, 1, Poisoned(), {"task_id": 123}, {"due_date": Poisoned()}]
+        for case in cases:
+            with self.subTest(task=repr(case)):
+                result = _task_detail_lines(case)
+                self.assertIsInstance(result, list)
+                joined = "\n".join(result)
+                self.assertNotIn("STR-SECRET-MARKER", joined)
+                self.assertNotIn("REPR-SECRET-MARKER", joined)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -950,15 +1134,17 @@ class TestBusinessBuilderConstructGuardHelperUnit(unittest.TestCase):
 # (mirrors the business_builder.py guard above — see that section's
 # comment for the rationale). Proves that of every top-level Import/
 # ImportFrom/FunctionDef/AsyncFunctionDef/ClassDef/Assign/AnnAssign in
-# telegram_handlers.py, only unassigntask_cmd and COMMAND_ENFORCEMENT_MAP
-# may differ — no other handler command function, registration, or
-# module-level constant changes. _task_assignment_message (approved to
-# differ in the prior mapper-hardening phase) is now source-identical
-# again, protected the same as every other function.
+# telegram_handlers.py, only bctask_cmd, _task_detail_lines and
+# COMMAND_ENFORCEMENT_MAP may differ — no other handler command
+# function, registration, or module-level constant changes.
+# unassigntask_cmd and _task_assignment_message (each approved to
+# differ in an earlier phase) are now source-identical again,
+# protected the same as every other function.
 # ─────────────────────────────────────────────────────────────
 
 _TELEGRAM_HANDLERS_APPROVED_TO_DIFFER = frozenset({
-    "async_function:unassigntask_cmd", "assignment:COMMAND_ENFORCEMENT_MAP",
+    "async_function:bctask_cmd", "function:_task_detail_lines",
+    "assignment:COMMAND_ENFORCEMENT_MAP",
 })
 
 _TELEGRAM_HANDLERS_KNOWN_BENIGN_TOP_LEVEL_NODE_TYPES = (ast.Expr, ast.Pass)
@@ -1075,7 +1261,7 @@ class TestTelegramHandlersTopLevelConstructGuard(unittest.TestCase):
         current_src = (BUSINESS_CORE / "telegram_handlers.py").read_text(encoding="utf-8")
         head = _telegram_handlers_top_level_constructs(head_src)
         current = _telegram_handlers_top_level_constructs(current_src)
-        for name in ("assigntask_cmd", "reassigntask_cmd", "bctasks_cmd", "bctask_cmd", "newbctask_cmd", "updatetask_cmd"):
+        for name in ("assigntask_cmd", "reassigntask_cmd", "bctasks_cmd", "unassigntask_cmd", "newbctask_cmd", "updatetask_cmd"):
             key = f"async_function:{name}"
             self.assertIn(key, head)
             self.assertEqual(head[key], current[key], f"{name} must not change this phase")
@@ -1096,7 +1282,19 @@ class TestTelegramHandlersTopLevelConstructGuard(unittest.TestCase):
         self.assertNotEqual(head["assignment:COMMAND_ENFORCEMENT_MAP"], current["assignment:COMMAND_ENFORCEMENT_MAP"])
 
         import business_core.telegram_handlers as th
-        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 15)
+        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 16)
+        self.assertIn("bctask", th.COMMAND_ENFORCEMENT_MAP)
+        self.assertEqual(
+            th.COMMAND_ENFORCEMENT_MAP["bctask"],
+            {
+                "resource": "TASK", "action": "READ", "target_shape": "BUSINESS",
+                "operation_kind": "READ", "requires_fresh_reread": False,
+            },
+        )
+        self.assertNotIn("bctasks", th.COMMAND_ENFORCEMENT_MAP)
+
+        # Committed in an earlier phase, not this one — still present
+        # and unchanged.
         self.assertIn("unassigntask", th.COMMAND_ENFORCEMENT_MAP)
         self.assertEqual(
             th.COMMAND_ENFORCEMENT_MAP["unassigntask"],
