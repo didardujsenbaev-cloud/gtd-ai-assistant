@@ -52,96 +52,991 @@ def _make_update(text: str, args_list: list[str]):
 # /newbctask
 # ─────────────────────────────────────────────────────────────
 
-class TestNewBcTaskCommand(unittest.TestCase):
-    """Phase 18A.8-B0: /newbctask is temporarily fail-closed — no
-    parsing, no storage read/write, no authorization call, exactly one
-    fixed reply. Result-code-mapping behavior (formerly exercised by
-    invoking the handler with a mocked create_business_task) is now
-    tested directly against _task_creation_message in
-    TestTaskCreationMessageMapping below, since the handler no longer
-    calls create_business_task on this path."""
+_NEWBCTASK_UNSET = object()
+
+
+def _newbctask_allow_result():
+    return {"ok": True, "allowed": True, "code": "TELEGRAM_ACCESS_ALLOWED",
+            "authorization_result": {"ok": True, "allowed": True, "code": "ACCESS_ALLOWED"}}
+
+
+def _newbctask_deny_result():
+    return {"ok": True, "allowed": False, "code": "AUTHORIZATION_DENIED",
+            "authorization_result": {"ok": True, "allowed": False, "code": "SCOPE_NOT_MATCHED"}}
+
+
+def _newbctask_infra_failure_result():
+    return {"ok": False, "allowed": False, "code": "AUTHORIZATION_UNAVAILABLE",
+            "authorization_result": None}
+
+
+class NewBcTaskCommandTestBase(unittest.TestCase):
+    """Phase 18A.8-C1: /newbctask is TASK/CREATE, target_shape=BUSINESS.
+    Mirrors BcTasksCommandTestBase's low-level-authorization-patch
+    pattern (patches authorize_telegram_business_core_request, the
+    function _authorize_or_reply itself calls, rather than
+    _authorize_or_reply — proving the real authorization wiring, not
+    a test-only shortcut)."""
+
+    def _run_handler(self, update, args=None, *, create_side_effect=None, create_return=_NEWBCTASK_UNSET,
+                      authz_result=None, th=None):
+        th = th or _fresh_th()
+        call_log = []
+
+        if create_side_effect is not None:
+            def _create(*a, **kw):
+                call_log.append(("create_business_task", a, kw))
+                if callable(create_side_effect):
+                    return create_side_effect(*a, **kw)
+                raise create_side_effect
+            mock_create = MagicMock(side_effect=_create)
+        else:
+            effective_return = create_return if create_return is not _NEWBCTASK_UNSET else {
+                "ok": True, "code": "TASK_CREATED", "task_id": "TSK-001",
+                "business_id": "BIZ-001", "final_status": "new", "error": None,
+            }
+
+            def _create(*a, **kw):
+                call_log.append(("create_business_task", a, kw))
+                return effective_return
+            mock_create = MagicMock(side_effect=_create)
+
+        async def _authz(update, **kwargs):
+            call_log.append(("authorize", kwargs.get("resource"), kwargs.get("action"), kwargs.get("business_id")))
+            return authz_result if authz_result is not None else _newbctask_allow_result()
+        mock_authz = AsyncMock(side_effect=_authz)
+
+        ctx_args = args if args is not None else ["business_id=BIZ-001", 'title="Prepare docs"']
+        ctx = MagicMock()
+        ctx.args = ctx_args
+
+        async def run():
+            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
+                 patch("business_core.business_builder.create_business_task", new=mock_create), \
+                 patch("business_core.telegram_authorization.authorize_telegram_business_core_request", new=mock_authz):
+                await th.newbctask_cmd(update, ctx)
+
+        _run(run())
+        return mock_create, mock_authz, call_log
+
+    def _sent_text(self, update) -> str:
+        call = update.message.reply_text.call_args
+        return call.args[0] if call.args else call.kwargs.get("text", "")
+
+
+class TestNewBcTaskCommand(NewBcTaskCommandTestBase):
+
+    # ── registration / enforcement scope ──
 
     def test_registered(self):
         th = _fresh_th()
         self.assertTrue(hasattr(th, "newbctask_cmd"))
 
-    def test_map_does_not_contain_newbctask(self):
+    def test_map_contains_newbctask(self):
         th = _fresh_th()
-        self.assertNotIn("newbctask", th.COMMAND_ENFORCEMENT_MAP)
+        self.assertIn("newbctask", th.COMMAND_ENFORCEMENT_MAP)
+        self.assertEqual(
+            th.COMMAND_ENFORCEMENT_MAP["newbctask"],
+            {
+                "resource": "TASK", "action": "CREATE", "target_shape": "BUSINESS",
+                "operation_kind": "MUTATION", "requires_fresh_reread": False,
+            },
+        )
 
-    def test_task_map_keys_unchanged(self):
+    def test_task_map_keys(self):
         th = _fresh_th()
         task_keys = {k for k in th.COMMAND_ENFORCEMENT_MAP if "task" in k}
-        self.assertEqual(task_keys, {"unassigntask", "bctask", "bctasks"})
+        self.assertEqual(task_keys, {"unassigntask", "bctask", "bctasks", "newbctask"})
 
-    def test_fail_closed_fixed_message_any_args(self):
+    def test_map_size_18(self):
         th = _fresh_th()
-        upd, ctx = _make_update(
-            '/newbctask business_id=BIZ-001 title="Prepare docs"',
-            ["business_id=BIZ-001", 'title="Prepare docs"'],
-        )
+        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 18)
+
+    # ── gates ──
+
+    def test_disabled_gate(self):
+        upd, _ = _make_update('/newbctask business_id=BIZ-001 title="X"', ["business_id=BIZ-001", 'title="X"'])
+        th = _fresh_th()
 
         async def run():
-            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
-                await th.newbctask_cmd(upd, ctx)
+            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=False), \
+                 patch("business_core.business_builder.create_business_task") as m_create, \
+                 patch("business_core.telegram_authorization.authorize_telegram_business_core_request") as m_authz:
+                await th.newbctask_cmd(upd, _make_update("x", [])[1])
+                m_create.assert_not_called()
+                m_authz.assert_not_called()
 
         _run(run())
-        upd.message.reply_text.assert_awaited_once_with(
-            "❌ Создание Business Task временно недоступно.", parse_mode=None,
-        )
 
-    def test_fail_closed_no_args(self):
+    def test_transport_validation(self):
+        upd, _ = _make_update('/newbctask business_id=BIZ-001 title="X"', ["business_id=BIZ-001", 'title="X"'])
+        upd.effective_chat = None
+        mock_create, mock_authz, _ = self._run_handler(upd)
+        mock_create.assert_not_called()
+        mock_authz.assert_not_called()
+
+    # ── allowed-key set ──
+
+    def test_exact_allowed_key_set(self):
+        # allowed_keys is function-local (Phase 18A.8-C1-F0) — extract
+        # it from the handler's own source rather than a module
+        # attribute.
         th = _fresh_th()
-        upd, ctx = _make_update("/newbctask", [])
-
-        async def run():
-            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
-                await th.newbctask_cmd(upd, ctx)
-
-        _run(run())
-        upd.message.reply_text.assert_awaited_once_with(
-            "❌ Создание Business Task временно недоступно.", parse_mode=None,
+        import ast, inspect
+        src = inspect.getsource(th.newbctask_cmd)
+        tree = ast.parse(src)
+        func = tree.body[0]
+        allowed_keys = None
+        for node in ast.walk(func):
+            if isinstance(node, ast.Assign) and any(
+                isinstance(t, ast.Name) and t.id == "allowed_keys" for t in node.targets
+            ):
+                allowed_keys = {elt.value for elt in node.value.elts}
+                break
+        self.assertIsNotNone(allowed_keys, "allowed_keys assignment not found in newbctask_cmd source")
+        self.assertEqual(
+            allowed_keys,
+            {
+                "business_id", "title", "description", "priority", "due_date", "source",
+                "idempotency_key", "client_id", "object_id", "service_id", "roadmap_id", "stage_id",
+            },
         )
 
-    def test_create_business_task_never_called(self):
+    def test_positional_rejected(self):
+        upd, _ = _make_update("/newbctask BIZ-001", ["BIZ-001"])
+        mock_create, mock_authz, _ = self._run_handler(upd, args=["BIZ-001"])
+        mock_create.assert_not_called()
+        mock_authz.assert_not_called()
+
+    def test_unknown_key_rejected(self):
+        upd, _ = _make_update(
+            '/newbctask business_id=BIZ-001 title="X" foo=bar',
+            ["business_id=BIZ-001", 'title="X"', "foo=bar"],
+        )
+        mock_create, mock_authz, _ = self._run_handler(upd, args=["business_id=BIZ-001", 'title="X"', "foo=bar"])
+        mock_create.assert_not_called()
+        mock_authz.assert_not_called()
+
+    def test_status_key_rejected(self):
+        upd, _ = _make_update(
+            '/newbctask business_id=BIZ-001 title="X" status=done',
+            ["business_id=BIZ-001", 'title="X"', "status=done"],
+        )
+        mock_create, mock_authz, _ = self._run_handler(upd, args=["business_id=BIZ-001", 'title="X"', "status=done"])
+        mock_create.assert_not_called()
+        mock_authz.assert_not_called()
+
+    def test_created_by_key_rejected(self):
+        upd, _ = _make_update(
+            '/newbctask business_id=BIZ-001 title="X" created_by=999',
+            ["business_id=BIZ-001", 'title="X"', "created_by=999"],
+        )
+        mock_create, mock_authz, _ = self._run_handler(upd, args=["business_id=BIZ-001", 'title="X"', "created_by=999"])
+        mock_create.assert_not_called()
+        mock_authz.assert_not_called()
+
+    def test_task_id_key_rejected(self):
+        upd, _ = _make_update(
+            '/newbctask business_id=BIZ-001 title="X" task_id=TSK-999',
+            ["business_id=BIZ-001", 'title="X"', "task_id=TSK-999"],
+        )
+        mock_create, mock_authz, _ = self._run_handler(upd, args=["business_id=BIZ-001", 'title="X"', "task_id=TSK-999"])
+        mock_create.assert_not_called()
+        mock_authz.assert_not_called()
+
+    def test_gtd_action_id_key_rejected(self):
+        upd, _ = _make_update(
+            '/newbctask business_id=BIZ-001 title="X" gtd_action_id=ACT-1',
+            ["business_id=BIZ-001", 'title="X"', "gtd_action_id=ACT-1"],
+        )
+        mock_create, mock_authz, _ = self._run_handler(upd, args=["business_id=BIZ-001", 'title="X"', "gtd_action_id=ACT-1"])
+        mock_create.assert_not_called()
+        mock_authz.assert_not_called()
+
+    def test_responsible_role_id_key_rejected(self):
+        upd, _ = _make_update(
+            '/newbctask business_id=BIZ-001 title="X" responsible_role_id=ROLE-1',
+            ["business_id=BIZ-001", 'title="X"', "responsible_role_id=ROLE-1"],
+        )
+        mock_create, mock_authz, _ = self._run_handler(upd, args=["business_id=BIZ-001", 'title="X"', "responsible_role_id=ROLE-1"])
+        mock_create.assert_not_called()
+        mock_authz.assert_not_called()
+
+    def test_assignee_person_id_key_rejected(self):
+        upd, _ = _make_update(
+            '/newbctask business_id=BIZ-001 title="X" assignee_person_id=PRS-1',
+            ["business_id=BIZ-001", 'title="X"', "assignee_person_id=PRS-1"],
+        )
+        mock_create, mock_authz, _ = self._run_handler(upd, args=["business_id=BIZ-001", 'title="X"', "assignee_person_id=PRS-1"])
+        mock_create.assert_not_called()
+        mock_authz.assert_not_called()
+
+    def test_scope_key_rejected(self):
+        upd, _ = _make_update(
+            '/newbctask business_id=BIZ-001 title="X" scope=ALL',
+            ["business_id=BIZ-001", 'title="X"', "scope=ALL"],
+        )
+        mock_create, mock_authz, _ = self._run_handler(upd, args=["business_id=BIZ-001", 'title="X"', "scope=ALL"])
+        mock_create.assert_not_called()
+        mock_authz.assert_not_called()
+
+    # ── required fields ──
+
+    def test_missing_business_id_rejected(self):
+        upd, _ = _make_update('/newbctask title="X"', ['title="X"'])
+        mock_create, mock_authz, _ = self._run_handler(upd, args=['title="X"'])
+        mock_create.assert_not_called()
+        mock_authz.assert_not_called()
+
+    def test_missing_title_rejected(self):
+        upd, _ = _make_update("/newbctask business_id=BIZ-001", ["business_id=BIZ-001"])
+        mock_create, mock_authz, _ = self._run_handler(upd, args=["business_id=BIZ-001"])
+        mock_create.assert_not_called()
+        mock_authz.assert_not_called()
+
+    def test_blank_business_id_rejected(self):
+        upd, _ = _make_update('/newbctask business_id= title="X"', ["business_id=", 'title="X"'])
+        mock_create, mock_authz, _ = self._run_handler(upd, args=["business_id=", 'title="X"'])
+        mock_create.assert_not_called()
+        mock_authz.assert_not_called()
+
+    def test_blank_title_rejected(self):
+        upd, _ = _make_update('/newbctask business_id=BIZ-001 title=', ["business_id=BIZ-001", "title="])
+        mock_create, mock_authz, _ = self._run_handler(upd, args=["business_id=BIZ-001", "title="])
+        mock_create.assert_not_called()
+        mock_authz.assert_not_called()
+
+    # ── input caps ──
+
+    def test_business_id_at_limit_accepted(self):
+        value = "B" * 64
+        upd, _ = _make_update(
+            f'/newbctask business_id={value} title="X"', [f"business_id={value}", 'title="X"'],
+        )
+        mock_create, mock_authz, _ = self._run_handler(upd, args=[f"business_id={value}", 'title="X"'])
+        mock_authz.assert_awaited_once()
+        mock_create.assert_called_once()
+
+    def test_business_id_over_limit_rejected(self):
+        value = "B" * 65
+        upd, _ = _make_update(
+            f'/newbctask business_id={value} title="X"', [f"business_id={value}", 'title="X"'],
+        )
+        mock_create, mock_authz, _ = self._run_handler(upd, args=[f"business_id={value}", 'title="X"'])
+        mock_create.assert_not_called()
+        mock_authz.assert_not_called()
+
+    def test_title_at_limit_accepted(self):
+        value = "T" * 300
+        upd, _ = _make_update(
+            f'/newbctask business_id=BIZ-001 title={value}', ["business_id=BIZ-001", f"title={value}"],
+        )
+        mock_create, mock_authz, _ = self._run_handler(upd, args=["business_id=BIZ-001", f"title={value}"])
+        mock_authz.assert_awaited_once()
+        mock_create.assert_called_once()
+
+    def test_title_over_limit_rejected(self):
+        value = "T" * 301
+        upd, _ = _make_update(
+            f'/newbctask business_id=BIZ-001 title={value}', ["business_id=BIZ-001", f"title={value}"],
+        )
+        mock_create, mock_authz, _ = self._run_handler(upd, args=["business_id=BIZ-001", f"title={value}"])
+        mock_create.assert_not_called()
+        mock_authz.assert_not_called()
+
+    def test_description_over_limit_rejected(self):
+        value = "D" * 4001
+        args = ["business_id=BIZ-001", 'title="X"', f"description={value}"]
+        upd, _ = _make_update("/newbctask ...", args)
+        mock_create, mock_authz, _ = self._run_handler(upd, args=args)
+        mock_create.assert_not_called()
+        mock_authz.assert_not_called()
+
+    def test_priority_over_limit_rejected(self):
+        value = "P" * 33
+        args = ["business_id=BIZ-001", 'title="X"', f"priority={value}"]
+        upd, _ = _make_update("/newbctask ...", args)
+        mock_create, mock_authz, _ = self._run_handler(upd, args=args)
+        mock_create.assert_not_called()
+        mock_authz.assert_not_called()
+
+    def test_due_date_over_limit_rejected(self):
+        value = "2" * 33
+        args = ["business_id=BIZ-001", 'title="X"', f"due_date={value}"]
+        upd, _ = _make_update("/newbctask ...", args)
+        mock_create, mock_authz, _ = self._run_handler(upd, args=args)
+        mock_create.assert_not_called()
+        mock_authz.assert_not_called()
+
+    def test_source_over_limit_rejected(self):
+        value = "S" * 65
+        args = ["business_id=BIZ-001", 'title="X"', f"source={value}"]
+        upd, _ = _make_update("/newbctask ...", args)
+        mock_create, mock_authz, _ = self._run_handler(upd, args=args)
+        mock_create.assert_not_called()
+        mock_authz.assert_not_called()
+
+    def test_idempotency_key_over_limit_rejected(self):
+        value = "K" * 129
+        args = ["business_id=BIZ-001", 'title="X"', f"idempotency_key={value}"]
+        upd, _ = _make_update("/newbctask ...", args)
+        mock_create, mock_authz, _ = self._run_handler(upd, args=args)
+        mock_create.assert_not_called()
+        mock_authz.assert_not_called()
+
+    def test_client_id_over_limit_rejected(self):
+        value = "C" * 65
+        args = ["business_id=BIZ-001", 'title="X"', f"client_id={value}"]
+        upd, _ = _make_update("/newbctask ...", args)
+        mock_create, mock_authz, _ = self._run_handler(upd, args=args)
+        mock_create.assert_not_called()
+        mock_authz.assert_not_called()
+
+    def test_object_id_over_limit_rejected(self):
+        value = "O" * 65
+        args = ["business_id=BIZ-001", 'title="X"', f"object_id={value}"]
+        upd, _ = _make_update("/newbctask ...", args)
+        mock_create, mock_authz, _ = self._run_handler(upd, args=args)
+        mock_create.assert_not_called()
+        mock_authz.assert_not_called()
+
+    def test_service_id_over_limit_rejected(self):
+        value = "S" * 65
+        args = ["business_id=BIZ-001", 'title="X"', f"service_id={value}"]
+        upd, _ = _make_update("/newbctask ...", args)
+        mock_create, mock_authz, _ = self._run_handler(upd, args=args)
+        mock_create.assert_not_called()
+        mock_authz.assert_not_called()
+
+    def test_roadmap_id_over_limit_rejected(self):
+        value = "R" * 65
+        args = ["business_id=BIZ-001", 'title="X"', f"roadmap_id={value}"]
+        upd, _ = _make_update("/newbctask ...", args)
+        mock_create, mock_authz, _ = self._run_handler(upd, args=args)
+        mock_create.assert_not_called()
+        mock_authz.assert_not_called()
+
+    def test_stage_id_over_limit_rejected(self):
+        value = "T" * 65
+        args = ["business_id=BIZ-001", 'title="X"', f"stage_id={value}"]
+        upd, _ = _make_update("/newbctask ...", args)
+        mock_create, mock_authz, _ = self._run_handler(upd, args=args)
+        mock_create.assert_not_called()
+        mock_authz.assert_not_called()
+
+    def test_due_date_bad_format_rejected(self):
+        args = ["business_id=BIZ-001", 'title="X"', "due_date=not-a-date"]
+        upd, _ = _make_update("/newbctask ...", args)
+        mock_create, mock_authz, _ = self._run_handler(upd, args=args)
+        mock_create.assert_not_called()
+        mock_authz.assert_not_called()
+
+    def test_due_date_valid_format_accepted(self):
+        args = ["business_id=BIZ-001", 'title="X"', "due_date=2026-01-15"]
+        upd, _ = _make_update("/newbctask ...", args)
+        mock_create, mock_authz, _ = self._run_handler(upd, args=args)
+        mock_authz.assert_awaited_once()
+        mock_create.assert_called_once()
+
+    # ── authorization wiring ──
+
+    def test_authorization_exact_call(self):
+        upd, _ = _make_update('/newbctask business_id=BIZ-001 title="X"', ["business_id=BIZ-001", 'title="X"'])
+        mock_create, mock_authz, call_log = self._run_handler(upd, args=["business_id=BIZ-001", 'title="X"'])
+        mock_authz.assert_awaited_once()
+        _, kwargs = mock_authz.call_args
+        self.assertEqual(kwargs.get("resource"), "TASK")
+        self.assertEqual(kwargs.get("action"), "CREATE")
+        self.assertEqual(kwargs.get("business_id"), "BIZ-001")
+
+    def test_authorization_count_one(self):
+        upd, _ = _make_update('/newbctask business_id=BIZ-001 title="X"', ["business_id=BIZ-001", 'title="X"'])
+        mock_create, mock_authz, _ = self._run_handler(upd, args=["business_id=BIZ-001", 'title="X"'])
+        self.assertEqual(mock_authz.call_count, 1)
+
+    def test_authorization_before_create_call(self):
+        upd, _ = _make_update('/newbctask business_id=BIZ-001 title="X"', ["business_id=BIZ-001", 'title="X"'])
+        _, _, call_log = self._run_handler(upd, args=["business_id=BIZ-001", 'title="X"'])
+        names = [c[0] for c in call_log]
+        self.assertEqual(names.index("authorize"), 0)
+        self.assertLess(names.index("authorize"), names.index("create_business_task"))
+
+    def test_denied_blocks_create(self):
         th = _fresh_th()
-        upd, ctx = _make_update(
-            '/newbctask business_id=BIZ-001 title="X"',
-            ["business_id=BIZ-001", 'title="X"'],
+        upd, _ = _make_update('/newbctask business_id=BIZ-001 title="X"', ["business_id=BIZ-001", 'title="X"'])
+        mock_create, mock_authz, _ = self._run_handler(
+            upd, args=["business_id=BIZ-001", 'title="X"'], authz_result=_newbctask_deny_result(), th=th,
         )
+        mock_create.assert_not_called()
+        self.assertEqual(self._sent_text(upd), th._BC_ENFORCEMENT_NOT_FOUND_OR_DENIED_MSG)
+
+    def test_authorization_infra_failure_blocks_create(self):
+        th = _fresh_th()
+        upd, _ = _make_update('/newbctask business_id=BIZ-001 title="X"', ["business_id=BIZ-001", 'title="X"'])
+        mock_create, mock_authz, _ = self._run_handler(
+            upd, args=["business_id=BIZ-001", 'title="X"'], authz_result=_newbctask_infra_failure_result(), th=th,
+        )
+        mock_create.assert_not_called()
+        self.assertEqual(self._sent_text(upd), th._BC_ENFORCEMENT_TEMPORARILY_UNAVAILABLE_MSG)
+
+    # ── thread offload / call shape ──
+
+    def test_create_business_task_called_once_on_allowed_path(self):
+        upd, _ = _make_update('/newbctask business_id=BIZ-001 title="X"', ["business_id=BIZ-001", 'title="X"'])
+        mock_create, _, _ = self._run_handler(upd, args=["business_id=BIZ-001", 'title="X"'])
+        self.assertEqual(mock_create.call_count, 1)
+
+    def test_exact_kwargs_passed(self):
+        upd, _ = _make_update(
+            '/newbctask business_id=BIZ-001 title="X" description=D priority=P due_date=2026-01-01 '
+            'source=telegram idempotency_key=K1 client_id=PRS-1 object_id=OBJ-1 service_id=SVC-1 '
+            'roadmap_id=RM-1 stage_id=ST-1',
+            ["business_id=BIZ-001", 'title="X"', "description=D", "priority=P", "due_date=2026-01-01",
+             "source=telegram", "idempotency_key=K1", "client_id=PRS-1", "object_id=OBJ-1",
+             "service_id=SVC-1", "roadmap_id=RM-1", "stage_id=ST-1"],
+        )
+        mock_create, _, call_log = self._run_handler(upd, args=[
+            "business_id=BIZ-001", 'title="X"', "description=D", "priority=P", "due_date=2026-01-01",
+            "source=telegram", "idempotency_key=K1", "client_id=PRS-1", "object_id=OBJ-1",
+            "service_id=SVC-1", "roadmap_id=RM-1", "stage_id=ST-1",
+        ])
+        args, kwargs = mock_create.call_args
+        self.assertEqual(args, ("BIZ-001", "X"))
+        self.assertEqual(kwargs["description"], "D")
+        self.assertEqual(kwargs["priority"], "P")
+        self.assertEqual(kwargs["due_date"], "2026-01-01")
+        self.assertEqual(kwargs["source"], "telegram")
+        self.assertEqual(kwargs["idempotency_key"], "K1")
+        self.assertEqual(kwargs["client_id"], "PRS-1")
+        self.assertEqual(kwargs["object_id"], "OBJ-1")
+        self.assertEqual(kwargs["service_id"], "SVC-1")
+        self.assertEqual(kwargs["roadmap_id"], "RM-1")
+        self.assertEqual(kwargs["stage_id"], "ST-1")
+        self.assertEqual(kwargs["created_by"], "999")
+        self.assertNotIn("gtd_action_id", kwargs)
+        self.assertNotIn("status", kwargs)
+        self.assertNotIn("task_id", kwargs)
+
+    def test_create_business_task_offloaded_to_thread(self):
+        th = _fresh_th()
+        upd, ctx = _make_update('/newbctask business_id=BIZ-001 title="X"', ["business_id=BIZ-001", 'title="X"'])
+        seen_thread = {}
+
+        def fake_create(*a, **kw):
+            import threading
+            seen_thread["name"] = threading.current_thread().name
+            return {"ok": True, "code": "TASK_CREATED", "task_id": "T1", "business_id": "BIZ-001", "final_status": "new", "error": None}
+
+        async def _authz(update, **kwargs):
+            return _newbctask_allow_result()
 
         async def run():
             with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
-                 patch("business_core.business_builder.create_business_task") as mock_create:
+                 patch("business_core.business_builder.create_business_task", side_effect=fake_create), \
+                 patch("business_core.telegram_authorization.authorize_telegram_business_core_request", new=AsyncMock(side_effect=_authz)):
+                import threading
+                seen_thread["main"] = threading.current_thread().name
                 await th.newbctask_cmd(upd, ctx)
-                mock_create.assert_not_called()
 
         _run(run())
+        self.assertNotEqual(seen_thread["name"], seen_thread["main"])
 
-    def test_disabled_short_circuits_before_transport_check(self):
+    def test_no_retry_on_denied(self):
+        upd, _ = _make_update('/newbctask business_id=BIZ-001 title="X"', ["business_id=BIZ-001", 'title="X"'])
+        mock_create, mock_authz, _ = self._run_handler(
+            upd, args=["business_id=BIZ-001", 'title="X"'], authz_result=_newbctask_deny_result(),
+        )
+        self.assertEqual(mock_authz.call_count, 1)
+        mock_create.assert_not_called()
+
+    # ── source / idempotency-key defaults ──
+
+    def test_default_source(self):
+        upd, _ = _make_update('/newbctask business_id=BIZ-001 title="X"', ["business_id=BIZ-001", 'title="X"'])
+        mock_create, _, _ = self._run_handler(upd, args=["business_id=BIZ-001", 'title="X"'])
+        self.assertEqual(mock_create.call_args[1]["source"], "telegram")
+
+    def test_caller_source(self):
+        args = ["business_id=BIZ-001", 'title="X"', "source=manual"]
+        upd, _ = _make_update("/newbctask ...", args)
+        mock_create, _, _ = self._run_handler(upd, args=args)
+        self.assertEqual(mock_create.call_args[1]["source"], "manual")
+
+    def test_default_idempotency_key(self):
+        upd, _ = _make_update('/newbctask business_id=BIZ-001 title="X"', ["business_id=BIZ-001", 'title="X"'])
+        upd.update_id = 777
+        mock_create, _, _ = self._run_handler(upd, args=["business_id=BIZ-001", 'title="X"'])
+        self.assertEqual(mock_create.call_args[1]["idempotency_key"], "tg-777")
+
+    def test_caller_idempotency_key(self):
+        args = ["business_id=BIZ-001", 'title="X"', "idempotency_key=MY-KEY"]
+        upd, _ = _make_update("/newbctask ...", args)
+        mock_create, _, _ = self._run_handler(upd, args=args)
+        self.assertEqual(mock_create.call_args[1]["idempotency_key"], "MY-KEY")
+
+    def test_missing_update_id_fails_closed(self):
+        th = _fresh_th()
+        upd, _ = _make_update('/newbctask business_id=BIZ-001 title="X"', ["business_id=BIZ-001", 'title="X"'])
+        upd.update_id = None
+        mock_create, mock_authz, _ = self._run_handler(upd, args=["business_id=BIZ-001", 'title="X"'], th=th)
+        mock_create.assert_not_called()
+        mock_authz.assert_not_called()
+        self.assertEqual(self._sent_text(upd), th._BC_ENFORCEMENT_TEMPORARILY_UNAVAILABLE_MSG)
+
+    # ── created_by ──
+
+    def test_created_by_derived_from_effective_user(self):
+        upd, _ = _make_update('/newbctask business_id=BIZ-001 title="X"', ["business_id=BIZ-001", 'title="X"'])
+        upd.effective_user = SimpleNamespace(id=54321)
+        mock_create, _, _ = self._run_handler(upd, args=["business_id=BIZ-001", 'title="X"'])
+        self.assertEqual(mock_create.call_args[1]["created_by"], "54321")
+
+    def test_caller_cannot_override_created_by(self):
+        args = ["business_id=BIZ-001", 'title="X"', "created_by=SOMEONE-ELSE"]
+        upd, _ = _make_update("/newbctask ...", args)
+        upd.effective_user = SimpleNamespace(id=111)
+        mock_create, mock_authz, _ = self._run_handler(upd, args=args)
+        # created_by is an unknown/rejected key — the command is
+        # rejected outright before ever reaching create_business_task.
+        mock_create.assert_not_called()
+        mock_authz.assert_not_called()
+
+    def test_missing_effective_user_at_transport_layer_fails_closed(self):
+        # update.effective_user is required (and .id checked) by the
+        # existing, unmodified _validate_bc_transport_or_reply layer
+        # itself — so this case is already blocked before this
+        # handler's own authorization/created_by logic ever runs.
+        th = _fresh_th()
+        upd, _ = _make_update('/newbctask business_id=BIZ-001 title="X"', ["business_id=BIZ-001", 'title="X"'])
+        upd.effective_user = None
+        mock_create, mock_authz, _ = self._run_handler(upd, args=["business_id=BIZ-001", 'title="X"'], th=th)
+        mock_authz.assert_not_called()
+        mock_create.assert_not_called()
+
+    def test_created_by_guard_fires_if_reached_post_authorization(self):
+        # Direct, isolated proof of this handler's OWN created_by
+        # fail-closed guard (§12), independent of the transport layer
+        # that would normally catch a missing effective_user first —
+        # bypasses _validate_bc_transport_or_reply to reach the point
+        # in newbctask_cmd where this handler resolves created_by
+        # itself, proving that code path also fails closed rather than
+        # ever calling create_business_task with a bad/blank actor id.
         th = _fresh_th()
         upd, ctx = _make_update('/newbctask business_id=BIZ-001 title="X"', ["business_id=BIZ-001", 'title="X"'])
+        upd.effective_user = None
+
+        async def _authz(update, **kwargs):
+            return _newbctask_allow_result()
 
         async def run():
-            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=False):
+            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
+                 patch("business_core.telegram_handlers._validate_bc_transport_or_reply", new=AsyncMock(return_value=True)), \
+                 patch("business_core.telegram_authorization.authorize_telegram_business_core_request", new=AsyncMock(side_effect=_authz)), \
+                 patch("business_core.business_builder.create_business_task") as m_create:
                 await th.newbctask_cmd(upd, ctx)
+                m_create.assert_not_called()
 
         _run(run())
-        reply = upd.message.reply_text.call_args[0][0]
-        self.assertNotEqual(reply, "❌ Создание Business Task временно недоступно.")
+        self.assertEqual(self._sent_text(upd), th._BC_ENFORCEMENT_TEMPORARILY_UNAVAILABLE_MSG)
 
-    def test_group_chat_rejected_by_transport_before_fixed_message(self):
+    # ── malformed result / exceptions ──
+
+    def test_malformed_result_none_handled_safely(self):
+        upd, _ = _make_update('/newbctask business_id=BIZ-001 title="X"', ["business_id=BIZ-001", 'title="X"'])
+        mock_create, _, _ = self._run_handler(upd, args=["business_id=BIZ-001", 'title="X"'], create_return=None)
+        self.assertIn("❌", self._sent_text(upd))
+        self.assertEqual(upd.message.reply_text.call_count, 1)
+
+    def test_malformed_result_list_handled_safely(self):
+        upd, _ = _make_update('/newbctask business_id=BIZ-001 title="X"', ["business_id=BIZ-001", 'title="X"'])
+        mock_create, _, _ = self._run_handler(upd, args=["business_id=BIZ-001", 'title="X"'], create_return=[])
+        self.assertIn("❌", self._sent_text(upd))
+        self.assertEqual(upd.message.reply_text.call_count, 1)
+
+    def test_unexpected_exception_uses_uncertain_create_message(self):
         th = _fresh_th()
-        upd, ctx = _make_update('/newbctask business_id=BIZ-001 title="X"', ["business_id=BIZ-001", 'title="X"'])
-        upd.effective_chat = SimpleNamespace(type="group")
+        upd, _ = _make_update('/newbctask business_id=BIZ-001 title="X"', ["business_id=BIZ-001", 'title="X"'])
+        mock_create, _, _ = self._run_handler(
+            upd, args=["business_id=BIZ-001", 'title="X"'], create_side_effect=RuntimeError("SENTINEL-BOOM"), th=th,
+        )
+        reply = self._sent_text(upd)
+        self.assertEqual(
+            reply,
+            "❌ Не удалось подтвердить создание Task. Проверьте список Tasks перед повторной попыткой.",
+        )
+        self.assertNotIn("SENTINEL-BOOM", reply)
+        self.assertNotIn("TASK_REUSED", reply)
+        self.assertEqual(upd.message.reply_text.call_count, 1)
+
+    def test_exception_reply_not_a_success_claim(self):
+        upd, _ = _make_update('/newbctask business_id=BIZ-001 title="X"', ["business_id=BIZ-001", 'title="X"'])
+        mock_create, _, _ = self._run_handler(
+            upd, args=["business_id=BIZ-001", 'title="X"'], create_side_effect=RuntimeError("boom"),
+        )
+        reply = self._sent_text(upd)
+        self.assertNotIn("✅", reply)
+
+    # ── result-code mapping via the handler ──
+
+    def test_task_created_reply(self):
+        upd, _ = _make_update('/newbctask business_id=BIZ-001 title="X"', ["business_id=BIZ-001", 'title="X"'])
+        self._run_handler(upd, args=["business_id=BIZ-001", 'title="X"'], create_return={
+            "ok": True, "code": "TASK_CREATED", "task_id": "TSK-1", "business_id": "BIZ-001",
+            "final_status": "new", "error": None,
+        })
+        reply = self._sent_text(upd)
+        self.assertIn("✅", reply)
+        self.assertIn("TSK-1", reply)
+
+    def test_task_reused_reply(self):
+        upd, _ = _make_update('/newbctask business_id=BIZ-001 title="X"', ["business_id=BIZ-001", 'title="X"'])
+        self._run_handler(upd, args=["business_id=BIZ-001", 'title="X"'], create_return={
+            "ok": True, "code": "TASK_REUSED", "task_id": "TSK-2", "final_status": "ready", "error": None,
+        })
+        reply = self._sent_text(upd)
+        self.assertIn("ℹ️", reply)
+        self.assertIn("TSK-2", reply)
+
+    def test_task_storage_error_reply(self):
+        upd, _ = _make_update('/newbctask business_id=BIZ-001 title="X"', ["business_id=BIZ-001", 'title="X"'])
+        self._run_handler(upd, args=["business_id=BIZ-001", 'title="X"'], create_return={
+            "ok": False, "code": "TASK_STORAGE_ERROR", "error": None,
+        })
+        reply = self._sent_text(upd)
+        self.assertIn("❌", reply)
+
+    def test_relation_mismatch_reply(self):
+        upd, _ = _make_update('/newbctask business_id=BIZ-001 title="X"', ["business_id=BIZ-001", 'title="X"'])
+        self._run_handler(upd, args=["business_id=BIZ-001", 'title="X"'], create_return={
+            "ok": False, "code": "TASK_ENTITY_RELATION_MISMATCH", "error": "x",
+        })
+        reply = self._sent_text(upd)
+        self.assertIn("❌", reply)
+
+    def test_exactly_one_reply(self):
+        upd, _ = _make_update('/newbctask business_id=BIZ-001 title="X"', ["business_id=BIZ-001", 'title="X"'])
+        self._run_handler(upd, args=["business_id=BIZ-001", 'title="X"'])
+        self.assertEqual(upd.message.reply_text.call_count, 1)
+
+    # ── adversarial output-bound proof ──
+
+    def test_adversarial_long_result_stays_one_reply(self):
+        upd, _ = _make_update('/newbctask business_id=BIZ-001 title="X"', ["business_id=BIZ-001", 'title="X"'])
+        huge = "A" * 100000
+        self._run_handler(upd, args=["business_id=BIZ-001", 'title="X"'], create_return={
+            "ok": True, "code": "TASK_CREATED", "task_id": huge, "business_id": huge, "final_status": "new", "error": None,
+        })
+        self.assertEqual(upd.message.reply_text.call_count, 1)
+        reply = upd.message.reply_text.call_args[0][0]
+        self.assertLess(len(reply), 4000)
+        self.assertNotIn("A" * 1000, reply)
+
+    # ── no GTD / no assignment writes ──
+
+    def test_no_gtd_module_imported(self):
+        upd, _ = _make_update('/newbctask business_id=BIZ-001 title="X"', ["business_id=BIZ-001", 'title="X"'])
+        th = _fresh_th()
+        import inspect
+        src = inspect.getsource(th.newbctask_cmd)
+        for forbidden in ("inbox_processor", "project_planner", "calendar_sync", "create_task_assignment"):
+            self.assertNotIn(forbidden, src)
+
+    def test_no_direct_create_business_task_call_on_event_loop(self):
+        th = _fresh_th()
+        import inspect
+        src = inspect.getsource(th.newbctask_cmd)
+        self.assertIn("asyncio.to_thread(", src)
+        self.assertNotIn("create_business_task(\n", src.split("asyncio.to_thread(")[0])
+
+
+class _PoisonedIdentity:
+    """Stands in for a Telegram identity field whose __str__/__repr__
+    raise — proves type(x) is int rejects it without ever invoking
+    either dunder (type() never touches instance-level __getattribute__/
+    __str__/__repr__)."""
+    def __str__(self):
+        raise RuntimeError("STR-SENTINEL-MARKER")
+
+    def __repr__(self):
+        raise RuntimeError("REPR-SENTINEL-MARKER")
+
+
+class TestNewBcTaskCommandIdentityHardening(NewBcTaskCommandTestBase):
+    """Phase 18A.8-C1-F1: strict type(x) is int + positivity validation
+    for update.effective_user.id and update.update_id — both must be
+    genuine positive int, never bool, never a caller-controlled string,
+    never an unchecked arbitrary object."""
+
+    _ARGS = ["business_id=BIZ-001", 'title="Prepare docs"']
+
+    # ── effective_user.id matrix ──
+
+    def _run_with_user_id(self, user_id, effective_user_present=True):
+        upd, _ = _make_update('/newbctask business_id=BIZ-001 title="X"', list(self._ARGS))
+        upd.effective_user = SimpleNamespace(id=user_id) if effective_user_present else None
+        return self._run_handler(upd, args=list(self._ARGS)), upd
+
+    def test_user_id_none_effective_user_rejected(self):
+        (mock_create, mock_authz, _), upd = self._run_with_user_id(None, effective_user_present=False)
+        mock_create.assert_not_called()
+
+    def test_user_id_missing_attribute_rejected(self):
+        upd, _ = _make_update('/newbctask business_id=BIZ-001 title="X"', list(self._ARGS))
+        upd.effective_user = object()  # no .id attribute at all
+        mock_create, mock_authz, _ = self._run_handler(upd, args=list(self._ARGS))
+        mock_create.assert_not_called()
+        self.assertEqual(upd.message.reply_text.call_count, 1)
+
+    def test_user_id_none_rejected(self):
+        (mock_create, mock_authz, _), upd = self._run_with_user_id(None)
+        mock_create.assert_not_called()
+
+    def test_user_id_blank_string_rejected(self):
+        (mock_create, mock_authz, _), upd = self._run_with_user_id("")
+        mock_create.assert_not_called()
+
+    def test_user_id_numeric_string_rejected(self):
+        (mock_create, mock_authz, _), upd = self._run_with_user_id("123")
+        mock_create.assert_not_called()
+
+    def test_user_id_zero_rejected(self):
+        (mock_create, mock_authz, _), upd = self._run_with_user_id(0)
+        mock_create.assert_not_called()
+
+    def test_user_id_negative_rejected(self):
+        (mock_create, mock_authz, _), upd = self._run_with_user_id(-1)
+        mock_create.assert_not_called()
+
+    def test_user_id_bool_true_rejected(self):
+        (mock_create, mock_authz, _), upd = self._run_with_user_id(True)
+        mock_create.assert_not_called()
+
+    def test_user_id_bool_false_rejected(self):
+        (mock_create, mock_authz, _), upd = self._run_with_user_id(False)
+        mock_create.assert_not_called()
+
+    def test_user_id_float_rejected(self):
+        (mock_create, mock_authz, _), upd = self._run_with_user_id(1.0)
+        mock_create.assert_not_called()
+
+    def test_user_id_list_rejected(self):
+        (mock_create, mock_authz, _), upd = self._run_with_user_id([])
+        mock_create.assert_not_called()
+
+    def test_user_id_dict_rejected(self):
+        (mock_create, mock_authz, _), upd = self._run_with_user_id({})
+        mock_create.assert_not_called()
+
+    def test_user_id_tuple_rejected(self):
+        (mock_create, mock_authz, _), upd = self._run_with_user_id(())
+        mock_create.assert_not_called()
+
+    def test_user_id_plain_object_rejected(self):
+        (mock_create, mock_authz, _), upd = self._run_with_user_id(object())
+        mock_create.assert_not_called()
+
+    def test_user_id_poisoned_rejected_by_own_check_no_str_invocation(self):
+        # Isolated proof of newbctask_cmd's OWN type(x) is int guard:
+        # with the shared, unmodified transport-validation layer
+        # bypassed (it is out of this phase's approved scope and has
+        # its own pre-existing, separate str(user_id) call — see
+        # test_user_id_poisoned_crashes_at_shared_transport_layer
+        # below), this handler's own identity check rejects a poisoned
+        # object without ever invoking its __str__/__repr__.
+        # th resolved BEFORE entering the patch context — patching by
+        # dotted module path only rebinds attributes on the currently-
+        # imported module object, so a fresh import performed *inside*
+        # the patched block would silently bypass every patch above.
+        th = _fresh_th()
+        upd, ctx = _make_update('/newbctask business_id=BIZ-001 title="X"', list(self._ARGS))
+        upd.effective_user = SimpleNamespace(id=_PoisonedIdentity())
+
+        async def _authz(update, **kwargs):
+            return _newbctask_allow_result()
 
         async def run():
-            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True):
-                await th.newbctask_cmd(upd, ctx)
+            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
+                 patch("business_core.telegram_handlers._validate_bc_transport_or_reply", new=AsyncMock(return_value=True)), \
+                 patch("business_core.business_builder.create_business_task") as m_cbt, \
+                 patch("business_core.telegram_authorization.authorize_telegram_business_core_request", new=AsyncMock(side_effect=_authz)):
+                try:
+                    await th.newbctask_cmd(upd, ctx)
+                except Exception as e:
+                    self.fail(f"exception escaped newbctask_cmd's own identity check: {type(e).__name__}: {e}")
+                m_cbt.assert_not_called()
 
         _run(run())
-        reply = upd.message.reply_text.call_args[0][0]
-        self.assertNotEqual(reply, "❌ Создание Business Task временно недоступно.")
+        reply = self._sent_text(upd)
+        self.assertNotIn("STR-SENTINEL-MARKER", reply)
+        self.assertNotIn("REPR-SENTINEL-MARKER", reply)
+        self.assertEqual(upd.message.reply_text.call_count, 1)
+
+    def test_user_id_poisoned_end_to_end_fails_closed_no_crash(self):
+        # Phase 18A.8-C1-F2: the shared transport layer
+        # (validate_telegram_business_core_transport, in
+        # telegram_authorization.py) is now hardened too — a poisoned
+        # effective_user.id no longer crashes the real end-to-end
+        # flow. This replaces the prior phase's crash-expectation test
+        # now that the shared boundary itself fails closed; the
+        # isolated handler-local check above remains as defense-in-
+        # depth proving newbctask_cmd's own logic is independently
+        # safe regardless of the shared layer.
+        th = _fresh_th()
+        upd, ctx = _make_update('/newbctask business_id=BIZ-001 title="X"', list(self._ARGS))
+        upd.effective_user = SimpleNamespace(id=_PoisonedIdentity())
+
+        async def run():
+            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
+                 patch("business_core.business_builder.create_business_task") as m_cbt, \
+                 patch("business_core.telegram_authorization.authorize_telegram_business_core_request") as m_authz:
+                try:
+                    await th.newbctask_cmd(upd, ctx)
+                except Exception as e:
+                    self.fail(f"exception escaped newbctask_cmd end-to-end: {type(e).__name__}: {e}")
+                m_authz.assert_not_called()
+                m_cbt.assert_not_called()
+
+        _run(run())
+        reply = self._sent_text(upd)
+        self.assertNotIn("STR-SENTINEL-MARKER", reply)
+        self.assertNotIn("REPR-SENTINEL-MARKER", reply)
+        self.assertEqual(upd.message.reply_text.call_count, 1)
+
+    def test_user_id_positive_int_accepted(self):
+        (mock_create, mock_authz, _), upd = self._run_with_user_id(777)
+        mock_create.assert_called_once()
+
+    def test_user_id_created_by_exact_string(self):
+        (mock_create, mock_authz, _), upd = self._run_with_user_id(777)
+        self.assertEqual(mock_create.call_args[1]["created_by"], "777")
+
+    def test_user_id_large_positive_int_accepted(self):
+        (mock_create, mock_authz, _), upd = self._run_with_user_id(9999999999)
+        mock_create.assert_called_once()
+        self.assertEqual(mock_create.call_args[1]["created_by"], "9999999999")
+
+    def test_user_id_rejected_authorization_never_called(self):
+        # user_id is validated before authorization (§6) — malformed
+        # actor state must never spend an authorization call.
+        (mock_create, mock_authz, call_log), upd = self._run_with_user_id(-5)
+        mock_authz.assert_not_called()
+        mock_create.assert_not_called()
+
+    def test_user_id_rejected_exactly_one_reply(self):
+        (mock_create, mock_authz, _), upd = self._run_with_user_id("bad")
+        self.assertEqual(upd.message.reply_text.call_count, 1)
+
+    def test_user_id_rejected_no_raw_value_in_reply(self):
+        (mock_create, mock_authz, _), upd = self._run_with_user_id("SENTINEL-USER-VALUE")
+        self.assertNotIn("SENTINEL-USER-VALUE", self._sent_text(upd))
+
+    # ── update_id matrix ──
+
+    def _run_with_update_id(self, update_id, args=None):
+        upd, _ = _make_update('/newbctask business_id=BIZ-001 title="X"', list(args or self._ARGS))
+        upd.update_id = update_id
+        return self._run_handler(upd, args=list(args or self._ARGS)), upd
+
+    def test_update_id_none_rejected(self):
+        (mock_create, mock_authz, _), upd = self._run_with_update_id(None)
+        mock_create.assert_not_called()
+        mock_authz.assert_not_called()
+
+    def test_update_id_missing_attribute_rejected(self):
+        # spec= restricts the mock to only these attributes, so
+        # getattr(update, "update_id", None) genuinely falls back to
+        # the default rather than returning an auto-generated Mock.
+        upd = MagicMock(spec=["message", "effective_user", "effective_chat"])
+        upd.message.reply_text = AsyncMock()
+        upd.effective_user = SimpleNamespace(id=999)
+        upd.effective_chat = SimpleNamespace(type="private")
+        mock_create, mock_authz, _ = self._run_handler(upd, args=list(self._ARGS))
+        mock_create.assert_not_called()
+        mock_authz.assert_not_called()
+
+    def test_update_id_numeric_string_rejected(self):
+        (mock_create, mock_authz, _), upd = self._run_with_update_id("555")
+        mock_create.assert_not_called()
+        mock_authz.assert_not_called()
+
+    def test_update_id_zero_rejected(self):
+        (mock_create, mock_authz, _), upd = self._run_with_update_id(0)
+        mock_create.assert_not_called()
+        mock_authz.assert_not_called()
+
+    def test_update_id_negative_rejected(self):
+        (mock_create, mock_authz, _), upd = self._run_with_update_id(-1)
+        mock_create.assert_not_called()
+        mock_authz.assert_not_called()
+
+    def test_update_id_bool_true_rejected(self):
+        (mock_create, mock_authz, _), upd = self._run_with_update_id(True)
+        mock_create.assert_not_called()
+        mock_authz.assert_not_called()
+
+    def test_update_id_bool_false_rejected(self):
+        (mock_create, mock_authz, _), upd = self._run_with_update_id(False)
+        mock_create.assert_not_called()
+        mock_authz.assert_not_called()
+
+    def test_update_id_float_rejected(self):
+        (mock_create, mock_authz, _), upd = self._run_with_update_id(1.5)
+        mock_create.assert_not_called()
+        mock_authz.assert_not_called()
+
+    def test_update_id_list_rejected(self):
+        (mock_create, mock_authz, _), upd = self._run_with_update_id([])
+        mock_create.assert_not_called()
+        mock_authz.assert_not_called()
+
+    def test_update_id_dict_rejected(self):
+        (mock_create, mock_authz, _), upd = self._run_with_update_id({})
+        mock_create.assert_not_called()
+        mock_authz.assert_not_called()
+
+    def test_update_id_tuple_rejected(self):
+        (mock_create, mock_authz, _), upd = self._run_with_update_id(())
+        mock_create.assert_not_called()
+        mock_authz.assert_not_called()
+
+    def test_update_id_plain_object_rejected(self):
+        (mock_create, mock_authz, _), upd = self._run_with_update_id(object())
+        mock_create.assert_not_called()
+        mock_authz.assert_not_called()
+
+    def test_update_id_poisoned_rejected_no_exception(self):
+        upd, _ = _make_update('/newbctask business_id=BIZ-001 title="X"', list(self._ARGS))
+        upd.update_id = _PoisonedIdentity()
+        mock_create, mock_authz, _ = self._run_handler(upd, args=list(self._ARGS))
+        mock_create.assert_not_called()
+        mock_authz.assert_not_called()
+        reply = self._sent_text(upd)
+        self.assertNotIn("STR-SENTINEL-MARKER", reply)
+
+    def test_update_id_positive_produces_tg_prefixed_key(self):
+        (mock_create, mock_authz, _), upd = self._run_with_update_id(4242)
+        mock_create.assert_called_once()
+        self.assertEqual(mock_create.call_args[1]["idempotency_key"], "tg-4242")
+
+    def test_update_id_exactly_one_reply_on_invalid(self):
+        (mock_create, mock_authz, _), upd = self._run_with_update_id(-1)
+        self.assertEqual(upd.message.reply_text.call_count, 1)
+
+    def test_update_id_not_required_when_caller_supplies_idempotency_key(self):
+        # §4/§6: a caller-supplied valid idempotency_key must not
+        # require update_id at all.
+        args = ["business_id=BIZ-001", 'title="X"', "idempotency_key=CALLER-KEY"]
+        upd, _ = _make_update("/newbctask ...", args)
+        upd.update_id = None  # malformed/unavailable — must not matter
+        mock_create, mock_authz, _ = self._run_handler(upd, args=args)
+        mock_create.assert_called_once()
+        self.assertEqual(mock_create.call_args[1]["idempotency_key"], "CALLER-KEY")
+
+    def test_update_id_required_only_when_idempotency_key_omitted(self):
+        upd, _ = _make_update('/newbctask business_id=BIZ-001 title="X"', list(self._ARGS))
+        upd.update_id = "not-an-int"
+        mock_create, mock_authz, _ = self._run_handler(upd, args=list(self._ARGS))
+        mock_create.assert_not_called()
 
 
 class TestTaskCreationMessageMapping(unittest.TestCase):
@@ -1852,17 +2747,17 @@ class TestNoRawExceptionExposure(unittest.TestCase):
 
         th = _fresh_th()
         commands_and_patches = [
-            ("newbctask_cmd", ("create_business_task",), '/newbctask business_id=BIZ-001 title="X"', ["business_id=BIZ-001", 'title="X"']),
             ("bctasks_cmd", ("task_manager.list_tasks",), "/bctasks", []),
             ("updatetask_cmd", ("transition_task_status",), "/updatetask task_id=TSK-001 status=ready", ["task_id=TSK-001", "status=ready"]),
             ("assigntask_cmd", ("assign_task",), "/assigntask task_id=TSK-001 role_id=ROLE-001", ["task_id=TSK-001", "role_id=ROLE-001"]),
             ("reassigntask_cmd", ("assign_task",), "/reassigntask task_id=TSK-001 role_id=ROLE-001", ["task_id=TSK-001", "role_id=ROLE-001"]),
-            # unassigntask_cmd and bctask_cmd are now authorized,
-            # secure-flow commands (canonical lookup + authorization sit
-            # ahead of any mutation/formatting) — their own raw-exception-
-            # secrecy coverage lives in TestUnassignTaskCommand and
-            # TestBcTaskCommand instead, with the finder/authorization
-            # properly mocked.
+            # unassigntask_cmd, bctask_cmd and newbctask_cmd are all
+            # authorized, secure-flow commands (canonical lookup and/or
+            # authorization sit ahead of any mutation/formatting) —
+            # their own raw-exception-secrecy coverage lives in
+            # TestUnassignTaskCommand, TestBcTaskCommand and
+            # TestNewBcTaskCommand instead, with the finder/
+            # authorization properly mocked.
         ]
         for cmd_name, targets, text, args_list in commands_and_patches:
             upd, ctx = _make_update(text, args_list)

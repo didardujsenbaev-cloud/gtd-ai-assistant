@@ -148,11 +148,21 @@ def validate_telegram_business_core_transport(update) -> dict:
     """
     Synchronous. valid=True means only: the Update shape is
     acceptable, effective_chat resolves, the chat type is private,
-    effective_user resolves, and effective_user.id exists. It does
-    NOT mean the Telegram user has a registered Business Core
-    identity, an active Employee, or any authorization — those are
-    only ever determined by authorize_telegram_business_core_request's
-    own Sheets-backed authorize_business_core_access call.
+    effective_user resolves, and effective_user.id is a genuine
+    positive int. It does NOT mean the Telegram user has a registered
+    Business Core identity, an active Employee, or any authorization —
+    those are only ever determined by
+    authorize_telegram_business_core_request's own Sheets-backed
+    authorize_business_core_access call.
+
+    Phase 18A.8-C1-F2: effective_user.id is strictly validated as
+    type(x) is int (bool excluded — bool is an int subclass in
+    Python) and x > 0 before any conversion. type() never invokes
+    __getattribute__/__str__/__repr__ on the value, so a malformed or
+    adversarial identity object can never escape this function as an
+    uncaught exception — it is treated identically to "user not
+    found" (same anti-enumeration code/message, never stringified or
+    logged).
     """
     chat_ctx = _resolve_chat_context(update)
     if not chat_ctx["ok"]:
@@ -177,9 +187,17 @@ def validate_telegram_business_core_transport(update) -> dict:
             "user_message_key": "identity_not_recognized" if ok else None,
         }
 
+    telegram_user_id = user_ctx["telegram_user_id"]
+    if type(telegram_user_id) is not int or telegram_user_id <= 0:
+        return {
+            "ok": True, "valid": False, "code": "TELEGRAM_USER_NOT_FOUND", "error": None, "retry_safe": True,
+            "telegram_user_id": None, "chat_type": chat_ctx["chat_type"], "is_private_chat": True,
+            "user_message_key": "identity_not_recognized",
+        }
+
     return {
         "ok": True, "valid": True, "code": None, "error": None, "retry_safe": True,
-        "telegram_user_id": str(user_ctx["telegram_user_id"]),
+        "telegram_user_id": str(telegram_user_id),
         "chat_type": chat_ctx["chat_type"], "is_private_chat": True,
         "user_message_key": None,
     }

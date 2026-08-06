@@ -473,9 +473,11 @@ class TestUnassignTaskPartialStateHardening(unittest.TestCase):
         # construct must update the expected `changed` set here to
         # name exactly that construct.
         #
-        # Phase 18A.8-B0 legitimately hardens create_task's exception
-        # contract (TASK_STORAGE_ERROR, no raw exception text) — the
-        # only approved changed construct this phase.
+        # Phase 18A.8-C1 does not touch task_manager.py at all (its
+        # scope is confined to telegram_handlers.py) — create_task's
+        # TASK_STORAGE_ERROR contract, hardened in Phase 18A.8-B0, is
+        # now part of HEAD itself, so the expected changed set is
+        # empty again this phase.
         import subprocess
 
         head_src = subprocess.run(
@@ -489,7 +491,7 @@ class TestUnassignTaskPartialStateHardening(unittest.TestCase):
         self.assertEqual(set(current) - set(head), set(), "task_manager.py: unapproved new top-level construct")
         self.assertEqual(set(head) - set(current), set(), "task_manager.py: a top-level construct was removed")
         changed = {k for k in head if head[k] != current[k]}
-        self.assertEqual(changed, {"function:create_task"}, "task_manager.py: only create_task may change this phase")
+        self.assertEqual(changed, set(), "task_manager.py: no construct may change this phase")
 
     _TASK_MANAGER_DUPLICATE_CASES = (
         (
@@ -1751,6 +1753,15 @@ _TELEGRAM_HANDLERS_APPROVED_TO_DIFFER = frozenset({
     "async_function:newbctask_cmd", "function:_task_creation_message",
 })
 
+# Phase 18A.8-C1-F0 removed all 6 top-level constants Phase 18A.8-C1
+# had introduced (newbctask_cmd's allowed-key/length-cap/date-regex/
+# uncertain-create-message values, and _task_creation_message's
+# output-bounding values) — every one of them is now function-local.
+# This phase's approved production scope adds zero new top-level
+# constructs, so this stays the empty set — not a permanent marker,
+# just accurately reflecting the current working tree.
+_TELEGRAM_HANDLERS_APPROVED_TO_ADD_THIS_PHASE = frozenset()
+
 # NOTE: there is deliberately no "_TELEGRAM_HANDLERS_APPROVED_TO_ADD"
 # constant. That concept named a specific already-committed function
 # (_task_list_lines) as a "pending addition relative to HEAD" — but
@@ -1866,19 +1877,17 @@ class TestTelegramHandlersTopLevelConstructGuard(unittest.TestCase):
     def test_no_unapproved_construct_added(self):
         # Durable version of the old "added must equal
         # _TELEGRAM_HANDLERS_APPROVED_TO_ADD" check. This phase
-        # (18A.8-B0) adds zero new top-level constructs to
-        # telegram_handlers.py — newbctask_cmd and _task_creation_message
-        # both already existed at HEAD and are only changed, not added.
-        # Unlike the retired constant, this assertion never names an
-        # already-merged construct, so it stays satisfiable on any
-        # clean checkout — it only needs updating when a future phase
-        # genuinely introduces a brand-new top-level construct here.
+        # (18A.8-C1) genuinely adds the 6 named constants above — no
+        # other new top-level construct is permitted.
         head_src = _git_show_head_telegram_handlers_py()
         current_src = (BUSINESS_CORE / "telegram_handlers.py").read_text(encoding="utf-8")
         head = _telegram_handlers_top_level_constructs(head_src)
         current = _telegram_handlers_top_level_constructs(current_src)
         added = set(current) - set(head)
-        self.assertEqual(added, set(), f"telegram_handlers.py: unexpected new construct(s): {sorted(added)}")
+        self.assertEqual(
+            added, _TELEGRAM_HANDLERS_APPROVED_TO_ADD_THIS_PHASE,
+            f"telegram_handlers.py: unexpected new construct(s): {sorted(added - _TELEGRAM_HANDLERS_APPROVED_TO_ADD_THIS_PHASE)}",
+        )
 
     def test_only_approved_construct_changed(self):
         head_src = _git_show_head_telegram_handlers_py()
@@ -1936,13 +1945,23 @@ class TestTelegramHandlersTopLevelConstructGuard(unittest.TestCase):
         # test_command_enforcement.py's test_mutation_entries_exact
         # and the Task-key-set guard in test_authorization_domain.py.
         import business_core.telegram_handlers as th
-        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 17)
+        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 18)
         self.assertIn("bctasks", th.COMMAND_ENFORCEMENT_MAP)
         self.assertEqual(
             th.COMMAND_ENFORCEMENT_MAP["bctasks"],
             {
                 "resource": "TASK", "action": "READ", "target_shape": "BUSINESS",
                 "operation_kind": "READ", "requires_fresh_reread": False,
+            },
+        )
+
+        # Phase 18A.8-C1: /newbctask re-enabled with TASK/CREATE.
+        self.assertIn("newbctask", th.COMMAND_ENFORCEMENT_MAP)
+        self.assertEqual(
+            th.COMMAND_ENFORCEMENT_MAP["newbctask"],
+            {
+                "resource": "TASK", "action": "CREATE", "target_shape": "BUSINESS",
+                "operation_kind": "MUTATION", "requires_fresh_reread": False,
             },
         )
 
@@ -2032,6 +2051,304 @@ class TestTaskListLinesConstructInvariants(unittest.TestCase):
             if name in _TELEGRAM_HANDLERS_KNOWN_TASK_FORMATTERS
         }
         self.assertEqual(present, _TELEGRAM_HANDLERS_KNOWN_TASK_FORMATTERS)
+
+
+class TestNewBcTaskCmdArchitectureGuards(unittest.TestCase):
+    """Phase 18A.8-C1: durable, git-history-independent source-shape
+    invariants for the re-enabled newbctask_cmd — proves the secure
+    flow's structure directly from current working-tree source."""
+
+    def _source(self) -> str:
+        import inspect
+        from business_core import telegram_handlers as th
+        return inspect.getsource(th.newbctask_cmd)
+
+    def _code_lines(self) -> list[str]:
+        """Source lines with full-line comments and the docstring body
+        excluded — so a call name mentioned in prose (e.g. explaining
+        why a check exists) never counts as an executable occurrence."""
+        import ast
+        src = self._source()
+        tree = ast.parse(src)
+        func = tree.body[0]
+        doc_end = 0
+        if (func.body and isinstance(func.body[0], ast.Expr)
+                and isinstance(func.body[0].value, ast.Constant) and isinstance(func.body[0].value.value, str)):
+            doc_end = func.body[0].end_lineno
+        lines = src.splitlines()
+        out = []
+        for i, line in enumerate(lines, start=1):
+            if i <= doc_end:
+                continue
+            if line.strip().startswith("#"):
+                continue
+            out.append(line)
+        return out
+
+    # ── Phase 18A.8-C1-F0: scope-reduction guards ──
+
+    def test_no_removed_constant_names_exist_at_module_level(self):
+        from business_core import telegram_handlers as th
+        for name in (
+            "_NEWBCTASK_ALLOWED_KEYS", "_NEWBCTASK_MAX_LENGTHS", "_NEWBCTASK_DATE_RE",
+            "_NEWBCTASK_UNCERTAIN_CREATE_MSG", "_TASK_CREATION_MSG_FIELD_MAX_LEN", "_TASK_CREATION_MSG_MAX_IDS",
+        ):
+            self.assertFalse(hasattr(th, name), f"{name} must not exist at module level")
+
+    def test_allowed_keys_is_function_local_not_module_level(self):
+        src = self._source()
+        self.assertIn("allowed_keys = {", src)
+
+    def test_max_lengths_is_function_local_with_exact_values(self):
+        import ast
+        tree = ast.parse(self._source())
+        func = tree.body[0]
+        max_lengths = None
+        for node in ast.walk(func):
+            if isinstance(node, ast.Assign) and any(
+                isinstance(t, ast.Name) and t.id == "max_lengths" for t in node.targets
+            ):
+                max_lengths = {k.value: v.value for k, v in zip(node.value.keys, node.value.values)}
+                break
+        self.assertIsNotNone(max_lengths, "max_lengths assignment not found")
+        self.assertEqual(max_lengths, {
+            "business_id": 64, "title": 300, "description": 4000, "priority": 32,
+            "due_date": 32, "source": 64, "idempotency_key": 128,
+            "client_id": 64, "object_id": 64, "service_id": 64, "roadmap_id": 64, "stage_id": 64,
+        })
+
+    def test_no_module_level_helper_added_for_newbctask(self):
+        # No replacement top-level construct of any kind — checked via
+        # the durable added==set() assertion above
+        # (_TELEGRAM_HANDLERS_APPROVED_TO_ADD_THIS_PHASE), reconfirmed
+        # here at the handler-source level: no local "def "/"class "
+        # nested inside newbctask_cmd either.
+        import ast
+        tree = ast.parse(self._source())
+        func = tree.body[0]
+        nested_defs = [n for n in ast.walk(func) if n is not func and isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))]
+        self.assertEqual(nested_defs, [])
+
+    def _mapper_source(self) -> str:
+        import inspect
+        from business_core import telegram_handlers as th
+        return inspect.getsource(th._task_creation_message)
+
+    def test_mapper_output_bounds_are_function_local_with_exact_values(self):
+        import ast
+        tree = ast.parse(self._mapper_source())
+        func = tree.body[0]
+        values = {}
+        for node in ast.walk(func):
+            if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+                if node.targets[0].id in ("field_max_len", "max_ids") and isinstance(node.value, ast.Constant):
+                    values[node.targets[0].id] = node.value.value
+        self.assertEqual(values.get("field_max_len"), 64)
+        self.assertEqual(values.get("max_ids"), 10)
+
+    def test_mapper_no_module_level_or_nested_helper_added(self):
+        import ast
+        tree = ast.parse(self._mapper_source())
+        func = tree.body[0]
+        nested_defs = [
+            n for n in ast.walk(func)
+            if n is not func and isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+        ]
+        # _g is the one pre-existing nested accessor (present since
+        # Phase 18A.8-B0) — no additional nested def/class is approved.
+        self.assertEqual([n.name for n in nested_defs if isinstance(n, ast.FunctionDef)], ["_g"])
+
+    def test_authorization_before_thread_offload(self):
+        src = self._source()
+        idx_authz = src.index("_authorize_or_reply(")
+        idx_thread = src.index("asyncio.to_thread(")
+        self.assertLess(idx_authz, idx_thread)
+
+    def test_exactly_one_authorize_call(self):
+        code = "\n".join(self._code_lines())
+        self.assertEqual(code.count("_authorize_or_reply("), 1)
+
+    def test_exactly_one_to_thread_call(self):
+        code = "\n".join(self._code_lines())
+        self.assertEqual(code.count("asyncio.to_thread("), 1)
+
+    def test_to_thread_targets_create_business_task(self):
+        src = self._source()
+        idx_thread = src.index("asyncio.to_thread(")
+        # The very next non-whitespace token after the opening call is
+        # the offloaded callable itself.
+        tail = src[idx_thread + len("asyncio.to_thread("):]
+        self.assertTrue(tail.lstrip().startswith("create_business_task,"))
+
+    def test_no_direct_create_business_task_call(self):
+        # The only executable-code appearance of "create_business_task("
+        # is the "from ... import create_business_task" line and the
+        # asyncio.to_thread(create_business_task, ...) offload itself —
+        # any other direct call would bypass the thread offload.
+        for line in self._code_lines():
+            stripped = line.strip()
+            if stripped.startswith("from business_core.business_builder import"):
+                continue
+            if "create_business_task," in stripped:
+                continue
+            self.assertNotIn("create_business_task(", stripped)
+
+    def test_no_loop_wraps_authorize_or_mutation_call(self):
+        # Not "zero loops anywhere" — the input-bounds validation loop
+        # (iterating _NEWBCTASK_ALLOWED_KEYS) is legitimate. The real
+        # invariant is that no loop node *contains* a call to
+        # _authorize_or_reply or asyncio.to_thread — i.e. no retry of
+        # authorization or the mutation itself.
+        import ast
+        tree = ast.parse(self._source())
+        func = tree.body[0]
+        for node in ast.walk(func):
+            if isinstance(node, (ast.For, ast.AsyncFor, ast.While)):
+                for inner in ast.walk(node):
+                    if isinstance(inner, ast.Call) and isinstance(inner.func, ast.Attribute):
+                        self.assertNotEqual(inner.func.attr, "to_thread")
+                    if isinstance(inner, ast.Call) and isinstance(inner.func, ast.Name):
+                        self.assertNotEqual(inner.func.id, "_authorize_or_reply")
+
+    def test_no_gtd_or_assignment_logic(self):
+        src = self._source()
+        for forbidden in (
+            "inbox_processor", "project_planner", "calendar_sync",
+            "create_task_assignment", "assign_task", "responsible_role_id=", "assignee_person_id=",
+        ):
+            self.assertNotIn(forbidden, src)
+
+    def test_no_raw_exception_interpolation(self):
+        src = self._source()
+        self.assertNotIn("{exc}", src)
+        self.assertNotIn("{e}", src)
+        self.assertNotIn("str(exc)", src)
+        self.assertNotIn("repr(exc)", src)
+
+    def test_result_shape_validated_before_mapper(self):
+        src = self._source()
+        idx_isinstance = src.index("isinstance(result, dict)")
+        idx_mapper = src.index("_task_creation_message(result)")
+        self.assertLess(idx_isinstance, idx_mapper)
+
+    def test_created_by_never_reads_args_dict(self):
+        # created_by must come only from update.effective_user.id — an
+        # allowlist violation elsewhere (§4) already rejects a caller-
+        # supplied created_by key, but this proves the assignment site
+        # itself never reads it from args/values either.
+        src = self._source()
+        self.assertNotIn('values["created_by"]', src)
+        self.assertNotIn('args.get("created_by"', src)
+        self.assertIn("effective_user", src)
+
+    def test_no_business_lookup_before_authorization(self):
+        src = self._source()
+        idx_authz = src.index("_authorize_or_reply(")
+        preamble = src[:idx_authz]
+        for forbidden in ("find_row_by_id", "find_person_by_id", "find_object_by_id",
+                           "find_service_by_id", "find_stage_by_id", "find_roadmap_by_id",
+                           "find_tasks_by_idempotency_key"):
+            self.assertNotIn(forbidden, preamble)
+
+    # ── Phase 18A.8-C1-F1: identity-hardening guards ──
+
+    def _identity_check_nodes(self):
+        """AST If-node whose test compares `type(<name>) is not int`
+        (or `is int` negated) for the given variable name — the exact
+        durable shape this phase's user_id/update_id guards must have,
+        found via structural AST matching rather than a fragile
+        source substring."""
+        import ast
+        tree = ast.parse(self._source())
+        func = tree.body[0]
+        matches = {}
+        for node in ast.walk(func):
+            if not isinstance(node, ast.If):
+                continue
+            for sub in ast.walk(node.test):
+                if isinstance(sub, ast.Compare) and isinstance(sub.left, ast.Call):
+                    call = sub.left
+                    if isinstance(call.func, ast.Name) and call.func.id == "type" and len(call.args) == 1 and isinstance(call.args[0], ast.Name):
+                        var_name = call.args[0].id
+                        is_not_op = any(isinstance(op, ast.IsNot) for op in sub.ops)
+                        if is_not_op:
+                            matches[var_name] = node
+        return matches
+
+    def _str_call_linenos(self, var_name):
+        """Line numbers of executable str(<var_name>) call expressions
+        only — AST-based, so a comment/docstring merely mentioning the
+        same text never counts."""
+        import ast
+        tree = ast.parse(self._source())
+        func = tree.body[0]
+        linenos = []
+        for node in ast.walk(func):
+            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "str"
+                    and len(node.args) == 1 and isinstance(node.args[0], ast.Name) and node.args[0].id == var_name):
+                linenos.append(node.lineno)
+        return linenos
+
+    def _fstring_update_id_linenos(self):
+        """Line numbers of executable f"tg-{update_id}" JoinedStr
+        expressions only — AST-based."""
+        import ast
+        tree = ast.parse(self._source())
+        func = tree.body[0]
+        linenos = []
+        for node in ast.walk(func):
+            if isinstance(node, ast.JoinedStr):
+                for value in node.values:
+                    if isinstance(value, ast.FormattedValue) and isinstance(value.value, ast.Name) and value.value.id == "update_id":
+                        linenos.append(node.lineno)
+        return linenos
+
+    def test_user_id_has_exact_type_is_int_guard_before_str(self):
+        matches = self._identity_check_nodes()
+        self.assertIn("user_id", matches, "no `type(user_id) is not int` guard found")
+        node = matches["user_id"]
+        str_linenos = self._str_call_linenos("user_id")
+        self.assertEqual(len(str_linenos), 1, "expected exactly one str(user_id) call")
+        self.assertGreater(str_linenos[0], node.end_lineno, "str(user_id) must execute strictly after the type(x) is not int guard")
+
+    def test_update_id_has_exact_type_is_int_guard_before_interpolation(self):
+        matches = self._identity_check_nodes()
+        self.assertIn("update_id", matches, "no `type(update_id) is not int` guard found")
+        node = matches["update_id"]
+        fstring_linenos = self._fstring_update_id_linenos()
+        self.assertEqual(len(fstring_linenos), 1, 'expected exactly one f"tg-{update_id}" expression')
+        self.assertGreater(fstring_linenos[0], node.end_lineno, 'f"tg-{update_id}" must execute strictly after the type(x) is not int guard')
+
+    def test_user_id_guard_also_rejects_non_positive(self):
+        matches = self._identity_check_nodes()
+        node = matches["user_id"]
+        src_seg = "\n".join(self._source().splitlines()[node.lineno - 1:node.end_lineno])
+        self.assertIn("<= 0", src_seg)
+
+    def test_update_id_guard_also_rejects_non_positive(self):
+        matches = self._identity_check_nodes()
+        node = matches["update_id"]
+        src_seg = "\n".join(self._source().splitlines()[node.lineno - 1:node.end_lineno])
+        self.assertIn("<= 0", src_seg)
+
+    def test_no_isinstance_int_used_for_identity_checks(self):
+        # isinstance(x, int) would silently accept bool (bool is an
+        # int subclass) — the durable invariant is that identity
+        # checks use type(x) is/is not int, never isinstance for this
+        # specific purpose.
+        src = self._source()
+        self.assertNotIn("isinstance(user_id, int)", src)
+        self.assertNotIn("isinstance(update_id, int)", src)
+
+    def test_no_bare_str_call_on_unchecked_identity_values(self):
+        # Belt-and-braces textual proof alongside the AST-based
+        # ordering tests above: str(user_id) and the tg-{update_id}
+        # f-string each appear exactly once in the whole function body
+        # — the one call site, already proven above to sit after the
+        # respective type(x) is not int guard.
+        code = "\n".join(self._code_lines())
+        self.assertEqual(code.count("str(user_id)"), 1)
+        self.assertEqual(code.count('f"tg-{update_id}"'), 1)
 
 
 class TestTelegramHandlersConstructGuardHelperUnit(unittest.TestCase):
@@ -2241,6 +2558,137 @@ class TestTelegramHandlersConstructGuardHelperUnit(unittest.TestCase):
         duplicate_src = self._BASELINE + "\nclass Foo:\n    x = 1\n"
         with self.assertRaises(ValueError):
             _telegram_handlers_top_level_constructs(duplicate_src)
+
+
+# ─────────────────────────────────────────────────────────────
+# Phase 18A.8-C1-F2: shared transport identity-hardening guards for
+# business_core/telegram_authorization.py's
+# validate_telegram_business_core_transport — durable, AST-based
+# where practical, proving the exact structural shape rather than a
+# fragile substring count.
+# ─────────────────────────────────────────────────────────────
+
+def _git_show_head_telegram_authorization_py() -> str:
+    import subprocess
+    result = subprocess.run(
+        ["git", "show", "HEAD:business_core/telegram_authorization.py"],
+        cwd=WORKSPACE, capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        raise AssertionError(f"git show HEAD:business_core/telegram_authorization.py failed: {result.stderr}")
+    return result.stdout
+
+
+class TestTelegramAuthorizationTransportIdentityGuards(unittest.TestCase):
+
+    def _source(self) -> str:
+        import inspect
+        from business_core import telegram_authorization as ta
+        return inspect.getsource(ta.validate_telegram_business_core_transport)
+
+    def test_ast_scope_exact(self):
+        # Reuses the same generic top-level-construct collector shape
+        # as the business_builder.py/telegram_handlers.py guards above
+        # (duplicated here rather than imported, matching this file's
+        # own established per-module-collector convention).
+        import ast
+        def constructs(src):
+            tree = ast.parse(src)
+            lines = src.splitlines(keepends=True)
+            out = {}
+            for node in tree.body:
+                if isinstance(node, ast.FunctionDef):
+                    key = f"function:{node.name}"
+                elif isinstance(node, ast.AsyncFunctionDef):
+                    key = f"async_function:{node.name}"
+                elif isinstance(node, ast.ClassDef):
+                    key = f"class:{node.name}"
+                elif isinstance(node, ast.Assign):
+                    names = [t.id for t in node.targets if isinstance(t, ast.Name)]
+                    key = "assignment:" + ",".join(sorted(names))
+                elif isinstance(node, ast.Import):
+                    key = "import:" + ",".join(sorted(a.name for a in node.names))
+                elif isinstance(node, ast.ImportFrom):
+                    key = f"import_from:{node.module}:" + ",".join(sorted(a.name for a in node.names))
+                else:
+                    continue
+                if key in out:
+                    raise ValueError(f"duplicate top-level construct identifier: {key!r}")
+                out[key] = "".join(lines[node.lineno - 1:node.end_lineno])
+            return out
+
+        head = constructs(_git_show_head_telegram_authorization_py())
+        current = constructs(open(BUSINESS_CORE / "telegram_authorization.py", encoding="utf-8").read())
+        removed = set(head) - set(current)
+        added = set(current) - set(head)
+        changed = {k for k in head if k in current and head[k] != current[k]}
+        self.assertEqual(removed, set())
+        self.assertEqual(added, set())
+        self.assertEqual(changed, {"function:validate_telegram_business_core_transport"})
+
+    def test_telegram_handlers_unchanged_this_correction(self):
+        # This correction's production scope is confined to
+        # telegram_authorization.py alone — telegram_handlers.py must
+        # remain at exactly the cumulative scope already proven by
+        # TestTelegramHandlersTopLevelConstructGuard above (unchanged
+        # by this specific correction).
+        import business_core.telegram_handlers as th
+        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 18)
+        self.assertIn("newbctask", th.COMMAND_ENFORCEMENT_MAP)
+
+    def test_role_matrix_unchanged(self):
+        from business_core import authorization as az
+        actions = az.ROLE_RESOURCE_ACTION_MATRIX.get("COORDINATOR", {}).get("TASK", frozenset())
+        self.assertIn("CREATE", actions)
+        actions_doc = az.ROLE_RESOURCE_ACTION_MATRIX.get("DOCUMENT_SPECIALIST", {}).get("TASK", frozenset())
+        self.assertNotIn("CREATE", actions_doc)
+
+    def test_strict_type_check_precedes_str_conversion(self):
+        import ast
+        tree = ast.parse(self._source())
+        str_call_linenos = []
+        guard_end_lineno = None
+        for node in ast.walk(tree):
+            if isinstance(node, ast.If):
+                for sub in ast.walk(node.test):
+                    if (isinstance(sub, ast.Compare) and isinstance(sub.left, ast.Call)
+                            and isinstance(sub.left.func, ast.Name) and sub.left.func.id == "type"
+                            and len(sub.left.args) == 1 and isinstance(sub.left.args[0], ast.Name)
+                            and sub.left.args[0].id == "telegram_user_id"
+                            and any(isinstance(op, ast.IsNot) for op in sub.ops)):
+                        guard_end_lineno = node.end_lineno
+            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "str"
+                    and len(node.args) == 1 and isinstance(node.args[0], ast.Name) and node.args[0].id == "telegram_user_id"):
+                str_call_linenos.append(node.lineno)
+        self.assertIsNotNone(guard_end_lineno, "no `type(telegram_user_id) is not int` guard found")
+        self.assertEqual(len(str_call_linenos), 1, "expected exactly one str(telegram_user_id) call")
+        self.assertGreater(str_call_linenos[0], guard_end_lineno)
+
+    def test_bool_rejected_by_source_shape(self):
+        src = self._source()
+        self.assertIn("type(telegram_user_id) is not int", src)
+        self.assertNotIn("isinstance(telegram_user_id, int)", src)
+
+    def test_no_unchecked_str_or_repr_of_telegram_user_id(self):
+        src = self._source()
+        self.assertNotIn("repr(telegram_user_id)", src)
+
+    def test_malformed_identity_returns_before_authorization(self):
+        # This function never calls authorization itself (proven
+        # generally by test_zero_authorization_domain_calls in
+        # test_telegram_authorization.py) — durable structural proof
+        # here that no Call node anywhere in the function targets
+        # either authorization-adjacent name (AST-based, so this
+        # function's own docstring prose mentioning those names is
+        # never mistaken for an actual call).
+        import ast
+        tree = ast.parse(self._source())
+        called_names = {
+            node.func.id for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        }
+        self.assertNotIn("authorize_business_core_access", called_names)
+        self.assertNotIn("authorize_telegram_business_core_request", called_names)
 
 
 if __name__ == "__main__":

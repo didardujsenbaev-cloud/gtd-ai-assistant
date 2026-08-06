@@ -609,5 +609,139 @@ class TestValidateTelegramBusinessCoreTransport(unittest.TestCase):
         self.assertIn("_resolve_telegram_user_id(", src)
 
 
+class _PoisonedTransportIdentity:
+    """Object whose __str__/__repr__ raise — proves type(x) is int
+    rejects it without ever invoking either dunder (type() touches
+    neither __getattribute__ nor __str__/__repr__ on the instance)."""
+    def __str__(self):
+        raise RuntimeError("TRANSPORT-STR-SENTINEL")
+
+    def __repr__(self):
+        raise RuntimeError("TRANSPORT-REPR-SENTINEL")
+
+    def __getattribute__(self, name):
+        raise RuntimeError("TRANSPORT-GETATTRIBUTE-SENTINEL")
+
+
+def _update_with_raw_user_id(user_id):
+    return SimpleNamespace(
+        effective_chat=SimpleNamespace(type="private"),
+        effective_user=SimpleNamespace(id=user_id),
+    )
+
+
+class TestValidateTelegramBusinessCoreTransportIdentityHardening(unittest.TestCase):
+    """Phase 18A.8-C1-F2: strict type(x) is int + positivity validation
+    for effective_user.id inside validate_telegram_business_core_transport
+    itself — the shared transport preflight every Business Core Telegram
+    command (bctask/bctasks/unassigntask/newbctask/...) calls before
+    authorization. Malformed identity must never crash, never be
+    stringified, and must map to the existing TELEGRAM_USER_NOT_FOUND /
+    identity_not_recognized anti-enumeration contract."""
+
+    def _assert_rejected(self, user_id):
+        r = _ta().validate_telegram_business_core_transport(_update_with_raw_user_id(user_id))
+        self.assertTrue(r["ok"])
+        self.assertFalse(r["valid"])
+        self.assertEqual(r["code"], "TELEGRAM_USER_NOT_FOUND")
+        self.assertEqual(r["user_message_key"], "identity_not_recognized")
+        self.assertIsNone(r["telegram_user_id"])
+        self.assertTrue(r["retry_safe"])
+        return r
+
+    def test_positive_int_accepted(self):
+        r = _ta().validate_telegram_business_core_transport(_update_with_raw_user_id(111))
+        self.assertTrue(r["valid"])
+        self.assertEqual(r["telegram_user_id"], "111")
+
+    def test_large_positive_int_accepted(self):
+        r = _ta().validate_telegram_business_core_transport(_update_with_raw_user_id(9999999999))
+        self.assertTrue(r["valid"])
+        self.assertEqual(r["telegram_user_id"], "9999999999")
+
+    def test_none_rejected(self):
+        # None already routes through _resolve_telegram_user_id's own
+        # ok=False branch — confirmed still TELEGRAM_USER_NOT_FOUND.
+        r = _ta().validate_telegram_business_core_transport(_update_with_raw_user_id(None))
+        self.assertEqual(r["code"], "TELEGRAM_USER_NOT_FOUND")
+        self.assertFalse(r["valid"])
+
+    def test_missing_id_attribute_rejected(self):
+        upd = SimpleNamespace(effective_chat=SimpleNamespace(type="private"), effective_user=SimpleNamespace())
+        r = _ta().validate_telegram_business_core_transport(upd)
+        self.assertEqual(r["code"], "TELEGRAM_USER_NOT_FOUND")
+
+    def test_blank_string_rejected(self):
+        self._assert_rejected("")
+
+    def test_numeric_string_rejected(self):
+        self._assert_rejected("123")
+
+    def test_zero_rejected(self):
+        self._assert_rejected(0)
+
+    def test_negative_rejected(self):
+        self._assert_rejected(-1)
+
+    def test_bool_true_rejected(self):
+        self._assert_rejected(True)
+
+    def test_bool_false_rejected(self):
+        self._assert_rejected(False)
+
+    def test_float_rejected(self):
+        self._assert_rejected(1.0)
+
+    def test_list_rejected(self):
+        self._assert_rejected([])
+
+    def test_dict_rejected(self):
+        self._assert_rejected({})
+
+    def test_tuple_rejected(self):
+        self._assert_rejected(())
+
+    def test_plain_object_rejected(self):
+        self._assert_rejected(object())
+
+    def test_poisoned_str_rejected_without_invocation(self):
+        r = self._assert_rejected(_PoisonedTransportIdentity())
+        self.assertNotIn("TRANSPORT-STR-SENTINEL", str(r))
+
+    def test_poisoned_repr_rejected_without_invocation(self):
+        r = self._assert_rejected(_PoisonedTransportIdentity())
+        # repr(r) is safe to call here — r is a plain dict of plain
+        # values (None/str/bool), not the poisoned object itself.
+        self.assertNotIn("TRANSPORT-REPR-SENTINEL", repr(r))
+
+    def test_raising_getattribute_does_not_escape(self):
+        # type(x) is int is evaluated via a C-level slot check, not an
+        # attribute lookup on the instance, so even __getattribute__
+        # itself raising unconditionally cannot escape here.
+        try:
+            r = self._assert_rejected(_PoisonedTransportIdentity())
+        except Exception as e:
+            self.fail(f"exception escaped validate_telegram_business_core_transport: {type(e).__name__}: {e}")
+
+    def test_canonical_actor_unchanged_for_valid_input(self):
+        r_before = _ta().validate_telegram_business_core_transport(_update_with_raw_user_id(555))
+        r_after = _ta().validate_telegram_business_core_transport(_update_with_raw_user_id(555))
+        self.assertEqual(r_before["telegram_user_id"], r_after["telegram_user_id"])
+        self.assertEqual(r_before["telegram_user_id"], "555")
+
+    def test_authorization_not_reached_on_malformed_identity(self):
+        with patch("business_core.telegram_authorization.authorize_business_core_access") as mock_domain:
+            self._assert_rejected(-5)
+        mock_domain.assert_not_called()
+
+    def test_fixed_result_shape_on_malformed_identity(self):
+        r = self._assert_rejected("bad")
+        self.assertEqual(
+            set(r.keys()),
+            {"ok", "valid", "code", "error", "retry_safe", "telegram_user_id", "chat_type", "is_private_chat", "user_message_key"},
+        )
+        self.assertIsNone(r["error"])
+
+
 if __name__ == "__main__":
     unittest.main()

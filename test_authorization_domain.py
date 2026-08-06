@@ -1224,39 +1224,44 @@ class TestTaskCrossLayerIsolation(unittest.TestCase):
     # test_task_architecture_guards.py's dedicated top-level construct
     # guard instead.
 
-    def test_resource_task_call_confined_to_unassigntask_bctask_and_bctasks_handlers(self):
-        # bctasks_cmd is now a third, independent resource="TASK"
-        # authorization call site (TASK/READ, business-scoped list),
-        # alongside bctask_cmd's single-record TASK/READ call and
-        # unassigntask_cmd's TASK/ASSIGN call. No other function may
-        # reference resource="TASK".
+    def test_resource_task_call_confined_to_unassigntask_bctask_bctasks_and_newbctask_handlers(self):
+        # newbctask_cmd is now a fourth, independent resource="TASK"
+        # authorization call site (TASK/CREATE, business-scoped),
+        # alongside bctasks_cmd's TASK/READ list call, bctask_cmd's
+        # single-record TASK/READ call and unassigntask_cmd's
+        # TASK/ASSIGN call. No other function may reference
+        # resource="TASK".
         with open("business_core/telegram_handlers.py", encoding="utf-8") as f:
             content = f.read()
-        self.assertEqual(content.count('resource="TASK"'), 3)
-        for fn_name in ("unassigntask_cmd", "bctask_cmd", "bctasks_cmd"):
+        self.assertEqual(content.count('resource="TASK"'), 4)
+        for fn_name in ("unassigntask_cmd", "bctask_cmd", "bctasks_cmd", "newbctask_cmd"):
             start = content.index(f"async def {fn_name}(")
             candidates = [i for i in (content.find("\nasync def ", start + 10), content.find("\ndef ", start + 10)) if i != -1]
             end = min(candidates) if candidates else len(content)
             self.assertIn('resource="TASK"', content[start:end])
 
-    def test_command_enforcement_map_size_seventeen(self):
+    def test_command_enforcement_map_size_eighteen(self):
         from business_core import telegram_handlers as th
-        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 17)
+        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 18)
 
-    def test_command_enforcement_map_task_keys_unassigntask_bctask_and_bctasks(self):
-        # bctasks (business-scoped TASK/READ list) joins the existing
-        # unassigntask (TASK/ASSIGN) and bctask (TASK/READ) keys.
+    def test_command_enforcement_map_task_keys_unassigntask_bctask_bctasks_and_newbctask(self):
+        # newbctask (business-scoped TASK/CREATE) joins the existing
+        # unassigntask (TASK/ASSIGN), bctask (TASK/READ) and bctasks
+        # (TASK/READ) keys.
         from business_core import telegram_handlers as th
         task_keys = {key for key in th.COMMAND_ENFORCEMENT_MAP if "task" in key.lower()}
-        self.assertEqual(task_keys, {"unassigntask", "bctask", "bctasks"})
+        self.assertEqual(task_keys, {"unassigntask", "bctask", "bctasks", "newbctask"})
 
     def test_telegram_authorization_zero_diff(self):
-        import subprocess
-        result = subprocess.run(
-            ["git", "diff", "--name-only", "HEAD", "--", "business_core/telegram_authorization.py"],
-            capture_output=True, text=True, cwd=".",
-        )
-        self.assertEqual(result.stdout.strip(), "")
+        # Superseded as a whole-file zero-diff check by Phase
+        # 18A.8-C1-F2, which legitimately hardens
+        # validate_telegram_business_core_transport's identity
+        # validation. Scope protection for this file is now carried by
+        # TestTelegramAuthorizationTransportIdentityGuards.test_ast_scope_exact
+        # in test_task_architecture_guards.py, which is construct-
+        # identity based rather than whole-file-diff based and names
+        # exactly that one approved construct.
+        self.skipTest("superseded by TestTelegramAuthorizationTransportIdentityGuards.test_ast_scope_exact")
 
     def test_identity_manager_zero_diff(self):
         import subprocess

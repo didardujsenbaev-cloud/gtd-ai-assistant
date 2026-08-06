@@ -131,6 +131,10 @@ COMMAND_ENFORCEMENT_MAP = {
         "resource": "TASK", "action": "READ", "target_shape": "BUSINESS",
         "operation_kind": "READ", "requires_fresh_reread": False,
     },
+    "newbctask": {
+        "resource": "TASK", "action": "CREATE", "target_shape": "BUSINESS",
+        "operation_kind": "MUTATION", "requires_fresh_reread": False,
+    },
 }
 
 _BC_ENFORCEMENT_NOT_FOUND_OR_DENIED_MSG = "Запись недоступна или не найдена."
@@ -15849,13 +15853,29 @@ def _task_creation_message(result: dict) -> str:
     malformed `result` (wrong type, missing keys, poisoned values)
     degrades to a fixed safe message instead of raising or rendering
     the raw input.
+
+    Phase 18A.8-C1 §16: field/list output-bounding is enforced
+    locally (field_max_len/max_ids below) — newbctask_cmd now caps
+    business_id at 64 chars and task_id is always system-generated
+    (short, sequential) in the real create_task()/create_business_task()
+    contract, so these bounds exist purely as a second, independent
+    defense so an adversarial/malformed result dict (however
+    constructed) can never grow the rendered reply past one
+    _safe_send chunk.
     """
     if not isinstance(result, dict):
         return "❌ Ошибка при создании Task."
 
+    field_max_len = 64
+    max_ids = 10
+
     def _g(key: str, default: str = "") -> str:
         value = result.get(key, default)
-        return value if isinstance(value, str) else default
+        if not isinstance(value, str):
+            return default
+        if len(value) > field_max_len:
+            return value[:field_max_len] + "…"
+        return value
 
     code = _g("code")
 
@@ -15898,7 +15918,10 @@ def _task_creation_message(result: dict) -> str:
     if code == "MULTIPLE_TASK_IDEMPOTENCY_MATCHES":
         raw_ids = result.get("conflicting_task_ids", ())
         id_list = raw_ids if isinstance(raw_ids, (tuple, list)) else ()
-        safe_ids = [t for t in id_list if isinstance(t, str)]
+        safe_ids = [
+            (t[:field_max_len] + "…") if len(t) > field_max_len else t
+            for t in id_list if isinstance(t, str)
+        ][:max_ids]
         ids = ", ".join(f"`{t}`" for t in safe_ids) or "—"
         return "\n".join([
             "⚠️ Обнаружен конфликт целостности данных",
@@ -16190,16 +16213,23 @@ def _task_detail_lines(task) -> list[str]:
 
 async def newbctask_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    /newbctask — temporarily disabled, fails closed before any parsing
-    or storage access.
+    /newbctask business_id=BIZ-001 title="..." [description=...]
+               [priority=...] [due_date=YYYY-MM-DD] [source=...]
+               [idempotency_key=...] [client_id=...] [object_id=...]
+               [service_id=...] [roadmap_id=...] [stage_id=...]
 
-    TASK/CREATE authorization does not exist yet for this command, and
-    the underlying create_business_task()/create_task() ownership and
-    error contracts were only just hardened — this command remains
-    fail-closed until a dedicated authorization phase adds the
-    TASK/CREATE gate and re-enables it. No argument is parsed, no
-    storage helper is imported or called, and no Task is written on
-    this path.
+    Phase 18A.8-C1: TASK/CREATE, target_shape=BUSINESS, MUTATION,
+    requires_fresh_reread=False. business_id is the caller-requested
+    authorization scope (there is no pre-existing Task row to derive
+    it from, unlike a single-record mutation) — it is validated and
+    bounded first, then authorized, and only that exact value is ever
+    passed to storage. No positional arguments, no unknown keys, and
+    no caller-supplied created_by/status/task_id are accepted. The
+    entire create_business_task() orchestration call runs once, off
+    the event loop; if it raises after already having reached its own
+    storage layer, the reply does not claim success or invite an
+    immediate identical retry, since the write may have completed
+    despite the exception surfacing here.
     """
     if not _is_bc_enabled():
         await _reply(update, _bc_disabled_msg(), parse_mode=None)
@@ -16208,7 +16238,143 @@ async def newbctask_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not await _validate_bc_transport_or_reply(update):
         return
 
-    await _reply(update, "❌ Создание Business Task временно недоступно.", parse_mode=None)
+    allowed_keys = {
+        "business_id", "title", "description", "priority", "due_date", "source",
+        "idempotency_key", "client_id", "object_id", "service_id", "roadmap_id", "stage_id",
+    }
+    max_lengths = {
+        "business_id": 64, "title": 300, "description": 4000, "priority": 32,
+        "due_date": 32, "source": 64, "idempotency_key": 128,
+        "client_id": 64, "object_id": 64, "service_id": 64, "roadmap_id": 64, "stage_id": 64,
+    }
+
+    raw = " ".join(context.args or [])
+    args = _parse_kv_args(raw)
+
+    if not set(args.keys()) <= allowed_keys:
+        await _reply(
+            update,
+            "❌ /newbctask принимает только: " + ", ".join(sorted(allowed_keys)) + ".",
+            parse_mode=None,
+        )
+        return
+
+    values: dict[str, str] = {}
+    for key in allowed_keys:
+        raw_value = args.get(key, "")
+        if not isinstance(raw_value, str):
+            await _reply(update, "❌ Некорректные аргументы /newbctask.", parse_mode=None)
+            return
+        value = raw_value.strip()
+        if len(value) > max_lengths[key]:
+            await _reply(update, "❌ Слишком длинное значение одного из аргументов /newbctask.", parse_mode=None)
+            return
+        values[key] = value
+
+    business_id = values["business_id"]
+    title = values["title"]
+    if not business_id or not title:
+        await _reply(
+            update,
+            "❌ Укажи business_id и title.\n\nПример:\n"
+            '`/newbctask business_id=BIZ-001 title="Подготовить документы"`',
+            parse_mode=None,
+        )
+        return
+
+    due_date = values["due_date"]
+    if due_date and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", due_date):
+        await _reply(update, "❌ due_date должен быть в формате YYYY-MM-DD.", parse_mode=None)
+        return
+
+    source = values["source"] or "telegram"
+
+    idempotency_key = values["idempotency_key"]
+    if not idempotency_key:
+        # type(x) is int (not isinstance) deliberately excludes bool —
+        # bool is a subclass of int in Python, so isinstance(True, int)
+        # is True; a Telegram update_id must be a genuine positive int,
+        # never a bool. type() never invokes __getattribute__/__str__/
+        # __repr__ on the value, so this check alone is already safe
+        # against a poisoned/adversarial object.
+        update_id = getattr(update, "update_id", None)
+        if type(update_id) is not int or update_id <= 0:
+            await _reply(update, _BC_ENFORCEMENT_TEMPORARILY_UNAVAILABLE_MSG, parse_mode=None)
+            return
+        idempotency_key = f"tg-{update_id}"
+
+    # created_by identity (§12/F1): the shared _authorize_or_reply()
+    # wrapper (and the lower adapter it alone calls) only exposes a
+    # bool to callers — it does not surface the canonical
+    # telegram_actor identity authorization resolves internally, and
+    # widening that shared contract is out of this phase's approved,
+    # narrow scope (it is used by every other secure mutation
+    # command). The next-best stable, non-caller-overridable identity
+    # already used by this exact command's own pre-hardening design is
+    # the numeric Telegram user ID — never a caller-supplied string.
+    #
+    # Validated here, before authorization: the existing shared
+    # transport-validation layer (_validate_bc_transport_or_reply)
+    # only proves effective_user.id is non-None, not that it is a
+    # genuine positive int — so this handler cannot rely on it and
+    # must not spend an authorization call on a malformed actor state.
+    # Exactly the same type(x) is int (bool excluded) + positivity
+    # check as update_id above — str(user_id) below only ever runs
+    # once user_id is already proven to be a normal positive int, so
+    # no try/except is required around it.
+    effective_user = getattr(update, "effective_user", None)
+    user_id = getattr(effective_user, "id", None) if effective_user is not None else None
+    if type(user_id) is not int or user_id <= 0:
+        await _reply(update, _BC_ENFORCEMENT_TEMPORARILY_UNAVAILABLE_MSG, parse_mode=None)
+        return
+    created_by = str(user_id)
+
+    if not await _authorize_or_reply(
+        update, resource="TASK", action="CREATE", business_id=business_id,
+    ):
+        return
+
+    from business_core.business_builder import create_business_task
+
+    try:
+        result = await asyncio.to_thread(
+            create_business_task,
+            business_id, title,
+            description=values["description"],
+            priority=values["priority"],
+            due_date=due_date,
+            source=source,
+            idempotency_key=idempotency_key,
+            client_id=values["client_id"],
+            object_id=values["object_id"],
+            service_id=values["service_id"],
+            roadmap_id=values["roadmap_id"],
+            stage_id=values["stage_id"],
+            created_by=created_by,
+        )
+    except Exception:
+        # Fixed literal only — no exception interpolation. The
+        # underlying write may have already succeeded before this
+        # exception surfaced, so the reply must not claim failure
+        # outright or invite an automatic duplicate attempt.
+        log.error("newbctask_cmd creation call failure")
+        await _reply(
+            update,
+            "❌ Не удалось подтвердить создание Task. Проверьте список Tasks перед повторной попыткой.",
+            parse_mode=None,
+        )
+        return
+
+    if not isinstance(result, dict):
+        # A canonical orchestration function is documented to return
+        # dict — any other shape is malformed/unusable and fails
+        # closed here, before it ever reaches the mapper, without
+        # stringifying or logging the raw value.
+        log.error("newbctask_cmd malformed creation result")
+        await _reply(update, "❌ Ошибка при создании Task.", parse_mode=None)
+        return
+
+    await _reply(update, _task_creation_message(result), parse_mode=None)
 
 
 def _task_list_lines(tasks, business_id) -> list[str]:

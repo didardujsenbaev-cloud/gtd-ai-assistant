@@ -194,6 +194,14 @@ _EXPECTED_MUTATION_ENTRY = {
         "resource": "TASK", "action": "READ", "target_shape": "BUSINESS",
         "operation_kind": "READ", "requires_fresh_reread": False,
     },
+    # Phase 18A.8-C1: /newbctask re-enabled with TASK/CREATE. No
+    # mutation_side_effect_class/idempotency_class keys — matches the
+    # exact 5-key shape specified by that phase's instruction (unlike
+    # the other MUTATION entries above, which predate that constraint).
+    "newbctask": {
+        "resource": "TASK", "action": "CREATE", "target_shape": "BUSINESS",
+        "operation_kind": "MUTATION", "requires_fresh_reread": False,
+    },
 }
 
 _NON_ENFORCED_SAMPLE_HANDLERS = [
@@ -227,9 +235,9 @@ class TestEnforcementMap(unittest.TestCase):
             with self.subTest(command=key):
                 self.assertEqual(th.COMMAND_ENFORCEMENT_MAP[key], val)
 
-    def test_no_eighteenth_command_in_map(self):
-        # bctasks added the 17th entry; no 18th exists.
-        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 17)
+    def test_no_nineteenth_command_in_map(self):
+        # newbctask added the 18th entry; no 19th exists.
+        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 18)
 
     def test_updatelead_not_in_map(self):
         self.assertNotIn("updatelead", th.COMMAND_ENFORCEMENT_MAP)
@@ -530,10 +538,10 @@ class TestPhase17E2A4H1OfferHardeningScope(unittest.TestCase):
         # Phase 17E-2A6-H1 itself added no map entry. Phase
         # 17E-2A6-AUTH-B1 added failpayment; Phase 17E-2A6-AUTH-B2
         # added confirmpayment and reversepayment. unassigntask, bctask,
-        # and bctasks were each added later, in their own Task
-        # read/write authorization phases — no other entry beyond
-        # these six.
-        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 17)
+        # bctasks and newbctask were each added later, in their own
+        # Task read/write/create authorization phases — no other
+        # entry beyond these seven.
+        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 18)
         self.assertIn("failpayment", th.COMMAND_ENFORCEMENT_MAP)
         self.assertIn("confirmpayment", th.COMMAND_ENFORCEMENT_MAP)
         self.assertIn("reversepayment", th.COMMAND_ENFORCEMENT_MAP)
@@ -650,8 +658,8 @@ class TestPhase17E2A4H1OfferHardeningScope(unittest.TestCase):
         self.assertTrue(hasattr(th, "updatedocnotes_cmd"))
         self.assertIn("updatedocnotes", th.COMMAND_ENFORCEMENT_MAP)
 
-    def test_enforcement_map_now_seventeen_entries(self):
-        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 17)
+    def test_enforcement_map_now_eighteen_entries(self):
+        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 18)
 
     def test_exactly_nine_dedicated_mutation_handlers_use_mutate_helper(self):
         dedicated = [
