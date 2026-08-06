@@ -116,6 +116,8 @@ def list_tasks(
     stage_id: str = "",
     role_id: str = "",
     person_id: str = "",
+    *,
+    raise_on_error: bool = False,
 ) -> list[dict]:
     """
     Read-only. Все Task, опционально отфильтрованные по любой комбинации
@@ -126,6 +128,17 @@ def list_tasks(
     Phase 36D (ADR-019 §6): единственный read API, который /bctasks
     вызывает — сам не содержит cross-entity policy, только фильтрацию
     уже персистентных значений.
+
+    raise_on_error (keyword-only, default False): when False, an
+    internal storage exception is logged and this function returns
+    [] — the original, unchanged behavior every existing caller
+    already relies on. When True, the exception propagates unchanged
+    instead of being converted to [] — no retry, no partial result,
+    no logging here (a caller that opts into raise_on_error is
+    expected to log its own fixed-literal message and must not have
+    this function's dynamic exception text land in a log first).
+    Filtering, scan order, and result shape are identical in both
+    modes — only error propagation differs.
     """
     try:
         from business_core.sheets import get_business_sheet, get_header_index_map
@@ -161,6 +174,8 @@ def list_tasks(
             results.append(_task_row_to_dict(0, {f: _g(row, f) for f in _TASK_FIELDS}))
         return results
     except Exception as exc:
+        if raise_on_error:
+            raise
         log.warning(f"list_tasks() error: {exc}")
         return []
 

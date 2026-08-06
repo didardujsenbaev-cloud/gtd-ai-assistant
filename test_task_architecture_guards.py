@@ -409,6 +409,48 @@ def _bb_function_body(fn_name: str) -> str:
     return src[start:end]
 
 
+def _task_manager_top_level_constructs(src: str) -> dict:
+    """Maps a deterministic construct identifier -> exact source text
+    for every top-level node in task_manager.py — Import/ImportFrom/
+    FunctionDef/AsyncFunctionDef/ClassDef/Assign (single Name target)
+    fall into a named category; anything else (module docstring Expr,
+    multi-target assignments, etc.) falls into a content-keyed
+    fallback category so it is still tracked, not silently ignored.
+
+    Raises ValueError on a duplicate identifier — overwriting one
+    construct with another under the same key would hide an
+    unauthorized top-level construct instead of surfacing it as a
+    guard failure, so a collision must fail loudly rather than pick
+    one value arbitrarily. Shared by the real task_manager.py scope
+    guard and its own duplicate-identifier tests, so both always
+    observe identical collector behavior.
+    """
+    tree = ast.parse(src)
+    lines = src.splitlines(keepends=True)
+    out: dict[str, str] = {}
+
+    def _add(key: str, node) -> None:
+        if key in out:
+            raise ValueError(f"duplicate top-level construct identifier: {key!r} (line {node.lineno})")
+        out[key] = "".join(lines[node.lineno - 1:node.end_lineno])
+
+    for node in tree.body:
+        text = "".join(lines[node.lineno - 1:node.end_lineno])
+        if isinstance(node, ast.FunctionDef):
+            _add(f"function:{node.name}", node)
+        elif isinstance(node, ast.AsyncFunctionDef):
+            _add(f"async_function:{node.name}", node)
+        elif isinstance(node, ast.ClassDef):
+            _add(f"class:{node.name}", node)
+        elif isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            _add(f"assignment:{node.targets[0].id}", node)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            _add(f"import:{text.strip()}", node)
+        else:
+            _add(f"other:{text.strip()[:80]}", node)
+    return out
+
+
 class TestUnassignTaskPartialStateHardening(unittest.TestCase):
 
     def test_only_unassign_task_changed_in_business_builder(self):
@@ -437,12 +479,76 @@ class TestUnassignTaskPartialStateHardening(unittest.TestCase):
             )
 
     def test_task_manager_unchanged(self):
+        # list_tasks gained a keyword-only raise_on_error parameter for
+        # the strict storage-error-contract mode — every other
+        # top-level construct in task_manager.py must remain
+        # source-identical to HEAD.
         import subprocess
-        diff = subprocess.run(
-            ["git", "diff", "--name-only", "HEAD", "--", "business_core/task_manager.py"],
+
+        head_src = subprocess.run(
+            ["git", "show", "HEAD:business_core/task_manager.py"],
             cwd=WORKSPACE, capture_output=True, text=True, check=True,
         ).stdout
-        self.assertEqual(diff.strip(), "")
+        current_src = (BUSINESS_CORE / "task_manager.py").read_text(encoding="utf-8")
+
+        head = _task_manager_top_level_constructs(head_src)
+        current = _task_manager_top_level_constructs(current_src)
+        self.assertEqual(set(current) - set(head), set(), "task_manager.py: unapproved new top-level construct")
+        self.assertEqual(set(head) - set(current), set(), "task_manager.py: a top-level construct was removed")
+        changed = {k for k in head if head[k] != current[k]}
+        self.assertEqual(changed, {"function:list_tasks"}, "task_manager.py: only list_tasks may change this phase")
+
+    _TASK_MANAGER_DUPLICATE_CASES = (
+        (
+            "duplicate sync function",
+            "def foo():\n    pass\n\n\ndef foo():\n    pass\n",
+            "function:foo",
+        ),
+        (
+            "duplicate async function",
+            "async def foo():\n    pass\n\n\nasync def foo():\n    pass\n",
+            "async_function:foo",
+        ),
+        (
+            "duplicate class",
+            "class Foo:\n    pass\n\n\nclass Foo:\n    pass\n",
+            "class:Foo",
+        ),
+        (
+            "duplicate assignment",
+            "X = 1\nX = 2\n",
+            "assignment:X",
+        ),
+    )
+
+    def test_task_manager_collector_rejects_duplicate_identifiers(self):
+        # Overwriting a duplicate top-level construct identifier
+        # instead of failing would hide an unauthorized second
+        # construct sharing the same name behind whichever one
+        # happened to be collected last — this must fail loudly
+        # instead of picking a value arbitrarily.
+        for label, src, expected_key in self._TASK_MANAGER_DUPLICATE_CASES:
+            with self.subTest(case=label):
+                with self.assertRaises(ValueError) as ctx:
+                    _task_manager_top_level_constructs(src)
+                self.assertIn(expected_key, str(ctx.exception))
+
+    def test_task_manager_collector_accepts_valid_non_duplicate_source(self):
+        src = (
+            "import os\n"
+            "from pathlib import Path\n"
+            "X = 1\n"
+            "def foo():\n"
+            "    pass\n"
+            "async def bar():\n"
+            "    pass\n"
+            "class Baz:\n"
+            "    pass\n"
+        )
+        constructs = _task_manager_top_level_constructs(src)
+        for key in ("import:import os", "import:from pathlib import Path",
+                    "assignment:X", "function:foo", "async_function:bar", "class:Baz"):
+            self.assertIn(key, constructs)
 
     # telegram_handlers.py zero-diff was true for the unassign_task
     # business-layer hardening phase specifically; ongoing
@@ -1274,13 +1380,13 @@ class TestTelegramHandlersTopLevelConstructGuard(unittest.TestCase):
         self.assertEqual(head["function:_task_assignment_message"], current["function:_task_assignment_message"])
 
     def test_command_enforcement_map_gains_exactly_one_entry(self):
-        head_src = _git_show_head_telegram_handlers_py()
-        current_src = (BUSINESS_CORE / "telegram_handlers.py").read_text(encoding="utf-8")
-        head = _telegram_handlers_top_level_constructs(head_src)
-        current = _telegram_handlers_top_level_constructs(current_src)
-        self.assertIn("assignment:COMMAND_ENFORCEMENT_MAP", head)
-        self.assertNotEqual(head["assignment:COMMAND_ENFORCEMENT_MAP"], current["assignment:COMMAND_ENFORCEMENT_MAP"])
-
+        # The bctask entry was committed as HEAD itself, so comparing
+        # the working tree against HEAD no longer reveals this
+        # addition — that transient check is retired here. Durable
+        # protection is the exact-value assertions below, plus the
+        # exact-value guard in test_command_enforcement.py's
+        # test_mutation_entries_exact and the Task-key-set guard in
+        # test_authorization_domain.py.
         import business_core.telegram_handlers as th
         self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 16)
         self.assertIn("bctask", th.COMMAND_ENFORCEMENT_MAP)

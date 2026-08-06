@@ -1269,14 +1269,13 @@ class TestTaskCrossLayerIsolation(unittest.TestCase):
     # resource itself was true at the time of that commit; ongoing
     # business_builder.py Task-domain changes (e.g. unassign_task
     # hardening) are scoped by test_task_architecture_guards.py instead.
-
-    def test_task_manager_zero_diff(self):
-        import subprocess
-        result = subprocess.run(
-            ["git", "diff", "--name-only", "HEAD", "--", "business_core/task_manager.py"],
-            capture_output=True, text=True, cwd=".",
-        )
-        self.assertEqual(result.stdout.strip(), "")
+    #
+    # task_manager.py cross-layer isolation was true at the time of
+    # that commit too; ongoing task_manager.py Task-domain changes
+    # (e.g. list_tasks's raise_on_error strict-mode contract) are
+    # scoped by test_task_architecture_guards.py's
+    # test_task_manager_unchanged instead — a single-function AST
+    # guard, not a whole-file zero-diff check.
 
     def test_sheets_zero_diff(self):
         import subprocess

@@ -26,6 +26,7 @@ from business_core.business_builder import (
     create_business_task, update_task_admin_fields, transition_task_status,
     assign_task, unassign_task, task_assignment_cache_is_consistent,
 )
+from business_core.task_manager import list_tasks, _TASK_FIELDS
 
 ACTIVE_TASK = {
     "task_id": "TSK-001", "business_id": "BIZ-001", "title": "Prepare docs",
@@ -856,6 +857,166 @@ class TestAssignmentCacheConsistency(unittest.TestCase):
             result = task_assignment_cache_is_consistent("TSK-001")
         self.assertTrue(result["ok"])
         self.assertTrue(result["consistent"])
+
+
+# ─────────────────────────────────────────────────────────────
+# list_tasks — strict error-contract mode (raise_on_error)
+# ─────────────────────────────────────────────────────────────
+
+def _task_row_values(task_id="TSK-001", business_id="BIZ-001", title="Prepare docs",
+                      status="ready", roadmap_id="", stage_id="",
+                      responsible_role_id="", assignee_person_id="", due_date=""):
+    values = {
+        "Task ID": task_id, "Business ID": business_id, "Title": title,
+        "Description": "", "Status": status, "Priority": "", "Due Date": due_date,
+        "Source": "manual", "Idempotency Key": "", "Client ID": "", "Object ID": "",
+        "Service ID": "", "Roadmap ID": roadmap_id, "Stage ID": stage_id,
+        "Responsible Role ID": responsible_role_id, "Assignee Person ID": assignee_person_id,
+        "Created At": "2026-01-01", "Updated At": "2026-01-01",
+        "Started At": "", "Completed At": "", "Cancelled At": "",
+        "Created By": "", "GTD Action ID": "",
+    }
+    return [values[f] for f in _TASK_FIELDS]
+
+
+def _mock_sheet(rows):
+    sheet = unittest.mock.MagicMock()
+    sheet.get_all_values.return_value = [list(_TASK_FIELDS)] + rows
+    return sheet
+
+
+def _fresh_tm():
+    for k in list(sys.modules):
+        if "business_core" in k:
+            del sys.modules[k]
+    import importlib
+    return importlib.import_module("business_core.task_manager")
+
+
+class TestListTasksStrictErrorMode(unittest.TestCase):
+
+    def test_default_call_backward_compatible(self):
+        with patch("business_core.sheets.get_business_sheet", return_value=_mock_sheet([])):
+            result = list_tasks()
+        self.assertEqual(result, [])
+
+    def test_zero_result_default_mode(self):
+        row = _task_row_values(business_id="BIZ-001")
+        with patch("business_core.sheets.get_business_sheet", return_value=_mock_sheet([row])):
+            result = list_tasks(business_id="BIZ-999")
+        self.assertEqual(result, [])
+
+    def test_zero_result_raise_on_error_true(self):
+        row = _task_row_values(business_id="BIZ-001")
+        with patch("business_core.sheets.get_business_sheet", return_value=_mock_sheet([row])):
+            result = list_tasks(business_id="BIZ-999", raise_on_error=True)
+        self.assertEqual(result, [])
+
+    def test_matching_rows_identical_in_both_modes(self):
+        row = _task_row_values(task_id="TSK-001", business_id="BIZ-001", title="Prepare docs")
+        with patch("business_core.sheets.get_business_sheet", return_value=_mock_sheet([row])):
+            default_result = list_tasks(business_id="BIZ-001")
+        with patch("business_core.sheets.get_business_sheet", return_value=_mock_sheet([row])):
+            strict_result = list_tasks(business_id="BIZ-001", raise_on_error=True)
+        self.assertEqual(default_result, strict_result)
+        self.assertEqual(len(default_result), 1)
+        self.assertEqual(default_result[0]["task_id"], "TSK-001")
+
+    def test_every_filter_behaves_identically_in_both_modes(self):
+        matching = _task_row_values(
+            task_id="TSK-001", business_id="BIZ-001", status="ready",
+            roadmap_id="RM-001", stage_id="STAGE-001",
+            responsible_role_id="ROLE-001", assignee_person_id="PRS-001",
+        )
+        other_business = _task_row_values(task_id="TSK-002", business_id="BIZ-002")
+        rows = [matching, other_business]
+        filters = dict(
+            business_id="BIZ-001", status="ready", roadmap_id="RM-001",
+            stage_id="STAGE-001", role_id="ROLE-001", person_id="PRS-001",
+        )
+        for key in filters:
+            with self.subTest(filter=key):
+                kwargs = {key: filters[key]}
+                with patch("business_core.sheets.get_business_sheet", return_value=_mock_sheet(rows)):
+                    default_result = list_tasks(**kwargs)
+                with patch("business_core.sheets.get_business_sheet", return_value=_mock_sheet(rows)):
+                    strict_result = list_tasks(**kwargs, raise_on_error=True)
+                self.assertEqual(default_result, strict_result)
+
+    def test_storage_exception_default_mode_returns_empty(self):
+        with patch("business_core.sheets.get_business_sheet", side_effect=RuntimeError("STRICT-MODE-SECRET-MARKER")):
+            result = list_tasks()
+        self.assertEqual(result, [])
+
+    def test_storage_exception_raise_on_error_true_propagates(self):
+        with patch("business_core.sheets.get_business_sheet", side_effect=RuntimeError("STRICT-MODE-SECRET-MARKER")):
+            with self.assertRaises(RuntimeError) as ctx:
+                list_tasks(raise_on_error=True)
+        self.assertIn("STRICT-MODE-SECRET-MARKER", str(ctx.exception))
+
+    def test_strict_mode_does_not_return_partial_result(self):
+        with patch("business_core.sheets.get_business_sheet", side_effect=RuntimeError("STRICT-MODE-SECRET-MARKER")):
+            with self.assertRaises(RuntimeError):
+                result = list_tasks(raise_on_error=True)
+                # If control reached here, a partial value would exist —
+                # the assertRaises context proves it never did.
+                del result
+
+    def test_strict_mode_performs_no_retry(self):
+        mock_getter = unittest.mock.MagicMock(side_effect=RuntimeError("STRICT-MODE-SECRET-MARKER"))
+        with patch("business_core.sheets.get_business_sheet", mock_getter):
+            with self.assertRaises(RuntimeError):
+                list_tasks(raise_on_error=True)
+        self.assertEqual(mock_getter.call_count, 1)
+
+    def test_strict_mode_does_not_log_before_propagating(self):
+        tm = _fresh_tm()
+        with patch("business_core.sheets.get_business_sheet", side_effect=RuntimeError("STRICT-MODE-SECRET-MARKER")), \
+             patch.object(tm, "log") as mock_log:
+            with self.assertRaises(RuntimeError):
+                tm.list_tasks(raise_on_error=True)
+            mock_log.warning.assert_not_called()
+            mock_log.error.assert_not_called()
+            for call in mock_log.mock_calls:
+                self.assertNotIn("STRICT-MODE-SECRET-MARKER", str(call))
+
+    def test_default_mode_preserves_currently_approved_logging(self):
+        tm = _fresh_tm()
+        with patch("business_core.sheets.get_business_sheet", side_effect=RuntimeError("STRICT-MODE-SECRET-MARKER")), \
+             patch.object(tm, "log") as mock_log:
+            result = tm.list_tasks()
+        self.assertEqual(result, [])
+        mock_log.warning.assert_called_once()
+        self.assertIn("STRICT-MODE-SECRET-MARKER", str(mock_log.warning.call_args))
+
+    def test_returned_row_order_unchanged(self):
+        row1 = _task_row_values(task_id="TSK-001", business_id="BIZ-001")
+        row2 = _task_row_values(task_id="TSK-002", business_id="BIZ-001")
+        row3 = _task_row_values(task_id="TSK-003", business_id="BIZ-001")
+        with patch("business_core.sheets.get_business_sheet", return_value=_mock_sheet([row1, row2, row3])):
+            result = list_tasks(business_id="BIZ-001")
+        self.assertEqual([t["task_id"] for t in result], ["TSK-001", "TSK-002", "TSK-003"])
+
+    def test_six_positional_parameters_still_work(self):
+        row = _task_row_values(
+            task_id="TSK-001", business_id="BIZ-001", status="ready",
+            roadmap_id="RM-001", stage_id="STAGE-001",
+            responsible_role_id="ROLE-001", assignee_person_id="PRS-001",
+        )
+        with patch("business_core.sheets.get_business_sheet", return_value=_mock_sheet([row])):
+            result = list_tasks("BIZ-001", "ready", "RM-001", "STAGE-001", "ROLE-001", "PRS-001")
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["task_id"], "TSK-001")
+
+    def test_raise_on_error_is_keyword_only(self):
+        with self.assertRaises(TypeError):
+            list_tasks("BIZ-001", "", "", "", "", "", True)
+
+    def test_no_bctasks_caller_passes_raise_on_error(self):
+        import inspect
+        from business_core import telegram_handlers as th
+        src = inspect.getsource(th.bctasks_cmd)
+        self.assertNotIn("raise_on_error", src)
 
 
 if __name__ == "__main__":
