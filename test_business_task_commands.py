@@ -269,60 +269,362 @@ class TestNewBcTaskCommand(unittest.TestCase):
 # /bctasks
 # ─────────────────────────────────────────────────────────────
 
-class TestBcTasksCommand(unittest.TestCase):
+_BCTASKS_UNSET = object()
+
+
+class BcTasksCommandTestBase(unittest.TestCase):
+    def _run_handler(self, update, args=None, *, list_side_effect=None, list_return=_BCTASKS_UNSET,
+                      authz_result=None, business_id="BIZ-001", th=None):
+        th = th or _fresh_th()
+        call_log = []
+        effective_return = [] if list_return is _BCTASKS_UNSET else list_return
+
+        if list_side_effect is not None:
+            def _list(**kwargs):
+                call_log.append(("list_tasks", kwargs))
+                if callable(list_side_effect):
+                    return list_side_effect(**kwargs)
+                raise list_side_effect
+            mock_list = MagicMock(side_effect=_list)
+        else:
+            def _list(**kwargs):
+                call_log.append(("list_tasks", kwargs))
+                return effective_return
+            mock_list = MagicMock(side_effect=_list)
+
+        async def _authz(update, **kwargs):
+            call_log.append(("authorize", kwargs.get("resource"), kwargs.get("action"), kwargs.get("business_id")))
+            return authz_result if authz_result is not None else _bctask_allow_result()
+        mock_authz = AsyncMock(side_effect=_authz)
+
+        ctx_args = args if args is not None else [f"business_id={business_id}"]
+        ctx = MagicMock()
+        ctx.args = ctx_args
+
+        async def run():
+            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
+                 patch("business_core.task_manager.list_tasks", new=mock_list), \
+                 patch("business_core.telegram_authorization.authorize_telegram_business_core_request", new=mock_authz):
+                await th.bctasks_cmd(update, ctx)
+
+        _run(run())
+        return mock_list, mock_authz, call_log
+
+    def _sent_text(self, update) -> str:
+        call = update.message.reply_text.call_args
+        return call.args[0] if call.args else call.kwargs.get("text", "")
+
+
+class TestBcTasksCommand(BcTasksCommandTestBase):
 
     def test_registered(self):
         th = _fresh_th()
         self.assertTrue(hasattr(th, "bctasks_cmd"))
 
-    def test_empty(self):
+    def test_transport_validation(self):
+        upd, _ = _make_update("/bctasks business_id=BIZ-001", ["business_id=BIZ-001"])
+        upd.effective_chat = None
         th = _fresh_th()
-        upd, ctx = _make_update("/bctasks", [])
+        mock_list, mock_authz, _ = self._run_handler(upd, th=th)
+        mock_list.assert_not_called()
+        mock_authz.assert_not_called()
 
-        async def run():
-            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
-                 patch("business_core.task_manager.list_tasks", return_value=[]):
-                await th.bctasks_cmd(upd, ctx)
+    def test_missing_business_id_rejected(self):
+        upd, _ = _make_update("/bctasks", [])
+        mock_list, mock_authz, _ = self._run_handler(upd, args=[])
+        mock_list.assert_not_called()
+        mock_authz.assert_not_called()
+        self.assertIn("business_id", self._sent_text(upd))
 
-        _run(run())
-        reply = upd.message.reply_text.call_args[0][0]
-        self.assertIn("Пусто", reply)
+    def test_blank_business_id_rejected(self):
+        upd, _ = _make_update("/bctasks business_id=", ["business_id="])
+        mock_list, mock_authz, _ = self._run_handler(upd, args=["business_id="])
+        mock_list.assert_not_called()
+        mock_authz.assert_not_called()
 
-    def test_list_with_one(self):
+    def test_positional_token_rejected(self):
+        upd, _ = _make_update("/bctasks BIZ-001", ["BIZ-001"])
+        mock_list, mock_authz, _ = self._run_handler(upd, args=["BIZ-001"])
+        mock_list.assert_not_called()
+        mock_authz.assert_not_called()
+
+    def test_unknown_key_rejected(self):
+        upd, _ = _make_update("/bctasks business_id=BIZ-001 foo=bar", ["business_id=BIZ-001", "foo=bar"])
+        mock_list, mock_authz, _ = self._run_handler(upd, args=["business_id=BIZ-001", "foo=bar"])
+        mock_list.assert_not_called()
+        mock_authz.assert_not_called()
+
+    def test_task_id_key_rejected(self):
+        upd, _ = _make_update("/bctasks business_id=BIZ-001 task_id=TSK-001", ["business_id=BIZ-001", "task_id=TSK-001"])
+        mock_list, mock_authz, _ = self._run_handler(upd, args=["business_id=BIZ-001", "task_id=TSK-001"])
+        mock_list.assert_not_called()
+        mock_authz.assert_not_called()
+
+    def test_limit_offset_page_rejected(self):
+        for extra in ("limit=10", "offset=0", "page=1", "resource=TASK", "action=READ", "scope=ALL"):
+            with self.subTest(extra=extra):
+                upd, _ = _make_update(f"/bctasks business_id=BIZ-001 {extra}", ["business_id=BIZ-001", extra])
+                mock_list, mock_authz, _ = self._run_handler(upd, args=["business_id=BIZ-001", extra])
+                mock_list.assert_not_called()
+                mock_authz.assert_not_called()
+
+    def test_role_id_without_business_id_rejected(self):
+        upd, _ = _make_update("/bctasks role_id=ROLE-001", ["role_id=ROLE-001"])
+        mock_list, mock_authz, _ = self._run_handler(upd, args=["role_id=ROLE-001"])
+        mock_list.assert_not_called()
+        mock_authz.assert_not_called()
+
+    def test_person_id_without_business_id_rejected(self):
+        upd, _ = _make_update("/bctasks person_id=PRS-001", ["person_id=PRS-001"])
+        mock_list, mock_authz, _ = self._run_handler(upd, args=["person_id=PRS-001"])
+        mock_list.assert_not_called()
+        mock_authz.assert_not_called()
+
+    def test_malformed_business_id_from_parser_rejected(self):
+        upd, _ = _make_update("/bctasks business_id=BIZ-001", ["business_id=BIZ-001"])
         th = _fresh_th()
-        upd, ctx = _make_update("/bctasks", [])
-        task = {"task_id": "TSK-001", "title": "Prepare docs", "status": "ready", "due_date": "2026-08-01"}
+        with patch.object(th, "_parse_kv_args", return_value={"business_id": object()}):
+            mock_list, mock_authz, _ = self._run_handler(upd, th=th)
+        mock_list.assert_not_called()
+        mock_authz.assert_not_called()
 
-        async def run():
-            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
-                 patch("business_core.task_manager.list_tasks", return_value=[task]):
-                await th.bctasks_cmd(upd, ctx)
-
-        _run(run())
-        reply = upd.message.reply_text.call_args[0][0]
-        self.assertIn("TSK-001", reply)
-        self.assertIn("Prepare docs", reply)
-
-    def test_filters_passed_exactly(self):
+    def test_malformed_optional_filter_rejected(self):
+        upd, _ = _make_update("/bctasks business_id=BIZ-001", ["business_id=BIZ-001"])
         th = _fresh_th()
-        upd, ctx = _make_update(
+        with patch.object(th, "_parse_kv_args", return_value={"business_id": "BIZ-001", "status": object()}):
+            mock_list, mock_authz, _ = self._run_handler(upd, th=th)
+        mock_list.assert_not_called()
+        mock_authz.assert_not_called()
+
+    def test_authorization_uses_task_read(self):
+        upd, _ = _make_update("/bctasks business_id=BIZ-001", ["business_id=BIZ-001"])
+        _, _, call_log = self._run_handler(upd)
+        authz_call = [c for c in call_log if c[0] == "authorize"][0]
+        self.assertEqual(authz_call[1], "TASK")
+        self.assertEqual(authz_call[2], "READ")
+
+    def test_authorization_uses_requested_business_id(self):
+        upd, _ = _make_update("/bctasks business_id=BIZ-001", ["business_id=BIZ-001"])
+        _, _, call_log = self._run_handler(upd, business_id="BIZ-001")
+        authz_call = [c for c in call_log if c[0] == "authorize"][0]
+        self.assertEqual(authz_call[3], "BIZ-001")
+
+    def test_authorization_called_exactly_once(self):
+        upd, _ = _make_update("/bctasks business_id=BIZ-001", ["business_id=BIZ-001"])
+        _, mock_authz, _ = self._run_handler(upd)
+        mock_authz.assert_called_once()
+
+    def test_authorization_before_scan(self):
+        upd, _ = _make_update("/bctasks business_id=BIZ-001", ["business_id=BIZ-001"])
+        _, _, call_log = self._run_handler(upd)
+        order = [c[0] for c in call_log]
+        self.assertEqual(order.index("authorize"), 0)
+        self.assertLess(order.index("authorize"), order.index("list_tasks"))
+
+    def test_deny_blocks_scan(self):
+        upd, _ = _make_update("/bctasks business_id=BIZ-001", ["business_id=BIZ-001"])
+        mock_list, _, _ = self._run_handler(upd, authz_result=_bctask_deny_result())
+        mock_list.assert_not_called()
+        self.assertEqual(self._sent_text(upd), "Запись недоступна или не найдена.")
+
+    def test_authorization_read_failure_blocks_scan(self):
+        upd, _ = _make_update("/bctasks business_id=BIZ-001", ["business_id=BIZ-001"])
+        mock_list, _, _ = self._run_handler(upd, authz_result=_bctask_infra_failure_result())
+        mock_list.assert_not_called()
+        self.assertEqual(self._sent_text(upd), "Временная ошибка проверки доступа. Попробуйте ещё раз позже.")
+
+    def test_list_tasks_called_exactly_once(self):
+        upd, _ = _make_update("/bctasks business_id=BIZ-001", ["business_id=BIZ-001"])
+        mock_list, _, _ = self._run_handler(upd)
+        mock_list.assert_called_once()
+
+    def test_list_tasks_thread_offloaded(self):
+        upd, _ = _make_update("/bctasks business_id=BIZ-001", ["business_id=BIZ-001"])
+        th = _fresh_th()
+        with patch.object(th.asyncio, "to_thread", wraps=th.asyncio.to_thread) as mock_to_thread:
+            self._run_handler(upd, th=th)
+        mock_to_thread.assert_called_once()
+
+    def test_list_tasks_gets_same_business_id(self):
+        upd, _ = _make_update("/bctasks business_id=BIZ-001", ["business_id=BIZ-001"])
+        mock_list, _, _ = self._run_handler(upd, business_id="BIZ-001")
+        self.assertEqual(mock_list.call_args.kwargs["business_id"], "BIZ-001")
+
+    def test_list_tasks_gets_all_normalized_filters(self):
+        upd, _ = _make_update(
             "/bctasks business_id=BIZ-001 status=ready roadmap_id=RM-001 stage_id=STAGE-001 role_id=ROLE-001 person_id=PRS-001",
             ["business_id=BIZ-001", "status=ready", "roadmap_id=RM-001", "stage_id=STAGE-001", "role_id=ROLE-001", "person_id=PRS-001"],
         )
-        calls = {}
-
-        async def run():
-            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
-                 patch("business_core.task_manager.list_tasks", return_value=[]) as mock_list:
-                await th.bctasks_cmd(upd, ctx)
-                calls["call_args"] = mock_list.call_args
-
-        _run(run())
+        mock_list, _, _ = self._run_handler(
+            upd, args=["business_id=BIZ-001", "status=ready", "roadmap_id=RM-001", "stage_id=STAGE-001", "role_id=ROLE-001", "person_id=PRS-001"],
+        )
         self.assertEqual(
-            calls["call_args"].kwargs,
+            {k: v for k, v in mock_list.call_args.kwargs.items() if k != "raise_on_error"},
             dict(business_id="BIZ-001", status="ready", roadmap_id="RM-001",
                  stage_id="STAGE-001", role_id="ROLE-001", person_id="PRS-001"),
         )
+
+    def test_raise_on_error_true_passed_exactly(self):
+        upd, _ = _make_update("/bctasks business_id=BIZ-001", ["business_id=BIZ-001"])
+        mock_list, _, _ = self._run_handler(upd)
+        self.assertIs(mock_list.call_args.kwargs["raise_on_error"], True)
+
+    def test_no_default_mode_fallback(self):
+        upd, _ = _make_update("/bctasks business_id=BIZ-001", ["business_id=BIZ-001"])
+        mock_list, _, call_log = self._run_handler(upd)
+        list_calls = [c for c in call_log if c[0] == "list_tasks"]
+        self.assertEqual(len(list_calls), 1)
+        self.assertIs(list_calls[0][1]["raise_on_error"], True)
+
+    def test_storage_exception_not_treated_as_empty(self):
+        upd, _ = _make_update("/bctasks business_id=BIZ-001", ["business_id=BIZ-001"])
+        self._run_handler(upd, list_side_effect=RuntimeError("boom"))
+        reply = self._sent_text(upd)
+        self.assertNotEqual(reply, "📋 Tasks — BIZ-001\n\nПусто.")
+        self.assertEqual(reply, "Временная ошибка проверки доступа. Попробуйте ещё раз позже.")
+
+    def test_fixed_literal_storage_error_logging(self):
+        upd, _ = _make_update("/bctasks business_id=BIZ-001", ["business_id=BIZ-001"])
+        th = _fresh_th()
+        with patch.object(th, "log") as mock_log:
+            self._run_handler(upd, list_side_effect=RuntimeError("SECRET-DETAIL-MARKER"), th=th)
+            mock_log.error.assert_called_once_with("bctasks_cmd storage read failure")
+            for call in mock_log.mock_calls:
+                self.assertNotIn("SECRET-DETAIL-MARKER", str(call))
+
+    def test_non_list_result_handled_safely(self):
+        for value in (None, {}, "bad", object(), 0, 1, (1, 2)):
+            with self.subTest(result=repr(type(value))):
+                upd, _ = _make_update("/bctasks business_id=BIZ-001", ["business_id=BIZ-001"])
+                self._run_handler(upd, list_return=value)
+                self.assertEqual(upd.message.reply_text.call_count, 1)
+                self.assertEqual(self._sent_text(upd), "Временная ошибка проверки доступа. Попробуйте ещё раз позже.")
+
+    def test_malformed_rows_skipped(self):
+        upd, _ = _make_update("/bctasks business_id=BIZ-001", ["business_id=BIZ-001"])
+        rows = [None, "bad", object(), {"task_id": "TSK-001", "business_id": "BIZ-001", "title": "X", "status": "ready", "due_date": ""}]
+        self._run_handler(upd, list_return=rows)
+        reply = self._sent_text(upd)
+        self.assertIn("TSK-001", reply)
+
+    def test_foreign_business_rows_excluded(self):
+        upd, _ = _make_update("/bctasks business_id=BIZ-001", ["business_id=BIZ-001"])
+        rows = [{"task_id": "TSK-999", "business_id": "BIZ-999", "title": "Other", "status": "ready", "due_date": ""}]
+        self._run_handler(upd, list_return=rows)
+        reply = self._sent_text(upd)
+        self.assertNotIn("TSK-999", reply)
+        self.assertIn("Пусто", reply)
+
+    def test_missing_business_id_rows_excluded(self):
+        upd, _ = _make_update("/bctasks business_id=BIZ-001", ["business_id=BIZ-001"])
+        rows = [{"task_id": "TSK-999", "title": "Other", "status": "ready", "due_date": ""}]
+        self._run_handler(upd, list_return=rows)
+        self.assertIn("Пусто", self._sent_text(upd))
+
+    def test_poisoned_business_id_rows_excluded(self):
+        class Poisoned:
+            def __str__(self):
+                return "STR-SECRET-MARKER"
+
+            def __repr__(self):
+                return "REPR-SECRET-MARKER"
+
+        upd, _ = _make_update("/bctasks business_id=BIZ-001", ["business_id=BIZ-001"])
+        rows = [{"task_id": "TSK-999", "business_id": Poisoned(), "title": "Other", "status": "ready", "due_date": ""}]
+        self._run_handler(upd, list_return=rows)
+        reply = self._sent_text(upd)
+        self.assertNotIn("STR-SECRET-MARKER", reply)
+        self.assertNotIn("REPR-SECRET-MARKER", reply)
+        self.assertIn("Пусто", reply)
+
+    def test_valid_empty_authorized_business(self):
+        upd, _ = _make_update("/bctasks business_id=BIZ-001", ["business_id=BIZ-001"])
+        self._run_handler(upd, list_return=[])
+        reply = self._sent_text(upd)
+        self.assertIn("Пусто", reply)
+        self.assertNotIn("newbctask", reply)
+
+    def test_formatter_called_exactly_once_with_filtered_rows(self):
+        upd, _ = _make_update("/bctasks business_id=BIZ-001", ["business_id=BIZ-001"])
+        th = _fresh_th()
+        rows = [
+            {"task_id": "TSK-001", "business_id": "BIZ-001", "title": "X", "status": "ready", "due_date": ""},
+            {"task_id": "TSK-999", "business_id": "BIZ-999", "title": "Foreign", "status": "ready", "due_date": ""},
+        ]
+        with patch("business_core.telegram_handlers._task_list_lines", wraps=th._task_list_lines) as mock_formatter:
+            self._run_handler(upd, list_return=rows, th=th)
+        mock_formatter.assert_called_once()
+        passed_rows = mock_formatter.call_args.args[0]
+        self.assertEqual(len(passed_rows), 1)
+        self.assertEqual(passed_rows[0]["task_id"], "TSK-001")
+
+    def test_result_cap_behavior(self):
+        upd, _ = _make_update("/bctasks business_id=BIZ-001", ["business_id=BIZ-001"])
+        rows = [
+            {"task_id": f"TSK-{i:03d}", "business_id": "BIZ-001", "title": "X", "status": "ready", "due_date": ""}
+            for i in range(25)
+        ]
+        self._run_handler(upd, list_return=rows)
+        reply = self._sent_text(upd)
+        self.assertIn("… и ещё 5", reply)
+
+    def test_adversarial_long_fields_stay_one_telegram_message(self):
+        # Closes the exact blind spot found in review: bctasks_cmd
+        # calling _reply exactly once does not by itself prove exactly
+        # one Telegram message is sent, since _reply/_safe_send may
+        # chunk a long enough joined string into several reply_text
+        # calls. This test exercises the real _reply/_safe_send path
+        # (only authorization and list_tasks are mocked) against 25
+        # same-Business rows with every displayed field at 10,000
+        # characters, forcing both the 20-row cap and the more-results
+        # line, and proves the per-field output caps keep the total
+        # rendered text — and therefore the real reply_text call count
+        # — bounded to a single Telegram message.
+        upd, _ = _make_update("/bctasks business_id=BIZ-001", ["business_id=BIZ-001"])
+        long = "L" * 10000
+        rows = [
+            {
+                "task_id": "T" * 10000, "business_id": "BIZ-001", "title": "X" * 10000,
+                "status": long, "due_date": "D" * 10000,
+            }
+            for _ in range(25)
+        ]
+        self._run_handler(upd, list_return=rows)
+        self.assertEqual(upd.message.reply_text.call_count, 1)
+        sent_text = upd.message.reply_text.call_args[0][0]
+        self.assertLessEqual(len(sent_text), 4000)
+        # Every capped field must appear only in its clipped form —
+        # the full 10,000-character value must never reach the reply.
+        self.assertNotIn("T" * 41, sent_text)
+        self.assertNotIn("X" * 61, sent_text)
+        self.assertNotIn(long[:42], sent_text)
+        self.assertNotIn("D" * 31, sent_text)
+        self.assertIn("… и ещё 5", sent_text)
+
+    def test_reply_exactly_once_allowed_path(self):
+        upd, _ = _make_update("/bctasks business_id=BIZ-001", ["business_id=BIZ-001"])
+        self._run_handler(upd, list_return=[{"task_id": "TSK-001", "business_id": "BIZ-001", "title": "X", "status": "ready", "due_date": ""}])
+        self.assertEqual(upd.message.reply_text.call_count, 1)
+
+    def test_reply_exactly_once_deny_path(self):
+        upd, _ = _make_update("/bctasks business_id=BIZ-001", ["business_id=BIZ-001"])
+        self._run_handler(upd, authz_result=_bctask_deny_result())
+        self.assertEqual(upd.message.reply_text.call_count, 1)
+
+    def test_reply_exactly_once_storage_error_path(self):
+        upd, _ = _make_update("/bctasks business_id=BIZ-001", ["business_id=BIZ-001"])
+        self._run_handler(upd, list_side_effect=RuntimeError("boom"))
+        self.assertEqual(upd.message.reply_text.call_count, 1)
+
+    def test_no_mutation_helper_called(self):
+        upd, _ = _make_update("/bctasks business_id=BIZ-001", ["business_id=BIZ-001"])
+        with patch("business_core.business_builder.unassign_task") as mock_unassign, \
+             patch("business_core.task_manager.end_task_assignment") as mock_end, \
+             patch("business_core.task_manager.update_task_assignment_cache") as mock_cache:
+            self._run_handler(upd)
+            mock_unassign.assert_not_called()
+            mock_end.assert_not_called()
+            mock_cache.assert_not_called()
 
     def test_no_gtd_read_path(self):
         path = WORKSPACE / "business_core" / "telegram_handlers.py"

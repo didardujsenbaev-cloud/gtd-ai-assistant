@@ -479,10 +479,13 @@ class TestUnassignTaskPartialStateHardening(unittest.TestCase):
             )
 
     def test_task_manager_unchanged(self):
-        # list_tasks gained a keyword-only raise_on_error parameter for
-        # the strict storage-error-contract mode — every other
-        # top-level construct in task_manager.py must remain
-        # source-identical to HEAD.
+        # list_tasks's raise_on_error strict-mode contract is now part
+        # of HEAD itself, so comparing the working tree against HEAD
+        # no longer reveals it. This guard proves task_manager.py has
+        # zero diff against HEAD in any phase that does not touch it —
+        # a phase that legitimately changes a task_manager.py
+        # construct must update the expected `changed` set here to
+        # name exactly that construct.
         import subprocess
 
         head_src = subprocess.run(
@@ -496,7 +499,7 @@ class TestUnassignTaskPartialStateHardening(unittest.TestCase):
         self.assertEqual(set(current) - set(head), set(), "task_manager.py: unapproved new top-level construct")
         self.assertEqual(set(head) - set(current), set(), "task_manager.py: a top-level construct was removed")
         changed = {k for k in head if head[k] != current[k]}
-        self.assertEqual(changed, {"function:list_tasks"}, "task_manager.py: only list_tasks may change this phase")
+        self.assertEqual(changed, set(), "task_manager.py: no construct may change this phase")
 
     _TASK_MANAGER_DUPLICATE_CASES = (
         (
@@ -993,6 +996,403 @@ class TestTaskDetailLinesFormatterSafety(unittest.TestCase):
 
 
 # ─────────────────────────────────────────────────────────────
+# bctasks_cmd secure-list-flow guards.
+# ─────────────────────────────────────────────────────────────
+
+class TestBctasksSecureListFlow(unittest.TestCase):
+
+    def test_transport_validation_exists(self):
+        body = _th_function_body("bctasks_cmd")
+        self.assertIn("_validate_bc_transport_or_reply(update)", body)
+
+    def test_allowed_keys_exact(self):
+        body = _th_function_body("bctasks_cmd")
+        self.assertIn(
+            '{"business_id", "status", "roadmap_id", "stage_id", "role_id", "person_id"}',
+            body,
+        )
+
+    def test_business_id_mandatory(self):
+        body = _th_function_body("bctasks_cmd")
+        self.assertIn("if not business_id:", body)
+
+    def test_no_positional_support(self):
+        body = _th_function_body("bctasks_cmd")
+        self.assertNotIn("_pos0", body)
+
+    def test_authorization_precedes_list_tasks(self):
+        body = _th_function_body("bctasks_cmd")
+        authorize_idx = body.index("_authorize_or_reply(")
+        list_idx = body.index("list_tasks,")
+        self.assertLess(authorize_idx, list_idx)
+
+    def test_authorization_uses_task_read(self):
+        body = _th_function_body("bctasks_cmd")
+        self.assertIn('resource="TASK"', body)
+        self.assertIn('action="READ"', body)
+
+    def test_authorization_called_exactly_once(self):
+        body = _th_function_body("bctasks_cmd")
+        self.assertEqual(body.count("_authorize_or_reply("), 1)
+
+    def test_list_tasks_called_exactly_once(self):
+        body = _th_function_body("bctasks_cmd")
+        self.assertEqual(body.count("list_tasks,"), 1)
+
+    def test_raise_on_error_true_literal(self):
+        body = _th_function_body("bctasks_cmd")
+        self.assertIn("raise_on_error=True", body)
+
+    def test_no_default_mode_fallback(self):
+        body = _th_function_body("bctasks_cmd")
+        self.assertNotIn("raise_on_error=False", body)
+
+    def test_thread_offload_exists(self):
+        body = _th_function_body("bctasks_cmd")
+        self.assertIn("asyncio.to_thread(", body)
+
+    def test_defensive_business_post_filter_exists(self):
+        body = _th_function_body("bctasks_cmd")
+        self.assertIn("row_business_id.strip() != business_id", body)
+        self.assertIn("isinstance(row, dict)", body)
+        self.assertIn("isinstance(row_business_id, str)", body)
+
+    def test_no_mutation_call(self):
+        body = _th_function_body("bctasks_cmd")
+        for forbidden in ("unassign_task(", "assign_task(", "transition_task_status(", "_mutate_target_in_thread("):
+            self.assertNotIn(forbidden, body)
+
+    def test_no_retry_construct(self):
+        body = _th_function_body("bctasks_cmd")
+        for forbidden in ("while True", "for attempt", "range(3)", "retry_count"):
+            self.assertNotIn(forbidden, body)
+
+    def test_fixed_literal_exception_logging(self):
+        body = _th_function_body("bctasks_cmd")
+        self.assertIn('log.error("bctasks_cmd storage read failure")', body)
+        self.assertIn('log.error("bctasks_cmd formatting/reply failure")', body)
+        for forbidden in ("str(exc)", "repr(exc)", 'f"bctasks_cmd error: {e}"', "exc_info=True"):
+            self.assertNotIn(forbidden, body)
+
+    def test_no_str_conversion_of_unchecked_business_id(self):
+        body = _th_function_body("bctasks_cmd")
+        self.assertNotIn("str(business_id_value)", body)
+        self.assertNotIn("str(args.get(\"business_id\"", body)
+
+
+# ─────────────────────────────────────────────────────────────
+# _task_list_lines formatter fail-closed guards.
+# ─────────────────────────────────────────────────────────────
+
+class TestTaskListLinesFormatterSafety(unittest.TestCase):
+
+    def test_no_direct_subscript_access(self):
+        body = _th_bare_function_source("_task_list_lines")
+        self.assertNotIn("row['", body)
+        self.assertNotIn('row["', body)
+        self.assertNotIn("task['", body)
+        self.assertNotIn('task["', body)
+
+    def test_no_str_or_repr_of_arbitrary_input(self):
+        body = _th_bare_function_source("_task_list_lines")
+        for forbidden in ("str(row)", "repr(row)", "str(tasks)", "repr(tasks)"):
+            self.assertNotIn(forbidden, body)
+
+    def test_no_sheets_telegram_authorization_business_layer_calls(self):
+        body = _th_bare_function_source("_task_list_lines")
+        for forbidden in (
+            "get_business_sheet(", "read_business_sheet(", "_reply(", "await ",
+            "authorize_business_core_access(", "business_builder.", "task_manager.",
+        ):
+            self.assertNotIn(forbidden, body)
+
+    def test_no_logging(self):
+        body = _th_bare_function_source("_task_list_lines")
+        self.assertNotIn("log.", body)
+
+    def test_no_internal_fields_rendered(self):
+        body = _th_bare_function_source("_task_list_lines")
+        for forbidden in (
+            "assignee_person_id", "responsible_role_id", "client_id", "object_id",
+            "service_id", "roadmap_id", "stage_id", "assignment_id", "created_by",
+            "\"source\"", "gtd_action_id", "created_at", "updated_at",
+        ):
+            self.assertNotIn(forbidden, body)
+
+    def test_business_id_cap_exists(self):
+        body = _th_bare_function_source("_task_list_lines")
+        self.assertIn("_clip(business_id, 40)", body)
+
+    def test_task_id_cap_exists(self):
+        body = _th_bare_function_source("_task_list_lines")
+        self.assertIn('_clip(_g(row, "task_id"), 40)', body)
+
+    def test_title_cap_exists(self):
+        body = _th_bare_function_source("_task_list_lines")
+        self.assertIn('_clip(_g(row, "title"), 60)', body)
+
+    def test_due_date_cap_exists(self):
+        body = _th_bare_function_source("_task_list_lines")
+        self.assertIn('_clip(_g(row, "due_date"), 30)', body)
+
+    def test_status_cap_applied_after_translation(self):
+        # The status cap must wrap the already-translated
+        # _task_status_ru(...) call, not the raw status — an unknown
+        # status can be expanded by translation, and clipping before
+        # that expansion would not bound the final rendered length.
+        body = _th_bare_function_source("_task_list_lines")
+        self.assertIn("_clip(_task_status_ru(status_raw), 40)", body)
+
+    def test_no_module_level_cap_constants_added(self):
+        body = _th_bare_function_source("_task_list_lines")
+        self.assertIn("def _clip(", body, "the clip helper must be a nested function, not module-level")
+
+    def test_row_cap_remains_twenty(self):
+        body = _th_bare_function_source("_task_list_lines")
+        self.assertIn("rows[:20]", body)
+        self.assertIn("len(rows) > 20", body)
+
+    def test_no_additional_rendered_field_added(self):
+        # Exactly the four approved display fields — task_id, title,
+        # status, due_date — may be read via _g inside the render loop.
+        import re
+        body = _th_bare_function_source("_task_list_lines")
+        get_field_calls = re.findall(r'_g\(row, "(\w+)"\)', body)
+        self.assertEqual(set(get_field_calls), {"task_id", "title", "status", "due_date"})
+
+    def test_safe_send_threshold_unchanged(self):
+        import inspect
+        from business_core.telegram_handlers import _safe_send
+        sig = inspect.signature(_safe_send)
+        self.assertEqual(sig.parameters["max_len"].default, 4000)
+
+    def test_formatter_does_not_mutate_input(self):
+        import copy
+        from business_core.telegram_handlers import _task_list_lines
+        tasks = [{"task_id": "TSK-1", "business_id": "BIZ-1", "title": "X", "status": "ready", "due_date": ""}]
+        before = copy.deepcopy(tasks)
+        _task_list_lines(tasks, "BIZ-1")
+        self.assertEqual(tasks, before)
+
+    def test_formatter_never_raises_for_malformed_input(self):
+        from business_core.telegram_handlers import _task_list_lines
+
+        class Poisoned:
+            def __str__(self):
+                return "STR-SECRET-MARKER"
+
+            def __repr__(self):
+                return "REPR-SECRET-MARKER"
+
+        class RaisingStr:
+            def __str__(self):
+                raise RuntimeError("RAISE-SECRET-MARKER")
+
+        task_cases = [
+            None, {}, [], "bad", object(), 0, 1,
+            [None], ["bad"], [object()],
+            [{"task_id": 123}], [{"title": Poisoned()}], [{"status": Poisoned()}],
+            [{"due_date": RaisingStr()}],
+        ]
+        markers = ("STR-SECRET-MARKER", "REPR-SECRET-MARKER", "RAISE-SECRET-MARKER")
+        for case in task_cases:
+            with self.subTest(tasks=repr(case)):
+                result = _task_list_lines(case, "BIZ-1")
+                self.assertIsInstance(result, list)
+                joined = "\n".join(result)
+                for marker in markers:
+                    self.assertNotIn(marker, joined)
+
+        for business_id_case in [None, object(), 0, Poisoned()]:
+            with self.subTest(business_id=repr(business_id_case)):
+                result = _task_list_lines([], business_id_case)
+                self.assertIsInstance(result, list)
+                for marker in markers:
+                    self.assertNotIn(marker, "\n".join(result))
+
+    def test_deterministic_output(self):
+        from business_core.telegram_handlers import _task_list_lines
+        tasks = [{"task_id": "TSK-1", "business_id": "BIZ-1", "title": "X", "status": "ready", "due_date": "2026-08-01"}]
+        first = _task_list_lines(tasks, "BIZ-1")
+        second = _task_list_lines(tasks, "BIZ-1")
+        self.assertEqual(first, second)
+
+    def test_title_truncation_exact_sixty_untruncated(self):
+        from business_core.telegram_handlers import _task_list_lines
+        title = "T" * 60
+        tasks = [{"task_id": "TSK-1", "title": title, "status": "ready", "due_date": ""}]
+        result = _task_list_lines(tasks, "BIZ-1")
+        self.assertIn(f"• TSK-1 — {title}", result)
+
+    def test_title_truncation_sixty_one_truncated(self):
+        from business_core.telegram_handlers import _task_list_lines
+        title = "T" * 61
+        tasks = [{"task_id": "TSK-1", "title": title, "status": "ready", "due_date": ""}]
+        result = _task_list_lines(tasks, "BIZ-1")
+        expected = f"• TSK-1 — {'T' * 60}…"
+        self.assertIn(expected, result)
+        self.assertEqual(len(expected) - len("• TSK-1 — "), 61)
+
+    def test_title_much_longer_than_sixty(self):
+        from business_core.telegram_handlers import _task_list_lines
+        title = "T" * 500
+        tasks = [{"task_id": "TSK-1", "title": title, "status": "ready", "due_date": ""}]
+        result = _task_list_lines(tasks, "BIZ-1")
+        joined = "\n".join(result)
+        self.assertIn("T" * 60 + "…", joined)
+        self.assertNotIn("T" * 61, joined)
+
+    def test_exactly_twenty_rows_no_more_results_line(self):
+        from business_core.telegram_handlers import _task_list_lines
+        tasks = [{"task_id": f"TSK-{i:03d}", "title": "T", "status": "ready", "due_date": ""} for i in range(20)]
+        result = _task_list_lines(tasks, "BIZ-1")
+        self.assertFalse(any("и ещё" in line for line in result))
+
+    def test_twenty_one_rows_more_results_line(self):
+        from business_core.telegram_handlers import _task_list_lines
+        tasks = [{"task_id": f"TSK-{i:03d}", "title": "T", "status": "ready", "due_date": ""} for i in range(21)]
+        result = _task_list_lines(tasks, "BIZ-1")
+        self.assertIn("… и ещё 1", result)
+
+    def test_more_results_count_exact(self):
+        from business_core.telegram_handlers import _task_list_lines
+        tasks = [{"task_id": f"TSK-{i:03d}", "title": "T", "status": "ready", "due_date": ""} for i in range(35)]
+        result = _task_list_lines(tasks, "BIZ-1")
+        self.assertIn("… и ещё 15", result)
+
+    def test_no_raw_dict_rendered(self):
+        from business_core.telegram_handlers import _task_list_lines
+        tasks = [{"task_id": "TSK-1", "title": "X", "status": "ready", "due_date": ""}]
+        result = _task_list_lines(tasks, "BIZ-1")
+        joined = "\n".join(result)
+        self.assertNotIn("{", joined)
+        self.assertNotIn("}", joined)
+
+    def _row(self, **over):
+        base = {"task_id": "TSK-1", "title": "X", "status": "ready", "due_date": "2026-08-01", "business_id": "BIZ-1"}
+        base.update(over)
+        return base
+
+    def test_business_id_length_forty_unchanged(self):
+        from business_core.telegram_handlers import _task_list_lines
+        biz = "B" * 40
+        result = _task_list_lines([self._row()], biz)
+        self.assertIn(f"📋 Tasks — {biz}", result)
+
+    def test_business_id_length_forty_one_clipped(self):
+        from business_core.telegram_handlers import _task_list_lines
+        biz = "B" * 41
+        result = _task_list_lines([self._row()], biz)
+        self.assertIn(f"📋 Tasks — {'B' * 40}…", result)
+
+    def test_business_id_length_ten_thousand_clipped(self):
+        from business_core.telegram_handlers import _task_list_lines
+        biz = "B" * 10000
+        result = _task_list_lines([self._row()], biz)
+        self.assertIn(f"📋 Tasks — {'B' * 40}…", result)
+
+    def test_task_id_length_forty_unchanged(self):
+        from business_core.telegram_handlers import _task_list_lines
+        tid = "T" * 40
+        result = _task_list_lines([self._row(task_id=tid)], "BIZ-1")
+        self.assertIn(f"• {tid} — X", result)
+
+    def test_task_id_length_forty_one_clipped(self):
+        from business_core.telegram_handlers import _task_list_lines
+        tid = "T" * 41
+        result = _task_list_lines([self._row(task_id=tid)], "BIZ-1")
+        self.assertIn(f"• {'T' * 40}… — X", result)
+
+    def test_task_id_length_ten_thousand_clipped(self):
+        from business_core.telegram_handlers import _task_list_lines
+        tid = "T" * 10000
+        result = _task_list_lines([self._row(task_id=tid)], "BIZ-1")
+        self.assertIn(f"• {'T' * 40}… — X", result)
+
+    def test_known_status_under_limit_unchanged(self):
+        from business_core.telegram_handlers import _task_list_lines, _task_status_ru
+        result = _task_list_lines([self._row(status="ready")], "BIZ-1")
+        expected_status = _task_status_ru("ready")
+        self.assertTrue(any(expected_status in line for line in result))
+        self.assertLessEqual(len(expected_status), 40)
+
+    def test_unknown_status_formatted_output_clipped_after_translation(self):
+        from business_core.telegram_handlers import _task_list_lines, _task_status_ru
+        raw_status = "S" * 60
+        formatted = _task_status_ru(raw_status)
+        self.assertGreater(len(formatted), 40, "fixture must exceed the cap to prove clipping happens after formatting")
+        result = _task_list_lines([self._row(status=raw_status)], "BIZ-1")
+        status_lines = [line for line in result if line.startswith("  ")]
+        self.assertEqual(len(status_lines), 1)
+        status_field = status_lines[0].split(" · ")[0].removeprefix("  ")
+        self.assertEqual(len(status_field), 41)
+        self.assertTrue(status_field.endswith("…"))
+
+    def test_raw_status_length_ten_thousand_bounded_output(self):
+        from business_core.telegram_handlers import _task_list_lines
+        raw_status = "S" * 10000
+        result = _task_list_lines([self._row(status=raw_status)], "BIZ-1")
+        status_lines = [line for line in result if line.startswith("  ")]
+        status_field = status_lines[0].split(" · ")[0].removeprefix("  ")
+        self.assertLessEqual(len(status_field), 41)
+
+    def test_due_date_length_thirty_unchanged(self):
+        from business_core.telegram_handlers import _task_list_lines
+        due = "D" * 30
+        result = _task_list_lines([self._row(due_date=due)], "BIZ-1")
+        self.assertTrue(any(line.endswith(due) for line in result))
+
+    def test_due_date_length_thirty_one_clipped(self):
+        from business_core.telegram_handlers import _task_list_lines
+        due = "D" * 31
+        result = _task_list_lines([self._row(due_date=due)], "BIZ-1")
+        self.assertTrue(any(line.endswith("D" * 30 + "…") for line in result))
+
+    def test_due_date_length_ten_thousand_clipped(self):
+        from business_core.telegram_handlers import _task_list_lines
+        due = "D" * 10000
+        result = _task_list_lines([self._row(due_date=due)], "BIZ-1")
+        self.assertTrue(any(line.endswith("D" * 30 + "…") for line in result))
+
+    def test_one_row_all_fields_ten_thousand_bounded(self):
+        from business_core.telegram_handlers import _task_list_lines, _safe_send
+        L = 10000
+        row = self._row(task_id="T" * L, title="X" * L, status="S" * L, due_date="D" * L)
+        result = _task_list_lines([row], "B" * L)
+        text = "\n".join(result)
+        self.assertLess(len(text), 4000)
+        self.assertEqual(len(_safe_send(text)), 1)
+
+    def test_twenty_rows_every_field_adversarially_long(self):
+        from business_core.telegram_handlers import _task_list_lines, _safe_send
+        L = 10000
+        rows = [self._row(task_id="T" * L, title="X" * L, status="S" * L, due_date="D" * L) for _ in range(20)]
+        result = _task_list_lines(rows, "B" * L)
+        text = "\n".join(result)
+        self.assertLess(len(text), 4000)
+        self.assertEqual(len(_safe_send(text)), 1)
+
+    def test_twenty_rows_plus_more_results_line_bounded(self):
+        from business_core.telegram_handlers import _task_list_lines, _safe_send
+        L = 10000
+        rows = [self._row(task_id="T" * L, title="X" * L, status="S" * L, due_date="D" * L) for _ in range(25)]
+        result = _task_list_lines(rows, "B" * L)
+        self.assertIn("… и ещё 5", result)
+        text = "\n".join(result)
+        self.assertLess(len(text), 4000)
+        self.assertEqual(len(_safe_send(text)), 1)
+
+    def test_long_business_id_plus_twenty_long_rows_bounded(self):
+        from business_core.telegram_handlers import _task_list_lines, _safe_send
+        L = 10000
+        rows = [self._row(task_id="T" * L, title="X" * L, status="S" * L, due_date="D" * L) for _ in range(20)]
+        result = _task_list_lines(rows, "B" * L)
+        text = "\n".join(result)
+        self.assertLess(len(text), 4000)
+        self.assertEqual(len(_safe_send(text)), 1)
+
+
+# ─────────────────────────────────────────────────────────────
 # business_builder.py comprehensive top-level construct guard.
 #
 # Complements TestPhase17E2A4H1OfferHardeningScope in
@@ -1249,8 +1649,11 @@ class TestBusinessBuilderConstructGuardHelperUnit(unittest.TestCase):
 # ─────────────────────────────────────────────────────────────
 
 _TELEGRAM_HANDLERS_APPROVED_TO_DIFFER = frozenset({
-    "async_function:bctask_cmd", "function:_task_detail_lines",
-    "assignment:COMMAND_ENFORCEMENT_MAP",
+    "async_function:bctasks_cmd", "assignment:COMMAND_ENFORCEMENT_MAP",
+})
+
+_TELEGRAM_HANDLERS_APPROVED_TO_ADD = frozenset({
+    "function:_task_list_lines",
 })
 
 _TELEGRAM_HANDLERS_KNOWN_BENIGN_TOP_LEVEL_NODE_TYPES = (ast.Expr, ast.Pass)
@@ -1335,7 +1738,10 @@ class TestTelegramHandlersTopLevelConstructGuard(unittest.TestCase):
         removed = set(head) - set(current)
         added = set(current) - set(head)
         self.assertEqual(removed, set(), f"telegram_handlers.py: construct(s) removed: {sorted(removed)}")
-        self.assertEqual(added, set(), f"telegram_handlers.py: unexpected new construct(s): {sorted(added)}")
+        self.assertEqual(
+            added, _TELEGRAM_HANDLERS_APPROVED_TO_ADD,
+            f"telegram_handlers.py: unexpected new construct(s): {sorted(added - _TELEGRAM_HANDLERS_APPROVED_TO_ADD)}",
+        )
 
         for key in head:
             if key in _TELEGRAM_HANDLERS_APPROVED_TO_DIFFER:
@@ -1352,7 +1758,7 @@ class TestTelegramHandlersTopLevelConstructGuard(unittest.TestCase):
         head = _telegram_handlers_top_level_constructs(head_src)
         current = _telegram_handlers_top_level_constructs(current_src)
         added = set(current) - set(head)
-        self.assertEqual(added, set())
+        self.assertEqual(added, _TELEGRAM_HANDLERS_APPROVED_TO_ADD)
 
     def test_task_assignment_message_construct_present_in_both_versions(self):
         head_src = _git_show_head_telegram_handlers_py()
@@ -1367,7 +1773,7 @@ class TestTelegramHandlersTopLevelConstructGuard(unittest.TestCase):
         current_src = (BUSINESS_CORE / "telegram_handlers.py").read_text(encoding="utf-8")
         head = _telegram_handlers_top_level_constructs(head_src)
         current = _telegram_handlers_top_level_constructs(current_src)
-        for name in ("assigntask_cmd", "reassigntask_cmd", "bctasks_cmd", "unassigntask_cmd", "newbctask_cmd", "updatetask_cmd"):
+        for name in ("assigntask_cmd", "reassigntask_cmd", "bctask_cmd", "unassigntask_cmd", "newbctask_cmd", "updatetask_cmd"):
             key = f"async_function:{name}"
             self.assertIn(key, head)
             self.assertEqual(head[key], current[key], f"{name} must not change this phase")
@@ -1380,15 +1786,26 @@ class TestTelegramHandlersTopLevelConstructGuard(unittest.TestCase):
         self.assertEqual(head["function:_task_assignment_message"], current["function:_task_assignment_message"])
 
     def test_command_enforcement_map_gains_exactly_one_entry(self):
-        # The bctask entry was committed as HEAD itself, so comparing
-        # the working tree against HEAD no longer reveals this
-        # addition — that transient check is retired here. Durable
-        # protection is the exact-value assertions below, plus the
-        # exact-value guard in test_command_enforcement.py's
-        # test_mutation_entries_exact and the Task-key-set guard in
-        # test_authorization_domain.py.
+        # Comparing the working tree against HEAD no longer reveals
+        # any specific historical addition once that addition is
+        # itself committed as HEAD — that kind of transient check does
+        # not belong here. Durable protection is the exact-value
+        # assertions below, plus the exact-value guard in
+        # test_command_enforcement.py's test_mutation_entries_exact
+        # and the Task-key-set guard in test_authorization_domain.py.
         import business_core.telegram_handlers as th
-        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 16)
+        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 17)
+        self.assertIn("bctasks", th.COMMAND_ENFORCEMENT_MAP)
+        self.assertEqual(
+            th.COMMAND_ENFORCEMENT_MAP["bctasks"],
+            {
+                "resource": "TASK", "action": "READ", "target_shape": "BUSINESS",
+                "operation_kind": "READ", "requires_fresh_reread": False,
+            },
+        )
+
+        # Committed in earlier phases, not this one — still present
+        # and unchanged.
         self.assertIn("bctask", th.COMMAND_ENFORCEMENT_MAP)
         self.assertEqual(
             th.COMMAND_ENFORCEMENT_MAP["bctask"],
@@ -1397,10 +1814,6 @@ class TestTelegramHandlersTopLevelConstructGuard(unittest.TestCase):
                 "operation_kind": "READ", "requires_fresh_reread": False,
             },
         )
-        self.assertNotIn("bctasks", th.COMMAND_ENFORCEMENT_MAP)
-
-        # Committed in an earlier phase, not this one — still present
-        # and unchanged.
         self.assertIn("unassigntask", th.COMMAND_ENFORCEMENT_MAP)
         self.assertEqual(
             th.COMMAND_ENFORCEMENT_MAP["unassigntask"],

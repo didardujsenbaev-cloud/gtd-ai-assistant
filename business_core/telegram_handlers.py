@@ -127,6 +127,10 @@ COMMAND_ENFORCEMENT_MAP = {
         "resource": "TASK", "action": "READ", "target_shape": "BUSINESS",
         "operation_kind": "READ", "requires_fresh_reread": False,
     },
+    "bctasks": {
+        "resource": "TASK", "action": "READ", "target_shape": "BUSINESS",
+        "operation_kind": "READ", "requires_fresh_reread": False,
+    },
 }
 
 _BC_ENFORCEMENT_NOT_FOUND_OR_DENIED_MSG = "Запись недоступна или не найдена."
@@ -16215,44 +16219,149 @@ async def newbctask_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await _reply(update, "❌ Ошибка при создании Task.")
 
 
+def _task_list_lines(tasks, business_id) -> list[str]:
+    """
+    Pure, deterministic rendering of an already-authorized, already
+    Business-filtered Task list for /bctasks. Every row is expected to
+    already belong to the one authorized Business — this function
+    performs no filtering, no I/O, no logging, no authorization, and
+    no storage calls of its own, and never mutates its input.
+
+    Malformed input (a non-list `tasks`, or any row that is not a
+    dict, or any missing/non-string field) degrades to a safe
+    placeholder — it never raises and never renders a raw row.
+
+    Every displayed field is clipped to a fixed maximum length —
+    Business ID/Task ID to 40, Title to 60, formatted Status to 40,
+    Due Date to 30 — so the total rendered output for the 20-row cap
+    stays deterministically under the 4000-character _safe_send
+    threshold regardless of how long any single stored value is.
+    """
+    def _clip(value: str, limit: int) -> str:
+        return value if len(value) <= limit else value[:limit] + "…"
+
+    label = _clip(business_id, 40) if isinstance(business_id, str) and business_id else "—"
+    header = f"📋 Tasks — {label}"
+
+    rows = [t for t in tasks if isinstance(t, dict)] if isinstance(tasks, list) else []
+
+    if not rows:
+        return [header, "", "Пусто."]
+
+    def _g(row: dict, key: str) -> str:
+        value = row.get(key, "")
+        return value if isinstance(value, str) else ""
+
+    lines = [header, ""]
+    for row in rows[:20]:
+        task_id = _clip(_g(row, "task_id"), 40) or "—"
+        title = _clip(_g(row, "title"), 60) or "—"
+        status_raw = _g(row, "status")
+        status = _clip(_task_status_ru(status_raw), 40) if status_raw else "—"
+        due_date = _clip(_g(row, "due_date"), 30) or "—"
+        lines.append(f"• {task_id} — {title}")
+        lines.append(f"  {status} · {due_date}")
+
+    if len(rows) > 20:
+        lines.append(f"… и ещё {len(rows) - 20}")
+
+    return lines
+
+
 async def bctasks_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    /bctasks [business_id=BIZ-001] [status=ready] [roadmap_id=RM-001]
+    /bctasks business_id=BIZ-001 [status=ready] [roadmap_id=RM-001]
              [stage_id=STAGE-001] [role_id=ROLE-001] [person_id=PRS-001]
 
-    Read-only. Exact filters only — no fuzzy matching. Never reads
-    personal GTD Next Actions.
+    Read-only Task list confined to one caller-requested, then
+    authorized, Business. business_id acts as the requested
+    authorization scope rather than a proven ownership field — there
+    is no single Task row to derive it from before a list scan, unlike
+    a single-record read — so it is validated first and authorized
+    before any storage call, and that exact same value is the only
+    Business ID ever passed to storage. Every row storage returns is
+    defensively re-checked against it afterward, on top of storage's
+    own filtering. list_tasks is called with raise_on_error=True so a
+    storage failure can never be confused with a genuinely empty,
+    authorized Business — the two use different fixed replies.
     """
     if not _is_bc_enabled():
-        await _reply(update, _bc_disabled_msg())
+        await _reply(update, _bc_disabled_msg(), parse_mode=None)
+        return
+
+    if not await _validate_bc_transport_or_reply(update):
         return
 
     raw = " ".join(context.args or [])
     args = _parse_kv_args(raw)
 
-    try:
-        from business_core.task_manager import list_tasks
-
-        tasks = list_tasks(
-            business_id=args.get("business_id", ""), status=args.get("status", ""),
-            roadmap_id=args.get("roadmap_id", ""), stage_id=args.get("stage_id", ""),
-            role_id=args.get("role_id", ""), person_id=args.get("person_id", ""),
+    allowed_keys = {"business_id", "status", "roadmap_id", "stage_id", "role_id", "person_id"}
+    if not set(args.keys()) <= allowed_keys:
+        await _reply(
+            update,
+            "❌ /bctasks принимает только business_id, status, roadmap_id, stage_id, role_id, person_id.",
+            parse_mode=None,
         )
+        return
 
-        if not tasks:
-            await _reply(update, "📋 *Business Tasks*\n\nПусто. Создай первый: /newbctask")
+    business_id_value = args.get("business_id", "")
+    business_id = business_id_value.strip() if isinstance(business_id_value, str) else ""
+    if not business_id:
+        await _reply(update, "❌ Укажи business_id.\n\nПример: /bctasks business_id=BIZ-001", parse_mode=None)
+        return
+
+    filters = {}
+    for key in ("status", "roadmap_id", "stage_id", "role_id", "person_id"):
+        value = args.get(key, "")
+        if not isinstance(value, str):
+            await _reply(update, "❌ Некорректные аргументы /bctasks.", parse_mode=None)
             return
+        filters[key] = value.strip()
 
-        lines = [f"📋 *Business Tasks* ({len(tasks)} шт.)\n"]
-        for t in tasks[:30]:
-            line = f"`{t['task_id']}` {t['title']} — {_task_status_ru(t['status'])}"
-            if t.get("due_date"):
-                line += f" (до {t['due_date']})"
-            lines.append(line)
-        await _reply(update, "\n".join(lines))
-    except Exception as e:
-        log.error(f"bctasks_cmd error: {e}")
-        await _reply(update, "❌ Ошибка при получении списка Task.")
+    if not await _authorize_or_reply(
+        update, resource="TASK", action="READ", business_id=business_id,
+    ):
+        return
+
+    from business_core.task_manager import list_tasks
+
+    try:
+        result = await asyncio.to_thread(
+            list_tasks,
+            business_id=business_id, status=filters["status"], roadmap_id=filters["roadmap_id"],
+            stage_id=filters["stage_id"], role_id=filters["role_id"], person_id=filters["person_id"],
+            raise_on_error=True,
+        )
+    except Exception:
+        # Fixed literal only — no exception interpolation, no
+        # Business ID, no filters.
+        log.error("bctasks_cmd storage read failure")
+        await _reply(update, _BC_ENFORCEMENT_TEMPORARILY_UNAVAILABLE_MSG, parse_mode=None)
+        return
+
+    if not isinstance(result, list):
+        log.error("bctasks_cmd storage read failure")
+        await _reply(update, _BC_ENFORCEMENT_TEMPORARILY_UNAVAILABLE_MSG, parse_mode=None)
+        return
+
+    valid_rows = []
+    for row in result:
+        if not isinstance(row, dict):
+            continue
+        row_business_id = row.get("business_id", "")
+        if not isinstance(row_business_id, str):
+            continue
+        if row_business_id.strip() != business_id:
+            continue
+        valid_rows.append(row)
+
+    try:
+        await _reply(update, "\n".join(_task_list_lines(valid_rows, business_id)), parse_mode=None)
+    except Exception:
+        # Fixed literal only — no exception interpolation, no Business
+        # ID, no Task rows.
+        log.error("bctasks_cmd formatting/reply failure")
+        await _reply(update, "❌ Ошибка при получении списка Task.", parse_mode=None)
 
 
 async def bctask_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

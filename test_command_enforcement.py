@@ -188,6 +188,12 @@ _EXPECTED_MUTATION_ENTRY = {
         "resource": "TASK", "action": "READ", "target_shape": "BUSINESS",
         "operation_kind": "READ", "requires_fresh_reread": False,
     },
+    # Not a mutation (operation_kind=READ) — a business-scoped Task
+    # list read, same shape as bctask's single-record read.
+    "bctasks": {
+        "resource": "TASK", "action": "READ", "target_shape": "BUSINESS",
+        "operation_kind": "READ", "requires_fresh_reread": False,
+    },
 }
 
 _NON_ENFORCED_SAMPLE_HANDLERS = [
@@ -221,9 +227,9 @@ class TestEnforcementMap(unittest.TestCase):
             with self.subTest(command=key):
                 self.assertEqual(th.COMMAND_ENFORCEMENT_MAP[key], val)
 
-    def test_no_seventeenth_command_in_map(self):
-        # Phase 18A.6-B added the 16th entry (bctask); no 17th exists.
-        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 16)
+    def test_no_eighteenth_command_in_map(self):
+        # bctasks added the 17th entry; no 18th exists.
+        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 17)
 
     def test_updatelead_not_in_map(self):
         self.assertNotIn("updatelead", th.COMMAND_ENFORCEMENT_MAP)
@@ -449,11 +455,12 @@ class TestPhase17E2A4H1OfferHardeningScope(unittest.TestCase):
                 "_payment_transaction_reversal_message", "_payment_transaction_failure_message",
                 "confirmpayment_cmd", "reversepayment_cmd", "failpayment_cmd", "updateinteractionnotes_cmd",
                 "_task_assignment_message", "unassigntask_cmd",
-                "_task_detail_lines", "bctask_cmd",
+                "_task_detail_lines", "bctask_cmd", "bctasks_cmd",
             },
             allowed_added_function_names={
                 "_offer_notes_message", "updateoffernotes_cmd",
                 "_document_notes_message", "updatedocnotes_cmd",
+                "_task_list_lines",
             },
         )
 
@@ -511,11 +518,11 @@ class TestPhase17E2A4H1OfferHardeningScope(unittest.TestCase):
     def test_payment_ledger_read_failed_code_added_no_extra_map_entry_beyond_failpayment(self):
         # Phase 17E-2A6-H1 itself added no map entry. Phase
         # 17E-2A6-AUTH-B1 added failpayment; Phase 17E-2A6-AUTH-B2
-        # added confirmpayment and reversepayment. unassigntask was
-        # added later, in the Task assignment mapper's own
-        # authorization phase, and bctask in Phase 18A.6-B's Task
-        # read-authorization hardening — no other entry beyond these five.
-        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 16)
+        # added confirmpayment and reversepayment. unassigntask, bctask,
+        # and bctasks were each added later, in their own Task
+        # read/write authorization phases — no other entry beyond
+        # these six.
+        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 17)
         self.assertIn("failpayment", th.COMMAND_ENFORCEMENT_MAP)
         self.assertIn("confirmpayment", th.COMMAND_ENFORCEMENT_MAP)
         self.assertIn("reversepayment", th.COMMAND_ENFORCEMENT_MAP)
@@ -598,11 +605,12 @@ class TestPhase17E2A4H1OfferHardeningScope(unittest.TestCase):
                 "_payment_transaction_reversal_message", "_payment_transaction_failure_message",
                 "confirmpayment_cmd", "reversepayment_cmd", "failpayment_cmd", "updateinteractionnotes_cmd",
                 "_task_assignment_message", "unassigntask_cmd",
-                "_task_detail_lines", "bctask_cmd",
+                "_task_detail_lines", "bctask_cmd", "bctasks_cmd",
             },
             allowed_added_function_names={
                 "_offer_notes_message", "updateoffernotes_cmd",
                 "_document_notes_message", "updatedocnotes_cmd",
+                "_task_list_lines",
             },
         )
         # Redundant with the file-level check above but explicit:
@@ -627,8 +635,8 @@ class TestPhase17E2A4H1OfferHardeningScope(unittest.TestCase):
         self.assertTrue(hasattr(th, "updatedocnotes_cmd"))
         self.assertIn("updatedocnotes", th.COMMAND_ENFORCEMENT_MAP)
 
-    def test_enforcement_map_now_sixteen_entries(self):
-        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 16)
+    def test_enforcement_map_now_seventeen_entries(self):
+        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 17)
 
     def test_exactly_nine_dedicated_mutation_handlers_use_mutate_helper(self):
         dedicated = [

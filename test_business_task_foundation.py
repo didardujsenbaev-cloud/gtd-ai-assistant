@@ -1012,11 +1012,18 @@ class TestListTasksStrictErrorMode(unittest.TestCase):
         with self.assertRaises(TypeError):
             list_tasks("BIZ-001", "", "", "", "", "", True)
 
-    def test_no_bctasks_caller_passes_raise_on_error(self):
+    def test_bctasks_caller_uses_raise_on_error_true(self):
+        # bctasks_cmd is the one authorized caller of list_tasks that
+        # must opt into strict mode — a storage failure must never be
+        # silently indistinguishable from a genuinely empty, authorized
+        # Business (business_core/telegram_handlers.py::bctasks_cmd's
+        # own architecture guards prove the exact call shape; this is
+        # a coarse source-text confirmation that the opt-in exists).
         import inspect
         from business_core import telegram_handlers as th
         src = inspect.getsource(th.bctasks_cmd)
-        self.assertNotIn("raise_on_error", src)
+        self.assertIn("raise_on_error=True", src)
+        self.assertNotIn("raise_on_error=False", src)
 
 
 if __name__ == "__main__":
