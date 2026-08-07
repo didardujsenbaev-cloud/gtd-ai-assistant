@@ -15880,19 +15880,32 @@ def _task_creation_message(result: dict) -> str:
     code = _g("code")
 
     if code == "TASK_CREATED":
-        return "\n".join([
+        # Phase 18A.9-A3-A1: surface the caller-owned operation
+        # identity (idempotency_key) in the same one-message reply —
+        # bounded via _g / field_max_len so adversarial input cannot
+        # inflate the reply. Key identifies a CREATE operation, not
+        # Task content identity.
+        lines = [
             "✅ Task создан",
             f"Task ID: `{_g('task_id')}`",
             f"Business ID: `{_g('business_id')}`",
             f"Статус: {_task_status_ru(_g('final_status', 'new'))}",
-        ])
+        ]
+        key = _g("idempotency_key")
+        if key:
+            lines.append(f"Idempotency Key: `{key}`")
+        return "\n".join(lines)
 
     if code == "TASK_REUSED":
-        return "\n".join([
+        lines = [
             "ℹ️ Task уже существует — переиспользован по Idempotency Key",
             f"Task ID: `{_g('task_id')}`",
             f"Статус: {_task_status_ru(_g('final_status'))}",
-        ])
+        ]
+        key = _g("idempotency_key")
+        if key:
+            lines.append(f"Idempotency Key: `{key}`")
+        return "\n".join(lines)
 
     if code == "BUSINESS_NOT_FOUND":
         return f"❌ Business `{_g('business_id')}` не найден."
@@ -16237,6 +16250,15 @@ def _task_detail_lines(task) -> list[str]:
         lines.append(f"Source: {_g('source')}")
     if _g("created_by"):
         lines.append(f"Created By: {_g('created_by')}")
+    # Phase 18A.9-A3-A1: surface non-blank Idempotency Key so the
+    # caller can recover the stable business-operation identity and
+    # safely reuse it on retry. Blank legacy rows stay silent — never
+    # synthesize a key.
+    if _g("idempotency_key"):
+        key = _g("idempotency_key")
+        if len(key) > 64:
+            key = key[:64] + "…"
+        lines.append(f"Idempotency Key: `{key}`")
     if _g("gtd_action_id"):
         lines.append(f"GTD Action ID: `{_g('gtd_action_id')}`")
 
@@ -16245,9 +16267,9 @@ def _task_detail_lines(task) -> list[str]:
 
 async def newbctask_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    /newbctask business_id=BIZ-001 title="..." [description=...]
-               [priority=...] [due_date=YYYY-MM-DD] [source=...]
-               [idempotency_key=...] [client_id=...] [object_id=...]
+    /newbctask business_id=BIZ-001 title="..." idempotency_key=...
+               [description=...] [priority=...] [due_date=YYYY-MM-DD]
+               [source=...] [client_id=...] [object_id=...]
                [service_id=...] [roadmap_id=...] [stage_id=...]
 
     Phase 18A.8-C1: TASK/CREATE, target_shape=BUSINESS, MUTATION,
@@ -16262,6 +16284,13 @@ async def newbctask_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     storage layer, the reply does not claim success or invite an
     immediate identical retry, since the write may have completed
     despite the exception surfacing here.
+
+    Phase 18A.9-A3-A1: idempotency_key is required and is the explicit
+    business-operation identity for this CREATE (scoped with Business
+    ID in core). Same key → TASK_REUSED; new key → new operation.
+    Silent tg-<update_id> fallback is removed — transport event IDs
+    are not business-operation keys. Content equality alone never
+    identifies an operation.
     """
     if not _is_bc_enabled():
         await _reply(update, _bc_disabled_msg(), parse_mode=None)
@@ -16305,11 +16334,36 @@ async def newbctask_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     business_id = values["business_id"]
     title = values["title"]
+    idempotency_key = values["idempotency_key"]
     if not business_id or not title:
         await _reply(
             update,
-            "❌ Укажи business_id и title.\n\nПример:\n"
-            '`/newbctask business_id=BIZ-001 title="Подготовить документы"`',
+            "❌ Укажи business_id, title и idempotency_key.\n\nПример:\n"
+            '`/newbctask business_id=BIZ-001 title="Подготовить документы" '
+            'idempotency_key=op:123`',
+            parse_mode=None,
+        )
+        return
+
+    # Phase 18A.9-A3-A1: idempotency_key is the required business-
+    # operation identity. Missing/blank (after strip) rejects before
+    # authorization and before any storage call. Same key ⇒ reuse;
+    # new key ⇒ intentional new operation. No tg-<update_id> /
+    # message_id / content-hash fallback.
+    if not idempotency_key:
+        await _reply(
+            update,
+            "\n".join([
+                "❌ Для создания Task укажите idempotency_key.",
+                "",
+                "При повторной отправке используйте тот же ключ —",
+                "тогда существующая Task будет переиспользована.",
+                "",
+                "Для новой Task используйте новый ключ.",
+                "",
+                "Пример:",
+                '`/newbctask business_id=BIZ-001 title="..." idempotency_key=op:123`',
+            ]),
             parse_mode=None,
         )
         return
@@ -16320,20 +16374,6 @@ async def newbctask_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     source = values["source"] or "telegram"
-
-    idempotency_key = values["idempotency_key"]
-    if not idempotency_key:
-        # type(x) is int (not isinstance) deliberately excludes bool —
-        # bool is a subclass of int in Python, so isinstance(True, int)
-        # is True; a Telegram update_id must be a genuine positive int,
-        # never a bool. type() never invokes __getattribute__/__str__/
-        # __repr__ on the value, so this check alone is already safe
-        # against a poisoned/adversarial object.
-        update_id = getattr(update, "update_id", None)
-        if type(update_id) is not int or update_id <= 0:
-            await _reply(update, _BC_ENFORCEMENT_TEMPORARILY_UNAVAILABLE_MSG, parse_mode=None)
-            return
-        idempotency_key = f"tg-{update_id}"
 
     # created_by identity (§12/F1): the shared _authorize_or_reply()
     # wrapper (and the lower adapter it alone calls) only exposes a
@@ -16351,9 +16391,9 @@ async def newbctask_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     # genuine positive int — so this handler cannot rely on it and
     # must not spend an authorization call on a malformed actor state.
     # Exactly the same type(x) is int (bool excluded) + positivity
-    # check as update_id above — str(user_id) below only ever runs
-    # once user_id is already proven to be a normal positive int, so
-    # no try/except is required around it.
+    # check — str(user_id) below only ever runs once user_id is
+    # already proven to be a normal positive int, so no try/except is
+    # required around it.
     effective_user = getattr(update, "effective_user", None)
     user_id = getattr(effective_user, "id", None) if effective_user is not None else None
     if type(user_id) is not int or user_id <= 0:
@@ -16405,6 +16445,12 @@ async def newbctask_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         log.error("newbctask_cmd malformed creation result")
         await _reply(update, "❌ Ошибка при создании Task.", parse_mode=None)
         return
+
+    # Core result does not currently carry the operation key; inject
+    # the normalized caller key for one-message UX only (no second
+    # reply, no schema change).
+    result = dict(result)
+    result["idempotency_key"] = idempotency_key
 
     await _reply(update, _task_creation_message(result), parse_mode=None)
 

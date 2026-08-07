@@ -465,23 +465,11 @@ class TestUnassignTaskPartialStateHardening(unittest.TestCase):
         self.skipTest("superseded by TestBusinessBuilderTopLevelConstructGuard._BUSINESS_BUILDER_APPROVED_TO_DIFFER")
 
     def test_task_manager_unchanged(self):
-        # list_tasks's raise_on_error strict-mode contract is now part
-        # of HEAD itself, so comparing the working tree against HEAD
-        # no longer reveals it. This guard proves task_manager.py's
-        # top-level constructs match HEAD exactly, except for whatever
-        # a given phase legitimately touches — a phase that changes a
-        # task_manager.py construct must update the expected sets here
-        # to name exactly that construct, and nothing else.
-        #
-        # Phase 18A.9-A1 (fail-closed Task creation storage hardening):
-        # find_tasks_by_idempotency_key() changed to a typed
-        # {"ok", "code", "matches", "error"} contract and normalized
-        # key comparison; create_task() changed to use
-        # generate_next_task_id()/append_task_registry_row() with
-        # post-append verification instead of the generic
-        # generate_next_id()/append_business_row(); a single new
-        # top-level helper, _verify_created_task_row(), was added for
-        # that verification read. No other construct changed.
+        # Phase 18A.9-A1 constructs (_verify_created_task_row,
+        # find_tasks_by_idempotency_key, create_task) are now in HEAD.
+        # Durable post-commit invariant for later phases (incl. A3-A1):
+        # working tree must match HEAD exactly unless a future phase
+        # explicitly updates this expectation.
         import subprocess
 
         head_src = subprocess.run(
@@ -494,14 +482,13 @@ class TestUnassignTaskPartialStateHardening(unittest.TestCase):
         current = _task_manager_top_level_constructs(current_src)
         added = set(current) - set(head)
         removed = set(head) - set(current)
-        self.assertEqual(added, {"function:_verify_created_task_row"}, "task_manager.py: unapproved new top-level construct")
+        self.assertEqual(added, set(), "task_manager.py: unapproved new top-level construct")
         self.assertEqual(removed, set(), "task_manager.py: a top-level construct was removed")
         changed = {k for k in head if k in current and head[k] != current[k]}
-        self.assertEqual(
-            changed,
-            {"function:find_tasks_by_idempotency_key", "function:create_task"},
-            "task_manager.py: only find_tasks_by_idempotency_key/create_task may change this phase",
-        )
+        self.assertEqual(changed, set(), "task_manager.py: unexpected construct change vs HEAD")
+        self.assertIn("function:_verify_created_task_row", current)
+        self.assertIn("function:find_tasks_by_idempotency_key", current)
+        self.assertIn("function:create_task", current)
 
     _TASK_MANAGER_DUPLICATE_CASES = (
         (
@@ -1761,6 +1748,7 @@ class TestBusinessBuilderConstructGuardHelperUnit(unittest.TestCase):
 _TELEGRAM_HANDLERS_APPROVED_TO_DIFFER = frozenset({
     "async_function:bctasks_cmd", "assignment:COMMAND_ENFORCEMENT_MAP",
     "async_function:newbctask_cmd", "function:_task_creation_message",
+    "function:_task_detail_lines",
 })
 
 # Phase 18A.8-C1-F0 removed all 6 top-level constants Phase 18A.8-C1
@@ -2260,14 +2248,12 @@ class TestNewBcTaskCmdArchitectureGuards(unittest.TestCase):
                            "find_tasks_by_idempotency_key"):
             self.assertNotIn(forbidden, preamble)
 
-    # ── Phase 18A.8-C1-F1: identity-hardening guards ──
+    # ── Phase 18A.8-C1-F1: identity-hardening + 18A.9-A3-A1 operation key ──
 
     def _identity_check_nodes(self):
         """AST If-node whose test compares `type(<name>) is not int`
-        (or `is int` negated) for the given variable name — the exact
-        durable shape this phase's user_id/update_id guards must have,
-        found via structural AST matching rather than a fragile
-        source substring."""
+        for the given variable name — durable shape for user_id
+        created_by hardening."""
         import ast
         tree = ast.parse(self._source())
         func = tree.body[0]
@@ -2299,20 +2285,6 @@ class TestNewBcTaskCmdArchitectureGuards(unittest.TestCase):
                 linenos.append(node.lineno)
         return linenos
 
-    def _fstring_update_id_linenos(self):
-        """Line numbers of executable f"tg-{update_id}" JoinedStr
-        expressions only — AST-based."""
-        import ast
-        tree = ast.parse(self._source())
-        func = tree.body[0]
-        linenos = []
-        for node in ast.walk(func):
-            if isinstance(node, ast.JoinedStr):
-                for value in node.values:
-                    if isinstance(value, ast.FormattedValue) and isinstance(value.value, ast.Name) and value.value.id == "update_id":
-                        linenos.append(node.lineno)
-        return linenos
-
     def test_user_id_has_exact_type_is_int_guard_before_str(self):
         matches = self._identity_check_nodes()
         self.assertIn("user_id", matches, "no `type(user_id) is not int` guard found")
@@ -2321,44 +2293,134 @@ class TestNewBcTaskCmdArchitectureGuards(unittest.TestCase):
         self.assertEqual(len(str_linenos), 1, "expected exactly one str(user_id) call")
         self.assertGreater(str_linenos[0], node.end_lineno, "str(user_id) must execute strictly after the type(x) is not int guard")
 
-    def test_update_id_has_exact_type_is_int_guard_before_interpolation(self):
-        matches = self._identity_check_nodes()
-        self.assertIn("update_id", matches, "no `type(update_id) is not int` guard found")
-        node = matches["update_id"]
-        fstring_linenos = self._fstring_update_id_linenos()
-        self.assertEqual(len(fstring_linenos), 1, 'expected exactly one f"tg-{update_id}" expression')
-        self.assertGreater(fstring_linenos[0], node.end_lineno, 'f"tg-{update_id}" must execute strictly after the type(x) is not int guard')
-
     def test_user_id_guard_also_rejects_non_positive(self):
         matches = self._identity_check_nodes()
         node = matches["user_id"]
         src_seg = "\n".join(self._source().splitlines()[node.lineno - 1:node.end_lineno])
         self.assertIn("<= 0", src_seg)
 
-    def test_update_id_guard_also_rejects_non_positive(self):
-        matches = self._identity_check_nodes()
-        node = matches["update_id"]
-        src_seg = "\n".join(self._source().splitlines()[node.lineno - 1:node.end_lineno])
-        self.assertIn("<= 0", src_seg)
-
     def test_no_isinstance_int_used_for_identity_checks(self):
-        # isinstance(x, int) would silently accept bool (bool is an
-        # int subclass) — the durable invariant is that identity
-        # checks use type(x) is/is not int, never isinstance for this
-        # specific purpose.
         src = self._source()
         self.assertNotIn("isinstance(user_id, int)", src)
-        self.assertNotIn("isinstance(update_id, int)", src)
 
     def test_no_bare_str_call_on_unchecked_identity_values(self):
-        # Belt-and-braces textual proof alongside the AST-based
-        # ordering tests above: str(user_id) and the tg-{update_id}
-        # f-string each appear exactly once in the whole function body
-        # — the one call site, already proven above to sit after the
-        # respective type(x) is not int guard.
         code = "\n".join(self._code_lines())
         self.assertEqual(code.count("str(user_id)"), 1)
-        self.assertEqual(code.count('f"tg-{update_id}"'), 1)
+
+    # ── Phase 18A.9-A3-A1: explicit stable operation key ──
+
+    def test_idempotency_key_is_required_before_authorization(self):
+        """Missing/blank idempotency_key rejects before _authorize_or_reply."""
+        import ast
+        tree = ast.parse(self._source())
+        func = tree.body[0]
+        authz_lineno = None
+        key_guard_end = None
+        for node in ast.walk(func):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "_authorize_or_reply":
+                authz_lineno = node.lineno
+            if isinstance(node, ast.If):
+                test = node.test
+                if (isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not)
+                        and isinstance(test.operand, ast.Name) and test.operand.id == "idempotency_key"):
+                    key_guard_end = node.end_lineno
+        self.assertIsNotNone(key_guard_end, "missing `if not idempotency_key:` guard")
+        self.assertIsNotNone(authz_lineno, "missing _authorize_or_reply call")
+        self.assertLess(key_guard_end, authz_lineno)
+
+    def test_no_automatic_tg_update_id_fallback(self):
+        """Executable JoinedStr must not build tg-{update_id}/message_id/chat_id keys."""
+        import ast
+        tree = ast.parse(self._source())
+        func = tree.body[0]
+        forbidden_names = {"update_id", "message_id", "chat_id"}
+        for node in ast.walk(func):
+            if not isinstance(node, ast.JoinedStr):
+                continue
+            for value in node.values:
+                if isinstance(value, ast.Constant) and isinstance(value.value, str) and "tg-" in value.value:
+                    self.fail(f"tg- prefix JoinedStr remnant at line {node.lineno}")
+                if isinstance(value, ast.FormattedValue) and isinstance(value.value, ast.Name):
+                    self.assertNotIn(
+                        value.value.id, forbidden_names,
+                        f"business key must not interpolate {value.value.id}",
+                    )
+
+    def test_no_update_id_read_for_idempotency_assignment(self):
+        """No Name binding of update_id used to assign idempotency_key."""
+        import ast
+        tree = ast.parse(self._source())
+        func = tree.body[0]
+        for node in ast.walk(func):
+            if isinstance(node, ast.Assign):
+                for t in node.targets:
+                    if isinstance(t, ast.Name) and t.id == "idempotency_key":
+                        for sub in ast.walk(node.value):
+                            if isinstance(sub, ast.Name) and sub.id in ("update_id", "message_id", "chat_id"):
+                                self.fail("idempotency_key assignment must not read transport IDs")
+            if isinstance(node, ast.AugAssign) and isinstance(node.target, ast.Name) and node.target.id == "idempotency_key":
+                self.fail("idempotency_key must not be augmented from transport identity")
+
+    def test_no_content_hash_operation_identity(self):
+        code = "\n".join(self._code_lines())
+        for forbidden in ("hashlib", "sha256", "md5", "blake2", "fingerprint", "title_hash"):
+            self.assertNotIn(forbidden, code)
+
+    def test_no_operation_key_alias(self):
+        code = "\n".join(self._code_lines())
+        self.assertNotIn("operation_key", code)
+        self.assertNotIn('"operation_key"', code)
+
+    def test_passes_explicit_normalized_idempotency_key_kwarg(self):
+        import ast
+        tree = ast.parse(self._source())
+        func = tree.body[0]
+        found = False
+        for node in ast.walk(func):
+            if not isinstance(node, ast.Call):
+                continue
+            if isinstance(node.func, ast.Attribute) and node.func.attr == "to_thread":
+                for kw in node.keywords:
+                    if kw.arg == "idempotency_key" and isinstance(kw.value, ast.Name) and kw.value.id == "idempotency_key":
+                        found = True
+        self.assertTrue(found, "to_thread must pass idempotency_key=idempotency_key")
+
+    def test_mapper_surfaces_idempotency_key_on_created_and_reused(self):
+        src = self._mapper_source()
+        self.assertIn("Idempotency Key:", src)
+        self.assertIn('code == "TASK_CREATED"', src)
+        self.assertIn('code == "TASK_REUSED"', src)
+
+    def test_detail_surfaces_nonblank_idempotency_key(self):
+        import inspect
+        from business_core import telegram_handlers as th
+        src = inspect.getsource(th._task_detail_lines)
+        self.assertIn("idempotency_key", src)
+        self.assertIn("Idempotency Key:", src)
+
+    def test_no_distributed_atomicity_claim_in_handler(self):
+        code = "\n".join(self._code_lines()).lower()
+        for forbidden in ("distributed atomic", "cross-process atomic", "exactly-once", "exactly once"):
+            self.assertNotIn(forbidden, code)
+
+    def test_core_modules_unchanged_vs_head_this_phase(self):
+        """Approved A3-A1 production scope is telegram_handlers only."""
+        import subprocess
+        from pathlib import Path
+        root = Path(__file__).resolve().parent
+        for rel in (
+            "business_core/business_builder.py",
+            "business_core/task_manager.py",
+            "business_core/sheets.py",
+            "business_core/authorization.py",
+            "business_core/telegram_authorization.py",
+            "business_core/identity_manager.py",
+        ):
+            diff = subprocess.check_output(
+                ["git", "diff", "HEAD", "--", str(root / rel)],
+                text=True,
+            )
+            self.assertEqual(diff, "", f"{rel} must remain zero-diff vs HEAD this phase")
 
 
 class TestTelegramHandlersConstructGuardHelperUnit(unittest.TestCase):
@@ -2825,14 +2887,10 @@ class TestFailClosedTaskCreationStorageGuards(unittest.TestCase):
                 self.assertNotIn(phrase.lower(), lowered)
 
     def test_sheets_py_scope_exactly_two_new_functions(self):
-        # Phase 18A.9-A1 narrowly adds exactly two new top-level
-        # functions to sheets.py (generate_next_task_id,
-        # append_task_registry_row) and changes nothing else in that
-        # file — replaces the whole-file zero-diff guards in
-        # test_command_enforcement.py::test_sheets_py_unchanged and
-        # test_authorization_domain.py::test_sheets_zero_diff, which
-        # are structurally stale the moment any phase legitimately
-        # touches sheets.py.
+        # Phase 18A.9-A1 added generate_next_task_id /
+        # append_task_registry_row; those are now in HEAD. Durable
+        # post-commit invariant: sheets.py working tree matches HEAD,
+        # and both Task-creation helpers remain present.
         import subprocess
 
         head_src = subprocess.run(
@@ -2867,8 +2925,10 @@ class TestFailClosedTaskCreationStorageGuards(unittest.TestCase):
         added = set(current) - set(head)
         changed = {k for k in head if k in current and head[k] != current[k]}
         self.assertEqual(removed, set())
-        self.assertEqual(added, {"function:generate_next_task_id", "function:append_task_registry_row"})
+        self.assertEqual(added, set(), "sheets.py: unapproved new top-level construct vs HEAD")
         self.assertEqual(changed, set(), "sheets.py: no existing construct may change this phase")
+        self.assertIn("function:generate_next_task_id", current)
+        self.assertIn("function:append_task_registry_row", current)
 
     def test_no_process_local_lock_object_introduced_this_phase(self):
         # Phase 18A.9-A1 §9: the lock is optional and was deferred this

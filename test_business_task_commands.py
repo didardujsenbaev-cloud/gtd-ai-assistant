@@ -106,7 +106,7 @@ class NewBcTaskCommandTestBase(unittest.TestCase):
             return authz_result if authz_result is not None else _newbctask_allow_result()
         mock_authz = AsyncMock(side_effect=_authz)
 
-        ctx_args = args if args is not None else ["business_id=BIZ-001", 'title="Prepare docs"']
+        ctx_args = args if args is not None else ["business_id=BIZ-001", 'title="Prepare docs"', "idempotency_key=op:test"]
         ctx = MagicMock()
         ctx.args = ctx_args
 
@@ -155,7 +155,7 @@ class TestNewBcTaskCommand(NewBcTaskCommandTestBase):
     # ── gates ──
 
     def test_disabled_gate(self):
-        upd, _ = _make_update('/newbctask business_id=BIZ-001 title="X"', ["business_id=BIZ-001", 'title="X"'])
+        upd, _ = _make_update('/newbctask business_id=BIZ-001 title="X"', ["business_id=BIZ-001", 'title="X"', "idempotency_key=op:test"])
         th = _fresh_th()
 
         async def run():
@@ -169,7 +169,7 @@ class TestNewBcTaskCommand(NewBcTaskCommandTestBase):
         _run(run())
 
     def test_transport_validation(self):
-        upd, _ = _make_update('/newbctask business_id=BIZ-001 title="X"', ["business_id=BIZ-001", 'title="X"'])
+        upd, _ = _make_update('/newbctask business_id=BIZ-001 title="X"', ["business_id=BIZ-001", 'title="X"', "idempotency_key=op:test"])
         upd.effective_chat = None
         mock_create, mock_authz, _ = self._run_handler(upd)
         mock_create.assert_not_called()
@@ -211,72 +211,72 @@ class TestNewBcTaskCommand(NewBcTaskCommandTestBase):
     def test_unknown_key_rejected(self):
         upd, _ = _make_update(
             '/newbctask business_id=BIZ-001 title="X" foo=bar',
-            ["business_id=BIZ-001", 'title="X"', "foo=bar"],
+            ["business_id=BIZ-001", 'title="X"', "foo=bar", "idempotency_key=op:test"],
         )
-        mock_create, mock_authz, _ = self._run_handler(upd, args=["business_id=BIZ-001", 'title="X"', "foo=bar"])
+        mock_create, mock_authz, _ = self._run_handler(upd, args=["business_id=BIZ-001", 'title="X"', "foo=bar", "idempotency_key=op:test"])
         mock_create.assert_not_called()
         mock_authz.assert_not_called()
 
     def test_status_key_rejected(self):
         upd, _ = _make_update(
             '/newbctask business_id=BIZ-001 title="X" status=done',
-            ["business_id=BIZ-001", 'title="X"', "status=done"],
+            ["business_id=BIZ-001", 'title="X"', "status=done", "idempotency_key=op:test"],
         )
-        mock_create, mock_authz, _ = self._run_handler(upd, args=["business_id=BIZ-001", 'title="X"', "status=done"])
+        mock_create, mock_authz, _ = self._run_handler(upd, args=["business_id=BIZ-001", 'title="X"', "status=done", "idempotency_key=op:test"])
         mock_create.assert_not_called()
         mock_authz.assert_not_called()
 
     def test_created_by_key_rejected(self):
         upd, _ = _make_update(
             '/newbctask business_id=BIZ-001 title="X" created_by=999',
-            ["business_id=BIZ-001", 'title="X"', "created_by=999"],
+            ["business_id=BIZ-001", 'title="X"', "created_by=999", "idempotency_key=op:test"],
         )
-        mock_create, mock_authz, _ = self._run_handler(upd, args=["business_id=BIZ-001", 'title="X"', "created_by=999"])
+        mock_create, mock_authz, _ = self._run_handler(upd, args=["business_id=BIZ-001", 'title="X"', "created_by=999", "idempotency_key=op:test"])
         mock_create.assert_not_called()
         mock_authz.assert_not_called()
 
     def test_task_id_key_rejected(self):
         upd, _ = _make_update(
             '/newbctask business_id=BIZ-001 title="X" task_id=TSK-999',
-            ["business_id=BIZ-001", 'title="X"', "task_id=TSK-999"],
+            ["business_id=BIZ-001", 'title="X"', "task_id=TSK-999", "idempotency_key=op:test"],
         )
-        mock_create, mock_authz, _ = self._run_handler(upd, args=["business_id=BIZ-001", 'title="X"', "task_id=TSK-999"])
+        mock_create, mock_authz, _ = self._run_handler(upd, args=["business_id=BIZ-001", 'title="X"', "task_id=TSK-999", "idempotency_key=op:test"])
         mock_create.assert_not_called()
         mock_authz.assert_not_called()
 
     def test_gtd_action_id_key_rejected(self):
         upd, _ = _make_update(
             '/newbctask business_id=BIZ-001 title="X" gtd_action_id=ACT-1',
-            ["business_id=BIZ-001", 'title="X"', "gtd_action_id=ACT-1"],
+            ["business_id=BIZ-001", 'title="X"', "gtd_action_id=ACT-1", "idempotency_key=op:test"],
         )
-        mock_create, mock_authz, _ = self._run_handler(upd, args=["business_id=BIZ-001", 'title="X"', "gtd_action_id=ACT-1"])
+        mock_create, mock_authz, _ = self._run_handler(upd, args=["business_id=BIZ-001", 'title="X"', "gtd_action_id=ACT-1", "idempotency_key=op:test"])
         mock_create.assert_not_called()
         mock_authz.assert_not_called()
 
     def test_responsible_role_id_key_rejected(self):
         upd, _ = _make_update(
             '/newbctask business_id=BIZ-001 title="X" responsible_role_id=ROLE-1',
-            ["business_id=BIZ-001", 'title="X"', "responsible_role_id=ROLE-1"],
+            ["business_id=BIZ-001", 'title="X"', "responsible_role_id=ROLE-1", "idempotency_key=op:test"],
         )
-        mock_create, mock_authz, _ = self._run_handler(upd, args=["business_id=BIZ-001", 'title="X"', "responsible_role_id=ROLE-1"])
+        mock_create, mock_authz, _ = self._run_handler(upd, args=["business_id=BIZ-001", 'title="X"', "responsible_role_id=ROLE-1", "idempotency_key=op:test"])
         mock_create.assert_not_called()
         mock_authz.assert_not_called()
 
     def test_assignee_person_id_key_rejected(self):
         upd, _ = _make_update(
             '/newbctask business_id=BIZ-001 title="X" assignee_person_id=PRS-1',
-            ["business_id=BIZ-001", 'title="X"', "assignee_person_id=PRS-1"],
+            ["business_id=BIZ-001", 'title="X"', "assignee_person_id=PRS-1", "idempotency_key=op:test"],
         )
-        mock_create, mock_authz, _ = self._run_handler(upd, args=["business_id=BIZ-001", 'title="X"', "assignee_person_id=PRS-1"])
+        mock_create, mock_authz, _ = self._run_handler(upd, args=["business_id=BIZ-001", 'title="X"', "assignee_person_id=PRS-1", "idempotency_key=op:test"])
         mock_create.assert_not_called()
         mock_authz.assert_not_called()
 
     def test_scope_key_rejected(self):
         upd, _ = _make_update(
             '/newbctask business_id=BIZ-001 title="X" scope=ALL',
-            ["business_id=BIZ-001", 'title="X"', "scope=ALL"],
+            ["business_id=BIZ-001", 'title="X"', "scope=ALL", "idempotency_key=op:test"],
         )
-        mock_create, mock_authz, _ = self._run_handler(upd, args=["business_id=BIZ-001", 'title="X"', "scope=ALL"])
+        mock_create, mock_authz, _ = self._run_handler(upd, args=["business_id=BIZ-001", 'title="X"', "scope=ALL", "idempotency_key=op:test"])
         mock_create.assert_not_called()
         mock_authz.assert_not_called()
 
@@ -295,14 +295,14 @@ class TestNewBcTaskCommand(NewBcTaskCommandTestBase):
         mock_authz.assert_not_called()
 
     def test_blank_business_id_rejected(self):
-        upd, _ = _make_update('/newbctask business_id= title="X"', ["business_id=", 'title="X"'])
-        mock_create, mock_authz, _ = self._run_handler(upd, args=["business_id=", 'title="X"'])
+        upd, _ = _make_update('/newbctask business_id= title="X"', ["business_id=", 'title="X"', "idempotency_key=op:test"])
+        mock_create, mock_authz, _ = self._run_handler(upd, args=["business_id=", 'title="X"', "idempotency_key=op:test"])
         mock_create.assert_not_called()
         mock_authz.assert_not_called()
 
     def test_blank_title_rejected(self):
-        upd, _ = _make_update('/newbctask business_id=BIZ-001 title=', ["business_id=BIZ-001", "title="])
-        mock_create, mock_authz, _ = self._run_handler(upd, args=["business_id=BIZ-001", "title="])
+        upd, _ = _make_update('/newbctask business_id=BIZ-001 title=', ["business_id=BIZ-001", "title=", "idempotency_key=op:test"])
+        mock_create, mock_authz, _ = self._run_handler(upd, args=["business_id=BIZ-001", "title=", "idempotency_key=op:test"])
         mock_create.assert_not_called()
         mock_authz.assert_not_called()
 
@@ -310,43 +310,41 @@ class TestNewBcTaskCommand(NewBcTaskCommandTestBase):
 
     def test_business_id_at_limit_accepted(self):
         value = "B" * 64
-        upd, _ = _make_update(
-            f'/newbctask business_id={value} title="X"', [f"business_id={value}", 'title="X"'],
-        )
-        mock_create, mock_authz, _ = self._run_handler(upd, args=[f"business_id={value}", 'title="X"'])
+        args = [f"business_id={value}", 'title="X"', "idempotency_key=op:test"]
+        upd, _ = _make_update(f'/newbctask business_id={value} title="X"', args)
+        mock_create, mock_authz, _ = self._run_handler(upd, args=args)
         mock_authz.assert_awaited_once()
         mock_create.assert_called_once()
 
     def test_business_id_over_limit_rejected(self):
         value = "B" * 65
-        upd, _ = _make_update(
-            f'/newbctask business_id={value} title="X"', [f"business_id={value}", 'title="X"'],
-        )
-        mock_create, mock_authz, _ = self._run_handler(upd, args=[f"business_id={value}", 'title="X"'])
+        args = [f"business_id={value}", 'title="X"', "idempotency_key=op:test"]
+        upd, _ = _make_update(f'/newbctask business_id={value} title="X"', args)
+        mock_create, mock_authz, _ = self._run_handler(upd, args=args)
         mock_create.assert_not_called()
         mock_authz.assert_not_called()
 
     def test_title_at_limit_accepted(self):
         value = "T" * 300
         upd, _ = _make_update(
-            f'/newbctask business_id=BIZ-001 title={value}', ["business_id=BIZ-001", f"title={value}"],
+            f'/newbctask business_id=BIZ-001 title={value}', ["business_id=BIZ-001", f"title={value}", "idempotency_key=op:test"],
         )
-        mock_create, mock_authz, _ = self._run_handler(upd, args=["business_id=BIZ-001", f"title={value}"])
+        mock_create, mock_authz, _ = self._run_handler(upd, args=["business_id=BIZ-001", f"title={value}", "idempotency_key=op:test"])
         mock_authz.assert_awaited_once()
         mock_create.assert_called_once()
 
     def test_title_over_limit_rejected(self):
         value = "T" * 301
         upd, _ = _make_update(
-            f'/newbctask business_id=BIZ-001 title={value}', ["business_id=BIZ-001", f"title={value}"],
+            f'/newbctask business_id=BIZ-001 title={value}', ["business_id=BIZ-001", f"title={value}", "idempotency_key=op:test"],
         )
-        mock_create, mock_authz, _ = self._run_handler(upd, args=["business_id=BIZ-001", f"title={value}"])
+        mock_create, mock_authz, _ = self._run_handler(upd, args=["business_id=BIZ-001", f"title={value}", "idempotency_key=op:test"])
         mock_create.assert_not_called()
         mock_authz.assert_not_called()
 
     def test_description_over_limit_rejected(self):
         value = "D" * 4001
-        args = ["business_id=BIZ-001", 'title="X"', f"description={value}"]
+        args = ["business_id=BIZ-001", 'title="X"', f"description={value}", "idempotency_key=op:test"]
         upd, _ = _make_update("/newbctask ...", args)
         mock_create, mock_authz, _ = self._run_handler(upd, args=args)
         mock_create.assert_not_called()
@@ -354,7 +352,7 @@ class TestNewBcTaskCommand(NewBcTaskCommandTestBase):
 
     def test_priority_over_limit_rejected(self):
         value = "P" * 33
-        args = ["business_id=BIZ-001", 'title="X"', f"priority={value}"]
+        args = ["business_id=BIZ-001", 'title="X"', f"priority={value}", "idempotency_key=op:test"]
         upd, _ = _make_update("/newbctask ...", args)
         mock_create, mock_authz, _ = self._run_handler(upd, args=args)
         mock_create.assert_not_called()
@@ -362,7 +360,7 @@ class TestNewBcTaskCommand(NewBcTaskCommandTestBase):
 
     def test_due_date_over_limit_rejected(self):
         value = "2" * 33
-        args = ["business_id=BIZ-001", 'title="X"', f"due_date={value}"]
+        args = ["business_id=BIZ-001", 'title="X"', f"due_date={value}", "idempotency_key=op:test"]
         upd, _ = _make_update("/newbctask ...", args)
         mock_create, mock_authz, _ = self._run_handler(upd, args=args)
         mock_create.assert_not_called()
@@ -370,7 +368,7 @@ class TestNewBcTaskCommand(NewBcTaskCommandTestBase):
 
     def test_source_over_limit_rejected(self):
         value = "S" * 65
-        args = ["business_id=BIZ-001", 'title="X"', f"source={value}"]
+        args = ["business_id=BIZ-001", 'title="X"', f"source={value}", "idempotency_key=op:test"]
         upd, _ = _make_update("/newbctask ...", args)
         mock_create, mock_authz, _ = self._run_handler(upd, args=args)
         mock_create.assert_not_called()
@@ -386,7 +384,7 @@ class TestNewBcTaskCommand(NewBcTaskCommandTestBase):
 
     def test_client_id_over_limit_rejected(self):
         value = "C" * 65
-        args = ["business_id=BIZ-001", 'title="X"', f"client_id={value}"]
+        args = ["business_id=BIZ-001", 'title="X"', f"client_id={value}", "idempotency_key=op:test"]
         upd, _ = _make_update("/newbctask ...", args)
         mock_create, mock_authz, _ = self._run_handler(upd, args=args)
         mock_create.assert_not_called()
@@ -394,7 +392,7 @@ class TestNewBcTaskCommand(NewBcTaskCommandTestBase):
 
     def test_object_id_over_limit_rejected(self):
         value = "O" * 65
-        args = ["business_id=BIZ-001", 'title="X"', f"object_id={value}"]
+        args = ["business_id=BIZ-001", 'title="X"', f"object_id={value}", "idempotency_key=op:test"]
         upd, _ = _make_update("/newbctask ...", args)
         mock_create, mock_authz, _ = self._run_handler(upd, args=args)
         mock_create.assert_not_called()
@@ -402,7 +400,7 @@ class TestNewBcTaskCommand(NewBcTaskCommandTestBase):
 
     def test_service_id_over_limit_rejected(self):
         value = "S" * 65
-        args = ["business_id=BIZ-001", 'title="X"', f"service_id={value}"]
+        args = ["business_id=BIZ-001", 'title="X"', f"service_id={value}", "idempotency_key=op:test"]
         upd, _ = _make_update("/newbctask ...", args)
         mock_create, mock_authz, _ = self._run_handler(upd, args=args)
         mock_create.assert_not_called()
@@ -410,7 +408,7 @@ class TestNewBcTaskCommand(NewBcTaskCommandTestBase):
 
     def test_roadmap_id_over_limit_rejected(self):
         value = "R" * 65
-        args = ["business_id=BIZ-001", 'title="X"', f"roadmap_id={value}"]
+        args = ["business_id=BIZ-001", 'title="X"', f"roadmap_id={value}", "idempotency_key=op:test"]
         upd, _ = _make_update("/newbctask ...", args)
         mock_create, mock_authz, _ = self._run_handler(upd, args=args)
         mock_create.assert_not_called()
@@ -418,21 +416,21 @@ class TestNewBcTaskCommand(NewBcTaskCommandTestBase):
 
     def test_stage_id_over_limit_rejected(self):
         value = "T" * 65
-        args = ["business_id=BIZ-001", 'title="X"', f"stage_id={value}"]
+        args = ["business_id=BIZ-001", 'title="X"', f"stage_id={value}", "idempotency_key=op:test"]
         upd, _ = _make_update("/newbctask ...", args)
         mock_create, mock_authz, _ = self._run_handler(upd, args=args)
         mock_create.assert_not_called()
         mock_authz.assert_not_called()
 
     def test_due_date_bad_format_rejected(self):
-        args = ["business_id=BIZ-001", 'title="X"', "due_date=not-a-date"]
+        args = ["business_id=BIZ-001", 'title="X"', "due_date=not-a-date", "idempotency_key=op:test"]
         upd, _ = _make_update("/newbctask ...", args)
         mock_create, mock_authz, _ = self._run_handler(upd, args=args)
         mock_create.assert_not_called()
         mock_authz.assert_not_called()
 
     def test_due_date_valid_format_accepted(self):
-        args = ["business_id=BIZ-001", 'title="X"', "due_date=2026-01-15"]
+        args = ["business_id=BIZ-001", 'title="X"', "due_date=2026-01-15", "idempotency_key=op:test"]
         upd, _ = _make_update("/newbctask ...", args)
         mock_create, mock_authz, _ = self._run_handler(upd, args=args)
         mock_authz.assert_awaited_once()
@@ -441,8 +439,8 @@ class TestNewBcTaskCommand(NewBcTaskCommandTestBase):
     # ── authorization wiring ──
 
     def test_authorization_exact_call(self):
-        upd, _ = _make_update('/newbctask business_id=BIZ-001 title="X"', ["business_id=BIZ-001", 'title="X"'])
-        mock_create, mock_authz, call_log = self._run_handler(upd, args=["business_id=BIZ-001", 'title="X"'])
+        upd, _ = _make_update('/newbctask business_id=BIZ-001 title="X"', ["business_id=BIZ-001", 'title="X"', "idempotency_key=op:test"])
+        mock_create, mock_authz, call_log = self._run_handler(upd, args=["business_id=BIZ-001", 'title="X"', "idempotency_key=op:test"])
         mock_authz.assert_awaited_once()
         _, kwargs = mock_authz.call_args
         self.assertEqual(kwargs.get("resource"), "TASK")
@@ -450,31 +448,31 @@ class TestNewBcTaskCommand(NewBcTaskCommandTestBase):
         self.assertEqual(kwargs.get("business_id"), "BIZ-001")
 
     def test_authorization_count_one(self):
-        upd, _ = _make_update('/newbctask business_id=BIZ-001 title="X"', ["business_id=BIZ-001", 'title="X"'])
-        mock_create, mock_authz, _ = self._run_handler(upd, args=["business_id=BIZ-001", 'title="X"'])
+        upd, _ = _make_update('/newbctask business_id=BIZ-001 title="X"', ["business_id=BIZ-001", 'title="X"', "idempotency_key=op:test"])
+        mock_create, mock_authz, _ = self._run_handler(upd, args=["business_id=BIZ-001", 'title="X"', "idempotency_key=op:test"])
         self.assertEqual(mock_authz.call_count, 1)
 
     def test_authorization_before_create_call(self):
-        upd, _ = _make_update('/newbctask business_id=BIZ-001 title="X"', ["business_id=BIZ-001", 'title="X"'])
-        _, _, call_log = self._run_handler(upd, args=["business_id=BIZ-001", 'title="X"'])
+        upd, _ = _make_update('/newbctask business_id=BIZ-001 title="X"', ["business_id=BIZ-001", 'title="X"', "idempotency_key=op:test"])
+        _, _, call_log = self._run_handler(upd, args=["business_id=BIZ-001", 'title="X"', "idempotency_key=op:test"])
         names = [c[0] for c in call_log]
         self.assertEqual(names.index("authorize"), 0)
         self.assertLess(names.index("authorize"), names.index("create_business_task"))
 
     def test_denied_blocks_create(self):
         th = _fresh_th()
-        upd, _ = _make_update('/newbctask business_id=BIZ-001 title="X"', ["business_id=BIZ-001", 'title="X"'])
+        upd, _ = _make_update('/newbctask business_id=BIZ-001 title="X"', ["business_id=BIZ-001", 'title="X"', "idempotency_key=op:test"])
         mock_create, mock_authz, _ = self._run_handler(
-            upd, args=["business_id=BIZ-001", 'title="X"'], authz_result=_newbctask_deny_result(), th=th,
+            upd, args=["business_id=BIZ-001", 'title="X"', "idempotency_key=op:test"], authz_result=_newbctask_deny_result(), th=th,
         )
         mock_create.assert_not_called()
         self.assertEqual(self._sent_text(upd), th._BC_ENFORCEMENT_NOT_FOUND_OR_DENIED_MSG)
 
     def test_authorization_infra_failure_blocks_create(self):
         th = _fresh_th()
-        upd, _ = _make_update('/newbctask business_id=BIZ-001 title="X"', ["business_id=BIZ-001", 'title="X"'])
+        upd, _ = _make_update('/newbctask business_id=BIZ-001 title="X"', ["business_id=BIZ-001", 'title="X"', "idempotency_key=op:test"])
         mock_create, mock_authz, _ = self._run_handler(
-            upd, args=["business_id=BIZ-001", 'title="X"'], authz_result=_newbctask_infra_failure_result(), th=th,
+            upd, args=["business_id=BIZ-001", 'title="X"', "idempotency_key=op:test"], authz_result=_newbctask_infra_failure_result(), th=th,
         )
         mock_create.assert_not_called()
         self.assertEqual(self._sent_text(upd), th._BC_ENFORCEMENT_TEMPORARILY_UNAVAILABLE_MSG)
@@ -482,8 +480,8 @@ class TestNewBcTaskCommand(NewBcTaskCommandTestBase):
     # ── thread offload / call shape ──
 
     def test_create_business_task_called_once_on_allowed_path(self):
-        upd, _ = _make_update('/newbctask business_id=BIZ-001 title="X"', ["business_id=BIZ-001", 'title="X"'])
-        mock_create, _, _ = self._run_handler(upd, args=["business_id=BIZ-001", 'title="X"'])
+        upd, _ = _make_update('/newbctask business_id=BIZ-001 title="X"', ["business_id=BIZ-001", 'title="X"', "idempotency_key=op:test"])
+        mock_create, _, _ = self._run_handler(upd, args=["business_id=BIZ-001", 'title="X"', "idempotency_key=op:test"])
         self.assertEqual(mock_create.call_count, 1)
 
     def test_exact_kwargs_passed(self):
@@ -519,7 +517,7 @@ class TestNewBcTaskCommand(NewBcTaskCommandTestBase):
 
     def test_create_business_task_offloaded_to_thread(self):
         th = _fresh_th()
-        upd, ctx = _make_update('/newbctask business_id=BIZ-001 title="X"', ["business_id=BIZ-001", 'title="X"'])
+        upd, ctx = _make_update('/newbctask business_id=BIZ-001 title="X"', ["business_id=BIZ-001", 'title="X"', "idempotency_key=op:test"])
         seen_thread = {}
 
         def fake_create(*a, **kw):
@@ -542,57 +540,185 @@ class TestNewBcTaskCommand(NewBcTaskCommandTestBase):
         self.assertNotEqual(seen_thread["name"], seen_thread["main"])
 
     def test_no_retry_on_denied(self):
-        upd, _ = _make_update('/newbctask business_id=BIZ-001 title="X"', ["business_id=BIZ-001", 'title="X"'])
+        upd, _ = _make_update('/newbctask business_id=BIZ-001 title="X"', ["business_id=BIZ-001", 'title="X"', "idempotency_key=op:test"])
         mock_create, mock_authz, _ = self._run_handler(
-            upd, args=["business_id=BIZ-001", 'title="X"'], authz_result=_newbctask_deny_result(),
+            upd, args=["business_id=BIZ-001", 'title="X"', "idempotency_key=op:test"], authz_result=_newbctask_deny_result(),
         )
         self.assertEqual(mock_authz.call_count, 1)
         mock_create.assert_not_called()
 
-    # ── source / idempotency-key defaults ──
+    # ── source / idempotency-key (Phase 18A.9-A3-A1: key required) ──
+    #
+    # idempotency_key identifies a business CREATE operation (scoped
+    # with Business ID in core). It is NOT Task content identity:
+    # same content + different key ⇒ new operation; same key in the
+    # same Business ⇒ reuse; same key in another Business ⇒ separate
+    # scope under current core semantics.
 
     def test_default_source(self):
-        upd, _ = _make_update('/newbctask business_id=BIZ-001 title="X"', ["business_id=BIZ-001", 'title="X"'])
-        mock_create, _, _ = self._run_handler(upd, args=["business_id=BIZ-001", 'title="X"'])
+        upd, _ = _make_update('/newbctask business_id=BIZ-001 title="X"', ["business_id=BIZ-001", 'title="X"', "idempotency_key=op:test"])
+        mock_create, _, _ = self._run_handler(upd, args=["business_id=BIZ-001", 'title="X"', "idempotency_key=op:test"])
         self.assertEqual(mock_create.call_args[1]["source"], "telegram")
 
     def test_caller_source(self):
-        args = ["business_id=BIZ-001", 'title="X"', "source=manual"]
+        args = ["business_id=BIZ-001", 'title="X"', "source=manual", "idempotency_key=op:test"]
         upd, _ = _make_update("/newbctask ...", args)
         mock_create, _, _ = self._run_handler(upd, args=args)
         self.assertEqual(mock_create.call_args[1]["source"], "manual")
 
-    def test_default_idempotency_key(self):
-        upd, _ = _make_update('/newbctask business_id=BIZ-001 title="X"', ["business_id=BIZ-001", 'title="X"'])
-        upd.update_id = 777
-        mock_create, _, _ = self._run_handler(upd, args=["business_id=BIZ-001", 'title="X"'])
-        self.assertEqual(mock_create.call_args[1]["idempotency_key"], "tg-777")
+    def test_missing_idempotency_key_rejected_no_mutation(self):
+        args = ["business_id=BIZ-001", 'title="X"']
+        upd, _ = _make_update("/newbctask ...", args)
+        mock_create, mock_authz, _ = self._run_handler(upd, args=args)
+        mock_create.assert_not_called()
+        mock_authz.assert_not_called()
+        text = self._sent_text(upd)
+        self.assertIn("idempotency_key", text)
+        self.assertIn("тот же ключ", text)
+        self.assertIn("новый ключ", text)
+        self.assertEqual(upd.message.reply_text.call_count, 1)
 
-    def test_caller_idempotency_key(self):
+    def test_blank_idempotency_key_rejected_no_mutation(self):
+        args = ["business_id=BIZ-001", 'title="X"', "idempotency_key="]
+        upd, _ = _make_update("/newbctask ...", args)
+        mock_create, mock_authz, _ = self._run_handler(upd, args=args)
+        mock_create.assert_not_called()
+        mock_authz.assert_not_called()
+
+    def test_whitespace_only_idempotency_key_rejected_no_mutation(self):
+        args = ["business_id=BIZ-001", 'title="X"', 'idempotency_key="   "']
+        upd, _ = _make_update("/newbctask ...", args)
+        mock_create, mock_authz, _ = self._run_handler(upd, args=args)
+        mock_create.assert_not_called()
+        mock_authz.assert_not_called()
+
+    def test_no_automatic_tg_update_id_business_key(self):
+        """Omitted key must NOT mint tg-<update_id> as operation identity."""
+        args = ["business_id=BIZ-001", 'title="X"']
+        upd, _ = _make_update("/newbctask ...", args)
+        upd.update_id = 777
+        mock_create, mock_authz, call_log = self._run_handler(upd, args=args)
+        mock_create.assert_not_called()
+        mock_authz.assert_not_called()
+        self.assertNotIn("tg-777", self._sent_text(upd))
+
+    def test_caller_idempotency_key_passed_unchanged(self):
         args = ["business_id=BIZ-001", 'title="X"', "idempotency_key=MY-KEY"]
         upd, _ = _make_update("/newbctask ...", args)
         mock_create, _, _ = self._run_handler(upd, args=args)
         self.assertEqual(mock_create.call_args[1]["idempotency_key"], "MY-KEY")
 
-    def test_missing_update_id_fails_closed(self):
-        th = _fresh_th()
-        upd, _ = _make_update('/newbctask business_id=BIZ-001 title="X"', ["business_id=BIZ-001", 'title="X"'])
+    def test_idempotency_key_strip_retains_case(self):
+        args = ["business_id=BIZ-001", 'title="X"', 'idempotency_key="  Op:AbC  "']
+        upd, _ = _make_update("/newbctask ...", args)
+        mock_create, _, _ = self._run_handler(upd, args=args)
+        self.assertEqual(mock_create.call_args[1]["idempotency_key"], "Op:AbC")
+
+    def test_legacy_tg_key_still_accepted_when_explicit(self):
+        """Legacy stored tg-* values remain usable if the caller supplies them."""
+        args = ["business_id=BIZ-001", 'title="X"', "idempotency_key=tg-12345"]
+        upd, _ = _make_update("/newbctask ...", args)
+        mock_create, _, _ = self._run_handler(upd, args=args)
+        mock_create.assert_called_once()
+        self.assertEqual(mock_create.call_args[1]["idempotency_key"], "tg-12345")
+
+    def test_update_id_irrelevant_when_key_supplied(self):
+        """Transport update_id is not a business-operation key after A3-A1."""
+        args = ["business_id=BIZ-001", 'title="X"', "idempotency_key=CALLER-KEY"]
+        upd, _ = _make_update("/newbctask ...", args)
         upd.update_id = None
-        mock_create, mock_authz, _ = self._run_handler(upd, args=["business_id=BIZ-001", 'title="X"'], th=th)
-        mock_create.assert_not_called()
-        mock_authz.assert_not_called()
-        self.assertEqual(self._sent_text(upd), th._BC_ENFORCEMENT_TEMPORARILY_UNAVAILABLE_MSG)
+        mock_create, _, _ = self._run_handler(upd, args=args)
+        mock_create.assert_called_once()
+        self.assertEqual(mock_create.call_args[1]["idempotency_key"], "CALLER-KEY")
+
+    def test_same_key_surfaces_reused_with_key(self):
+        args = ["business_id=BIZ-001", 'title="Prepare"', "idempotency_key=op:abc"]
+        upd1, _ = _make_update("/newbctask ...", args)
+        mock_create, _, _ = self._run_handler(
+            upd1, args=args,
+            create_return={
+                "ok": True, "code": "TASK_CREATED", "task_id": "TSK-001",
+                "business_id": "BIZ-001", "final_status": "new", "error": None,
+            },
+        )
+        self.assertEqual(mock_create.call_count, 1)
+        text1 = self._sent_text(upd1)
+        self.assertIn("TSK-001", text1)
+        self.assertIn("op:abc", text1)
+        self.assertEqual(upd1.message.reply_text.call_count, 1)
+
+        upd2, _ = _make_update("/newbctask ...", args)
+        mock_create2, _, _ = self._run_handler(
+            upd2, args=args,
+            create_return={
+                "ok": True, "code": "TASK_REUSED", "task_id": "TSK-001",
+                "business_id": "BIZ-001", "final_status": "new", "error": None,
+                "task_reused": True,
+            },
+        )
+        self.assertEqual(mock_create2.call_count, 1)
+        text2 = self._sent_text(upd2)
+        self.assertIn("переиспользован", text2)
+        self.assertIn("op:abc", text2)
+        self.assertIn("TSK-001", text2)
+        self.assertEqual(upd2.message.reply_text.call_count, 1)
+
+    def test_different_keys_are_separate_operations(self):
+        """Same title + different key must not be content-deduped at Telegram layer."""
+        args_a = ["business_id=BIZ-001", 'title="Prepare"', "idempotency_key=op:abc"]
+        args_b = ["business_id=BIZ-001", 'title="Prepare"', "idempotency_key=op:def"]
+        upd_a, _ = _make_update("/newbctask ...", args_a)
+        mock_a, _, _ = self._run_handler(
+            upd_a, args=args_a,
+            create_return={
+                "ok": True, "code": "TASK_CREATED", "task_id": "TSK-001",
+                "business_id": "BIZ-001", "final_status": "new", "error": None,
+            },
+        )
+        upd_b, _ = _make_update("/newbctask ...", args_b)
+        mock_b, _, _ = self._run_handler(
+            upd_b, args=args_b,
+            create_return={
+                "ok": True, "code": "TASK_CREATED", "task_id": "TSK-002",
+                "business_id": "BIZ-001", "final_status": "new", "error": None,
+            },
+        )
+        self.assertEqual(mock_a.call_args[1]["idempotency_key"], "op:abc")
+        self.assertEqual(mock_b.call_args[1]["idempotency_key"], "op:def")
+        self.assertIn("TSK-002", self._sent_text(upd_b))
+
+    def test_adversarial_key_output_bounded_no_injection(self):
+        key128 = ("*`_[]<>" * 20)[:128]
+        args = ["business_id=BIZ-001", 'title="X"', f"idempotency_key={key128}"]
+        upd, _ = _make_update("/newbctask ...", args)
+        mock_create, _, _ = self._run_handler(
+            upd, args=args,
+            create_return={
+                "ok": True, "code": "TASK_CREATED", "task_id": "TSK-001",
+                "business_id": "BIZ-001", "final_status": "new", "error": None,
+            },
+        )
+        mock_create.assert_called_once()
+        self.assertEqual(mock_create.call_args[1]["idempotency_key"], key128)
+        text = self._sent_text(upd)
+        self.assertEqual(upd.message.reply_text.call_count, 1)
+        self.assertLess(len(text), 4000)
+        # Mapper bounds rendered key to 64 + ellipsis; raw 128 never appears.
+        self.assertIn("…", text)
+        self.assertNotIn(key128, text)
+        kwargs = upd.message.reply_text.call_args.kwargs
+        self.assertTrue(kwargs.get("parse_mode") is None or "parse_mode" not in kwargs)
 
     # ── created_by ──
 
     def test_created_by_derived_from_effective_user(self):
-        upd, _ = _make_update('/newbctask business_id=BIZ-001 title="X"', ["business_id=BIZ-001", 'title="X"'])
+        upd, _ = _make_update('/newbctask business_id=BIZ-001 title="X"', ["business_id=BIZ-001", 'title="X"', "idempotency_key=op:test"])
         upd.effective_user = SimpleNamespace(id=54321)
-        mock_create, _, _ = self._run_handler(upd, args=["business_id=BIZ-001", 'title="X"'])
+        mock_create, _, _ = self._run_handler(upd, args=["business_id=BIZ-001", 'title="X"', "idempotency_key=op:test"])
         self.assertEqual(mock_create.call_args[1]["created_by"], "54321")
 
     def test_caller_cannot_override_created_by(self):
-        args = ["business_id=BIZ-001", 'title="X"', "created_by=SOMEONE-ELSE"]
+        args = ["business_id=BIZ-001", 'title="X"', "created_by=SOMEONE-ELSE", "idempotency_key=op:test"]
         upd, _ = _make_update("/newbctask ...", args)
         upd.effective_user = SimpleNamespace(id=111)
         mock_create, mock_authz, _ = self._run_handler(upd, args=args)
@@ -607,9 +733,9 @@ class TestNewBcTaskCommand(NewBcTaskCommandTestBase):
         # itself — so this case is already blocked before this
         # handler's own authorization/created_by logic ever runs.
         th = _fresh_th()
-        upd, _ = _make_update('/newbctask business_id=BIZ-001 title="X"', ["business_id=BIZ-001", 'title="X"'])
+        upd, _ = _make_update('/newbctask business_id=BIZ-001 title="X"', ["business_id=BIZ-001", 'title="X"', "idempotency_key=op:test"])
         upd.effective_user = None
-        mock_create, mock_authz, _ = self._run_handler(upd, args=["business_id=BIZ-001", 'title="X"'], th=th)
+        mock_create, mock_authz, _ = self._run_handler(upd, args=["business_id=BIZ-001", 'title="X"', "idempotency_key=op:test"], th=th)
         mock_authz.assert_not_called()
         mock_create.assert_not_called()
 
@@ -622,7 +748,7 @@ class TestNewBcTaskCommand(NewBcTaskCommandTestBase):
         # itself, proving that code path also fails closed rather than
         # ever calling create_business_task with a bad/blank actor id.
         th = _fresh_th()
-        upd, ctx = _make_update('/newbctask business_id=BIZ-001 title="X"', ["business_id=BIZ-001", 'title="X"'])
+        upd, ctx = _make_update('/newbctask business_id=BIZ-001 title="X"', ["business_id=BIZ-001", 'title="X"', "idempotency_key=op:test"])
         upd.effective_user = None
 
         async def _authz(update, **kwargs):
@@ -642,22 +768,22 @@ class TestNewBcTaskCommand(NewBcTaskCommandTestBase):
     # ── malformed result / exceptions ──
 
     def test_malformed_result_none_handled_safely(self):
-        upd, _ = _make_update('/newbctask business_id=BIZ-001 title="X"', ["business_id=BIZ-001", 'title="X"'])
-        mock_create, _, _ = self._run_handler(upd, args=["business_id=BIZ-001", 'title="X"'], create_return=None)
+        upd, _ = _make_update('/newbctask business_id=BIZ-001 title="X"', ["business_id=BIZ-001", 'title="X"', "idempotency_key=op:test"])
+        mock_create, _, _ = self._run_handler(upd, args=["business_id=BIZ-001", 'title="X"', "idempotency_key=op:test"], create_return=None)
         self.assertIn("❌", self._sent_text(upd))
         self.assertEqual(upd.message.reply_text.call_count, 1)
 
     def test_malformed_result_list_handled_safely(self):
-        upd, _ = _make_update('/newbctask business_id=BIZ-001 title="X"', ["business_id=BIZ-001", 'title="X"'])
-        mock_create, _, _ = self._run_handler(upd, args=["business_id=BIZ-001", 'title="X"'], create_return=[])
+        upd, _ = _make_update('/newbctask business_id=BIZ-001 title="X"', ["business_id=BIZ-001", 'title="X"', "idempotency_key=op:test"])
+        mock_create, _, _ = self._run_handler(upd, args=["business_id=BIZ-001", 'title="X"', "idempotency_key=op:test"], create_return=[])
         self.assertIn("❌", self._sent_text(upd))
         self.assertEqual(upd.message.reply_text.call_count, 1)
 
     def test_unexpected_exception_uses_uncertain_create_message(self):
         th = _fresh_th()
-        upd, _ = _make_update('/newbctask business_id=BIZ-001 title="X"', ["business_id=BIZ-001", 'title="X"'])
+        upd, _ = _make_update('/newbctask business_id=BIZ-001 title="X"', ["business_id=BIZ-001", 'title="X"', "idempotency_key=op:test"])
         mock_create, _, _ = self._run_handler(
-            upd, args=["business_id=BIZ-001", 'title="X"'], create_side_effect=RuntimeError("SENTINEL-BOOM"), th=th,
+            upd, args=["business_id=BIZ-001", 'title="X"', "idempotency_key=op:test"], create_side_effect=RuntimeError("SENTINEL-BOOM"), th=th,
         )
         reply = self._sent_text(upd)
         self.assertEqual(
@@ -669,9 +795,9 @@ class TestNewBcTaskCommand(NewBcTaskCommandTestBase):
         self.assertEqual(upd.message.reply_text.call_count, 1)
 
     def test_exception_reply_not_a_success_claim(self):
-        upd, _ = _make_update('/newbctask business_id=BIZ-001 title="X"', ["business_id=BIZ-001", 'title="X"'])
+        upd, _ = _make_update('/newbctask business_id=BIZ-001 title="X"', ["business_id=BIZ-001", 'title="X"', "idempotency_key=op:test"])
         mock_create, _, _ = self._run_handler(
-            upd, args=["business_id=BIZ-001", 'title="X"'], create_side_effect=RuntimeError("boom"),
+            upd, args=["business_id=BIZ-001", 'title="X"', "idempotency_key=op:test"], create_side_effect=RuntimeError("boom"),
         )
         reply = self._sent_text(upd)
         self.assertNotIn("✅", reply)
@@ -679,8 +805,8 @@ class TestNewBcTaskCommand(NewBcTaskCommandTestBase):
     # ── result-code mapping via the handler ──
 
     def test_task_created_reply(self):
-        upd, _ = _make_update('/newbctask business_id=BIZ-001 title="X"', ["business_id=BIZ-001", 'title="X"'])
-        self._run_handler(upd, args=["business_id=BIZ-001", 'title="X"'], create_return={
+        upd, _ = _make_update('/newbctask business_id=BIZ-001 title="X"', ["business_id=BIZ-001", 'title="X"', "idempotency_key=op:test"])
+        self._run_handler(upd, args=["business_id=BIZ-001", 'title="X"', "idempotency_key=op:test"], create_return={
             "ok": True, "code": "TASK_CREATED", "task_id": "TSK-1", "business_id": "BIZ-001",
             "final_status": "new", "error": None,
         })
@@ -689,8 +815,8 @@ class TestNewBcTaskCommand(NewBcTaskCommandTestBase):
         self.assertIn("TSK-1", reply)
 
     def test_task_reused_reply(self):
-        upd, _ = _make_update('/newbctask business_id=BIZ-001 title="X"', ["business_id=BIZ-001", 'title="X"'])
-        self._run_handler(upd, args=["business_id=BIZ-001", 'title="X"'], create_return={
+        upd, _ = _make_update('/newbctask business_id=BIZ-001 title="X"', ["business_id=BIZ-001", 'title="X"', "idempotency_key=op:test"])
+        self._run_handler(upd, args=["business_id=BIZ-001", 'title="X"', "idempotency_key=op:test"], create_return={
             "ok": True, "code": "TASK_REUSED", "task_id": "TSK-2", "final_status": "ready", "error": None,
         })
         reply = self._sent_text(upd)
@@ -698,32 +824,32 @@ class TestNewBcTaskCommand(NewBcTaskCommandTestBase):
         self.assertIn("TSK-2", reply)
 
     def test_task_storage_error_reply(self):
-        upd, _ = _make_update('/newbctask business_id=BIZ-001 title="X"', ["business_id=BIZ-001", 'title="X"'])
-        self._run_handler(upd, args=["business_id=BIZ-001", 'title="X"'], create_return={
+        upd, _ = _make_update('/newbctask business_id=BIZ-001 title="X"', ["business_id=BIZ-001", 'title="X"', "idempotency_key=op:test"])
+        self._run_handler(upd, args=["business_id=BIZ-001", 'title="X"', "idempotency_key=op:test"], create_return={
             "ok": False, "code": "TASK_STORAGE_ERROR", "error": None,
         })
         reply = self._sent_text(upd)
         self.assertIn("❌", reply)
 
     def test_relation_mismatch_reply(self):
-        upd, _ = _make_update('/newbctask business_id=BIZ-001 title="X"', ["business_id=BIZ-001", 'title="X"'])
-        self._run_handler(upd, args=["business_id=BIZ-001", 'title="X"'], create_return={
+        upd, _ = _make_update('/newbctask business_id=BIZ-001 title="X"', ["business_id=BIZ-001", 'title="X"', "idempotency_key=op:test"])
+        self._run_handler(upd, args=["business_id=BIZ-001", 'title="X"', "idempotency_key=op:test"], create_return={
             "ok": False, "code": "TASK_ENTITY_RELATION_MISMATCH", "error": "x",
         })
         reply = self._sent_text(upd)
         self.assertIn("❌", reply)
 
     def test_exactly_one_reply(self):
-        upd, _ = _make_update('/newbctask business_id=BIZ-001 title="X"', ["business_id=BIZ-001", 'title="X"'])
-        self._run_handler(upd, args=["business_id=BIZ-001", 'title="X"'])
+        upd, _ = _make_update('/newbctask business_id=BIZ-001 title="X"', ["business_id=BIZ-001", 'title="X"', "idempotency_key=op:test"])
+        self._run_handler(upd, args=["business_id=BIZ-001", 'title="X"', "idempotency_key=op:test"])
         self.assertEqual(upd.message.reply_text.call_count, 1)
 
     # ── adversarial output-bound proof ──
 
     def test_adversarial_long_result_stays_one_reply(self):
-        upd, _ = _make_update('/newbctask business_id=BIZ-001 title="X"', ["business_id=BIZ-001", 'title="X"'])
+        upd, _ = _make_update('/newbctask business_id=BIZ-001 title="X"', ["business_id=BIZ-001", 'title="X"', "idempotency_key=op:test"])
         huge = "A" * 100000
-        self._run_handler(upd, args=["business_id=BIZ-001", 'title="X"'], create_return={
+        self._run_handler(upd, args=["business_id=BIZ-001", 'title="X"', "idempotency_key=op:test"], create_return={
             "ok": True, "code": "TASK_CREATED", "task_id": huge, "business_id": huge, "final_status": "new", "error": None,
         })
         self.assertEqual(upd.message.reply_text.call_count, 1)
@@ -734,7 +860,7 @@ class TestNewBcTaskCommand(NewBcTaskCommandTestBase):
     # ── no GTD / no assignment writes ──
 
     def test_no_gtd_module_imported(self):
-        upd, _ = _make_update('/newbctask business_id=BIZ-001 title="X"', ["business_id=BIZ-001", 'title="X"'])
+        upd, _ = _make_update('/newbctask business_id=BIZ-001 title="X"', ["business_id=BIZ-001", 'title="X"', "idempotency_key=op:test"])
         th = _fresh_th()
         import inspect
         src = inspect.getsource(th.newbctask_cmd)
@@ -762,12 +888,12 @@ class _PoisonedIdentity:
 
 
 class TestNewBcTaskCommandIdentityHardening(NewBcTaskCommandTestBase):
-    """Phase 18A.8-C1-F1: strict type(x) is int + positivity validation
-    for update.effective_user.id and update.update_id — both must be
-    genuine positive int, never bool, never a caller-controlled string,
-    never an unchecked arbitrary object."""
+    """Phase 18A.8-C1-F1 / 18A.9-A3-A1: strict type(x) is int + positivity
+    validation for update.effective_user.id (created_by). Transport
+    update_id is no longer used as a business-operation key — the
+    explicit caller idempotency_key is required instead."""
 
-    _ARGS = ["business_id=BIZ-001", 'title="Prepare docs"']
+    _ARGS = ["business_id=BIZ-001", 'title="Prepare docs"', "idempotency_key=op:test"]
 
     # ── effective_user.id matrix ──
 
@@ -930,113 +1056,35 @@ class TestNewBcTaskCommandIdentityHardening(NewBcTaskCommandTestBase):
         (mock_create, mock_authz, _), upd = self._run_with_user_id("SENTINEL-USER-VALUE")
         self.assertNotIn("SENTINEL-USER-VALUE", self._sent_text(upd))
 
-    # ── update_id matrix ──
+    # ── transport update_id is not a business-operation key (A3-A1) ──
 
-    def _run_with_update_id(self, update_id, args=None):
-        upd, _ = _make_update('/newbctask business_id=BIZ-001 title="X"', list(args or self._ARGS))
-        upd.update_id = update_id
-        return self._run_handler(upd, args=list(args or self._ARGS)), upd
+    def test_malformed_update_id_ignored_when_explicit_key_present(self):
+        """update_id may be absent/malformed; explicit key still creates."""
+        for bad_update_id in (None, "555", 0, -1, True, 1.5, [], {}, object()):
+            with self.subTest(update_id=repr(bad_update_id)):
+                upd, _ = _make_update('/newbctask business_id=BIZ-001 title="X"', list(self._ARGS))
+                upd.update_id = bad_update_id
+                mock_create, mock_authz, _ = self._run_handler(upd, args=list(self._ARGS))
+                mock_create.assert_called_once()
+                self.assertEqual(mock_create.call_args[1]["idempotency_key"], "op:test")
+                mock_authz.assert_awaited_once()
 
-    def test_update_id_none_rejected(self):
-        (mock_create, mock_authz, _), upd = self._run_with_update_id(None)
-        mock_create.assert_not_called()
-        mock_authz.assert_not_called()
-
-    def test_update_id_missing_attribute_rejected(self):
-        # spec= restricts the mock to only these attributes, so
-        # getattr(update, "update_id", None) genuinely falls back to
-        # the default rather than returning an auto-generated Mock.
+    def test_missing_update_id_attribute_ignored_when_explicit_key_present(self):
         upd = MagicMock(spec=["message", "effective_user", "effective_chat"])
         upd.message.reply_text = AsyncMock()
         upd.effective_user = SimpleNamespace(id=999)
         upd.effective_chat = SimpleNamespace(type="private")
         mock_create, mock_authz, _ = self._run_handler(upd, args=list(self._ARGS))
-        mock_create.assert_not_called()
-        mock_authz.assert_not_called()
+        mock_create.assert_called_once()
+        self.assertEqual(mock_create.call_args[1]["idempotency_key"], "op:test")
 
-    def test_update_id_numeric_string_rejected(self):
-        (mock_create, mock_authz, _), upd = self._run_with_update_id("555")
-        mock_create.assert_not_called()
-        mock_authz.assert_not_called()
-
-    def test_update_id_zero_rejected(self):
-        (mock_create, mock_authz, _), upd = self._run_with_update_id(0)
-        mock_create.assert_not_called()
-        mock_authz.assert_not_called()
-
-    def test_update_id_negative_rejected(self):
-        (mock_create, mock_authz, _), upd = self._run_with_update_id(-1)
-        mock_create.assert_not_called()
-        mock_authz.assert_not_called()
-
-    def test_update_id_bool_true_rejected(self):
-        (mock_create, mock_authz, _), upd = self._run_with_update_id(True)
-        mock_create.assert_not_called()
-        mock_authz.assert_not_called()
-
-    def test_update_id_bool_false_rejected(self):
-        (mock_create, mock_authz, _), upd = self._run_with_update_id(False)
-        mock_create.assert_not_called()
-        mock_authz.assert_not_called()
-
-    def test_update_id_float_rejected(self):
-        (mock_create, mock_authz, _), upd = self._run_with_update_id(1.5)
-        mock_create.assert_not_called()
-        mock_authz.assert_not_called()
-
-    def test_update_id_list_rejected(self):
-        (mock_create, mock_authz, _), upd = self._run_with_update_id([])
-        mock_create.assert_not_called()
-        mock_authz.assert_not_called()
-
-    def test_update_id_dict_rejected(self):
-        (mock_create, mock_authz, _), upd = self._run_with_update_id({})
-        mock_create.assert_not_called()
-        mock_authz.assert_not_called()
-
-    def test_update_id_tuple_rejected(self):
-        (mock_create, mock_authz, _), upd = self._run_with_update_id(())
-        mock_create.assert_not_called()
-        mock_authz.assert_not_called()
-
-    def test_update_id_plain_object_rejected(self):
-        (mock_create, mock_authz, _), upd = self._run_with_update_id(object())
-        mock_create.assert_not_called()
-        mock_authz.assert_not_called()
-
-    def test_update_id_poisoned_rejected_no_exception(self):
+    def test_poisoned_update_id_ignored_when_explicit_key_present(self):
         upd, _ = _make_update('/newbctask business_id=BIZ-001 title="X"', list(self._ARGS))
         upd.update_id = _PoisonedIdentity()
         mock_create, mock_authz, _ = self._run_handler(upd, args=list(self._ARGS))
-        mock_create.assert_not_called()
-        mock_authz.assert_not_called()
-        reply = self._sent_text(upd)
-        self.assertNotIn("STR-SENTINEL-MARKER", reply)
-
-    def test_update_id_positive_produces_tg_prefixed_key(self):
-        (mock_create, mock_authz, _), upd = self._run_with_update_id(4242)
         mock_create.assert_called_once()
-        self.assertEqual(mock_create.call_args[1]["idempotency_key"], "tg-4242")
-
-    def test_update_id_exactly_one_reply_on_invalid(self):
-        (mock_create, mock_authz, _), upd = self._run_with_update_id(-1)
-        self.assertEqual(upd.message.reply_text.call_count, 1)
-
-    def test_update_id_not_required_when_caller_supplies_idempotency_key(self):
-        # §4/§6: a caller-supplied valid idempotency_key must not
-        # require update_id at all.
-        args = ["business_id=BIZ-001", 'title="X"', "idempotency_key=CALLER-KEY"]
-        upd, _ = _make_update("/newbctask ...", args)
-        upd.update_id = None  # malformed/unavailable — must not matter
-        mock_create, mock_authz, _ = self._run_handler(upd, args=args)
-        mock_create.assert_called_once()
-        self.assertEqual(mock_create.call_args[1]["idempotency_key"], "CALLER-KEY")
-
-    def test_update_id_required_only_when_idempotency_key_omitted(self):
-        upd, _ = _make_update('/newbctask business_id=BIZ-001 title="X"', list(self._ARGS))
-        upd.update_id = "not-an-int"
-        mock_create, mock_authz, _ = self._run_handler(upd, args=list(self._ARGS))
-        mock_create.assert_not_called()
+        self.assertEqual(mock_create.call_args[1]["idempotency_key"], "op:test")
+        self.assertNotIn("STR-SENTINEL-MARKER", self._sent_text(upd))
 
 
 class TestTaskCreationMessageMapping(unittest.TestCase):
@@ -1050,19 +1098,38 @@ class TestTaskCreationMessageMapping(unittest.TestCase):
         msg = th._task_creation_message({
             "ok": True, "code": "TASK_CREATED", "task_id": "TSK-001",
             "business_id": "BIZ-001", "final_status": "new", "error": None,
+            "idempotency_key": "op:abc",
         })
         self.assertIn("✅", msg)
         self.assertIn("TSK-001", msg)
+        self.assertIn("Idempotency Key:", msg)
+        self.assertIn("op:abc", msg)
 
     def test_reused(self):
         th = _fresh_th()
         msg = th._task_creation_message({
             "ok": True, "code": "TASK_REUSED", "task_id": "TSK-050",
             "business_id": "BIZ-001", "final_status": "ready", "error": None,
+            "idempotency_key": "op:abc",
         })
         self.assertNotIn("✅", msg)
         self.assertIn("ℹ️", msg)
         self.assertIn("TSK-050", msg)
+        self.assertIn("переиспользован", msg)
+        self.assertIn("Idempotency Key:", msg)
+        self.assertIn("op:abc", msg)
+
+    def test_created_key_bounded_to_field_max(self):
+        th = _fresh_th()
+        long_key = "K" * 128
+        msg = th._task_creation_message({
+            "ok": True, "code": "TASK_CREATED", "task_id": "TSK-001",
+            "business_id": "BIZ-001", "final_status": "new", "error": None,
+            "idempotency_key": long_key,
+        })
+        self.assertIn("…", msg)
+        self.assertNotIn(long_key, msg)
+        self.assertIn("K" * 64 + "…", msg)
 
     def test_business_not_found(self):
         th = _fresh_th()
@@ -1165,6 +1232,49 @@ class TestTaskCreationMessageMapping(unittest.TestCase):
         })
         self.assertNotIn("Попробуйте ещё раз позже", msg)
         self.assertIn("проверьте список Tasks", msg)
+
+
+class TestTaskDetailLinesIdempotencyKey(unittest.TestCase):
+    """Phase 18A.9-A3-A1: /bctask detail surfaces recoverable operation key."""
+
+    def test_nonblank_key_rendered_bounded(self):
+        th = _fresh_th()
+        task = {
+            "task_id": "TSK-001", "business_id": "BIZ-001", "title": "X",
+            "status": "new", "idempotency_key": "op:recover-me",
+        }
+        text = "\n".join(th._task_detail_lines(task))
+        self.assertIn("Idempotency Key:", text)
+        self.assertIn("op:recover-me", text)
+
+    def test_blank_legacy_key_omitted(self):
+        th = _fresh_th()
+        task = {
+            "task_id": "TSK-001", "business_id": "BIZ-001", "title": "X",
+            "status": "new", "idempotency_key": "",
+        }
+        text = "\n".join(th._task_detail_lines(task))
+        self.assertNotIn("Idempotency Key:", text)
+
+    def test_missing_key_field_omitted(self):
+        th = _fresh_th()
+        task = {
+            "task_id": "TSK-001", "business_id": "BIZ-001", "title": "X",
+            "status": "new",
+        }
+        text = "\n".join(th._task_detail_lines(task))
+        self.assertNotIn("Idempotency Key:", text)
+
+    def test_long_key_clipped_to_64(self):
+        th = _fresh_th()
+        long_key = "K" * 128
+        task = {
+            "task_id": "TSK-001", "business_id": "BIZ-001", "title": "X",
+            "status": "new", "idempotency_key": long_key,
+        }
+        text = "\n".join(th._task_detail_lines(task))
+        self.assertIn("K" * 64 + "…", text)
+        self.assertNotIn(long_key, text)
 
 
 # ─────────────────────────────────────────────────────────────

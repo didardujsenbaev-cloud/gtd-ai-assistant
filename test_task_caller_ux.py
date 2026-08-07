@@ -47,18 +47,43 @@ class TestStatusTranslation(unittest.TestCase):
 class TestTaskCreationMessageMapping(unittest.TestCase):
 
     def test_created(self):
-        result = {"ok": True, "code": "TASK_CREATED", "task_id": "TSK-001", "business_id": "BIZ-001", "final_status": "new"}
+        result = {
+            "ok": True, "code": "TASK_CREATED", "task_id": "TSK-001",
+            "business_id": "BIZ-001", "final_status": "new",
+            "idempotency_key": "op:abc",
+        }
         msg = th._task_creation_message(result)
         self.assertIn("✅", msg)
         self.assertIn("TSK-001", msg)
+        self.assertIn("Idempotency Key:", msg)
+        self.assertIn("op:abc", msg)
 
     def test_reused_distinct_from_created(self):
-        created = th._task_creation_message({"ok": True, "code": "TASK_CREATED", "task_id": "TSK-001", "final_status": "new"})
-        reused = th._task_creation_message({"ok": True, "code": "TASK_REUSED", "task_id": "TSK-001", "final_status": "ready"})
+        created = th._task_creation_message({
+            "ok": True, "code": "TASK_CREATED", "task_id": "TSK-001",
+            "final_status": "new", "idempotency_key": "op:abc",
+        })
+        reused = th._task_creation_message({
+            "ok": True, "code": "TASK_REUSED", "task_id": "TSK-001",
+            "final_status": "ready", "idempotency_key": "op:abc",
+        })
         self.assertNotEqual(created, reused)
         self.assertIn("✅", created)
         self.assertNotIn("✅", reused)
         self.assertIn("ℹ️", reused)
+        self.assertIn("Idempotency Key:", reused)
+        self.assertIn("op:abc", reused)
+
+    def test_created_adversarial_key_bounded(self):
+        key = ("*`_[]<>" * 30)[:128]
+        msg = th._task_creation_message({
+            "ok": True, "code": "TASK_CREATED", "task_id": "TSK-001",
+            "business_id": "BIZ-001", "final_status": "new",
+            "idempotency_key": key,
+        })
+        self.assertLess(len(msg), 4000)
+        self.assertIn("…", msg)
+        self.assertNotIn(key, msg)
 
     def test_business_not_found(self):
         msg = th._task_creation_message({"ok": False, "code": "BUSINESS_NOT_FOUND", "business_id": "BIZ-999", "error": "x"})
