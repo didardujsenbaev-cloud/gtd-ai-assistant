@@ -177,7 +177,10 @@ class TestTasksCommandUnchangedAndGtdOwned(unittest.TestCase):
         once — no duplicate CommandHandler registration."""
         path = BUSINESS_CORE / "telegram_handlers.py"
         src = path.read_text(encoding="utf-8")
-        for name in ("newbctask", "bctasks", "bctask", "updatetask", "assigntask", "reassigntask", "unassigntask"):
+        for name in (
+            "newtaskkey", "newbctask", "bctasks", "bctask",
+            "updatetask", "assigntask", "reassigntask", "unassigntask",
+        ):
             self.assertEqual(
                 src.count(f'CommandHandler("{name}"'), 1,
                 f"/{name} must be registered exactly once",
@@ -193,7 +196,10 @@ class TestTasksCommandUnchangedAndGtdOwned(unittest.TestCase):
         unrelated command's exact string registration."""
         path = BUSINESS_CORE / "telegram_handlers.py"
         src = path.read_text(encoding="utf-8")
-        new_names = {"newbctask", "bctasks", "bctask", "updatetask", "assigntask", "reassigntask", "unassigntask"}
+        new_names = {
+            "newtaskkey", "newbctask", "bctasks", "bctask",
+            "updatetask", "assigntask", "reassigntask", "unassigntask",
+        }
         import re
         all_registered = re.findall(r'CommandHandler\("([a-zA-Z_]+)"', src)
         counts = {}
@@ -1746,19 +1752,16 @@ class TestBusinessBuilderConstructGuardHelperUnit(unittest.TestCase):
 # ─────────────────────────────────────────────────────────────
 
 _TELEGRAM_HANDLERS_APPROVED_TO_DIFFER = frozenset({
-    "async_function:bctasks_cmd", "assignment:COMMAND_ENFORCEMENT_MAP",
-    "async_function:newbctask_cmd", "function:_task_creation_message",
-    "function:_task_detail_lines",
+    # Phase 18A.9-A3-A2-A1: registration only — newtaskkey_cmd +
+    # generate_task_operation_key are approved *additions* below.
+    "function:register_business_handlers",
 })
 
-# Phase 18A.8-C1-F0 removed all 6 top-level constants Phase 18A.8-C1
-# had introduced (newbctask_cmd's allowed-key/length-cap/date-regex/
-# uncertain-create-message values, and _task_creation_message's
-# output-bounding values) — every one of them is now function-local.
-# This phase's approved production scope adds zero new top-level
-# constructs, so this stays the empty set — not a permanent marker,
-# just accurately reflecting the current working tree.
-_TELEGRAM_HANDLERS_APPROVED_TO_ADD_THIS_PHASE = frozenset()
+# Phase 18A.9-A3-A2-A1: stateless /newtaskkey utility + pure key helper.
+_TELEGRAM_HANDLERS_APPROVED_TO_ADD_THIS_PHASE = frozenset({
+    "function:generate_task_operation_key",
+    "async_function:newtaskkey_cmd",
+})
 
 # NOTE: there is deliberately no "_TELEGRAM_HANDLERS_APPROVED_TO_ADD"
 # constant. That concept named a specific already-committed function
@@ -2404,7 +2407,7 @@ class TestNewBcTaskCmdArchitectureGuards(unittest.TestCase):
             self.assertNotIn(forbidden, code)
 
     def test_core_modules_unchanged_vs_head_this_phase(self):
-        """Approved A3-A1 production scope is telegram_handlers only."""
+        """Approved A3-A2-A1 production scope is telegram_handlers only."""
         import subprocess
         from pathlib import Path
         root = Path(__file__).resolve().parent
@@ -2421,6 +2424,94 @@ class TestNewBcTaskCmdArchitectureGuards(unittest.TestCase):
                 text=True,
             )
             self.assertEqual(diff, "", f"{rel} must remain zero-diff vs HEAD this phase")
+
+
+class TestNewTaskKeyArchitectureGuards(unittest.TestCase):
+    """Phase 18A.9-A3-A2-A1: durable invariants for /newtaskkey."""
+
+    def _handler_source(self) -> str:
+        import inspect
+        from business_core import telegram_handlers as th
+        return inspect.getsource(th.newtaskkey_cmd)
+
+    def _helper_source(self) -> str:
+        import inspect
+        from business_core import telegram_handlers as th
+        return inspect.getsource(th.generate_task_operation_key)
+
+    def test_newtaskkey_registered_exactly_once(self):
+        src = (BUSINESS_CORE / "telegram_handlers.py").read_text(encoding="utf-8")
+        self.assertEqual(src.count('CommandHandler("newtaskkey"'), 1)
+
+    def test_newtaskkey_outside_enforcement_map(self):
+        from business_core import telegram_handlers as th
+        self.assertNotIn("newtaskkey", th.COMMAND_ENFORCEMENT_MAP)
+        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 18)
+        for key in ("bctask", "bctasks", "unassigntask", "newbctask"):
+            self.assertIn(key, th.COMMAND_ENFORCEMENT_MAP)
+
+    def test_handler_uses_shared_transport_not_task_create_authz(self):
+        src = self._handler_source()
+        self.assertIn("_validate_bc_transport_or_reply(update)", src)
+        self.assertNotIn("_authorize_or_reply(", src)
+        self.assertNotIn('resource="TASK"', src)
+        self.assertNotIn('action="CREATE"', src)
+        self.assertNotIn("authorize_telegram_business_core_request", src)
+
+    def test_handler_no_storage_or_core_mutation_calls(self):
+        src = self._handler_source()
+        for forbidden in (
+            "create_business_task", "create_task(", "append_task_registry_row",
+            "append_business_row", "find_tasks_by_idempotency_key",
+            "update_task", "create_task_assignment", "google_drive",
+            "inbox_processor", "project_planner", "calendar_sync",
+            "get_business_sheet", "read_business_sheet", "find_row_by_id",
+        ):
+            self.assertNotIn(forbidden, src)
+
+    def test_helper_uses_uuid4_op_prefix_no_caller_input(self):
+        import ast
+        src = self._helper_source()
+        self.assertIn("uuid.uuid4", src)
+        self.assertIn("op:", src)
+        tree = ast.parse(src)
+        func = tree.body[0]
+        self.assertEqual(func.args.args, [])
+        self.assertEqual(func.args.kwonlyargs, [])
+
+    def test_handler_rejects_args_before_generation(self):
+        src = self._handler_source()
+        idx_args = src.index("context.args")
+        idx_gen = src.index("generate_task_operation_key(")
+        self.assertLess(idx_args, idx_gen)
+
+    def test_handler_no_business_id_requirement(self):
+        """Usage skeleton may mention business_id=...; handler must not
+        parse or authorize on a Business ID."""
+        import ast
+        src = self._handler_source()
+        tree = ast.parse(src)
+        func = tree.body[0]
+        for node in ast.walk(func):
+            if isinstance(node, ast.Name) and node.id == "business_id":
+                self.fail("handler must not bind/read a business_id name")
+            if isinstance(node, ast.Constant) and node.value == "business_id":
+                self.fail("handler must not look up business_id as a key")
+        self.assertNotIn('args.get("business_id"', src)
+        self.assertNotIn('values["business_id"]', src)
+
+    def test_newbctask_explicit_key_contract_intact(self):
+        import inspect
+        from business_core import telegram_handlers as th
+        src = inspect.getsource(th.newbctask_cmd)
+        self.assertIn('if not idempotency_key:', src)
+        self.assertNotIn('f"tg-{update_id}"', src)
+        self.assertIn("idempotency_key=idempotency_key", src)
+
+    def test_no_distributed_atomicity_claim(self):
+        src = (self._handler_source() + self._helper_source()).lower()
+        for forbidden in ("distributed atomic", "cross-process atomic", "exactly-once"):
+            self.assertNotIn(forbidden, src)
 
 
 class TestTelegramHandlersConstructGuardHelperUnit(unittest.TestCase):

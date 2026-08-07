@@ -237,7 +237,10 @@ class TestEnforcementMap(unittest.TestCase):
 
     def test_no_nineteenth_command_in_map(self):
         # newbctask added the 18th entry; no 19th exists.
+        # Phase 18A.9-A3-A2-A1: /newtaskkey is registered but stays
+        # outside COMMAND_ENFORCEMENT_MAP (pure utility).
         self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 18)
+        self.assertNotIn("newtaskkey", th.COMMAND_ENFORCEMENT_MAP)
 
     def test_updatelead_not_in_map(self):
         self.assertNotIn("updatelead", th.COMMAND_ENFORCEMENT_MAP)
@@ -482,6 +485,8 @@ class TestPhase17E2A4H1OfferHardeningScope(unittest.TestCase):
                 "_offer_notes_message", "updateoffernotes_cmd",
                 "_document_notes_message", "updatedocnotes_cmd",
                 "_task_list_lines",
+                # Phase 18A.9-A3-A2-A1: stateless /newtaskkey utility.
+                "generate_task_operation_key", "newtaskkey_cmd",
             },
         )
 
@@ -636,6 +641,8 @@ class TestPhase17E2A4H1OfferHardeningScope(unittest.TestCase):
                 "_offer_notes_message", "updateoffernotes_cmd",
                 "_document_notes_message", "updatedocnotes_cmd",
                 "_task_list_lines",
+                # Phase 18A.9-A3-A2-A1: stateless /newtaskkey utility.
+                "generate_task_operation_key", "newtaskkey_cmd",
             },
         )
         # Redundant with the file-level check above but explicit:

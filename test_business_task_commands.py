@@ -2936,5 +2936,222 @@ class TestNoRawExceptionExposure(unittest.TestCase):
             self.assertNotIn("Traceback", reply, f"{cmd_name} leaked a traceback")
 
 
+# ─────────────────────────────────────────────────────────────
+# /newtaskkey — Phase 18A.9-A3-A2-A1
+# ─────────────────────────────────────────────────────────────
+
+
+class TestNewTaskKeyCommand(unittest.TestCase):
+    """Stateless Task CREATE operation-key generator."""
+
+    def _sent_text(self, upd):
+        return upd.message.reply_text.call_args[0][0]
+
+    def _run_cmd(self, args=None, *, th=None, transport_ok=True, enabled=True,
+                  gen_return=None, gen_side_effect=None):
+        th = th or _fresh_th()
+        upd, ctx = _make_update("/newtaskkey", list(args or []))
+        call_log = []
+        real_gen = th.generate_task_operation_key
+
+        def _gen():
+            call_log.append("generate_task_operation_key")
+            if gen_side_effect is not None:
+                if callable(gen_side_effect):
+                    return gen_side_effect()
+                raise gen_side_effect
+            if gen_return is not None:
+                return gen_return
+            return real_gen()
+
+        async def run():
+            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=enabled), \
+                 patch("business_core.telegram_handlers._validate_bc_transport_or_reply",
+                       new=AsyncMock(return_value=transport_ok)) as m_transport, \
+                 patch("business_core.telegram_handlers.generate_task_operation_key", side_effect=_gen) as m_gen, \
+                 patch("business_core.telegram_authorization.authorize_telegram_business_core_request") as m_authz, \
+                 patch("business_core.business_builder.create_business_task") as m_cbt, \
+                 patch("business_core.task_manager.create_task") as m_ct, \
+                 patch("business_core.sheets.append_task_registry_row") as m_append, \
+                 patch("business_core.sheets.append_business_row") as m_abrow, \
+                 patch("business_core.task_manager.create_task_assignment") as m_assign:
+                await th.newtaskkey_cmd(upd, ctx)
+                return m_transport, m_gen, m_authz, m_cbt, m_ct, m_append, m_abrow, m_assign
+
+        mocks = _run(run())
+        return upd, mocks, call_log, th
+
+    def test_registered(self):
+        th = _fresh_th()
+        self.assertTrue(hasattr(th, "newtaskkey_cmd"))
+        self.assertTrue(hasattr(th, "generate_task_operation_key"))
+
+    def test_disabled_gate(self):
+        upd, mocks, call_log, th = self._run_cmd(enabled=False)
+        m_transport, m_gen, m_authz, m_cbt, *_ = mocks
+        m_transport.assert_not_called()
+        m_gen.assert_not_called()
+        m_authz.assert_not_called()
+        m_cbt.assert_not_called()
+        self.assertEqual(call_log, [])
+
+    def test_success_one_reply_with_op_uuid_and_usage(self):
+        fixed = "op:11111111-2222-4333-8444-555555555555"
+        upd, mocks, _, _ = self._run_cmd(gen_return=fixed)
+        _, m_gen, m_authz, m_cbt, m_ct, m_append, m_abrow, m_assign = mocks
+        m_gen.assert_called_once()
+        m_authz.assert_not_called()
+        m_cbt.assert_not_called()
+        m_ct.assert_not_called()
+        m_append.assert_not_called()
+        m_abrow.assert_not_called()
+        m_assign.assert_not_called()
+        self.assertEqual(upd.message.reply_text.call_count, 1)
+        text = self._sent_text(upd)
+        self.assertIn("Ключ создания Task:", text)
+        self.assertIn(fixed, text)
+        self.assertIn("idempotency_key=" + fixed, text)
+        self.assertIn("/newbctask", text)
+        kwargs = upd.message.reply_text.call_args.kwargs
+        self.assertTrue(kwargs.get("parse_mode") is None or "parse_mode" not in kwargs)
+
+    def test_helper_format_uuid4_no_whitespace(self):
+        th = _fresh_th()
+        import uuid
+        key = th.generate_task_operation_key()
+        self.assertTrue(key.startswith("op:"))
+        suffix = key[3:]
+        parsed = uuid.UUID(suffix)
+        self.assertEqual(parsed.version, 4)
+        self.assertNotRegex(key, r"\s")
+        self.assertLess(len(key), 64)
+
+    def test_two_successive_keys_differ(self):
+        th = _fresh_th()
+        a = th.generate_task_operation_key()
+        b = th.generate_task_operation_key()
+        self.assertNotEqual(a, b)
+
+    def test_helper_ignores_no_args_contract(self):
+        th = _fresh_th()
+        with self.assertRaises(TypeError):
+            th.generate_task_operation_key("seed")  # noqa: unexpected
+
+    def test_transport_failure_no_generation(self):
+        upd, mocks, call_log, _ = self._run_cmd(transport_ok=False)
+        _, m_gen, m_authz, m_cbt, *_ = mocks
+        m_gen.assert_not_called()
+        m_authz.assert_not_called()
+        m_cbt.assert_not_called()
+        self.assertEqual(call_log, [])
+
+    def test_unexpected_args_rejected_no_generation(self):
+        for args in (
+            ["foo"],
+            ["business_id=BIZ-001"],
+            ["idempotency_key=x"],
+            ["x=y"],
+        ):
+            with self.subTest(args=args):
+                upd, mocks, call_log, _ = self._run_cmd(args=args)
+                _, m_gen, m_authz, m_cbt, m_ct, m_append, *_ = mocks
+                m_gen.assert_not_called()
+                m_authz.assert_not_called()
+                m_cbt.assert_not_called()
+                m_ct.assert_not_called()
+                m_append.assert_not_called()
+                self.assertEqual(call_log, [])
+                self.assertEqual(upd.message.reply_text.call_count, 1)
+                text = self._sent_text(upd)
+                self.assertIn("не принимает аргументы", text)
+                self.assertNotIn("op:", text)
+
+    def test_zero_mutations_on_success(self):
+        upd, mocks, _, _ = self._run_cmd()
+        *_, m_cbt, m_ct, m_append, m_abrow, m_assign = mocks
+        for m in (m_cbt, m_ct, m_append, m_abrow, m_assign):
+            m.assert_not_called()
+        self.assertEqual(upd.message.reply_text.call_count, 1)
+
+    def test_workflow_key_passes_into_newbctask(self):
+        """Generator output is a valid explicit /newbctask idempotency_key."""
+        th = _fresh_th()
+        key = "op:aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+        upd, ctx = _make_update("/newbctask ...", [
+            "business_id=BIZ-001", 'title="Prepare"', f"idempotency_key={key}",
+        ])
+
+        async def run():
+            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
+                 patch("business_core.telegram_handlers._validate_bc_transport_or_reply",
+                       new=AsyncMock(return_value=True)), \
+                 patch("business_core.telegram_authorization.authorize_telegram_business_core_request",
+                       new=AsyncMock(return_value=_newbctask_allow_result())), \
+                 patch("business_core.business_builder.create_business_task", return_value={
+                     "ok": True, "code": "TASK_CREATED", "task_id": "TSK-001",
+                     "business_id": "BIZ-001", "final_status": "new", "error": None,
+                 }) as m_create:
+                await th.newbctask_cmd(upd, ctx)
+                return m_create
+
+        m_create = _run(run())
+        self.assertEqual(m_create.call_args[1]["idempotency_key"], key)
+        self.assertIn(key, upd.message.reply_text.call_args[0][0])
+
+    def test_workflow_same_key_can_surface_reused(self):
+        th = _fresh_th()
+        key = "op:aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+        upd, ctx = _make_update("/newbctask ...", [
+            "business_id=BIZ-001", 'title="Prepare"', f"idempotency_key={key}",
+        ])
+
+        async def run():
+            with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
+                 patch("business_core.telegram_handlers._validate_bc_transport_or_reply",
+                       new=AsyncMock(return_value=True)), \
+                 patch("business_core.telegram_authorization.authorize_telegram_business_core_request",
+                       new=AsyncMock(return_value=_newbctask_allow_result())), \
+                 patch("business_core.business_builder.create_business_task", return_value={
+                     "ok": True, "code": "TASK_REUSED", "task_id": "TSK-001",
+                     "business_id": "BIZ-001", "final_status": "new", "error": None,
+                     "task_reused": True,
+                 }):
+                await th.newbctask_cmd(upd, ctx)
+
+        _run(run())
+        text = upd.message.reply_text.call_args[0][0]
+        self.assertIn("переиспользован", text)
+        self.assertIn(key, text)
+
+    def test_manual_and_legacy_keys_still_accepted_by_newbctask(self):
+        th = _fresh_th()
+        for key in ("my-key", "123", "tg-123", "op:aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"):
+            with self.subTest(key=key):
+                upd, ctx = _make_update("/newbctask ...", [
+                    "business_id=BIZ-001", 'title="X"', f"idempotency_key={key}",
+                ])
+
+                async def run():
+                    with patch("business_core.telegram_handlers._is_bc_enabled", return_value=True), \
+                         patch("business_core.telegram_handlers._validate_bc_transport_or_reply",
+                               new=AsyncMock(return_value=True)), \
+                         patch("business_core.telegram_authorization.authorize_telegram_business_core_request",
+                               new=AsyncMock(return_value=_newbctask_allow_result())), \
+                         patch("business_core.business_builder.create_business_task", return_value={
+                             "ok": True, "code": "TASK_CREATED", "task_id": "TSK-001",
+                             "business_id": "BIZ-001", "final_status": "new", "error": None,
+                         }) as m_create:
+                        await th.newbctask_cmd(upd, ctx)
+                        return m_create
+
+                m_create = _run(run())
+                self.assertEqual(m_create.call_args[1]["idempotency_key"], key)
+
+    def test_not_in_enforcement_map(self):
+        th = _fresh_th()
+        self.assertNotIn("newtaskkey", th.COMMAND_ENFORCEMENT_MAP)
+        self.assertEqual(len(th.COMMAND_ENFORCEMENT_MAP), 18)
+
+
 if __name__ == "__main__":
     unittest.main()

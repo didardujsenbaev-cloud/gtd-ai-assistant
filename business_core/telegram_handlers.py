@@ -16265,6 +16265,60 @@ def _task_detail_lines(task) -> list[str]:
     return lines
 
 
+def generate_task_operation_key() -> str:
+    """
+    Phase 18A.9-A3-A2-A1: mint one opaque, collision-resistant Task
+    CREATE operation key for human UX. Format is deterministic
+    (op:<uuid4>); the value is not. No I/O, no arguments, no PII,
+    no Task/Business content, no storage reservation.
+    """
+    import uuid
+    return f"op:{uuid.uuid4()}"
+
+
+async def newtaskkey_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /newtaskkey
+
+    Phase 18A.9-A3-A2-A1: pure Telegram utility — returns one fresh
+    Task CREATE operation key (op:<uuid4>) with a short /newbctask
+    usage skeleton. Does not read or write Business Core storage,
+    does not authorize TASK/CREATE, and does not accept arguments.
+    Transport validation only (shared private-chat / positive-user
+    gate). Outside COMMAND_ENFORCEMENT_MAP by design.
+    """
+    if not _is_bc_enabled():
+        await _reply(update, _bc_disabled_msg(), parse_mode=None)
+        return
+
+    if not await _validate_bc_transport_or_reply(update):
+        return
+
+    if context.args:
+        await _reply(
+            update,
+            "❌ /newtaskkey не принимает аргументы.\n\nПример:\n/newtaskkey",
+            parse_mode=None,
+        )
+        return
+
+    key = generate_task_operation_key()
+    await _reply(
+        update,
+        "\n".join([
+            "Ключ создания Task:",
+            key,
+            "",
+            "Используйте его в:",
+            f'/newbctask business_id=... title="..." idempotency_key={key}',
+            "",
+            "Сохраните этот ключ, если нужно повторить то же создание.",
+            "Для другой Task сгенерируйте новый ключ.",
+        ]),
+        parse_mode=None,
+    )
+
+
 async def newbctask_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     /newbctask business_id=BIZ-001 title="..." idempotency_key=...
@@ -17205,6 +17259,9 @@ def register_business_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("stageresponsibility", stageresponsibility_cmd))
     # Phase 36D: Task Domain (ADR-019) — deliberately NOT "/tasks", which
     # remains GTD-owned (telegram_bot.py's show_tasks()).
+    # Phase 18A.9-A3-A2-A1: /newtaskkey is a pure utility (outside
+    # COMMAND_ENFORCEMENT_MAP) that mints an opaque operation key.
+    app.add_handler(CommandHandler("newtaskkey",     newtaskkey_cmd))
     app.add_handler(CommandHandler("newbctask",      newbctask_cmd))
     app.add_handler(CommandHandler("bctasks",        bctasks_cmd))
     app.add_handler(CommandHandler("bctask",         bctask_cmd))
@@ -17224,6 +17281,6 @@ def register_business_handlers(app: Application) -> None:
         "/milestones /report "
         "/newdept /newrole /roles /roledetails /assignrole "
         "/assignstagerole /reassignstagerole /stageresponsibility "
-        "/newbctask /bctasks /bctask /updatetask /assigntask /reassigntask /unassigntask "
+        "/newtaskkey /newbctask /bctasks /bctask /updatetask /assigntask /reassigntask /unassigntask "
         "+ bc_ctx callback (Фаза 5B)"
     )
