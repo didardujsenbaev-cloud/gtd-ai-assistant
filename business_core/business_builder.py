@@ -4041,16 +4041,31 @@ def create_business_task(
         if service_id and roadmap.get("service_id", "") and roadmap.get("service_id", "") != service_id:
             return _task_result(ok=False, code="TASK_ENTITY_RELATION_MISMATCH", error=relation_unavailable_msg, business_id=business_id)
 
-    # M/N. Idempotency lookup.
-    if idempotency_key:
-        matches = find_tasks_by_idempotency_key(business_id, idempotency_key)
+    # M/N. Idempotency lookup. Phase 18A.9-A1: idempotency_key is
+    # normalized (stripped) exactly once here, and this single
+    # normalized value is used for the lookup below, for storage (the
+    # create_task() call further down), and for the returned result —
+    # never the raw caller-supplied value again after this point.
+    normalized_key = idempotency_key.strip() if isinstance(idempotency_key, str) else ""
+    if normalized_key:
+        idempotency_result = find_tasks_by_idempotency_key(business_id, normalized_key)
+        if not idempotency_result["ok"]:
+            # Phase 18A.9-A1: a storage read failure is never treated
+            # as "zero matches" — no write is attempted while the
+            # idempotency state is genuinely unknown (Phase 18A.9-A0
+            # audit, §3). Nothing was written, so this is safe to retry.
+            return _task_result(
+                ok=False, code="IDEMPOTENCY_CHECK_UNAVAILABLE", error=None,
+                business_id=business_id, retry_safe=True,
+            )
+        matches = idempotency_result["matches"]
         if len(matches) > 1:
             conflicting_ids = tuple(t.get("task_id", "") for t in matches)
             return _task_result(
                 ok=False, code="MULTIPLE_TASK_IDEMPOTENCY_MATCHES",
                 error=(
                     f"Найдено {len(matches)} Task для (Business={business_id}, "
-                    f"Idempotency Key={idempotency_key}): {conflicting_ids} — новый Task не создан"
+                    f"Idempotency Key={normalized_key}): {conflicting_ids} — новый Task не создан"
                 ),
                 business_id=business_id, conflicting_task_ids=conflicting_ids, retry_safe=True,
             )
@@ -4066,7 +4081,7 @@ def create_business_task(
     write_result = create_task(
         business_id, title,
         description=description, priority=priority, due_date=due_date,
-        source=source, idempotency_key=idempotency_key,
+        source=source, idempotency_key=normalized_key,
         client_id=client_id, object_id=object_id, service_id=service_id,
         roadmap_id=roadmap_id, stage_id=stage_id,
         created_by=created_by, gtd_action_id=gtd_action_id,
@@ -4076,11 +4091,33 @@ def create_business_task(
         if write_code == "TASK_STORAGE_ERROR":
             # Fixed, stable propagation — never synthesize error text
             # from the storage layer's own (already-safe) result, and
-            # never retry or re-run the idempotency lookup.
+            # never retry or re-run the idempotency lookup. Nothing was
+            # confirmed written — safe to retry.
             return _task_result(ok=False, code="TASK_STORAGE_ERROR", error=None, business_id=business_id, retry_safe=True)
+        if write_code == "TASK_ID_ALLOCATION_ERROR":
+            # No Task ID was allocated, no append was attempted — safe
+            # to retry.
+            return _task_result(ok=False, code="TASK_ID_ALLOCATION_ERROR", error=None, business_id=business_id, retry_safe=True)
+        if write_code == "TASK_WRITE_OUTCOME_UNKNOWN":
+            # Phase 18A.9-A1 §8: the client cannot know whether Sheets
+            # accepted the row. Never invite an immediate identical
+            # retry — the Task may already exist.
+            return _task_result(
+                ok=False, code="TASK_WRITE_OUTCOME_UNKNOWN", error=None, business_id=business_id,
+                task_id=write_result.get("task_id", ""), retry_safe=False,
+            )
+        if write_code == "TASK_DUPLICATE_DETECTED":
+            # Confirmed more than one row for the intended key/ID after
+            # append — never silently pick one, never invite a retry
+            # that would only add another possible duplicate.
+            return _task_result(
+                ok=False, code="TASK_DUPLICATE_DETECTED", error=None, business_id=business_id,
+                task_id=write_result.get("task_id", ""),
+                conflicting_task_ids=write_result.get("conflicting_task_ids", ()), retry_safe=False,
+            )
         return _task_result(
             ok=False, code=write_code, error=write_result.get("error"),
-            business_id=business_id, retry_safe=bool(idempotency_key),
+            business_id=business_id, retry_safe=bool(normalized_key),
         )
 
     return _task_result(

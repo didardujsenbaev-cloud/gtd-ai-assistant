@@ -1284,12 +1284,14 @@ class TestTaskCrossLayerIsolation(unittest.TestCase):
     # guard, not a whole-file zero-diff check.
 
     def test_sheets_zero_diff(self):
-        import subprocess
-        result = subprocess.run(
-            ["git", "diff", "--name-only", "HEAD", "--", "business_core/sheets.py"],
-            capture_output=True, text=True, cwd=".",
-        )
-        self.assertEqual(result.stdout.strip(), "")
+        # Phase 18A.9-A1 legitimately adds two new task_registry-only
+        # functions to sheets.py (generate_next_task_id,
+        # append_task_registry_row) — a whole-file zero-diff check is
+        # structurally stale the moment any phase touches this file.
+        # Superseded by the construct-identity guard in
+        # test_task_architecture_guards.py::
+        # TestFailClosedTaskCreationStorageGuards.test_sheets_py_scope_exactly_two_new_functions.
+        self.skipTest("superseded by TestFailClosedTaskCreationStorageGuards.test_sheets_py_scope_exactly_two_new_functions")
 
 
 # ─────────────────────────────────────────────────────────────

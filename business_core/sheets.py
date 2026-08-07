@@ -1558,6 +1558,57 @@ def generate_next_id(sheet_key: str, prefix: str | None = None) -> str:
     return _next_ids_from_values(all_values, prefix, 1)[0]
 
 
+def generate_next_task_id() -> str | None:
+    """
+    Phase 18A.9-A1 (task_registry-only). Unlike generate_next_id()
+    above, which intentionally falls back to "{prefix}-001" whenever
+    the current-state read fails (an acceptable convenience for every
+    other registry), Task ID allocation must never guess a predictable
+    ID under a read failure — a guessed ID that collides with an
+    existing or concurrently-created row is worse than refusing to
+    allocate at all (Phase 18A.9-A0 audit, §5). Returns None — never a
+    fallback ID — on any read failure; the caller (task_manager.
+    create_task()) must fail closed and perform no append.
+    """
+    prefix = _ID_PREFIXES.get("task_registry", "TSK")
+    try:
+        sheet = get_business_sheet("task_registry")
+        all_values = sheet.get_all_values()
+    except Exception:
+        return None
+    return _next_ids_from_values(all_values, prefix, 1)[0]
+
+
+def append_task_registry_row(values: list) -> None:
+    """
+    Phase 18A.9-A1 (task_registry-only). Unlike append_business_row()
+    above, which computes `next_row` client-side from a separate
+    get_all_values() read and then writes to that explicit A1 range
+    (letting two concurrent writers select the same row and silently
+    overwrite one another — Phase 18A.9-A0 audit, §5/§6), this uses
+    gspread's genuine append primitive (Worksheet.append_row(), backed
+    by the Sheets API's spreadsheets.values.append), which lets the
+    server itself choose the row to write to. This removes the
+    client-computed-row-overwrite risk only. It does NOT guarantee Task
+    ID uniqueness, Idempotency Key uniqueness, or any protection across
+    multiple Railway replicas or rolling-deploy overlap — that residual
+    is covered by task_manager.create_task()'s post-append verification
+    read, not by this function. Never call this for any registry other
+    than task_registry — other registries keep append_business_row()'s
+    existing semantics unchanged.
+
+    Raises on failure — the caller is responsible for catching and
+    mapping to a safe result code; this function never swallows an
+    exception into a silent no-op.
+    """
+    sheet = get_business_sheet("task_registry")
+    headers = BUSINESS_HEADERS.get("task_registry", [])
+    row = values
+    if headers and len(row) < len(headers):
+        row = row + [""] * (len(headers) - len(row))
+    sheet.append_row(row, value_input_option="USER_ENTERED")
+
+
 def generate_next_ids(sheet_key: str, count: int, prefix: str | None = None) -> list[str]:
     """
     Сгенерировать `count` уникальных последовательных ID одним чтением листа.

@@ -17,7 +17,7 @@ from __future__ import annotations
 import sys
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 WORKSPACE = Path(__file__).parent
 sys.path.insert(0, str(WORKSPACE))
@@ -89,7 +89,7 @@ class TestCreateBusinessTaskBasics(unittest.TestCase):
 
     def test_business_and_title_only_succeeds(self):
         with patch("business_core.sheets.find_row_by_id", return_value=(2, {"ID": "BIZ-001"})), \
-             patch("business_core.task_manager.find_tasks_by_idempotency_key", return_value=[]), \
+             patch("business_core.task_manager.find_tasks_by_idempotency_key", return_value={"ok": True, "code": "", "matches": [], "error": None}), \
              patch("business_core.task_manager.create_task",
                    return_value={"ok": True, "task_id": "TSK-001", "code": "TASK_CREATED", "error": None}):
             result = create_business_task("BIZ-001", "Title")
@@ -104,7 +104,7 @@ class TestCreateBusinessTaskRelationValidation(unittest.TestCase):
     def _base_patches(self):
         return [
             patch("business_core.sheets.find_row_by_id", return_value=(2, {"ID": "BIZ-001"})),
-            patch("business_core.task_manager.find_tasks_by_idempotency_key", return_value=[]),
+            patch("business_core.task_manager.find_tasks_by_idempotency_key", return_value={"ok": True, "code": "", "matches": [], "error": None}),
             patch("business_core.task_manager.create_task",
                   return_value={"ok": True, "task_id": "TSK-001", "code": "TASK_CREATED", "error": None}),
         ]
@@ -139,7 +139,7 @@ class TestCreateBusinessTaskRelationValidation(unittest.TestCase):
         with patch("business_core.sheets.find_row_by_id", return_value=(2, {"ID": "BIZ-001"})), \
              patch("business_core.person_manager.find_person_by_id",
                    return_value={"person_id": "PRS-001", "biz_ids": ["BIZ-001"]}), \
-             patch("business_core.task_manager.find_tasks_by_idempotency_key", return_value=[]), \
+             patch("business_core.task_manager.find_tasks_by_idempotency_key", return_value={"ok": True, "code": "", "matches": [], "error": None}), \
              patch("business_core.task_manager.create_task",
                    return_value={"ok": True, "task_id": "TSK-001", "code": "TASK_CREATED", "error": None}):
             result = create_business_task("BIZ-001", "Title", client_id="PRS-001")
@@ -277,7 +277,7 @@ class TestCreateBusinessTaskRelationValidation(unittest.TestCase):
              patch("business_core.roadmap_manager.find_stage_by_id", return_value=stage), \
              patch("business_core.roadmap_manager.find_roadmap_by_id", return_value=roadmap), \
              patch("business_core.roadmap_manager.normalize_roadmap_status", side_effect=lambda s: s), \
-             patch("business_core.task_manager.find_tasks_by_idempotency_key", return_value=[]), \
+             patch("business_core.task_manager.find_tasks_by_idempotency_key", return_value={"ok": True, "code": "", "matches": [], "error": None}), \
              patch("business_core.task_manager.create_task") as mock_create:
             mock_create.return_value = {"ok": True, "task_id": "TSK-001", "code": "TASK_CREATED", "error": None}
             result = create_business_task("BIZ-001", "Title", stage_id="STAGE-001")
@@ -331,7 +331,7 @@ class TestCreateBusinessTaskRelationValidation(unittest.TestCase):
         with patch("business_core.sheets.find_row_by_id", return_value=(2, {"ID": "BIZ-001"})), \
              patch("business_core.roadmap_manager.find_roadmap_by_id", return_value=roadmap), \
              patch("business_core.roadmap_manager.normalize_roadmap_status", side_effect=lambda s: s), \
-             patch("business_core.task_manager.find_tasks_by_idempotency_key", return_value=[]), \
+             patch("business_core.task_manager.find_tasks_by_idempotency_key", return_value={"ok": True, "code": "", "matches": [], "error": None}), \
              patch("business_core.task_manager.create_task",
                    return_value={"ok": True, "task_id": "TSK-001", "code": "TASK_CREATED", "error": None}):
             result = create_business_task("BIZ-001", "Title", roadmap_id="RM-001")
@@ -358,7 +358,7 @@ class TestRoadmapStageEligibilityHardening(unittest.TestCase):
 
     def _run(self, **kwargs):
         with patch("business_core.sheets.find_row_by_id", return_value=(2, {"ID": "BIZ-001"})), \
-             patch("business_core.task_manager.find_tasks_by_idempotency_key", return_value=[]), \
+             patch("business_core.task_manager.find_tasks_by_idempotency_key", return_value={"ok": True, "code": "", "matches": [], "error": None}), \
              patch("business_core.task_manager.create_task") as mock_create:
             mock_create.return_value = {"ok": True, "task_id": "TSK-001", "code": "TASK_CREATED", "error": None}
             result = create_business_task("BIZ-001", "Title", **kwargs)
@@ -650,7 +650,7 @@ class TestRoadmapStageEligibilityPoisonObjects(unittest.TestCase):
 
     def _run(self, **kwargs):
         with patch("business_core.sheets.find_row_by_id", return_value=(2, {"ID": "BIZ-001"})), \
-             patch("business_core.task_manager.find_tasks_by_idempotency_key", return_value=[]), \
+             patch("business_core.task_manager.find_tasks_by_idempotency_key", return_value={"ok": True, "code": "", "matches": [], "error": None}), \
              patch("business_core.task_manager.create_task") as mock_create:
             mock_create.return_value = {"ok": True, "task_id": "TSK-001", "code": "TASK_CREATED", "error": None}
             result = create_business_task("BIZ-001", "Title", **kwargs)
@@ -687,7 +687,8 @@ class TestCreateBusinessTaskIdempotency(unittest.TestCase):
 
     def test_zero_match_creates(self):
         with patch("business_core.sheets.find_row_by_id", return_value=(2, {"ID": "BIZ-001"})), \
-             patch("business_core.task_manager.find_tasks_by_idempotency_key", return_value=[]), \
+             patch("business_core.task_manager.find_tasks_by_idempotency_key",
+                   return_value={"ok": True, "code": "", "matches": [], "error": None}), \
              patch("business_core.task_manager.create_task",
                    return_value={"ok": True, "task_id": "TSK-001", "code": "TASK_CREATED", "error": None}):
             result = create_business_task("BIZ-001", "Title", idempotency_key="KEY-1")
@@ -698,7 +699,8 @@ class TestCreateBusinessTaskIdempotency(unittest.TestCase):
     def test_one_match_reuses(self):
         existing = {"task_id": "TSK-050", "status": "ready"}
         with patch("business_core.sheets.find_row_by_id", return_value=(2, {"ID": "BIZ-001"})), \
-             patch("business_core.task_manager.find_tasks_by_idempotency_key", return_value=[existing]):
+             patch("business_core.task_manager.find_tasks_by_idempotency_key",
+                   return_value={"ok": True, "code": "", "matches": [existing], "error": None}):
             result = create_business_task("BIZ-001", "Title", idempotency_key="KEY-1")
         self.assertTrue(result["ok"])
         self.assertEqual(result["code"], "TASK_REUSED")
@@ -709,11 +711,40 @@ class TestCreateBusinessTaskIdempotency(unittest.TestCase):
         dup1 = {"task_id": "TSK-A", "status": "new"}
         dup2 = {"task_id": "TSK-B", "status": "new"}
         with patch("business_core.sheets.find_row_by_id", return_value=(2, {"ID": "BIZ-001"})), \
-             patch("business_core.task_manager.find_tasks_by_idempotency_key", return_value=[dup1, dup2]):
+             patch("business_core.task_manager.find_tasks_by_idempotency_key",
+                   return_value={"ok": True, "code": "", "matches": [dup1, dup2], "error": None}):
             result = create_business_task("BIZ-001", "Title", idempotency_key="KEY-1")
         self.assertFalse(result["ok"])
         self.assertEqual(result["code"], "MULTIPLE_TASK_IDEMPOTENCY_MATCHES")
         self.assertEqual(set(result["conflicting_task_ids"]), {"TSK-A", "TSK-B"})
+
+    def test_idempotency_check_unavailable_blocks_create(self):
+        # Phase 18A.9-A1: a storage read failure must never be treated
+        # as zero matches -- no Task is created while the idempotency
+        # state is unknown.
+        with patch("business_core.sheets.find_row_by_id", return_value=(2, {"ID": "BIZ-001"})), \
+             patch("business_core.task_manager.find_tasks_by_idempotency_key",
+                   return_value={"ok": False, "code": "IDEMPOTENCY_CHECK_UNAVAILABLE", "matches": [], "error": None}), \
+             patch("business_core.task_manager.create_task") as mock_create:
+            result = create_business_task("BIZ-001", "Title", idempotency_key="KEY-1")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "IDEMPOTENCY_CHECK_UNAVAILABLE")
+        self.assertIsNone(result["error"])
+        self.assertTrue(result["retry_safe"])
+        mock_create.assert_not_called()
+
+    def test_idempotency_key_normalized_before_lookup_and_storage(self):
+        # Phase 18A.9-A1 §4: leading/trailing whitespace must not
+        # bypass reuse -- the same normalized key is used for the
+        # lookup and passed through to create_task() for storage.
+        with patch("business_core.sheets.find_row_by_id", return_value=(2, {"ID": "BIZ-001"})), \
+             patch("business_core.task_manager.find_tasks_by_idempotency_key",
+                   return_value={"ok": True, "code": "", "matches": [], "error": None}) as mock_lookup, \
+             patch("business_core.task_manager.create_task",
+                   return_value={"ok": True, "task_id": "TSK-001", "code": "TASK_CREATED", "error": None}) as mock_create:
+            create_business_task("BIZ-001", "Title", idempotency_key="  KEY-1  ")
+        mock_lookup.assert_called_once_with("BIZ-001", "KEY-1")
+        self.assertEqual(mock_create.call_args.kwargs["idempotency_key"], "KEY-1")
 
     def test_blank_idempotency_key_creates_without_lookup(self):
         with patch("business_core.sheets.find_row_by_id", return_value=(2, {"ID": "BIZ-001"})), \
@@ -1479,35 +1510,73 @@ class TestListTasksStrictErrorMode(unittest.TestCase):
 
 class TestCreateTaskStorageErrorContract(unittest.TestCase):
 
-    def test_storage_exception_yields_fixed_code_no_raw_error(self):
+    def test_id_allocation_exception_yields_fixed_code_no_raw_error(self):
+        # Phase 18A.9-A1: generate_next_task_id() itself never raises
+        # (it returns None on read failure) -- create_task() fails
+        # closed with TASK_ID_ALLOCATION_ERROR before any append.
         from business_core.task_manager import create_task
-        with patch("business_core.sheets.generate_next_id", side_effect=RuntimeError("SHEETS-SECRET-DETAIL")):
+        with patch("business_core.sheets.generate_next_task_id", return_value=None):
             result = create_task("BIZ-001", "Title")
-        self.assertEqual(result, {"ok": False, "task_id": "", "code": "TASK_STORAGE_ERROR", "error": None})
+        self.assertEqual(result, {"ok": False, "task_id": "", "code": "TASK_ID_ALLOCATION_ERROR", "error": None})
 
-    def test_storage_exception_logs_fixed_literal_only(self):
+    def test_id_allocation_failure_logs_fixed_literal_only(self):
         from business_core.task_manager import create_task
-        with patch("business_core.sheets.generate_next_id", side_effect=RuntimeError("SHEETS-SECRET-DETAIL")), \
+        with patch("business_core.sheets.generate_next_task_id", return_value=None), \
              self.assertLogs("business_core.task_manager", level="ERROR") as cm:
             create_task("BIZ-001", "Title")
         self.assertEqual(len(cm.output), 1)
-        self.assertIn("create_task storage write failure", cm.output[0])
-        self.assertNotIn("SHEETS-SECRET-DETAIL", cm.output[0])
+        self.assertIn("create_task: Task ID allocation failure", cm.output[0])
 
-    def test_storage_exception_no_retry_no_second_append(self):
+    def test_id_allocation_failure_no_retry_no_append(self):
         from business_core.task_manager import create_task
-        with patch("business_core.sheets.generate_next_id", side_effect=RuntimeError("boom")) as mock_gen, \
-             patch("business_core.sheets.append_business_row") as mock_append:
+        with patch("business_core.sheets.generate_next_task_id", return_value=None) as mock_gen, \
+             patch("business_core.sheets.append_task_registry_row") as mock_append:
             create_task("BIZ-001", "Title")
         self.assertEqual(mock_gen.call_count, 1)
         mock_append.assert_not_called()
+
+    def test_append_raises_verify_zero_propagates_unknown_not_retry_safe(self):
+        """Phase 18A.9-A1-F1: create_business_task must not invite retry."""
+        from business_core.task_manager import create_task
+        sheet = MagicMock()
+        sheet.row_values.return_value = [
+            "Task ID", "Business ID", "Title", "Description", "Status",
+            "Priority", "Due Date", "Source", "Idempotency Key",
+            "Client ID", "Object ID", "Service ID", "Roadmap ID", "Stage ID",
+            "Responsible Role ID", "Assignee Person ID",
+            "Created At", "Updated At", "Started At", "Completed At", "Cancelled At",
+            "Created By", "GTD Action ID",
+        ]
+        with patch("business_core.sheets.generate_next_task_id", return_value="TSK-050"), \
+             patch("business_core.sheets.get_business_sheet", return_value=sheet), \
+             patch("business_core.sheets.append_task_registry_row", side_effect=RuntimeError("SHEETS-SECRET-DETAIL")) as mock_append, \
+             patch("business_core.task_manager._verify_created_task_row", return_value={"ok": True, "matches": []}) as mock_verify:
+            low = create_task("BIZ-001", "Title")
+        self.assertEqual(mock_append.call_count, 1)
+        self.assertEqual(mock_verify.call_count, 1)
+        self.assertEqual(
+            low,
+            {"ok": False, "task_id": "TSK-050", "code": "TASK_WRITE_OUTCOME_UNKNOWN", "error": None},
+        )
+        self.assertNotIn("SHEETS-SECRET-DETAIL", str(low))
+
+        with patch("business_core.sheets.find_row_by_id", return_value=(2, {"ID": "BIZ-001"})), \
+             patch("business_core.task_manager.find_tasks_by_idempotency_key",
+                   return_value={"ok": True, "code": "", "matches": [], "error": None}), \
+             patch("business_core.task_manager.create_task", return_value=low):
+            result = create_business_task("BIZ-001", "Title")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "TASK_WRITE_OUTCOME_UNKNOWN")
+        self.assertFalse(result["retry_safe"])
+        self.assertEqual(result["task_id"], "TSK-050")
+        self.assertIsNone(result["error"])
 
 
 class TestCreateBusinessTaskStorageErrorPropagation(unittest.TestCase):
 
     def test_propagates_fixed_code_no_raw_error(self):
         with patch("business_core.sheets.find_row_by_id", return_value=(2, {"ID": "BIZ-001"})), \
-             patch("business_core.task_manager.find_tasks_by_idempotency_key", return_value=[]), \
+             patch("business_core.task_manager.find_tasks_by_idempotency_key", return_value={"ok": True, "code": "", "matches": [], "error": None}), \
              patch("business_core.task_manager.create_task",
                    return_value={"ok": False, "task_id": "", "code": "TASK_STORAGE_ERROR", "error": None}):
             result = create_business_task("BIZ-001", "Title")
@@ -1517,7 +1586,7 @@ class TestCreateBusinessTaskStorageErrorPropagation(unittest.TestCase):
 
     def test_does_not_synthesize_error_text(self):
         with patch("business_core.sheets.find_row_by_id", return_value=(2, {"ID": "BIZ-001"})), \
-             patch("business_core.task_manager.find_tasks_by_idempotency_key", return_value=[]), \
+             patch("business_core.task_manager.find_tasks_by_idempotency_key", return_value={"ok": True, "code": "", "matches": [], "error": None}), \
              patch("business_core.task_manager.create_task",
                    return_value={"ok": False, "task_id": "", "code": "TASK_STORAGE_ERROR", "error": None}):
             result = create_business_task("BIZ-001", "Title")
@@ -1525,7 +1594,7 @@ class TestCreateBusinessTaskStorageErrorPropagation(unittest.TestCase):
 
     def test_does_not_retry_or_re_lookup_idempotency(self):
         with patch("business_core.sheets.find_row_by_id", return_value=(2, {"ID": "BIZ-001"})), \
-             patch("business_core.task_manager.find_tasks_by_idempotency_key", return_value=[]) as mock_lookup, \
+             patch("business_core.task_manager.find_tasks_by_idempotency_key", return_value={"ok": True, "code": "", "matches": [], "error": None}) as mock_lookup, \
              patch("business_core.task_manager.create_task",
                    return_value={"ok": False, "task_id": "", "code": "TASK_STORAGE_ERROR", "error": None}) as mock_create:
             create_business_task("BIZ-001", "Title", idempotency_key="KEY-1")

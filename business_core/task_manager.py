@@ -203,22 +203,42 @@ def find_task_by_id(task_id: str) -> Optional[dict]:
     return _task_row_to_dict(row_num, v)
 
 
-def find_tasks_by_idempotency_key(business_id: str, idempotency_key: str) -> list[dict]:
+def find_tasks_by_idempotency_key(business_id: str, idempotency_key: str) -> dict:
     """
-    Read-only. Все Task для (Business ID, Idempotency Key) — используется
-    исключительно business_builder.create_business_task()'s zero/one/
-    multiple idempotency policy (ADR-019 §10/§23). Never called by
-    Telegram/other callers directly.
+    Read-only. Returns a typed result contract that distinguishes
+    "checked, zero matches" from "could not check" (Phase 18A.9-A1) —
+    a storage read failure must never be silently treated as zero
+    matches, since that previously let create_business_task() proceed
+    to create a Task while the idempotency state was genuinely unknown
+    (Phase 18A.9-A0 audit, §3/§12).
+
+    idempotency_key is normalized (stripped) once here before both the
+    comparison and the empty-input short-circuit below; each stored
+    cell value is already stripped by the existing `_g` accessor. Case
+    is preserved, not folded.
+
+    Returns:
+        {"ok": bool, "code": str, "matches": list[dict], "error": None}
+
+        ok=True  — read succeeded (matches may be an empty list).
+        ok=False, code="IDEMPOTENCY_CHECK_UNAVAILABLE", matches=[]
+            — the read itself failed; the caller must not treat this
+              as zero matches.
+
+    Never called by Telegram/other callers directly — exclusively
+    business_builder.create_business_task()'s zero/one/multiple
+    idempotency policy (ADR-019 §10/§23).
     """
-    if not business_id or not idempotency_key:
-        return []
+    normalized_key = idempotency_key.strip() if isinstance(idempotency_key, str) else ""
+    if not business_id or not normalized_key:
+        return {"ok": True, "code": "", "matches": [], "error": None}
     try:
         from business_core.sheets import get_business_sheet, get_header_index_map
 
         sheet = get_business_sheet("task_registry")
         all_values = sheet.get_all_values()
         if len(all_values) < 2:
-            return []
+            return {"ok": True, "code": "", "matches": [], "error": None}
 
         headers = all_values[0]
         idx = get_header_index_map(headers)
@@ -233,13 +253,66 @@ def find_tasks_by_idempotency_key(business_id: str, idempotency_key: str) -> lis
                 continue
             if _g(row, "Business ID") != business_id:
                 continue
-            if _g(row, "Idempotency Key") != idempotency_key:
+            if _g(row, "Idempotency Key") != normalized_key:
                 continue
             results.append(_task_row_to_dict(0, {f: _g(row, f) for f in _TASK_FIELDS}))
-        return results
-    except Exception as exc:
-        log.warning(f"find_tasks_by_idempotency_key({business_id}, {idempotency_key}) error: {exc}")
-        return []
+        return {"ok": True, "code": "", "matches": results, "error": None}
+    except Exception:
+        log.warning("find_tasks_by_idempotency_key: read failure")
+        return {"ok": False, "code": "IDEMPOTENCY_CHECK_UNAVAILABLE", "matches": [], "error": None}
+
+
+def _verify_created_task_row(task_id: str, business_id: str, idempotency_key: str) -> dict:
+    """
+    Phase 18A.9-A1. Read-only post-append verification for
+    create_task() — never called before an append attempt, never used
+    for any policy decision other than confirming what is actually
+    persisted.
+
+    Returns every task_registry row whose Task ID equals `task_id`,
+    UNIONED with (when `idempotency_key` is non-blank) every row whose
+    (Business ID, Idempotency Key) equals the intended compound key.
+    The union covers both "did my specific row land" and "did a
+    concurrent writer produce a duplicate under the same idempotency
+    key" in a single read.
+
+    Returns:
+        {"ok": bool, "matches": list[dict]}
+
+        ok=False means the verification read itself failed — the
+        caller must treat this as an unknown outcome, never as zero
+        matches.
+    """
+    try:
+        from business_core.sheets import get_business_sheet, get_header_index_map
+
+        sheet = get_business_sheet("task_registry")
+        all_values = sheet.get_all_values()
+        if len(all_values) < 2:
+            return {"ok": True, "matches": []}
+
+        headers = all_values[0]
+        idx = get_header_index_map(headers)
+
+        def _g(row, h):
+            i = idx.get(h)
+            return row[i].strip() if (i is not None and i < len(row)) else ""
+
+        results = []
+        for row in all_values[1:]:
+            if not row or not row[0].strip():
+                continue
+            row_task_id = _g(row, "Task ID")
+            row_business_id = _g(row, "Business ID")
+            row_key = _g(row, "Idempotency Key")
+            matches_task_id = row_task_id == task_id
+            matches_compound = bool(idempotency_key) and row_business_id == business_id and row_key == idempotency_key
+            if matches_task_id or matches_compound:
+                results.append(_task_row_to_dict(0, {f: _g(row, f) for f in _TASK_FIELDS}))
+        return {"ok": True, "matches": results}
+    except Exception:
+        log.warning("create_task: post-append verification read failure")
+        return {"ok": False, "matches": []}
 
 
 def create_task(
@@ -266,13 +339,35 @@ def create_task(
     Создать Business Task в TASK_REGISTRY. Низкоуровневая запись — не
     проверяет Business/Client/Object/Service/Roadmap/Stage существование
     или согласованность, не проверяет lifecycle eligibility, не
-    проверяет идемпотентность. Вся эта политика — исключительно
-    business_builder.create_business_task() (ADR-019 §7). Вызов этой
-    функции напрямую обходит эту политику осознанно — это примитив,
-    который orchestrator вызывает уже после собственной валидации.
+    проверяет идемпотентность (that policy is exclusively
+    business_builder.create_business_task(), ADR-019 §7). Calling this
+    function directly deliberately bypasses that policy — it is the
+    primitive the orchestrator calls only after its own validation.
+
+    Phase 18A.9-A1: Task ID allocation and the registry append use
+    Task-registry-only primitives (generate_next_task_id() /
+    append_task_registry_row()) that fail closed instead of the
+    generic generate_next_id()/append_business_row() fallback-prone /
+    row-overwrite-prone behavior used by other registries (Phase
+    18A.9-A0 audit, §5/§6). After the append attempt — whether or not
+    it raised — a fresh read (_verify_created_task_row) confirms what
+    is actually persisted before this function claims success,
+    distinguishing:
+      - unknown outcome (TASK_WRITE_OUTCOME_UNKNOWN): verification
+        read failed, OR verification found zero matching rows after
+        any append attempt (whether the append reported success or
+        raised — an append exception does not prove non-persistence);
+      - confirmed success, exactly one row (TASK_CREATED);
+      - confirmed duplicate, more than one row (TASK_DUPLICATE_DETECTED).
+    This function never retries a write and never claims distributed
+    atomicity — verification only proves what this one process can
+    observe in this one read. Phase 18A.9-A1-F1: there is no
+    post-append path that returns TASK_STORAGE_ERROR.
 
     Returns:
         {"ok": bool, "task_id": str, "code": str, "error": str | None}
+        (TASK_DUPLICATE_DETECTED additionally carries
+        "conflicting_task_ids": tuple)
     """
     if not business_id:
         return {"ok": False, "task_id": "", "code": "", "error": "business_id обязателен"}
@@ -284,34 +379,70 @@ def create_task(
             "error": f"Недопустимый статус '{status}'. Допустимые значения: {', '.join(TASK_STATUS)}",
         }
 
-    try:
-        from business_core.sheets import generate_next_id, append_business_row, row_from_header_map, get_business_sheet
+    normalized_key = idempotency_key.strip() if isinstance(idempotency_key, str) else ""
 
-        task_id = generate_next_id("task_registry")
+    from business_core.sheets import generate_next_task_id, append_task_registry_row, row_from_header_map, get_business_sheet
+
+    task_id = generate_next_task_id()
+    if not task_id:
+        log.error("create_task: Task ID allocation failure")
+        return {"ok": False, "task_id": "", "code": "TASK_ID_ALLOCATION_ERROR", "error": None}
+
+    try:
         sheet = get_business_sheet("task_registry")
         headers = sheet.row_values(1)
-        from datetime import datetime
-        ts = datetime.now().strftime("%Y-%m-%d")
-        values = {
-            "Task ID": task_id, "Business ID": business_id, "Title": title,
-            "Description": description, "Status": status, "Priority": priority,
-            "Due Date": due_date, "Source": source, "Idempotency Key": idempotency_key,
-            "Client ID": client_id, "Object ID": object_id, "Service ID": service_id,
-            "Roadmap ID": roadmap_id, "Stage ID": stage_id,
-            "Responsible Role ID": responsible_role_id, "Assignee Person ID": assignee_person_id,
-            "Created At": ts, "Updated At": ts, "Started At": "", "Completed At": "", "Cancelled At": "",
-            "Created By": created_by, "GTD Action ID": gtd_action_id,
-        }
-        row = row_from_header_map(headers, values)
-        append_business_row("task_registry", row)
-        log.info(f"create_task: {task_id} / {title}")
-        return {"ok": True, "task_id": task_id, "code": "TASK_CREATED", "error": None}
     except Exception:
-        # Fixed literal only — no exception interpolation, no Task
-        # row, no Business ID. The caller (create_business_task) must
-        # never receive raw exception text through this contract.
-        log.error("create_task storage write failure")
-        return {"ok": False, "task_id": "", "code": "TASK_STORAGE_ERROR", "error": None}
+        log.error("create_task: header read failure")
+        return {"ok": False, "task_id": "", "code": "TASK_ID_ALLOCATION_ERROR", "error": None}
+
+    from datetime import datetime
+    ts = datetime.now().strftime("%Y-%m-%d")
+    values = {
+        "Task ID": task_id, "Business ID": business_id, "Title": title,
+        "Description": description, "Status": status, "Priority": priority,
+        "Due Date": due_date, "Source": source, "Idempotency Key": normalized_key,
+        "Client ID": client_id, "Object ID": object_id, "Service ID": service_id,
+        "Roadmap ID": roadmap_id, "Stage ID": stage_id,
+        "Responsible Role ID": responsible_role_id, "Assignee Person ID": assignee_person_id,
+        "Created At": ts, "Updated At": ts, "Started At": "", "Completed At": "", "Cancelled At": "",
+        "Created By": created_by, "GTD Action ID": gtd_action_id,
+    }
+    row = row_from_header_map(headers, values)
+
+    append_raised = False
+    try:
+        append_task_registry_row(row)
+    except Exception:
+        append_raised = True
+        log.error("create_task: append attempt raised")
+
+    verification = _verify_created_task_row(task_id, business_id, normalized_key)
+    if not verification["ok"]:
+        log.warning("create_task: outcome unknown, verification read failed")
+        return {"ok": False, "task_id": task_id, "code": "TASK_WRITE_OUTCOME_UNKNOWN", "error": None}
+
+    matches = verification["matches"]
+    if len(matches) == 0:
+        # Phase 18A.9-A1-F1: zero matching rows after any append attempt
+        # is always ambiguous — an append exception does not prove the
+        # server rejected the write. Never classify as TASK_STORAGE_ERROR
+        # / retry-safe confirmed failure.
+        if append_raised:
+            log.warning("create_task: outcome unknown after append exception, no row found")
+        else:
+            log.warning("create_task: outcome unknown, append reported success but no row found")
+        return {"ok": False, "task_id": task_id, "code": "TASK_WRITE_OUTCOME_UNKNOWN", "error": None}
+
+    if len(matches) > 1:
+        conflicting_ids = tuple(t.get("task_id", "") for t in matches)
+        log.warning("create_task: duplicate rows detected after append")
+        return {
+            "ok": False, "task_id": task_id, "code": "TASK_DUPLICATE_DETECTED", "error": None,
+            "conflicting_task_ids": conflicting_ids,
+        }
+
+    log.info(f"create_task: {task_id} / {title}")
+    return {"ok": True, "task_id": task_id, "code": "TASK_CREATED", "error": None}
 
 
 _TASK_ADMIN_EDITABLE_FIELDS = (

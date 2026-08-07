@@ -467,17 +467,21 @@ class TestUnassignTaskPartialStateHardening(unittest.TestCase):
     def test_task_manager_unchanged(self):
         # list_tasks's raise_on_error strict-mode contract is now part
         # of HEAD itself, so comparing the working tree against HEAD
-        # no longer reveals it. This guard proves task_manager.py has
-        # zero diff against HEAD in any phase that does not touch it —
-        # a phase that legitimately changes a task_manager.py
-        # construct must update the expected `changed` set here to
-        # name exactly that construct.
+        # no longer reveals it. This guard proves task_manager.py's
+        # top-level constructs match HEAD exactly, except for whatever
+        # a given phase legitimately touches — a phase that changes a
+        # task_manager.py construct must update the expected sets here
+        # to name exactly that construct, and nothing else.
         #
-        # Phase 18A.8-C1 does not touch task_manager.py at all (its
-        # scope is confined to telegram_handlers.py) — create_task's
-        # TASK_STORAGE_ERROR contract, hardened in Phase 18A.8-B0, is
-        # now part of HEAD itself, so the expected changed set is
-        # empty again this phase.
+        # Phase 18A.9-A1 (fail-closed Task creation storage hardening):
+        # find_tasks_by_idempotency_key() changed to a typed
+        # {"ok", "code", "matches", "error"} contract and normalized
+        # key comparison; create_task() changed to use
+        # generate_next_task_id()/append_task_registry_row() with
+        # post-append verification instead of the generic
+        # generate_next_id()/append_business_row(); a single new
+        # top-level helper, _verify_created_task_row(), was added for
+        # that verification read. No other construct changed.
         import subprocess
 
         head_src = subprocess.run(
@@ -488,10 +492,16 @@ class TestUnassignTaskPartialStateHardening(unittest.TestCase):
 
         head = _task_manager_top_level_constructs(head_src)
         current = _task_manager_top_level_constructs(current_src)
-        self.assertEqual(set(current) - set(head), set(), "task_manager.py: unapproved new top-level construct")
-        self.assertEqual(set(head) - set(current), set(), "task_manager.py: a top-level construct was removed")
-        changed = {k for k in head if head[k] != current[k]}
-        self.assertEqual(changed, set(), "task_manager.py: no construct may change this phase")
+        added = set(current) - set(head)
+        removed = set(head) - set(current)
+        self.assertEqual(added, {"function:_verify_created_task_row"}, "task_manager.py: unapproved new top-level construct")
+        self.assertEqual(removed, set(), "task_manager.py: a top-level construct was removed")
+        changed = {k for k in head if k in current and head[k] != current[k]}
+        self.assertEqual(
+            changed,
+            {"function:find_tasks_by_idempotency_key", "function:create_task"},
+            "task_manager.py: only find_tasks_by_idempotency_key/create_task may change this phase",
+        )
 
     _TASK_MANAGER_DUPLICATE_CASES = (
         (
@@ -2566,18 +2576,14 @@ class TestTelegramHandlersConstructGuardHelperUnit(unittest.TestCase):
 # validate_telegram_business_core_transport — durable, AST-based
 # where practical, proving the exact structural shape rather than a
 # fragile substring count.
+#
+# Phase 18A.9-A1-F2: retired the temporary HEAD-delta phase-scope
+# assertion (test_ast_scope_exact). That guard was valid only while
+# 18A.8-C1-F2 was uncommitted; after merge it permanently expected a
+# non-empty working-tree delta that no longer exists. Live security
+# coverage remains in the sibling methods below plus
+# test_telegram_authorization.py.
 # ─────────────────────────────────────────────────────────────
-
-def _git_show_head_telegram_authorization_py() -> str:
-    import subprocess
-    result = subprocess.run(
-        ["git", "show", "HEAD:business_core/telegram_authorization.py"],
-        cwd=WORKSPACE, capture_output=True, text=True,
-    )
-    if result.returncode != 0:
-        raise AssertionError(f"git show HEAD:business_core/telegram_authorization.py failed: {result.stderr}")
-    return result.stdout
-
 
 class TestTelegramAuthorizationTransportIdentityGuards(unittest.TestCase):
 
@@ -2585,46 +2591,6 @@ class TestTelegramAuthorizationTransportIdentityGuards(unittest.TestCase):
         import inspect
         from business_core import telegram_authorization as ta
         return inspect.getsource(ta.validate_telegram_business_core_transport)
-
-    def test_ast_scope_exact(self):
-        # Reuses the same generic top-level-construct collector shape
-        # as the business_builder.py/telegram_handlers.py guards above
-        # (duplicated here rather than imported, matching this file's
-        # own established per-module-collector convention).
-        import ast
-        def constructs(src):
-            tree = ast.parse(src)
-            lines = src.splitlines(keepends=True)
-            out = {}
-            for node in tree.body:
-                if isinstance(node, ast.FunctionDef):
-                    key = f"function:{node.name}"
-                elif isinstance(node, ast.AsyncFunctionDef):
-                    key = f"async_function:{node.name}"
-                elif isinstance(node, ast.ClassDef):
-                    key = f"class:{node.name}"
-                elif isinstance(node, ast.Assign):
-                    names = [t.id for t in node.targets if isinstance(t, ast.Name)]
-                    key = "assignment:" + ",".join(sorted(names))
-                elif isinstance(node, ast.Import):
-                    key = "import:" + ",".join(sorted(a.name for a in node.names))
-                elif isinstance(node, ast.ImportFrom):
-                    key = f"import_from:{node.module}:" + ",".join(sorted(a.name for a in node.names))
-                else:
-                    continue
-                if key in out:
-                    raise ValueError(f"duplicate top-level construct identifier: {key!r}")
-                out[key] = "".join(lines[node.lineno - 1:node.end_lineno])
-            return out
-
-        head = constructs(_git_show_head_telegram_authorization_py())
-        current = constructs(open(BUSINESS_CORE / "telegram_authorization.py", encoding="utf-8").read())
-        removed = set(head) - set(current)
-        added = set(current) - set(head)
-        changed = {k for k in head if k in current and head[k] != current[k]}
-        self.assertEqual(removed, set())
-        self.assertEqual(added, set())
-        self.assertEqual(changed, {"function:validate_telegram_business_core_transport"})
 
     def test_telegram_handlers_unchanged_this_correction(self):
         # This correction's production scope is confined to
@@ -2689,6 +2655,229 @@ class TestTelegramAuthorizationTransportIdentityGuards(unittest.TestCase):
         }
         self.assertNotIn("authorize_business_core_access", called_names)
         self.assertNotIn("authorize_telegram_business_core_request", called_names)
+
+
+# ─────────────────────────────────────────────────────────────
+# Phase 18A.9-A1: fail-closed Task creation storage & ambiguous-
+# write hardening — durable guards (current-source-shape based,
+# not HEAD-relative, so they remain meaningful after this phase is
+# merged).
+# ─────────────────────────────────────────────────────────────
+
+class TestFailClosedTaskCreationStorageGuards(unittest.TestCase):
+
+    def _task_manager_src(self):
+        return (BUSINESS_CORE / "task_manager.py").read_text(encoding="utf-8")
+
+    def _sheets_src(self):
+        return (BUSINESS_CORE / "sheets.py").read_text(encoding="utf-8")
+
+    def _business_builder_src(self):
+        return (BUSINESS_CORE / "business_builder.py").read_text(encoding="utf-8")
+
+    def _function_source(self, src, name):
+        tree = ast.parse(src)
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
+                lines = src.splitlines(keepends=True)
+                return "".join(lines[node.lineno - 1:node.end_lineno])
+        raise AssertionError(f"function {name!r} not found at module top level")
+
+    def _function_code_only(self, src, name):
+        """Same as _function_source but with the docstring (if any)
+        excluded — for substring checks that must not be confused by a
+        docstring's own prose mentioning a forbidden name."""
+        tree = ast.parse(src)
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
+                lines = src.splitlines(keepends=True)
+                body = node.body
+                start_line = node.lineno
+                if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant) and isinstance(body[0].value.value, str):
+                    start_line = body[0].end_lineno + 1
+                if start_line > node.end_lineno:
+                    return ""
+                return "".join(lines[start_line - 1:node.end_lineno])
+        raise AssertionError(f"function {name!r} not found at module top level")
+
+    def test_idempotency_read_exception_path_returns_dict_not_bare_list(self):
+        src = self._function_source(self._task_manager_src(), "find_tasks_by_idempotency_key")
+        tree = ast.parse(src)
+        func = tree.body[0]
+        for node in ast.walk(func):
+            if isinstance(node, ast.ExceptHandler):
+                for ret in ast.walk(node):
+                    if isinstance(ret, ast.Return) and isinstance(ret.value, ast.List):
+                        self.fail("except-handler in find_tasks_by_idempotency_key returns a bare list -- "
+                                  "a read failure must be a typed {\"ok\": False, ...} result, never []")
+        self.assertIn('"code": "IDEMPOTENCY_CHECK_UNAVAILABLE"', src)
+        self.assertIn('"ok": False', src)
+
+    def test_id_allocation_has_no_predictable_fallback(self):
+        src = self._function_source(self._sheets_src(), "generate_next_task_id")
+        tree = ast.parse(src)
+        func = tree.body[0]
+        for node in ast.walk(func):
+            if isinstance(node, ast.ExceptHandler):
+                for ret in ast.walk(node):
+                    if isinstance(ret, ast.Return) and isinstance(ret.value, ast.Constant) and isinstance(ret.value.value, str):
+                        self.fail(f"generate_next_task_id() except-handler returns a string fallback "
+                                  f"{ret.value.value!r} instead of None -- predictable IDs are forbidden")
+        self.assertNotIn('f"{prefix}-001"', src)
+        self.assertIn("return None", src)
+
+    def test_task_registry_append_does_not_compute_explicit_next_row(self):
+        code = self._function_code_only(self._sheets_src(), "append_task_registry_row")
+        for forbidden in ("next_row", "len(all_rows)", "get_all_values", "range_name"):
+            self.assertNotIn(forbidden, code, f"append_task_registry_row must not compute an explicit row like append_business_row does: found {forbidden!r}")
+
+    def test_task_registry_append_uses_real_append_api(self):
+        code = self._function_code_only(self._sheets_src(), "append_task_registry_row")
+        self.assertIn(".append_row(", code)
+        self.assertNotIn(".update(", code)
+
+    def test_create_task_calls_task_safe_allocation_and_append_not_generic(self):
+        code = self._function_code_only(self._task_manager_src(), "create_task")
+        self.assertIn("generate_next_task_id", code)
+        self.assertIn("append_task_registry_row", code)
+        self.assertNotIn("generate_next_id(", code)
+        self.assertNotIn("append_business_row(", code)
+
+    def test_post_append_verification_exists_and_is_called(self):
+        tm_src = self._task_manager_src()
+        self.assertIn("def _verify_created_task_row(", tm_src)
+        create_src = self._function_source(tm_src, "create_task")
+        self.assertIn("_verify_created_task_row(", create_src)
+
+    def test_ambiguous_write_has_distinct_code_in_both_layers(self):
+        create_src = self._function_source(self._task_manager_src(), "create_task")
+        bb_src = self._function_source(self._business_builder_src(), "create_business_task")
+        self.assertIn("TASK_WRITE_OUTCOME_UNKNOWN", create_src)
+        self.assertIn("TASK_WRITE_OUTCOME_UNKNOWN", bb_src)
+        # Builder may still defensively map TASK_STORAGE_ERROR if ever
+        # received; create_task itself must not emit it post-append
+        # (Phase 18A.9-A1-F1).
+        self.assertIn("TASK_STORAGE_ERROR", bb_src)
+        self.assertNotEqual("TASK_WRITE_OUTCOME_UNKNOWN", "TASK_STORAGE_ERROR")
+
+    def test_append_exception_plus_zero_verify_maps_to_unknown_not_storage_error(self):
+        """Phase 18A.9-A1-F1: RAISES×ZERO cannot be TASK_STORAGE_ERROR."""
+        create_src = self._function_source(self._task_manager_src(), "create_task")
+        self.assertIn('"TASK_WRITE_OUTCOME_UNKNOWN"', create_src)
+        self.assertNotIn('"TASK_STORAGE_ERROR"', create_src)
+        self.assertNotIn("'TASK_STORAGE_ERROR'", create_src)
+        self.assertNotIn("confirmed no row after append failure", create_src)
+        bb_src = self._function_source(self._business_builder_src(), "create_business_task")
+        # Locate the UNKNOWN return _task_result( block and require
+        # retry_safe=False inside it (not a tiny substring window that
+        # can truncate mid-call).
+        marker = 'code="TASK_WRITE_OUTCOME_UNKNOWN"'
+        idx = bb_src.find(marker)
+        self.assertGreater(idx, -1)
+        block = bb_src[idx:idx + 250]
+        self.assertIn("retry_safe=False", block)
+
+    def test_create_task_never_retries_append_or_verification(self):
+        src = self._function_source(self._task_manager_src(), "create_task")
+        tree = ast.parse(src)
+        func = tree.body[0]
+        for node in ast.walk(func):
+            if isinstance(node, (ast.For, ast.AsyncFor, ast.While)):
+                for inner in ast.walk(node):
+                    if isinstance(inner, ast.Call) and isinstance(inner.func, ast.Name):
+                        self.assertNotIn(
+                            inner.func.id, ("append_task_registry_row", "generate_next_task_id", "_verify_created_task_row"),
+                            "create_task must never call its own write/verify primitives inside a loop",
+                        )
+
+    def test_no_raw_exception_interpolation_in_task_creation_path(self):
+        for src in (
+            self._function_source(self._task_manager_src(), "create_task"),
+            self._function_source(self._task_manager_src(), "find_tasks_by_idempotency_key"),
+            self._function_source(self._task_manager_src(), "_verify_created_task_row"),
+            self._function_source(self._sheets_src(), "generate_next_task_id"),
+            self._function_source(self._sheets_src(), "append_task_registry_row"),
+        ):
+            self.assertNotIn("{exc}", src)
+            self.assertNotIn("str(exc)", src)
+            self.assertNotIn("repr(exc)", src)
+
+    def test_no_assignment_gtd_or_drive_path_in_create_task(self):
+        src = self._function_source(self._task_manager_src(), "create_task")
+        for forbidden in (
+            "inbox_processor", "project_planner", "calendar_sync",
+            "create_task_assignment", "google_drive", "Drive",
+        ):
+            self.assertNotIn(forbidden, src)
+
+    def test_no_distributed_atomicity_claim_anywhere_in_task_creation_path(self):
+        # Phase 18A.9-A1 §17: this phase must never claim protection it
+        # does not provide. Forbid confident cross-process/replica
+        # wording; the accompanying docstrings must instead say what is
+        # NOT protected.
+        forbidden_phrases = (
+            "guarantees atomicity", "distributed lock", "atomic Task creation",
+            "guaranteed unique across replicas", "protects against concurrent replicas",
+        )
+        for src in (self._task_manager_src(), self._sheets_src()):
+            lowered = src.lower()
+            for phrase in forbidden_phrases:
+                self.assertNotIn(phrase.lower(), lowered)
+
+    def test_sheets_py_scope_exactly_two_new_functions(self):
+        # Phase 18A.9-A1 narrowly adds exactly two new top-level
+        # functions to sheets.py (generate_next_task_id,
+        # append_task_registry_row) and changes nothing else in that
+        # file — replaces the whole-file zero-diff guards in
+        # test_command_enforcement.py::test_sheets_py_unchanged and
+        # test_authorization_domain.py::test_sheets_zero_diff, which
+        # are structurally stale the moment any phase legitimately
+        # touches sheets.py.
+        import subprocess
+
+        head_src = subprocess.run(
+            ["git", "show", "HEAD:business_core/sheets.py"],
+            cwd=WORKSPACE, capture_output=True, text=True, check=True,
+        ).stdout
+        current_src = self._sheets_src()
+
+        def constructs(src):
+            tree = ast.parse(src)
+            lines = src.splitlines(keepends=True)
+            out = {}
+            for node in tree.body:
+                if isinstance(node, ast.FunctionDef):
+                    key = f"function:{node.name}"
+                elif isinstance(node, ast.AsyncFunctionDef):
+                    key = f"async_function:{node.name}"
+                elif isinstance(node, ast.ClassDef):
+                    key = f"class:{node.name}"
+                elif isinstance(node, ast.Assign):
+                    names = [t.id for t in node.targets if isinstance(t, ast.Name)]
+                    key = "assignment:" + ",".join(sorted(names))
+                else:
+                    continue
+                out.setdefault(key, "")
+                out[key] += "".join(lines[node.lineno - 1:node.end_lineno])
+            return out
+
+        head = constructs(head_src)
+        current = constructs(current_src)
+        removed = set(head) - set(current)
+        added = set(current) - set(head)
+        changed = {k for k in head if k in current and head[k] != current[k]}
+        self.assertEqual(removed, set())
+        self.assertEqual(added, {"function:generate_next_task_id", "function:append_task_registry_row"})
+        self.assertEqual(changed, set(), "sheets.py: no existing construct may change this phase")
+
+    def test_no_process_local_lock_object_introduced_this_phase(self):
+        # Phase 18A.9-A1 §9: the lock is optional and was deferred this
+        # phase (its lifecycle could not be bounded cleanly without a
+        # new abstraction) -- this guard documents that decision and
+        # will need updating the day a future phase actually adds one.
+        tm_src = self._task_manager_src()
+        self.assertNotIn("threading.Lock", tm_src)
+        self.assertNotIn("asyncio.Lock", tm_src)
 
 
 if __name__ == "__main__":

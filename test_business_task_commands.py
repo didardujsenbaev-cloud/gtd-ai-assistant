@@ -1119,6 +1119,53 @@ class TestTaskCreationMessageMapping(unittest.TestCase):
         self.assertNotIn("SOMETHING_NEW", msg)
         self.assertNotIn("detail", msg)
 
+    def test_idempotency_check_unavailable(self):
+        th = _fresh_th()
+        msg = th._task_creation_message({"ok": False, "code": "IDEMPOTENCY_CHECK_UNAVAILABLE", "error": None})
+        self.assertIn("❌", msg)
+        self.assertIn("Попробуйте ещё раз позже", msg)
+        self.assertNotIn("None", msg)
+
+    def test_task_id_allocation_error(self):
+        th = _fresh_th()
+        msg = th._task_creation_message({"ok": False, "code": "TASK_ID_ALLOCATION_ERROR", "error": None})
+        self.assertIn("❌", msg)
+        self.assertIn("Попробуйте ещё раз позже", msg)
+        self.assertNotIn("None", msg)
+
+    def test_write_outcome_unknown_does_not_invite_immediate_retry(self):
+        # Phase 18A.9-A1 §8: must say "check the list first", must
+        # never say "Попробуйте ещё раз позже" for this specific code.
+        th = _fresh_th()
+        msg = th._task_creation_message({
+            "ok": False, "code": "TASK_WRITE_OUTCOME_UNKNOWN", "task_id": "TSK-050", "error": None,
+        })
+        self.assertIn("❌", msg)
+        self.assertIn("проверьте список Tasks", msg)
+        self.assertNotIn("Попробуйте ещё раз позже", msg)
+
+    def test_duplicate_detected_bounds_conflicting_ids(self):
+        th = _fresh_th()
+        many_ids = [f"TSK-{i:03d}" for i in range(30)]
+        msg = th._task_creation_message({
+            "ok": False, "code": "TASK_DUPLICATE_DETECTED",
+            "conflicting_task_ids": tuple(many_ids), "error": None,
+        })
+        self.assertIn("⚠️", msg)
+        self.assertIn("TSK-000", msg)
+        # Bounded to max_ids=10 -- later IDs must not appear.
+        self.assertNotIn("TSK-029", msg)
+        self.assertLess(len(msg), 4000)
+
+    def test_duplicate_detected_no_immediate_retry_wording(self):
+        th = _fresh_th()
+        msg = th._task_creation_message({
+            "ok": False, "code": "TASK_DUPLICATE_DETECTED",
+            "conflicting_task_ids": ("TSK-A", "TSK-B"), "error": None,
+        })
+        self.assertNotIn("Попробуйте ещё раз позже", msg)
+        self.assertIn("проверьте список Tasks", msg)
+
 
 # ─────────────────────────────────────────────────────────────
 # /bctasks

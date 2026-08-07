@@ -15932,6 +15932,38 @@ def _task_creation_message(result: dict) -> str:
     if code == "TASK_STORAGE_ERROR":
         return "❌ Временная ошибка при создании Task. Попробуйте ещё раз позже."
 
+    if code == "IDEMPOTENCY_CHECK_UNAVAILABLE":
+        # Phase 18A.9-A1: the idempotency read itself failed — nothing
+        # was written, so a retry is safe, unlike TASK_WRITE_OUTCOME_UNKNOWN.
+        return "❌ Не удалось проверить Idempotency Key. Task не создан. Попробуйте ещё раз позже."
+
+    if code == "TASK_ID_ALLOCATION_ERROR":
+        # Phase 18A.9-A1: Task ID allocation failed — no append was
+        # attempted, so a retry is safe.
+        return "❌ Не удалось выделить Task ID. Task не создан. Попробуйте ещё раз позже."
+
+    if code == "TASK_WRITE_OUTCOME_UNKNOWN":
+        # Phase 18A.9-A1 §8: the client cannot know whether Sheets
+        # accepted the row — never invite an immediate identical retry.
+        return (
+            "❌ Не удалось подтвердить результат создания Task.\n"
+            "Сначала проверьте список Tasks перед повторной попыткой."
+        )
+
+    if code == "TASK_DUPLICATE_DETECTED":
+        raw_ids = result.get("conflicting_task_ids", ())
+        id_list = raw_ids if isinstance(raw_ids, (tuple, list)) else ()
+        safe_ids = [
+            (t[:field_max_len] + "…") if len(t) > field_max_len else t
+            for t in id_list if isinstance(t, str)
+        ][:max_ids]
+        ids = ", ".join(f"`{t}`" for t in safe_ids) or "—"
+        return "\n".join([
+            "⚠️ Обнаружен конфликт целостности данных после записи",
+            f"Найдено несколько Task-строк: {ids}",
+            "Сначала проверьте список Tasks перед повторной попыткой.",
+        ])
+
     # Fixed literal only — no code interpolation, no business_id, no
     # error text. An unmapped code degrades to the same generic
     # message every other unsafe path uses.
