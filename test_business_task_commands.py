@@ -573,10 +573,32 @@ class TestNewBcTaskCommand(NewBcTaskCommandTestBase):
         mock_create.assert_not_called()
         mock_authz.assert_not_called()
         text = self._sent_text(upd)
+        self.assertIn("Ключ создания", text)
+        self.assertIn("/newtaskkey", text)
         self.assertIn("idempotency_key", text)
         self.assertIn("тот же ключ", text)
         self.assertIn("новый ключ", text)
         self.assertEqual(upd.message.reply_text.call_count, 1)
+
+    def test_missing_key_self_discovering_prepare_flow(self):
+        """Phase 18A.9-A3-A3-A1: knowing only /newbctask discovers /newtaskkey."""
+        args = ["business_id=BIZ-001", 'title="Prepare"']
+        upd, _ = _make_update(
+            '/newbctask business_id=BIZ-001 title="Prepare"',
+            args,
+        )
+        mock_create, mock_authz, _ = self._run_handler(upd, args=args)
+        mock_create.assert_not_called()
+        mock_authz.assert_not_called()
+        text = self._sent_text(upd)
+        self.assertIn("/newtaskkey", text)
+        self.assertIn("Ключ создания", text)
+        self.assertIn("idempotency_key", text)
+        self.assertIn("тот же ключ", text)
+        self.assertIn("новый ключ", text)
+        self.assertNotIn("BIZ-001", text)
+        self.assertEqual(upd.message.reply_text.call_count, 1)
+        self.assertIsNone(upd.message.reply_text.call_args.kwargs.get("parse_mode"))
 
     def test_blank_idempotency_key_rejected_no_mutation(self):
         args = ["business_id=BIZ-001", 'title="X"', "idempotency_key="]
@@ -1102,7 +1124,8 @@ class TestTaskCreationMessageMapping(unittest.TestCase):
         })
         self.assertIn("✅", msg)
         self.assertIn("TSK-001", msg)
-        self.assertIn("Idempotency Key:", msg)
+        self.assertIn("Ключ создания:", msg)
+        self.assertNotIn("Idempotency Key:", msg)
         self.assertIn("op:abc", msg)
 
     def test_reused(self):
@@ -1116,7 +1139,8 @@ class TestTaskCreationMessageMapping(unittest.TestCase):
         self.assertIn("ℹ️", msg)
         self.assertIn("TSK-050", msg)
         self.assertIn("переиспользован", msg)
-        self.assertIn("Idempotency Key:", msg)
+        self.assertIn("Ключ создания:", msg)
+        self.assertNotIn("Idempotency Key:", msg)
         self.assertIn("op:abc", msg)
 
     def test_created_key_bounded_to_field_max(self):
@@ -1244,7 +1268,8 @@ class TestTaskDetailLinesIdempotencyKey(unittest.TestCase):
             "status": "new", "idempotency_key": "op:recover-me",
         }
         text = "\n".join(th._task_detail_lines(task))
-        self.assertIn("Idempotency Key:", text)
+        self.assertIn("Ключ создания:", text)
+        self.assertNotIn("Idempotency Key:", text)
         self.assertIn("op:recover-me", text)
 
     def test_blank_legacy_key_omitted(self):
@@ -1254,6 +1279,7 @@ class TestTaskDetailLinesIdempotencyKey(unittest.TestCase):
             "status": "new", "idempotency_key": "",
         }
         text = "\n".join(th._task_detail_lines(task))
+        self.assertNotIn("Ключ создания:", text)
         self.assertNotIn("Idempotency Key:", text)
 
     def test_missing_key_field_omitted(self):
@@ -1263,6 +1289,7 @@ class TestTaskDetailLinesIdempotencyKey(unittest.TestCase):
             "status": "new",
         }
         text = "\n".join(th._task_detail_lines(task))
+        self.assertNotIn("Ключ создания:", text)
         self.assertNotIn("Idempotency Key:", text)
 
     def test_long_key_clipped_to_64(self):
@@ -1275,6 +1302,24 @@ class TestTaskDetailLinesIdempotencyKey(unittest.TestCase):
         text = "\n".join(th._task_detail_lines(task))
         self.assertIn("K" * 64 + "…", text)
         self.assertNotIn(long_key, text)
+
+
+class TestBcTasksListDoesNotExposeOperationKey(unittest.TestCase):
+    """Phase 18A.9-A3-A3-A1: bulk list stays free of operation-key UX."""
+
+    def test_list_lines_omit_key_even_when_present_on_row(self):
+        th = _fresh_th()
+        rows = [{
+            "task_id": "TSK-001", "business_id": "BIZ-001", "title": "Prepare",
+            "status": "ready", "due_date": "2026-01-01",
+            "idempotency_key": "op:secret-should-not-list",
+        }]
+        text = "\n".join(th._task_list_lines(rows, "BIZ-001"))
+        self.assertIn("TSK-001", text)
+        self.assertNotIn("op:secret-should-not-list", text)
+        self.assertNotIn("Ключ создания", text)
+        self.assertNotIn("Idempotency Key", text)
+        self.assertNotIn("idempotency_key", text)
 
 
 # ─────────────────────────────────────────────────────────────

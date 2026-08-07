@@ -1752,16 +1752,16 @@ class TestBusinessBuilderConstructGuardHelperUnit(unittest.TestCase):
 # ─────────────────────────────────────────────────────────────
 
 _TELEGRAM_HANDLERS_APPROVED_TO_DIFFER = frozenset({
-    # Phase 18A.9-A3-A2-A1: registration only — newtaskkey_cmd +
-    # generate_task_operation_key are approved *additions* below.
-    "function:register_business_handlers",
+    # Phase 18A.9-A3-A3-A1: minimum Task Key discovery UX — missing-key
+    # self-discovery + human-facing "Ключ создания" display labels.
+    "async_function:newbctask_cmd",
+    "function:_task_creation_message",
+    "function:_task_detail_lines",
 })
 
-# Phase 18A.9-A3-A2-A1: stateless /newtaskkey utility + pure key helper.
-_TELEGRAM_HANDLERS_APPROVED_TO_ADD_THIS_PHASE = frozenset({
-    "function:generate_task_operation_key",
-    "async_function:newtaskkey_cmd",
-})
+# Phase 18A.9-A3-A3-A1: no new top-level constructs — wording/label
+# changes only inside already-committed functions.
+_TELEGRAM_HANDLERS_APPROVED_TO_ADD_THIS_PHASE = frozenset()
 
 # NOTE: there is deliberately no "_TELEGRAM_HANDLERS_APPROVED_TO_ADD"
 # constant. That concept named a specific already-committed function
@@ -2390,7 +2390,8 @@ class TestNewBcTaskCmdArchitectureGuards(unittest.TestCase):
 
     def test_mapper_surfaces_idempotency_key_on_created_and_reused(self):
         src = self._mapper_source()
-        self.assertIn("Idempotency Key:", src)
+        self.assertIn("Ключ создания:", src)
+        self.assertNotIn("Idempotency Key:", src)
         self.assertIn('code == "TASK_CREATED"', src)
         self.assertIn('code == "TASK_REUSED"', src)
 
@@ -2399,7 +2400,8 @@ class TestNewBcTaskCmdArchitectureGuards(unittest.TestCase):
         from business_core import telegram_handlers as th
         src = inspect.getsource(th._task_detail_lines)
         self.assertIn("idempotency_key", src)
-        self.assertIn("Idempotency Key:", src)
+        self.assertIn("Ключ создания:", src)
+        self.assertNotIn("Idempotency Key:", src)
 
     def test_no_distributed_atomicity_claim_in_handler(self):
         code = "\n".join(self._code_lines()).lower()
@@ -2407,7 +2409,7 @@ class TestNewBcTaskCmdArchitectureGuards(unittest.TestCase):
             self.assertNotIn(forbidden, code)
 
     def test_core_modules_unchanged_vs_head_this_phase(self):
-        """Approved A3-A2-A1 production scope is telegram_handlers only."""
+        """Approved A3-A3-A1 production scope is telegram_handlers only."""
         import subprocess
         from pathlib import Path
         root = Path(__file__).resolve().parent
@@ -2418,12 +2420,94 @@ class TestNewBcTaskCmdArchitectureGuards(unittest.TestCase):
             "business_core/authorization.py",
             "business_core/telegram_authorization.py",
             "business_core/identity_manager.py",
+            "telegram_bot.py",
         ):
             diff = subprocess.check_output(
                 ["git", "diff", "HEAD", "--", str(root / rel)],
                 text=True,
             )
             self.assertEqual(diff, "", f"{rel} must remain zero-diff vs HEAD this phase")
+
+
+class TestTaskKeyDiscoveryUxArchitectureGuards(unittest.TestCase):
+    """Phase 18A.9-A3-A3-A1: durable discovery/label UX invariants."""
+
+    def test_missing_key_reply_references_newtaskkey_and_human_term(self):
+        import inspect
+        from business_core import telegram_handlers as th
+        src = inspect.getsource(th.newbctask_cmd)
+        # Locate the blank-key rejection block only.
+        idx = src.index("if not idempotency_key:")
+        block = src[idx:src.index("due_date = values", idx)]
+        self.assertIn("/newtaskkey", block)
+        self.assertIn("Ключ создания", block)
+        self.assertIn("idempotency_key", block)
+        self.assertIn("тот же ключ", block)
+        self.assertIn("новый ключ", block)
+
+    def test_api_arg_remains_idempotency_key(self):
+        import inspect
+        from business_core import telegram_handlers as th
+        src = inspect.getsource(th.newbctask_cmd)
+        self.assertIn('"idempotency_key"', src)
+        self.assertIn("idempotency_key=idempotency_key", src)
+        self.assertNotIn("operation_key=", src)
+
+    def test_created_reused_detail_use_human_label_not_schema_rename(self):
+        import inspect
+        from business_core import telegram_handlers as th
+        mapper = inspect.getsource(th._task_creation_message)
+        detail = inspect.getsource(th._task_detail_lines)
+        for src in (mapper, detail):
+            self.assertIn("Ключ создания:", src)
+            self.assertNotIn("Idempotency Key:", src)
+            self.assertIn("idempotency_key", src)
+
+    def test_list_lines_do_not_expose_operation_key(self):
+        import inspect
+        from business_core import telegram_handlers as th
+        src = inspect.getsource(th._task_list_lines)
+        self.assertNotIn("Ключ создания", src)
+        self.assertNotIn("Idempotency Key", src)
+        self.assertNotIn("idempotency_key", src)
+
+    def test_newtaskkey_generator_semantics_unchanged(self):
+        import inspect
+        from business_core import telegram_handlers as th
+        helper = inspect.getsource(th.generate_task_operation_key)
+        handler = inspect.getsource(th.newtaskkey_cmd)
+        self.assertIn("uuid.uuid4()", helper)
+        self.assertIn("op:", helper)
+        self.assertIn("_validate_bc_transport_or_reply", handler)
+        self.assertNotIn("_authorize_or_reply", handler)
+        self.assertNotIn("newtaskkey", th.COMMAND_ENFORCEMENT_MAP)
+
+    def test_no_gtd_or_core_diff_this_phase(self):
+        import subprocess
+        from pathlib import Path
+        root = Path(__file__).resolve().parent
+        for rel in (
+            "telegram_bot.py",
+            "business_core/business_builder.py",
+            "business_core/task_manager.py",
+            "business_core/sheets.py",
+        ):
+            diff = subprocess.check_output(
+                ["git", "diff", "HEAD", "--", str(root / rel)],
+                text=True,
+            )
+            self.assertEqual(diff, "", f"{rel} must remain zero-diff")
+
+    def test_no_distributed_atomicity_claim_in_ux_copy(self):
+        import inspect
+        from business_core import telegram_handlers as th
+        blob = (
+            inspect.getsource(th.newbctask_cmd)
+            + inspect.getsource(th._task_creation_message)
+            + inspect.getsource(th._task_detail_lines)
+        ).lower()
+        for forbidden in ("distributed atomic", "cross-process atomic", "exactly-once"):
+            self.assertNotIn(forbidden, blob)
 
 
 class TestNewTaskKeyArchitectureGuards(unittest.TestCase):

@@ -55,7 +55,8 @@ class TestTaskCreationMessageMapping(unittest.TestCase):
         msg = th._task_creation_message(result)
         self.assertIn("✅", msg)
         self.assertIn("TSK-001", msg)
-        self.assertIn("Idempotency Key:", msg)
+        self.assertIn("Ключ создания:", msg)
+        self.assertNotIn("Idempotency Key:", msg)
         self.assertIn("op:abc", msg)
 
     def test_reused_distinct_from_created(self):
@@ -71,7 +72,8 @@ class TestTaskCreationMessageMapping(unittest.TestCase):
         self.assertIn("✅", created)
         self.assertNotIn("✅", reused)
         self.assertIn("ℹ️", reused)
-        self.assertIn("Idempotency Key:", reused)
+        self.assertIn("Ключ создания:", reused)
+        self.assertNotIn("Idempotency Key:", reused)
         self.assertIn("op:abc", reused)
 
     def test_created_adversarial_key_bounded(self):

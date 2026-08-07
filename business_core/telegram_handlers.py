@@ -15893,18 +15893,18 @@ def _task_creation_message(result: dict) -> str:
         ]
         key = _g("idempotency_key")
         if key:
-            lines.append(f"Idempotency Key: `{key}`")
+            lines.append(f"Ключ создания: `{key}`")
         return "\n".join(lines)
 
     if code == "TASK_REUSED":
         lines = [
-            "ℹ️ Task уже существует — переиспользован по Idempotency Key",
+            "ℹ️ Task уже существует — переиспользован по Ключу создания",
             f"Task ID: `{_g('task_id')}`",
             f"Статус: {_task_status_ru(_g('final_status'))}",
         ]
         key = _g("idempotency_key")
         if key:
-            lines.append(f"Idempotency Key: `{key}`")
+            lines.append(f"Ключ создания: `{key}`")
         return "\n".join(lines)
 
     if code == "BUSINESS_NOT_FOUND":
@@ -15938,7 +15938,7 @@ def _task_creation_message(result: dict) -> str:
         ids = ", ".join(f"`{t}`" for t in safe_ids) or "—"
         return "\n".join([
             "⚠️ Обнаружен конфликт целостности данных",
-            f"Найдено несколько Task с одним Idempotency Key: {ids}",
+            f"Найдено несколько Task с одним Ключом создания: {ids}",
             "Новый Task не создан — автоматический выбор одного из них не выполняется.",
         ])
 
@@ -15948,7 +15948,7 @@ def _task_creation_message(result: dict) -> str:
     if code == "IDEMPOTENCY_CHECK_UNAVAILABLE":
         # Phase 18A.9-A1: the idempotency read itself failed — nothing
         # was written, so a retry is safe, unlike TASK_WRITE_OUTCOME_UNKNOWN.
-        return "❌ Не удалось проверить Idempotency Key. Task не создан. Попробуйте ещё раз позже."
+        return "❌ Не удалось проверить Ключ создания. Task не создан. Попробуйте ещё раз позже."
 
     if code == "TASK_ID_ALLOCATION_ERROR":
         # Phase 18A.9-A1: Task ID allocation failed — no append was
@@ -16250,15 +16250,15 @@ def _task_detail_lines(task) -> list[str]:
         lines.append(f"Source: {_g('source')}")
     if _g("created_by"):
         lines.append(f"Created By: {_g('created_by')}")
-    # Phase 18A.9-A3-A1: surface non-blank Idempotency Key so the
-    # caller can recover the stable business-operation identity and
-    # safely reuse it on retry. Blank legacy rows stay silent — never
+    # Phase 18A.9-A3-A3-A1: surface non-blank operation key as
+    # human-facing "Ключ создания" (API/storage remains
+    # idempotency_key). Blank legacy rows stay silent — never
     # synthesize a key.
     if _g("idempotency_key"):
         key = _g("idempotency_key")
         if len(key) > 64:
             key = key[:64] + "…"
-        lines.append(f"Idempotency Key: `{key}`")
+        lines.append(f"Ключ создания: `{key}`")
     if _g("gtd_action_id"):
         lines.append(f"GTD Action ID: `{_g('gtd_action_id')}`")
 
@@ -16405,18 +16405,22 @@ async def newbctask_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     # new key ⇒ intentional new operation. No tg-<update_id> /
     # message_id / content-hash fallback.
     if not idempotency_key:
+        # Phase 18A.9-A3-A3-A1: self-discovering missing-key UX —
+        # direct the operator to /newtaskkey. API arg name stays
+        # idempotency_key; human term is Ключ создания.
         await _reply(
             update,
             "\n".join([
-                "❌ Для создания Task укажите idempotency_key.",
+                "❌ Для создания Task нужен Ключ создания.",
                 "",
-                "При повторной отправке используйте тот же ключ —",
-                "тогда существующая Task будет переиспользована.",
+                "Получите новый ключ:",
+                "/newtaskkey",
                 "",
-                "Для новой Task используйте новый ключ.",
+                "Затем повторите /newbctask с:",
+                "idempotency_key=<ключ>",
                 "",
-                "Пример:",
-                '`/newbctask business_id=BIZ-001 title="..." idempotency_key=op:123`',
+                "Для повторной отправки той же операции используйте тот же ключ.",
+                "Для другой Task получите новый ключ.",
             ]),
             parse_mode=None,
         )
